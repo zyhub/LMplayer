@@ -1,0 +1,15 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/app/build
+**/build/
+captures
+.externalNativeBuild
+.cxx
+*.apk
+!LMPlayer-v1.0.0.apk
+*github-token*.txt
+*.log

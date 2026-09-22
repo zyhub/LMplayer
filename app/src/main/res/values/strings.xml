@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">LMPlayer</string>
+    <string name="nav_home">首页</string>
+    <string name="nav_library">资料库</string>
+    <string name="nav_settings">设置</string>
+    <string name="server_local_downloaded">本地 · 已下载</string>
+    <string name="server_lemon_music">柠檬音乐</string>
+    <string name="sync_now">立即同步</string>
+    <string name="recent_played">最近播放</string>
+    <string name="recent_added">最近添加</string>
+    <string name="downloaded_badge">已下载</string>
+    <string name="play">播放</string>
+    <string name="pause">暂停</string>
+    <string name="next">下一首</string>
+    <string name="previous">上一首</string>
+    <string name="lyrics">歌词</string>
+    <string name="song">歌曲</string>
+    <string name="playlists">播放列表</string>
+    <string name="artists">艺术家</string>
+    <string name="albums">专辑</string>
+    <string name="songs">歌曲</string>
+    <string name="downloaded">已下载</string>
+    <string name="favorites">我喜欢</string>
+    <string name="channel_name">音频播放</string>
+    <string name="channel_desc">用于在通知栏展示音乐播放状态与控制按钮</string>
+</resources>

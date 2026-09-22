@@ -1,0 +1,14 @@
+<resources>
+    <color name="apple_red">#FA2D48</color>
+    <color name="apple_red_dark">#D81E37</color>
+    <color name="apple_bg_light">#F2F2F7</color>
+    <color name="apple_bg_dark">#000000</color>
+    <color name="apple_card_light">#FFFFFF</color>
+    <color name="apple_card_dark">#1C1C1E</color>
+    <color name="apple_text_primary_light">#000000</color>
+    <color name="apple_text_secondary_light">#8E8E93</color>
+    <color name="apple_text_primary_dark">#FFFFFF</color>
+    <color name="apple_text_secondary_dark">#98989D</color>
+    <color name="apple_pill_bg">#E5E5EA</color>
+    <color name="car_dock_bg">#1A1A1E</color>
+</resources>

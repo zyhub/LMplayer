@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.LMPlayer" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <style name="Theme.ZDSPlayer" parent="Theme.LMPlayer" />
+</resources>
