@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.media
+package com.lm.player.core.media
 
 import android.util.Log
 import com.lm.player.core.database.ZdsDatabase
@@ -141,40 +141,26 @@ object SongMatchingResolver {
             val activeTask = activeTaskBySongId[rawSong.id]
             val isDownloading = activeTask?.status == DownloadStatus.DOWNLOADING
 
-            // 策略 A: 检查 rawSong 自带的 localFilePath 是否为有效物理文件
-            val selfPathValid = !rawSong.localFilePath.isNullOrBlank() && File(rawSong.localFilePath).let { it.exists() && it.length() > 0 }
-            if (selfPathValid) {
-                return@map rawSong.copy(
-                    downloadStatus = DownloadStatus.DOWNLOADED,
-                    downloadProgress = 1f
-                )
-            }
-
-            // 策略 B: 数据库 ID 精确匹配
-            val matchById = cachedById[rawSong.id]
-            if (matchById != null && matchById.downloadStatus == DownloadStatus.DOWNLOADED && !matchById.localFilePath.isNullOrBlank() && File(matchById.localFilePath).exists()) {
-                return@map rawSong.copy(
-                    downloadStatus = DownloadStatus.DOWNLOADED,
-                    localFilePath = matchById.localFilePath,
-                    coverUrl = if (rawSong.coverUrl.isBlank()) matchById.coverUrl else rawSong.coverUrl,
-                    downloadProgress = 1f
-                )
-            }
-
-            // 策略 C: 规范化标题与歌手匹配
             val normKey = "${normalizeTrackTitle(rawSong.title)}|||${normalizeArtist(rawSong.artist)}"
-            val matchByNorm = cachedByNormalizedKey[normKey]
-            if (matchByNorm != null && matchByNorm.downloadStatus == DownloadStatus.DOWNLOADED && !matchByNorm.localFilePath.isNullOrBlank() && File(matchByNorm.localFilePath).exists()) {
-                return@map rawSong.copy(
-                    downloadStatus = DownloadStatus.DOWNLOADED,
-                    localFilePath = matchByNorm.localFilePath,
-                    coverUrl = if (rawSong.coverUrl.isBlank()) matchByNorm.coverUrl else rawSong.coverUrl,
-                    downloadProgress = 1f
-                )
-            }
+            val match = cachedById[rawSong.id] ?: cachedByNormalizedKey[normKey]
 
-            // 策略 D: 在物理离线目录中搜索匹配
-            if (physicalFiles.isNotEmpty()) {
+            // 检查本地离线文件有效性
+            val matchHasLocal = match != null && (
+                match.downloadStatus == DownloadStatus.DOWNLOADED ||
+                !match.localFilePath.isNullOrBlank() ||
+                match.serverId in listOf("local_storage", "local_folder", "local_saf")
+            )
+            val selfPathValid = !rawSong.localFilePath.isNullOrBlank()
+
+            // 检查服务端存储状态
+            val matchHasServer = match != null && (
+                match.serverId == "lemon_music" ||
+                (match.serverId.isNotBlank() && match.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online"))
+            )
+
+            // 物理磁盘匹配（兜底）
+            var matchedPhysicalPath: String? = null
+            if (!selfPathValid && !matchHasLocal && physicalFiles.isNotEmpty()) {
                 val normTitle = normalizeTrackTitle(rawSong.title)
                 val normArtist = normalizeArtist(rawSong.artist)
                 val matchedFile = physicalFiles.firstOrNull { f ->
@@ -183,28 +169,53 @@ object SongMatchingResolver {
                     val artistMatch = normArtist.isBlank() || f.absolutePath.lowercase().contains(normArtist) || fName.contains(normArtist)
                     titleMatch && artistMatch
                 }
-
                 if (matchedFile != null) {
-                    return@map rawSong.copy(
-                        downloadStatus = DownloadStatus.DOWNLOADED,
-                        localFilePath = matchedFile.absolutePath,
-                        downloadProgress = 1f
-                    )
+                    matchedPhysicalPath = matchedFile.absolutePath
                 }
             }
 
-            // 策略 E: 活跃下载任务
-            if (isDownloading && activeTask != null) {
-                return@map rawSong.copy(
-                    downloadStatus = DownloadStatus.DOWNLOADING,
-                    downloadProgress = activeTask.progress
-                )
+            val hasLocal = selfPathValid || matchHasLocal || matchedPhysicalPath != null
+            val effectiveLocalPath = if (selfPathValid) rawSong.localFilePath else if (matchHasLocal) match?.localFilePath else matchedPhysicalPath
+
+            val effectiveServerId = when {
+                matchHasServer -> match!!.serverId
+                rawSong.serverId.isNotBlank() && rawSong.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online") -> rawSong.serverId
+                hasLocal && (rawSong.serverId == "lemon_online" || rawSong.serverId.isBlank()) -> "local_storage"
+                else -> rawSong.serverId
             }
 
-            // 策略 F: 保持未下载线上状态
+            val effectiveDownloadStatus = when {
+                isDownloading -> DownloadStatus.DOWNLOADING
+                hasLocal -> DownloadStatus.DOWNLOADED
+                match != null -> match.downloadStatus
+                else -> DownloadStatus.NOT_DOWNLOADED
+            }
+
+            val effectiveProgress = when {
+                isDownloading && activeTask != null -> activeTask.progress
+                hasLocal -> 1f
+                else -> 0f
+            }
+
+            val effectiveCover = when {
+                rawSong.coverUrl.isNotBlank() -> rawSong.coverUrl
+                match?.coverUrl?.isNotBlank() == true -> match.coverUrl
+                else -> ""
+            }
+
+            val effectiveAddedTimestamp = when {
+                match != null && match.addedTimestamp > 0 -> match.addedTimestamp
+                rawSong.addedTimestamp > 0 -> rawSong.addedTimestamp
+                else -> 0L
+            }
+
             rawSong.copy(
-                downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                downloadProgress = 0f
+                serverId = effectiveServerId,
+                localFilePath = effectiveLocalPath,
+                downloadStatus = effectiveDownloadStatus,
+                downloadProgress = effectiveProgress,
+                coverUrl = effectiveCover,
+                addedTimestamp = effectiveAddedTimestamp
             )
         }
     }
@@ -231,9 +242,12 @@ object SongMatchingResolver {
     suspend fun syncAndUpsertServerSongs(
         database: ZdsDatabase,
         incomingServerSongs: List<SongEntity>,
-        downloadDir: File? = null
+        downloadDir: File? = null,
+        targetServerId: String? = null
     ): Int = withContext(Dispatchers.IO) {
         if (incomingServerSongs.isEmpty()) return@withContext 0
+
+        val effectiveServerId = targetServerId?.ifBlank { null } ?: incomingServerSongs.firstOrNull()?.serverId
 
         // 1. 读取数据库中现有的所有歌曲与已有下载记录
         val existingSongs = database.songDao().getAllSongsList()
@@ -280,22 +294,74 @@ object SongMatchingResolver {
                 }
             }
 
+            val existingMatch = existing ?: existingSongs.firstOrNull {
+                isSongMatch(
+                    title1 = incoming.title,
+                    artist1 = incoming.artist,
+                    durationMs1 = incoming.durationMs,
+                    title2 = it.title,
+                    artist2 = it.artist,
+                    durationMs2 = it.durationMs
+                )
+            }
+            val finalTimestamp = when {
+                existing != null && existing.addedTimestamp > 0 -> existing.addedTimestamp
+                existingMatch != null && existingMatch.addedTimestamp > 0 -> existingMatch.addedTimestamp
+                download != null && download.completedTimestamp > 0 -> download.completedTimestamp
+                incoming.addedTimestamp > 0 -> incoming.addedTimestamp
+                validLocalPath != null -> System.currentTimeMillis()
+                else -> 0L
+            }
+
             val finalDownloadStatus = if (validLocalPath != null) DownloadStatus.DOWNLOADED else DownloadStatus.NOT_DOWNLOADED
-            val finalIsFavorite = incoming.isFavorite || (existing?.isFavorite == true)
-            val finalRelPath = incoming.relativeFolderPath ?: existing?.relativeFolderPath
-            val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existing?.coverUrl ?: "")
+            val finalIsFavorite = incoming.isFavorite || (existing?.isFavorite == true) || (existingMatch?.isFavorite == true)
+            val candidateRelPath = incoming.relativeFolderPath ?: existing?.relativeFolderPath ?: existingMatch?.relativeFolderPath
+            val finalRelPath = candidateRelPath?.takeIf { !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100 }
+            val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existing?.coverUrl ?: existingMatch?.coverUrl ?: "")
 
             incoming.copy(
                 localFilePath = validLocalPath,
                 downloadStatus = finalDownloadStatus,
                 isFavorite = finalIsFavorite,
                 relativeFolderPath = finalRelPath,
-                coverUrl = finalCover
+                coverUrl = finalCover,
+                addedTimestamp = finalTimestamp
             )
         }
 
         // 4. 安全覆盖写入数据库
         database.songDao().insertSongs(preservedEntities)
+
+        // 4.1 差量审查与孤儿清理 (Pruning) - 解决服务端删歌/改名后客户端僵尸曲目残留导致曲目总数对不上的核心问题
+        if (!effectiveServerId.isNullOrBlank() && effectiveServerId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")) {
+            val incomingIds = preservedEntities.map { it.id }.toSet()
+            val serverIdsToCheck = if (effectiveServerId.startsWith("srv_")) {
+                listOf(effectiveServerId, "lemon_music")
+            } else {
+                listOf(effectiveServerId)
+            }
+            val existingServerSongs = existingSongs.filter { it.serverId in serverIdsToCheck }
+            val orphanedSongs = existingServerSongs.filter { !incomingIds.contains(it.id) }
+
+            if (orphanedSongs.isNotEmpty()) {
+                val toDeleteIds = ArrayList<String>()
+                for (orphan in orphanedSongs) {
+                    val localPath = orphan.localFilePath
+                    val hasValidLocalFile = !localPath.isNullOrBlank() && File(localPath).let { it.exists() && it.length() > 0 }
+                    if (hasValidLocalFile) {
+                        // 本地已有有效物理下载文件：降级归属为 local_storage，保留本地离线播放，但不占在线服务器库名额
+                        database.songDao().updateServerId(orphan.id, "local_storage")
+                    } else {
+                        // 本地无实体文件：彻底从数据库物理删除
+                        toDeleteIds.add(orphan.id)
+                    }
+                }
+                if (toDeleteIds.isNotEmpty()) {
+                    database.songDao().deleteSongsByIds(toDeleteIds)
+                    Log.i(TAG, "Pruned ${toDeleteIds.size} orphaned tracks from server $effectiveServerId")
+                }
+            }
+        }
 
         // 5. 触发全局匹配与双向关联去重
         autoMatchAndSyncServer(database, downloadDir, preservedEntities)

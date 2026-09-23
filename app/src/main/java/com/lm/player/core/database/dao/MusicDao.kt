@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.database.dao
+package com.lm.player.core.database.dao
 
 import androidx.room.*
 import com.lm.player.core.database.entity.DownloadEntity
@@ -38,11 +38,17 @@ interface SongDao {
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath WHERE id = :songId")
     suspend fun updateDownloadStatus(songId: String, status: DownloadStatus, localPath: String?)
 
+    @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath, addedTimestamp = :timestamp WHERE id = :songId")
+    suspend fun updateDownloadStatusAndTimestamp(songId: String, status: DownloadStatus, localPath: String?, timestamp: Long)
+
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath, coverUrl = CASE WHEN coverUrl = '' OR coverUrl IS NULL THEN :coverUrl ELSE coverUrl END WHERE id = :songId")
     suspend fun matchAndLinkLocalFile(songId: String, status: DownloadStatus, localPath: String?, coverUrl: String)
 
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :songId")
     suspend fun updateFavorite(songId: String, isFavorite: Boolean)
+
+    @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
+    suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
 
     @Query("UPDATE songs SET lastPlayedTimestamp = :timestamp WHERE id = :songId")
     suspend fun updateLastPlayed(songId: String, timestamp: Long)
@@ -61,6 +67,24 @@ interface SongDao {
 
     @Query("SELECT * FROM songs WHERE serverId IN ('local_storage', 'local_folder', 'local_saf')")
     suspend fun getLocalScannedSongs(): List<SongEntity>
+
+    @Query("DELETE FROM songs")
+    suspend fun clearAllSongs()
+
+    @Query("DELETE FROM songs WHERE serverId = :serverId")
+    suspend fun deleteSongsByServer(serverId: String)
+
+    @Query("DELETE FROM songs WHERE downloadStatus != 'DOWNLOADED' AND (localFilePath IS NULL OR localFilePath = '')")
+    suspend fun clearNonDownloadedSongs()
+
+    @Query("DELETE FROM songs WHERE serverId NOT IN (:validServerIds) AND downloadStatus != 'DOWNLOADED' AND (localFilePath IS NULL OR localFilePath = '')")
+    suspend fun deleteOrphanSongs(validServerIds: List<String>)
+
+    @Query("SELECT id FROM songs WHERE serverId = :serverId")
+    suspend fun getSongIdsByServer(serverId: String): List<String>
+
+    @Query("UPDATE songs SET serverId = :newServerId WHERE id = :songId")
+    suspend fun updateServerId(songId: String, newServerId: String)
 }
 
 @Dao
@@ -154,4 +178,13 @@ interface PlaylistDao {
 
     @Query("UPDATE playlists SET songCount = (SELECT COUNT(*) FROM playlist_songs WHERE playlistId = :playlistId), updatedTimestamp = :timestamp WHERE id = :playlistId")
     suspend fun updateSongCount(playlistId: String, timestamp: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM playlists WHERE id LIKE 'discover_%' OR id LIKE 'lemon_rec_%'")
+    suspend fun clearDiscoverPlaylists()
+
+    @Query("DELETE FROM playlists WHERE isOnline = 1")
+    suspend fun clearOnlinePlaylists()
+
+    @Query("DELETE FROM playlists")
+    suspend fun clearAllPlaylists()
 }

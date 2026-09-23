@@ -19,6 +19,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
@@ -45,11 +46,13 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.window.DialogProperties
+import com.lm.player.core.designsystem.component.AddToPlaylistDialog
+import com.lm.player.core.designsystem.component.AddToPlaylistDropdownMenu
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
+import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
-import com.lm.player.core.model.LyricResult
-import com.lm.player.core.model.UnifiedSong
+import com.lm.player.core.model.*
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -74,6 +77,9 @@ fun FullscreenPlayerSheet(
     isShuffle: Boolean,
     isRepeat: Boolean,
     playbackSpeed: Float = 1.0f,
+    allPlaylists: List<UnifiedPlaylist> = emptyList(),
+    activeDownloadTasks: List<DownloadTask> = emptyList(),
+    isServerConnected: Boolean = true,
     onTogglePlayPause: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
@@ -85,6 +91,9 @@ fun FullscreenPlayerSheet(
     onToggleRepeat: () -> Unit,
     onChangePlaybackSpeed: (Float) -> Unit = {},
     onDownloadSong: (UnifiedSong) -> Unit = {},
+    onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
+    onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
+    onCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { _, _ -> },
     onDismiss: () -> Unit
 ) {
     val configuration = LocalConfiguration.current
@@ -121,7 +130,12 @@ fun FullscreenPlayerSheet(
     var showSleepTimerPanel by remember { mutableStateOf(false) }
     var showAudioSpecsPanel by remember { mutableStateOf(false) }
     var showAudioOutputPanel by remember { mutableStateOf(false) }
+    var showLandscapeAddToPlaylistMenu by remember { mutableStateOf(false) }
+    var showPortraitAddToPlaylistMenu by remember { mutableStateOf(false) }
+    var showDownloadMenu by remember { mutableStateOf(false) }
+    var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
     var activeTimerMinutes by remember { mutableStateOf(0) }
+    var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     // 歌词偏好设置 (字号大小、时间快慢偏置、6 套主题预设)
@@ -214,41 +228,7 @@ fun FullscreenPlayerSheet(
                 )
             }
     ) {
-        if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO) {
-            // =========================================================================
-            // 怀旧专辑主题 (iPod Cover Flow)：3D 滚轮卡片流 + 下方歌词
-            // =========================================================================
-            RetroCoverFlowPlayerView(
-                song = song,
-                playlist = playlist,
-                isPlaying = isPlaying,
-                progressMs = progressMs,
-                totalDurationMs = totalDurationMs,
-                lyrics = lyrics,
-                isShuffle = isShuffle,
-                isRepeat = isRepeat,
-                activeTimerMinutes = activeTimerMinutes,
-                fontSizeSp = lyricsFontSize,
-                lyricsOffsetMs = lyricsOffsetMs,
-                lyricTheme = currentLyricTheme,
-                onTogglePlayPause = onTogglePlayPause,
-                onNext = onNext,
-                onPrevious = onPrevious,
-                onSeekTo = onSeekTo,
-                onSelectSongFromQueue = onSelectSongFromQueue,
-                onToggleFavorite = onToggleFavorite,
-                onToggleShuffle = onToggleShuffle,
-                onToggleRepeat = onToggleRepeat,
-                onSelectTimer = { min -> activeTimerMinutes = min },
-                onFontSizeChange = updateFontSize,
-                onOffsetChange = updateOffset,
-                onThemeChange = updateTheme,
-                onSwitchPlayerTheme = updatePlayerThemeStyle,
-                onOpenSleepTimer = { showSleepTimerPanel = true },
-                onOpenAudioSpecs = { showAudioSpecsPanel = true },
-                onDismiss = onDismiss
-            )
-        } else if (isLandscape) {
+        if (isLandscape) {
             // =========================================================================
             // 横屏布局：支持左右拖动调节比例 (左侧控制器 66.7%~100% + 中间手柄 + 右侧歌词/待播 0%~33.3%)
             // =========================================================================
@@ -308,21 +288,67 @@ fun FullscreenPlayerSheet(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = circleButtonBg,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { updatePlayerThemeStyle(com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO) }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                            // 加入歌单 (音频共享式展出)
+                            Box {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(circleButtonBg)
+                                        .clickable(onClick = { showLandscapeAddToPlaylistMenu = true }),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(Icons.Default.Album, contentDescription = null, tint = AppleRed, modifier = Modifier.size(13.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("怀旧", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = primaryTextColor)
+                                    Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = "加入歌单", tint = primaryTextColor, modifier = Modifier.size(19.dp))
                                 }
+                                AddToPlaylistDropdownMenu(
+                                    expanded = showLandscapeAddToPlaylistMenu,
+                                    onDismissRequest = { showLandscapeAddToPlaylistMenu = false },
+                                    song = song,
+                                    playlists = allPlaylists,
+                                    isServerConnected = isServerConnected,
+                                    onSelectPlaylist = { pl, s ->
+                                        onAddToPlaylist(pl, s)
+                                        Toast.makeText(context, "已添加至歌单: ${pl.name}", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onCreatePlaylistAndAdd = { name, s ->
+                                        onCreatePlaylistAndAddSong(name, s)
+                                        Toast.makeText(context, "已创建歌单 \"$name\" 并添加歌曲", Toast.LENGTH_SHORT).show()
+                                    }
+                                )
+                            }
+
+                            // 缓存与下载
+                            Box {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(circleButtonBg)
+                                        .clickable(onClick = { showLandscapeDownloadMenu = true }),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                    val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
+                                    if (isDownloaded && isServerCached) {
+                                        Icon(Icons.Default.CheckCircle, contentDescription = "双端已同步", tint = Color(0xFF34C759), modifier = Modifier.size(19.dp))
+                                    } else if (isDownloaded || isServerCached) {
+                                        Icon(Icons.Default.CheckCircleOutline, contentDescription = "单端已缓存", tint = Color(0xFF34C759), modifier = Modifier.size(19.dp))
+                                    } else {
+                                        Icon(Icons.Default.FileDownload, contentDescription = "下载", tint = primaryTextColor, modifier = Modifier.size(19.dp))
+                                    }
+                                }
+                                DownloadQualityDropdownMenu(
+                                    expanded = showLandscapeDownloadMenu,
+                                    onDismissRequest = { showLandscapeDownloadMenu = false },
+                                    song = song,
+                                    isServerConnected = isServerConnected,
+                                    hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                    hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
+                                    onConfirm = { target, quality ->
+                                        showLandscapeDownloadMenu = false
+                                        onDownloadSongWithOptions(song, target, quality)
+                                    }
+                                )
                             }
 
                             Box {
@@ -348,13 +374,16 @@ fun FullscreenPlayerSheet(
                                     .size(36.dp)
                                     .clip(CircleShape)
                                     .background(circleButtonBg)
-                                    .clickable(onClick = onToggleFavorite),
+                                    .clickable {
+                                        localIsFavorite = !localIsFavorite
+                                        onToggleFavorite()
+                                    },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = if (song.isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                    imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                                     contentDescription = "喜欢",
-                                    tint = if (song.isFavorite) AppleRed else primaryTextColor,
+                                    tint = if (localIsFavorite) AppleRed else primaryTextColor,
                                     modifier = Modifier.size(19.dp)
                                 )
                             }
@@ -370,9 +399,9 @@ fun FullscreenPlayerSheet(
                         AlbumArtworkImage(
                             model = song.coverUrl,
                             seedId = song.id,
-                            targetSize = 360,
+                            targetSize = 480,
                             modifier = Modifier
-                                .size(175.dp)
+                                .size(230.dp)
                                 .clip(RoundedCornerShape(18.dp))
                                 .shadow(16.dp, RoundedCornerShape(18.dp)),
                             cornerRadius = 18.dp
@@ -837,23 +866,6 @@ fun FullscreenPlayerSheet(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = circleButtonBg,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { updatePlayerThemeStyle(com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO) }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Album, contentDescription = null, tint = AppleRed, modifier = Modifier.size(13.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("怀旧", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = primaryTextColor)
-                            }
-                        }
-
                         Box {
                             Box(
                                 modifier = Modifier
@@ -882,13 +894,16 @@ fun FullscreenPlayerSheet(
                                 .size(36.dp)
                                 .clip(CircleShape)
                                 .background(circleButtonBg)
-                                .clickable(onClick = onToggleFavorite),
+                                .clickable {
+                                    localIsFavorite = !localIsFavorite
+                                    onToggleFavorite()
+                                },
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = if (song.isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                                 contentDescription = "红心喜欢",
-                                tint = if (song.isFavorite) AppleRed else primaryTextColor,
+                                tint = if (localIsFavorite) AppleRed else primaryTextColor,
                                 modifier = Modifier.size(19.dp)
                             )
                         }
@@ -909,15 +924,15 @@ fun FullscreenPlayerSheet(
                             modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.Center
                         ) {
-                            val artworkSize = (configuration.screenWidthDp * 0.78f).dp.coerceIn(240.dp, 360.dp)
+                            val artworkSize = (configuration.screenWidthDp - 48).dp.coerceIn(280.dp, 400.dp)
                             AlbumArtworkImage(
                                 model = song.coverUrl,
                                 seedId = song.id,
-                                targetSize = 360,
+                                targetSize = 512,
                                 modifier = Modifier
                                     .size(artworkSize)
-                                    .shadow(16.dp, RoundedCornerShape(20.dp)),
-                                cornerRadius = 20.dp
+                                    .shadow(20.dp, RoundedCornerShape(24.dp)),
+                                cornerRadius = 24.dp
                             )
                         }
                     } else {
@@ -938,34 +953,131 @@ fun FullscreenPlayerSheet(
                     }
                 }
 
-                // 3. 歌曲元数据：标题、歌手与专辑
-                Column(
+                // 3. 歌曲元数据：标题、歌手与专辑 + 加入歌单与下载按钮
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.Start
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = song.title,
-                        style = TextStyle(
-                            fontSize = 22.sp * dimensions.fontScale,
-                            fontWeight = FontWeight.Bold,
-                            color = primaryTextColor
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = song.title,
+                            style = TextStyle(
+                                fontSize = 22.sp * dimensions.fontScale,
+                                fontWeight = FontWeight.Bold,
+                                color = primaryTextColor
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
 
-                    Text(
-                        text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
-                        style = TextStyle(
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = secondaryTextColor
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                        Text(
+                            text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
+                            style = TextStyle(
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = secondaryTextColor
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // 加入歌单按钮 (音频共享式展出)
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(circleButtonBg)
+                                    .clickable { showPortraitAddToPlaylistMenu = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                    contentDescription = "加入歌单",
+                                    tint = primaryTextColor,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                            AddToPlaylistDropdownMenu(
+                                expanded = showPortraitAddToPlaylistMenu,
+                                onDismissRequest = { showPortraitAddToPlaylistMenu = false },
+                                song = song,
+                                playlists = allPlaylists,
+                                isServerConnected = isServerConnected,
+                                onSelectPlaylist = { pl, s ->
+                                    onAddToPlaylist(pl, s)
+                                    Toast.makeText(context, "已添加至歌单: ${pl.name}", Toast.LENGTH_SHORT).show()
+                                },
+                                onCreatePlaylistAndAdd = { name, s ->
+                                    onCreatePlaylistAndAddSong(name, s)
+                                    Toast.makeText(context, "已创建歌单 \"$name\" 并添加歌曲", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        }
+
+                        // 下载与缓存选择按钮 (支持本地/服务器/双端同步选择)
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(circleButtonBg)
+                                    .clickable { showDownloadMenu = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
+                                if (isDownloaded && isServerCached) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = "双端已同步",
+                                        tint = Color(0xFF34C759),
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                } else if (isDownloaded || isServerCached) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircleOutline,
+                                        contentDescription = "单端已缓存",
+                                        tint = Color(0xFF34C759),
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.FileDownload,
+                                        contentDescription = "下载",
+                                        tint = primaryTextColor,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+
+                            DownloadQualityDropdownMenu(
+                                expanded = showDownloadMenu,
+                                onDismissRequest = { showDownloadMenu = false },
+                                song = song,
+                                isServerConnected = isServerConnected,
+                                hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
+                                onConfirm = { target, quality ->
+                                    showDownloadMenu = false
+                                    onDownloadSongWithOptions(song, target, quality)
+                                }
+                            )
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -1178,6 +1290,8 @@ fun FullscreenPlayerSheet(
                 }
             }
         }
+
+
     }
 }
 

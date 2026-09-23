@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.media
+package com.lm.player.core.media
 
 import android.content.Context
 import android.util.Log
@@ -41,6 +41,18 @@ object PlaybackQueueManager {
 
     fun updatePlaylist(songs: List<UnifiedSong>) {
         _playlistFlow.value = songs
+        val current = _currentSongFlow.value
+        if (current != null) {
+            val updated = songs.firstOrNull { it.id == current.id }
+            if (updated != null && updated != current) {
+                _currentSongFlow.value = updated
+            }
+        }
+    }
+
+    fun updateCurrentSong(song: UnifiedSong) {
+        _currentSongFlow.value = song
+        _playlistFlow.value = _playlistFlow.value.map { if (it.id == song.id) song else it }
     }
 
     fun setShuffle(shuffle: Boolean) {

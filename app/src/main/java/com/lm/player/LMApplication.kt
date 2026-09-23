@@ -1,6 +1,7 @@
 package com.lm.player
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import coil.ImageLoader
@@ -21,6 +22,8 @@ class LMApplication : Application(), ImageLoaderFactory {
         // 1. 异步在后台线程加载 Conscrypt 安全提供商与 Media3 缓存，0ms 阻塞冷启动主线程
         CoroutineScope(Dispatchers.IO).launch {
             NetworkClientFactory.installSecurityProvider()
+            val streamCacheEnabled = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE).getBoolean("stream_cache_enabled", true)
+            com.lm.player.core.media.Media3Factory.setCacheEnabled(streamCacheEnabled)
             com.lm.player.core.media.Media3Factory.prewarm(this@LMApplication)
         }
 

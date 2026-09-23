@@ -1,4 +1,4 @@
-﻿package com.lm.player.feature.player
+package com.lm.player.feature.player
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
@@ -138,51 +138,250 @@ fun LyricsScrollingView(
             }
         }
 
-        // 右上角歌词悬浮调节按键 (Aa ⏱)
+        // 右上角歌词悬浮调节按键 (Aa ⏱) - 音频共享式展出
         if (showAdjustButton) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = if (isDark) Color(0xFF1E1E24).copy(alpha = 0.85f) else Color(0xFFE5E5EA).copy(alpha = 0.85f),
-                border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
+            Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 10.dp, end = 12.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable { showAdjustDialog = true }
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isDark) Color(0xFF1E1E24).copy(alpha = 0.85f) else Color(0xFFE5E5EA).copy(alpha = 0.85f),
+                    border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { showAdjustDialog = true }
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Tune,
-                        contentDescription = "歌词微调",
-                        tint = activeColor,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "歌词调节",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = activeColor
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tune,
+                            contentDescription = "歌词微调",
+                            tint = activeColor,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "歌词调节",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = activeColor
+                        )
+                    }
                 }
+
+                // 原位浮层音频共享展出卡片
+                LyricsAdjustDropdownMenu(
+                    expanded = showAdjustDialog,
+                    onDismissRequest = { showAdjustDialog = false },
+                    fontSizeSp = fontSizeSp,
+                    lyricsOffsetMs = lyricsOffsetMs,
+                    lyricTheme = lyricTheme,
+                    onFontSizeChange = onFontSizeChange,
+                    onOffsetChange = onOffsetChange,
+                    onThemeChange = onThemeChange
+                )
             }
         }
     }
+}
 
-    // 歌词大小与快慢调节弹窗
-    if (showAdjustDialog) {
-        LyricsAdjustDialog(
-            fontSizeSp = fontSizeSp,
-            lyricsOffsetMs = lyricsOffsetMs,
-            lyricTheme = lyricTheme,
-            onFontSizeChange = onFontSizeChange,
-            onOffsetChange = onOffsetChange,
-            onThemeChange = onThemeChange,
-            onDismiss = { showAdjustDialog = false }
-        )
+/**
+ * 原位音频共享展出方式的歌词微调菜单 (字号大小、时间偏置、6 套主题预设)
+ */
+@Composable
+fun LyricsAdjustDropdownMenu(
+    expanded: Boolean,
+    onDismissRequest: () -> Unit,
+    fontSizeSp: Float,
+    lyricsOffsetMs: Long,
+    lyricTheme: LyricTheme,
+    onFontSizeChange: (Float) -> Unit,
+    onOffsetChange: (Long) -> Unit,
+    onThemeChange: (LyricTheme) -> Unit
+) {
+    val isDark = isSystemInDarkTheme()
+    val primaryText = if (isDark) Color.White else Color.Black
+    val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
+
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = Modifier.widthIn(min = 270.dp, max = 320.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .fillMaxWidth()
+        ) {
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = null,
+                        tint = AppleRed,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "歌词调节与外观",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = primaryText
+                    )
+                }
+                IconButton(onClick = onDismissRequest, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "关闭", tint = secondaryText, modifier = Modifier.size(14.dp))
+                }
+            }
+
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+
+            // 1. 字号大小调节
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("字体大小", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = secondaryText)
+                Text("${fontSizeSp.toInt()} sp", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AppleRed)
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = { onFontSizeChange((fontSizeSp - 2f).coerceAtLeast(16f)) },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Text("A-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = primaryText)
+                }
+                Slider(
+                    value = fontSizeSp,
+                    onValueChange = { onFontSizeChange(it) },
+                    valueRange = 16f..36f,
+                    steps = 9,
+                    colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed),
+                    modifier = Modifier.weight(1f).height(24.dp)
+                )
+                IconButton(
+                    onClick = { onFontSizeChange((fontSizeSp + 2f).coerceAtMost(36f)) },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Text("A+", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = primaryText)
+                }
+            }
+
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 6.dp)
+            )
+
+            // 2. 歌词时间偏置快慢
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("时间同步", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = secondaryText)
+                val offsetSec = lyricsOffsetMs / 1000.0
+                Text(
+                    text = if (lyricsOffsetMs > 0) "+%.1fs (提前)".format(offsetSec) else if (lyricsOffsetMs < 0) "%.1fs (延后)".format(offsetSec) else "0.0s (标准)",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (lyricsOffsetMs != 0L) AppleRed else secondaryText
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { onOffsetChange((lyricsOffsetMs - 500L).coerceAtLeast(-5000L)) },
+                    modifier = Modifier.weight(1f).height(28.dp),
+                    contentPadding = PaddingValues(0.dp),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text("延后 0.5s", fontSize = 10.sp)
+                }
+                OutlinedButton(
+                    onClick = { onOffsetChange(0L) },
+                    modifier = Modifier.weight(0.7f).height(28.dp),
+                    contentPadding = PaddingValues(0.dp),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text("归零", fontSize = 10.sp)
+                }
+                OutlinedButton(
+                    onClick = { onOffsetChange((lyricsOffsetMs + 500L).coerceAtMost(5000L)) },
+                    modifier = Modifier.weight(1f).height(28.dp),
+                    contentPadding = PaddingValues(0.dp),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text("提前 0.5s", fontSize = 10.sp)
+                }
+            }
+
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 6.dp)
+            )
+
+            // 3. 歌词主题颜色
+            Text("主题配色", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = secondaryText)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                LyricTheme.entries.forEach { theme ->
+                    val isSelected = theme == lyricTheme
+                    val themeColor = if (isDark) theme.activeColorDark else theme.activeColorLight
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (isSelected) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                        border = if (isSelected) BorderStroke(1.5.dp, AppleRed) else null,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(28.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onThemeChange(theme) }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(themeColor)
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "${lyricTheme.displayName} • ${lyricTheme.description}",
+                fontSize = 10.sp,
+                color = secondaryText,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
     }
 }
 

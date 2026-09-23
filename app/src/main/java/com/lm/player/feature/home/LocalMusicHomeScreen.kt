@@ -29,13 +29,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.ArtistAvatarImage
+import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
+import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
+import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.DownloadStatus
+import com.lm.player.core.model.DownloadTarget
 import com.lm.player.core.model.DownloadTask
 import com.lm.player.core.model.HomeScreenDisplayConfig
 import com.lm.player.core.model.ServerConfig
+import com.lm.player.core.model.ServerType
 import com.lm.player.core.model.UnifiedAlbum
 import com.lm.player.core.model.UnifiedArtist
 import com.lm.player.core.model.UnifiedPlaylist
@@ -50,26 +55,10 @@ fun formatDownloadedSongSpecs(song: UnifiedSong): String {
     val qualityTag = if (isLossless) "Hi-Res 无损" else if (song.bitRate >= 320) "极高音质" else "标准音质"
     val bitrateStr = if (song.bitRate > 0) "${song.bitRate} kbps" else if (isLossless) "920 kbps (无损)" else "320 kbps"
 
-    val sizeStr = if (song.localFilePath != null && song.localFilePath.isNotBlank() && !song.localFilePath.startsWith("content://")) {
-        try {
-            val file = java.io.File(song.localFilePath)
-            if (file.exists()) {
-                val mb = file.length() / (1024.0 * 1024.0)
-                "%.1f MB".format(java.util.Locale.US, mb)
-            } else {
-                null
-            }
-        } catch (_: Exception) {
-            null
-        }
-    } else {
-        null
-    } ?: run {
-        val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
-        val rate = if (isLossless) 900 else song.bitRate.coerceAtLeast(320)
-        val estMb = (durationSec * rate * 1024L / 8L) / (1024.0 * 1024.0)
-        "%.1f MB".format(java.util.Locale.US, estMb)
-    }
+    val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
+    val rate = if (isLossless) 900 else song.bitRate.coerceAtLeast(320)
+    val estMb = (durationSec * rate * 1024L / 8L) / (1024.0 * 1024.0)
+    val sizeStr = "%.1f MB".format(java.util.Locale.US, estMb)
 
     return "$qualityTag • $formatStr • $bitrateStr • $sizeStr"
 }
@@ -83,8 +72,10 @@ fun SongListItemRow(
     song: UnifiedSong,
     isLocalOfflineMode: Boolean = false,
     activeDownloadTasks: List<DownloadTask> = emptyList(),
+    isServerConnected: Boolean = true,
     onClick: () -> Unit,
     onDownloadClick: () -> Unit = {},
+    onDownloadWithOptions: ((UnifiedSong, DownloadTarget, AudioQuality) -> Unit)? = null,
     onOpenDownloads: () -> Unit = {}
 ) {
     val dimensions = LocalAppDimensions.current
@@ -175,8 +166,24 @@ fun SongListItemRow(
 
         Spacer(modifier = Modifier.width(6.dp))
 
-        // 末尾操作区：直接展示下载按键 / 下载中动态进度 / 已下载标识
-        if (isDownloading) {
+        val hasLocal = (song.downloadStatus == DownloadStatus.DOWNLOADED) ||
+                (!song.localFilePath.isNullOrBlank()) ||
+                (song.serverId in listOf("local_storage", "local_folder", "local_saf"))
+        val hasServer = (song.serverId == "lemon_music" ||
+                (isServerConnected && song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")))
+
+        if (onDownloadWithOptions != null) {
+            com.lm.player.core.designsystem.component.SongSyncStatusTrailing(
+                song = song,
+                isDownloading = isDownloading,
+                downloadProgress = currentProgress,
+                isServerConnected = isServerConnected,
+                hasLocal = hasLocal,
+                hasServer = hasServer,
+                onOpenDownloads = onOpenDownloads,
+                onDownloadWithOptions = onDownloadWithOptions
+            )
+        } else if (isDownloading) {
             Surface(
                 shape = RoundedCornerShape(12.dp),
                 color = AppleRed.copy(alpha = 0.12f),
@@ -222,7 +229,7 @@ fun SongListItemRow(
             ) {
                 Icon(
                     imageVector = Icons.Default.ArrowCircleDown,
-                    contentDescription = "下载到本地",
+                    contentDescription = "下载歌曲",
                     tint = AppleRed,
                     modifier = Modifier.size(22.dp)
                 )
@@ -248,6 +255,7 @@ fun LocalMusicHomeScreen(
     activeDownloadCount: Int = 0,
     onSongClick: (UnifiedSong) -> Unit,
     onDownloadSong: (UnifiedSong) -> Unit = {},
+    onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
     onSelectLocalServer: () -> Unit = {},
     onSelectServer: (ServerConfig) -> Unit = {},
     onSyncNow: () -> Unit = {},
@@ -262,26 +270,24 @@ fun LocalMusicHomeScreen(
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = blurAlpha)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.10f)
 
-    // 本地模式仅筛选真正已下载到本地或扫描导入的离线音频
+    var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
+
+    // 本地模式仅筛选真正已下载到本地或扫描导入且物理文件存在的离线音频
     val localDownloadedSongs = remember(recentSongs) {
         recentSongs.filter {
-            it.downloadStatus == DownloadStatus.DOWNLOADED ||
-            it.serverId == "local_storage" ||
-            it.serverId == "local_saf" ||
-            it.serverId == "local_folder" ||
-            !it.localFilePath.isNullOrBlank()
+            val hasValidFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+            (it.downloadStatus == DownloadStatus.DOWNLOADED && hasValidFile) ||
+            (it.serverId in listOf("local_storage", "local_saf", "local_folder") && hasValidFile)
         }
     }
 
-    val activeSongSource = if (localDownloadedSongs.isNotEmpty()) localDownloadedSongs else recentSongs
+    // 严密约束：本地已下载界面绝不回退至包含全量在线服务器曲目的 recentSongs
+    val activeSongSource = localDownloadedSongs
 
-    val effectiveRecentlyAdded = remember(recentlyAddedSongs, activeSongSource) {
-        if (recentlyAddedSongs.isNotEmpty()) recentlyAddedSongs.take(20) else activeSongSource.take(20)
+    val effectiveRecentlyAdded = remember(activeSongSource) {
+        activeSongSource.sortedByDescending { it.addedTimestamp }.take(20)
     }
 
-    val effectiveRecentlyPlayed = remember(recentlyPlayedSongs, activeSongSource) {
-        if (recentlyPlayedSongs.isNotEmpty()) recentlyPlayedSongs.take(15) else activeSongSource.take(15)
-    }
 
     // 从真实歌曲列表中动态提取专辑集合
     val albums = remember(activeSongSource) {
@@ -313,16 +319,17 @@ fun LocalMusicHomeScreen(
             }
     }
 
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp),
-        contentPadding = PaddingValues(
-            top = contentPadding.calculateTopPadding(),
-            bottom = contentPadding.calculateBottomPadding() + 24.dp
-        ),
-        verticalArrangement = Arrangement.spacedBy(20.dp)
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(
+                top = contentPadding.calculateTopPadding(),
+                bottom = contentPadding.calculateBottomPadding() + 24.dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
         // 1. 顶部 Header (大标题 + 下载管理胶囊 + 音源下拉切换)
         item {
             Row(
@@ -343,7 +350,7 @@ fun LocalMusicHomeScreen(
                         )
                     )
                     Text(
-                        text = "已收录 ${activeSongSource.size} 首歌曲 · ${albums.size} 张专辑",
+                        text = if (activeSongSource.isEmpty()) "暂无已下载歌曲" else "已收录 ${activeSongSource.size} 首已下载歌曲 · ${albums.size} 张专辑",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -509,15 +516,32 @@ fun LocalMusicHomeScreen(
                 key = { it.id },
                 contentType = { "song_row" }
             ) { song ->
+                val isServerOk = configuredServers.any { it.type == ServerType.LEMON_MUSIC }
                 SongListItemRow(
                     song = song,
                     isLocalOfflineMode = true,
                     activeDownloadTasks = activeDownloadTasks,
+                    isServerConnected = isServerOk,
                     onClick = { onSongClick(song) },
-                    onDownloadClick = { onDownloadSong(song) },
+                    onDownloadClick = { songForDownloadChoice = song },
+                    onDownloadWithOptions = { s, target, quality ->
+                        onDownloadSongWithOptions(s, target, quality)
+                    },
                     onOpenDownloads = onOpenDownloads
                 )
             }
+        }
+    }
+
+    if (songForDownloadChoice != null) {
+            DownloadQualityChoiceDialog(
+                song = songForDownloadChoice!!,
+                onDismiss = { songForDownloadChoice = null },
+                onConfirm = { target, quality ->
+                    onDownloadSongWithOptions(songForDownloadChoice!!, target, quality)
+                    songForDownloadChoice = null
+                }
+            )
         }
     }
 }

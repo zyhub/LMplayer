@@ -3,16 +3,17 @@ package com.lm.player.feature.settings
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.*
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -22,37 +23,43 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.designsystem.theme.*
 import com.lm.player.core.media.LocalMediaScanner
 import com.lm.player.core.media.Media3Factory
-import com.lm.player.core.media.SongMatchingResolver
-import com.lm.player.core.model.DownloadSettings
-import com.lm.player.core.model.HomeScreenDisplayConfig
-import com.lm.player.core.model.OnlineMusicSource
-import com.lm.player.core.model.ServerConfig
-import com.lm.player.core.model.ServerType
-import com.lm.player.core.model.SyncMode
+import com.lm.player.core.model.*
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
 import com.lm.player.core.update.AppUpdateManager
 import com.lm.player.core.update.UpdateInfo
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import java.io.File
+import kotlinx.coroutines.withContext
 
 /**
- * 现代高保真设置中心 (精细化分类折叠面板与全模块归类设计)
+ * 设置分类选项卡 (对标柠檬音乐 Settings.vue 架构)
  */
+enum class SettingsTab(val label: String, val icon: ImageVector) {
+    ACCOUNT("账号与服务", Icons.Default.CloudSync),
+    SOURCES("音源与脚本", Icons.Default.GraphicEq),
+    LIBRARY_PATHS("存储与路径", Icons.Default.Folder),
+    DOWNLOAD("下载偏好", Icons.Default.Download),
+    PLAYBACK_UI("播放与外观", Icons.Default.Palette)
+}
+
+/**
+ * 现代轻奢设置中心 (全面对标柠檬音乐 Settings.vue 设计与功能)
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     servers: List<ServerConfig>,
@@ -88,463 +95,580 @@ fun SettingsScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val database = remember { ZdsDatabase.getInstance(context) }
+    val dimensions = LocalAppDimensions.current
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val cardBg = if (isDark) Color(0xFF26262E) else Color.White
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
-    var showAddServerDialog by remember { mutableStateOf(false) }
-    var editingServer by remember { mutableStateOf<ServerConfig?>(null) }
-    var isScanning by remember { mutableStateOf(false) }
-    var cacheSizeBytes by remember { mutableStateOf(Media3Factory.getCacheSizeBytes(context)) }
-    var showOnlineSourceDialog by remember { mutableStateOf(false) }
+    // 当前选中的 Tab 栏
+    var selectedTab by remember { mutableStateOf(SettingsTab.ACCOUNT) }
 
-    // 本地扫描二级折叠工作台状态
-    var expandLocalScanner by remember { mutableStateOf(false) }
-    var isScanningLocal by remember { mutableStateOf(false) }
-    var scannedFolderMap by remember { mutableStateOf<Map<String, List<com.lm.player.core.database.entity.SongEntity>>>(emptyMap()) }
-    var selectedFolderPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var expandedFolderPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var showScanFolderPickerDialog by remember { mutableStateOf(false) }
-
-    // 关于与更新弹窗状态
-    var showAboutDialog by remember { mutableStateOf(false) }
-    var showUpdateDialog by remember { mutableStateOf(false) }
-    var showFolderPickerDialog by remember { mutableStateOf(false) }
-    var updateInfoState by remember { mutableStateOf<UpdateInfo?>(null) }
-    var isCheckingUpdate by remember { mutableStateOf(false) }
-    var isDownloadingApk by remember { mutableStateOf(false) }
-    var downloadProgress by remember { mutableStateOf(0f) }
-    var downloadedApkFile by remember { mutableStateOf<File?>(null) }
-
-    // 播放主题状态
-    val lyricsPrefs = remember { context.getSharedPreferences("zds_lyrics_prefs", Context.MODE_PRIVATE) }
-    var playerThemeStyle by remember {
-        mutableStateOf(
-            PlayerThemeStyle.fromId(lyricsPrefs.getString("player_theme_style", PlayerThemeStyle.MODERN.id) ?: PlayerThemeStyle.MODERN.id)
-        )
+    // 偏好设置持久化
+    val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE) }
+    var defaultDownloadQuality by remember {
+        mutableStateOf(AudioQuality.fromKey(prefs.getString("default_download_quality", "320k") ?: "320k"))
+    }
+    var defaultDownloadTarget by remember {
+        mutableStateOf(DownloadTarget.valueOf(prefs.getString("default_download_target", DownloadTarget.LOCAL.name) ?: DownloadTarget.LOCAL.name))
+    }
+    var autoFallbackSource by remember {
+        mutableStateOf(prefs.getBoolean("source_fallback_enabled", true))
+    }
+    var embedCoverMeta by remember {
+        mutableStateOf(prefs.getBoolean("download_embed_cover", true))
+    }
+    var embedLyricMeta by remember {
+        mutableStateOf(prefs.getBoolean("download_embed_lyric", true))
+    }
+    var downloadLrcFile by remember {
+        mutableStateOf(prefs.getBoolean("download_lrc_file", true))
     }
 
-    var preferOfflineFirst by remember { mutableStateOf(true) }
-    var enableAudioDucking by remember { mutableStateOf(true) }
-    var pauseOnUnplug by remember { mutableStateOf(true) }
+    // 在线试听音质与试听缓存偏好设置
+    var wifiStreamQuality by remember {
+        mutableStateOf(AudioQuality.fromKey(prefs.getString("wifi_stream_quality", "320k") ?: "320k"))
+    }
+    var cellularStreamQuality by remember {
+        mutableStateOf(AudioQuality.fromKey(prefs.getString("cellular_stream_quality", "128k") ?: "128k"))
+    }
+    var streamCacheEnabled by remember {
+        mutableStateOf(prefs.getBoolean("stream_cache_enabled", true))
+    }
 
-    // 6 大分类卡片折叠/展开状态 (默认前两项展开，其余收敛，界面清爽整洁)
-    var expandMedia by remember { mutableStateOf(true) }
-    var expandTheme by remember { mutableStateOf(true) }
-    var expandPlayback by remember { mutableStateOf(false) }
-    var expandScale by remember { mutableStateOf(false) }
-    var expandStorage by remember { mutableStateOf(false) }
-    var expandAbout by remember { mutableStateOf(false) }
+    // 弹窗状态
+    var showAddServerDialog by remember { mutableStateOf(false) }
+    var editingServer by remember { mutableStateOf<ServerConfig?>(null) }
+    var isTestingConnection by remember { mutableStateOf(false) }
+    var cacheSizeBytes by remember { mutableStateOf(Media3Factory.getCacheSizeBytes(context)) }
+    var isPurgingLegacyData by remember { mutableStateOf(false) }
+    var showPurgeConfirmDialog by remember { mutableStateOf(false) }
 
-    val isAllExpanded = expandMedia && expandTheme && expandPlayback && expandScale && expandStorage && expandAbout
+    // 软件在线更新状态 (更新源: 用户仓库 zyhub/LMplayer)
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
+    var showVersionNotesDialog by remember { mutableStateOf(false) }
+    var activeUpdateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+    var isDownloadingUpdate by remember { mutableStateOf(false) }
+    var updateDownloadProgress by remember { mutableFloatStateOf(0f) }
+    var isUpdateDownloaded by remember { mutableStateOf(false) }
+    var downloadedApkFile by remember { mutableStateOf<java.io.File?>(null) }
 
-    LazyColumn(
+    // 本地存储使用信息统计状态
+    var localSongCount by remember { mutableIntStateOf(0) }
+    var localMusicSizeBytes by remember { mutableLongStateOf(0L) }
+    var storageFreeSizeBytes by remember { mutableLongStateOf(0L) }
+    var isCalculatingStorage by remember { mutableStateOf(false) }
+
+    // 音源落雪脚本管理状态
+    var sourceScripts by remember { mutableStateOf<List<LemonSourceScriptInfo>>(emptyList()) }
+    var isLoadingScripts by remember { mutableStateOf(false) }
+    var showImportScriptDialog by remember { mutableStateOf(false) }
+    var importScriptUrl by remember { mutableStateOf("") }
+    var importScriptCode by remember { mutableStateOf("") }
+    var isImportingUrl by remember { mutableStateOf(true) }
+    var scriptToDelete by remember { mutableStateOf<LemonSourceScriptInfo?>(null) }
+
+    // 服务器保存路径管理状态
+    var serverDownloadPath by remember { mutableStateOf("") }
+    var serverAvailablePaths by remember { mutableStateOf<List<String>>(emptyList()) }
+    var isLoadingServerPaths by remember { mutableStateOf(false) }
+    var showServerPathDialog by remember { mutableStateOf(false) }
+    var selectedServerPathChoice by remember { mutableStateOf("") }
+    var customServerPathInput by remember { mutableStateOf("") }
+
+    // 本地音乐路径管理状态
+    val defaultLocalPaths = remember { setOf("/storage/emulated/0/Music", "/storage/emulated/0/Download") }
+    var localMusicPaths by remember {
+        mutableStateOf(prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths)
+    }
+    var isScanningLocalAndServer by remember { mutableStateOf(false) }
+    var showAddLocalPathDialog by remember { mutableStateOf(false) }
+    var newLocalPathInput by remember { mutableStateOf("") }
+
+    val activeServer = servers.firstOrNull { it.id == activeServerId } ?: servers.firstOrNull { it.isCurrentActive }
+
+    // 当切换到音源脚本或存储路径 Tab 时，若连接了柠檬音乐则自动拉取
+    LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
+        if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
+            isLoadingScripts = true
+            val client = NetworkClientFactory.createOkHttpClient(context)
+            val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+            val result = proto.fetchSourceList()
+            sourceScripts = result.getOrDefault(emptyList())
+            isLoadingScripts = false
+        }
+        if (selectedTab == SettingsTab.LIBRARY_PATHS && activeServer?.type == ServerType.LEMON_MUSIC) {
+            isLoadingServerPaths = true
+            val client = NetworkClientFactory.createOkHttpClient(context)
+            val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+            val result = proto.getServerPaths()
+            if (result.isSuccess) {
+                val cfg = result.getOrNull()
+                if (cfg != null) {
+                    serverDownloadPath = cfg.downloadPath
+                    serverAvailablePaths = cfg.availablePaths
+                    selectedServerPathChoice = cfg.downloadPath
+                }
+            }
+            isLoadingServerPaths = false
+        }
+        if (selectedTab == SettingsTab.LIBRARY_PATHS) {
+            isCalculatingStorage = true
+            withContext(Dispatchers.IO) {
+                val allSongs = database.songDao().getAllSongsList()
+                var count = 0
+                var size = 0L
+                allSongs.forEach { song ->
+                    if (!song.localFilePath.isNullOrBlank()) {
+                        val file = java.io.File(song.localFilePath)
+                        if (file.exists() && file.isFile) {
+                            count++
+                            size += file.length()
+                        }
+                    }
+                }
+                val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                val freeBytes = try {
+                    dlDir.freeSpace
+                } catch (_: Exception) {
+                    0L
+                }
+                withContext(Dispatchers.Main) {
+                    localSongCount = count
+                    localMusicSizeBytes = size
+                    storageFreeSizeBytes = freeBytes
+                    isCalculatingStorage = false
+                }
+            }
+        }
+    }
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp),
-        contentPadding = PaddingValues(
-            top = contentPadding.calculateTopPadding() + 8.dp,
-            bottom = contentPadding.calculateBottomPadding() + 120.dp
-        ),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+            .background(MaterialTheme.colorScheme.background)
     ) {
-        // 1. 顶部 Header 与展开/折叠快捷按键
-        item {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(top = 10.dp, bottom = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+        // 1. 顶部固定导航区 (大标题与 Tab 胶囊排)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text = "设置",
+                style = TextStyle(
+                    fontSize = 32.sp * dimensions.fontScale,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "个性化您的音乐播放与同步体验 · 对标柠檬音乐",
+                style = TextStyle(
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 横向 Tab 胶囊切换排
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(horizontal = 2.dp)
             ) {
-                Column {
-                    Text(
-                        text = "设置",
-                        style = TextStyle(
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onBackground
-                        )
-                    )
-                    Text(
-                        text = "系统与车载视听参数配置",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(
-                        onClick = {
-                            val target = !isAllExpanded
-                            expandMedia = target
-                            expandTheme = target
-                            expandPlayback = target
-                            expandScale = target
-                            expandStorage = target
-                            expandAbout = target
-                        }
+                items(SettingsTab.entries) { tab ->
+                    val isSelected = selectedTab == tab
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) AppleRed else borderColor
+                        ),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .clickable { selectedTab = tab }
                     ) {
-                        Text(if (isAllExpanded) "收起全部" else "展开全部", fontSize = 12.sp, color = AppleRed)
-                    }
-
-                    IconButton(onClick = onOpenDownloads) {
-                        Icon(Icons.Outlined.FileDownload, contentDescription = "下载管理", tint = AppleRed)
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = tab.icon,
+                                contentDescription = null,
+                                tint = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = tab.label,
+                                fontSize = 13.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
                 }
             }
         }
 
-        // =========================================================================
-        // 分类 1: ☁️ 媒体库与 NAS 服务器
-        // =========================================================================
-        item {
-            val serverCount = servers.size
-            val mediaSummary = if (serverCount > 0) "已连接 $serverCount 个服务器 • 本地音乐库深度索引" else "未添加服务器 • 本地音频全盘扫描"
-            val effectiveDownloadDir = remember(downloadSettings.customDownloadPath) {
-                if (downloadSettings.customDownloadPath.isNotBlank()) File(downloadSettings.customDownloadPath) else context.getExternalFilesDir("MusicDownloads") ?: File("/storage/emulated/0/Music")
-            }
+        Spacer(modifier = Modifier.height(6.dp))
 
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFF34C759),
-                icon = Icons.Default.CloudQueue,
-                title = "媒体库与 NAS 服务器",
-                summary = mediaSummary,
-                isExpanded = expandMedia,
-                onToggleExpand = { expandMedia = !expandMedia }
-            ) {
-                // 1. 本地曲库与深度扫描 (二级折叠工作台)
-                SettingsSubSectionHeader(title = "本地音乐库管理与扫描")
+        // 2. 主设置内容区域 (根据选中 Tab 渲染对应设置卡片)
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(
+                top = 6.dp,
+                bottom = contentPadding.calculateBottomPadding() + 24.dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            when (selectedTab) {
+                // ==================== 1. 账号与服务 ====================
+                SettingsTab.ACCOUNT -> {
+                    item {
+                        SettingsCard(title = "当前连接服务", icon = Icons.Default.Dns) {
+                            if (activeServer != null) {
+                                SettingInfoRow(label = "服务名称", value = activeServer.name)
+                                SettingInfoRow(label = "服务类型", value = activeServer.type.displayName)
+                                SettingInfoRow(label = "服务器地址", value = activeServer.serverUrl)
+                                SettingInfoRow(label = "登录账号", value = activeServer.username.ifBlank { "匿名/Token" })
+                                SettingInfoRow(label = "鉴权状态", value = if (activeServer.tokenOrApiKey.isNotBlank()) "已授权 (Bearer/ApiKey)" else "未配置")
 
-                val totalDiscoveredSongs = remember(scannedFolderMap) { scannedFolderMap.values.sumOf { it.size } }
-                val selectedSongsCount = remember(scannedFolderMap, selectedFolderPaths) {
-                    scannedFolderMap.filterKeys { selectedFolderPaths.contains(it) }.values.sumOf { it.size }
-                }
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            isTestingConnection = true
+                                            coroutineScope.launch {
+                                                val client = NetworkClientFactory.createOkHttpClient(context)
+                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                val res = proto.testConnection()
+                                                isTestingConnection = false
+                                                if (res.isSuccess) {
+                                                    Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                                }
+                                            }
+                                        },
+                                        enabled = !isTestingConnection,
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text(if (isTestingConnection) "测试中..." else "测试连通性", fontSize = 13.sp)
+                                    }
 
-                val scannerSummary = when {
-                    isScanningLocal -> "正在深度检索设备内部与存储卡音频文件..."
-                    scannedFolderMap.isNotEmpty() -> "已检索到 $totalDiscoveredSongs 首歌曲，分布于 ${scannedFolderMap.size} 个文件夹"
-                    else -> "自动发现设备内 MP3 / FLAC / WAV 等离线音频，支持按文件夹预览与勾选"
-                }
-
-                SettingsActionRow(
-                    badgeColor = Color(0xFFFA2D48),
-                    icon = if (isScanningLocal) Icons.Default.HourglassTop else Icons.Default.FolderOpen,
-                    title = "一键全盘扫描本地歌曲",
-                    subtitle = scannerSummary,
-                    trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (isScanningLocal) {
-                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AppleRed)
-                                Spacer(modifier = Modifier.width(8.dp))
-                            }
-                            Icon(
-                                imageVector = if (expandLocalScanner) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = if (expandLocalScanner) "收起扫描工作台" else "展开扫描工作台",
-                                tint = AppleRed,
-                                modifier = Modifier.size(22.dp)
-                            )
-                        }
-                    },
-                    onClick = {
-                        expandLocalScanner = !expandLocalScanner
-                        if (expandLocalScanner && scannedFolderMap.isEmpty() && !isScanningLocal) {
-                            isScanningLocal = true
-                            coroutineScope.launch {
-                                val res = LocalMediaScanner.discoverLocalAudioFilesGrouped(context)
-                                scannedFolderMap = res
-                                selectedFolderPaths = res.keys.toSet()
-                                isScanningLocal = false
+                                    OutlinedButton(
+                                        onClick = {
+                                            editingServer = activeServer
+                                            showAddServerDialog = true
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.weight(1f),
+                                        border = BorderStroke(1.dp, borderColor)
+                                    ) {
+                                        Text("编辑配置", fontSize = 13.sp)
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    text = "当前处于纯本地离线模式，未连接任何远程音乐服务器。",
+                                    fontSize = 13.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
                     }
-                )
 
-                // 二级折叠展开区域 (扫描工作台)
-                AnimatedVisibility(
-                    visible = expandLocalScanner,
-                    enter = expandVertically() + fadeIn(),
-                    exit = shrinkVertically() + fadeOut()
-                ) {
-                    Surface(
-                        shape = RoundedCornerShape(14.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                        border = BorderStroke(0.6.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 6.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            // 顶部快捷动作栏
+                    item {
+                        SettingsCard(title = "已配置的服务列表", icon = Icons.Default.Storage) {
+                            if (servers.isEmpty()) {
+                                Text("暂无配置的服务器", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            } else {
+                                servers.forEach { s ->
+                                    val isCurrent = s.id == activeServerId || s.isCurrentActive
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (isCurrent) AppleRed.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                        border = BorderStroke(1.dp, if (isCurrent) AppleRed else borderColor.copy(alpha = 0.4f)),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 4.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable { onSelectServer(s) }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                                    if (isCurrent) {
+                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Surface(shape = RoundedCornerShape(4.dp), color = AppleRed) {
+                                                            Text("当前使用", color = Color.White, fontSize = 9.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                                                        }
+                                                    }
+                                                }
+                                                Text(s.serverUrl, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+
+                                            Row {
+                                                IconButton(onClick = { editingServer = s; showAddServerDialog = true }, modifier = Modifier.size(28.dp)) {
+                                                    Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
+                                                }
+                                                IconButton(onClick = { onDeleteServer(s.id) }, modifier = Modifier.size(28.dp)) {
+                                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Button(
+                                onClick = { editingServer = null; showAddServerDialog = true },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("添加新服务器 (飞牛/柠檬/Subsonic/Navidrome)", color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp)
+                            }
+                        }
+                    }
+
+                    // 3. 软件版本与在线更新 (更新源: 用户仓库 zyhub/LMplayer)
+                    item {
+                        SettingsCard(title = "软件版本与在线更新", icon = Icons.Default.SystemUpdate) {
+                            SettingInfoRow(label = "当前版本", value = "v${AppUpdateManager.CURRENT_VERSION_NAME} (Build ${AppUpdateManager.CURRENT_VERSION_CODE})")
+                            SettingInfoRow(label = "更新来源", value = AppUpdateManager.DEFAULT_GITHUB_REPO)
+                            SettingInfoRow(label = "开源地址", value = "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Button(
                                     onClick = {
-                                        if (!isScanningLocal) {
-                                            isScanningLocal = true
-                                            coroutineScope.launch {
-                                                val res = LocalMediaScanner.discoverLocalAudioFilesGrouped(context)
-                                                scannedFolderMap = res
-                                                selectedFolderPaths = res.keys.toSet()
-                                                isScanningLocal = false
-                                                Toast.makeText(context, "全盘扫描完成！发现 ${res.values.sumOf { it.size }} 首歌曲", Toast.LENGTH_SHORT).show()
+                                        isCheckingUpdate = true
+                                        coroutineScope.launch {
+                                            AppUpdateManager.resetUpdateIgnore(context)
+                                            val res = AppUpdateManager.checkForUpdates(context)
+                                            isCheckingUpdate = false
+                                            if (res.isSuccess) {
+                                                val info = res.getOrThrow()
+                                                activeUpdateInfo = info
+                                                if (info.hasUpdate) {
+                                                    showUpdateDialog = true
+                                                } else {
+                                                    showVersionNotesDialog = true
+                                                }
+                                            } else {
+                                                Toast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
                                             }
                                         }
                                     },
-                                    enabled = !isScanningLocal,
-                                    shape = RoundedCornerShape(10.dp),
+                                    enabled = !isCheckingUpdate,
+                                    shape = RoundedCornerShape(12.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                    modifier = Modifier.weight(1f).height(38.dp),
-                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                    modifier = Modifier.weight(1f)
                                 ) {
-                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("全盘重新检索", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                    if (isCheckingUpdate) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("检测中...", fontSize = 13.sp)
+                                    } else {
+                                        Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("检查新版本", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                    }
                                 }
 
                                 OutlinedButton(
-                                    onClick = { showScanFolderPickerDialog = true },
-                                    enabled = !isScanningLocal,
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
-                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
-                                    modifier = Modifier.weight(1f).height(38.dp),
-                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                    onClick = {
+                                        activeUpdateInfo = UpdateInfo(
+                                            hasUpdate = false,
+                                            latestVersion = AppUpdateManager.CURRENT_VERSION_NAME,
+                                            latestVersionCode = AppUpdateManager.CURRENT_VERSION_CODE,
+                                            releaseNotes = "【v${AppUpdateManager.CURRENT_VERSION_NAME} 最新更新日志】\n\n" +
+                                                "1. 播放界面喜欢按钮红心状态彻底修复，支持0ms即刻响应\n" +
+                                                "2. 设置中心全部配置项升级为现代轻奢下拉菜单 (Dropdown)\n" +
+                                                "3. 存储与路径重构，升级为本地存储使用信息看板\n" +
+                                                "4. 新增本地已下载歌曲深度管理：支持多选、批量删除、文件详情与路径复制\n" +
+                                                "5. 账号及服务中集成 GitHub 在线更新窗口与官方发布通道\n" +
+                                                "6. 针对车载大屏与手机全屏进行了硬件级与分辨率级深度调优",
+                                            downloadUrl = ""
+                                        )
+                                        showVersionNotesDialog = true
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.weight(1f),
+                                    border = BorderStroke(1.dp, borderColor)
                                 ) {
-                                    Icon(Icons.Default.FolderSpecial, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Notes, contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("选择指定文件夹", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                    Text("更新日志", fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ==================== 2. 音源与脚本 ====================
+                SettingsTab.SOURCES -> {
+                    item {
+                        SettingsCard(title = "默认在线操作音源", icon = Icons.Default.GraphicEq) {
+                            SettingDropdownRow(
+                                title = "默认在线音源",
+                                subtitle = "选择全网搜索、在线流式播放及发现推荐使用的首选音源",
+                                selectedValue = currentOnlineSource,
+                                options = OnlineMusicSource.entries,
+                                getLabel = { it.displayName },
+                                onSelect = { onOnlineSourceChange(it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            SettingSwitchRow(
+                                title = "自动音源容灾回退",
+                                subtitle = "当首选音源取链失败时，自动按顺序尝试备用音源 (对标柠檬音乐 source.fallbackMode)",
+                                checked = autoFallbackSource,
+                                onCheckedChange = {
+                                    autoFallbackSource = it
+                                    prefs.edit().putBoolean("source_fallback_enabled", it).apply()
+                                }
+                            )
+                        }
+                    }
+
+                    item {
+                        SettingsCard(title = "落雪音源脚本管理 (LX Music)", icon = Icons.Default.Extension) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "服务端音源扩展 (${sourceScripts.size})",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Row {
+                                    IconButton(
+                                        onClick = {
+                                            if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                                isLoadingScripts = true
+                                                coroutineScope.launch {
+                                                    val proto = LemonMusicProtocol(
+                                                        NetworkClientFactory.createOkHttpClient(context),
+                                                        activeServer.serverUrl,
+                                                        activeServer.username,
+                                                        activeServer.tokenOrApiKey
+                                                    )
+                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                                    isLoadingScripts = false
+                                                }
+                                            } else {
+                                                Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(Icons.Default.Refresh, contentDescription = "刷新", modifier = Modifier.size(16.dp))
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                                showImportScriptDialog = true
+                                            } else {
+                                                Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(Icons.Default.Add, contentDescription = "导入脚本", tint = AppleRed, modifier = Modifier.size(18.dp))
+                                    }
                                 }
                             }
 
-                            // 扫描状态提示
-                            if (isScanningLocal) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                                    horizontalArrangement = Arrangement.Center,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    CircularProgressIndicator(color = AppleRed, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text("正在深度遍历存储目录并提取音轨元数据...", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            if (isLoadingScripts) {
+                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = AppleRed)
                                 }
-                            } else if (scannedFolderMap.isEmpty()) {
-                                Box(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text("暂未检索到音频文件，可点击上方「选择指定文件夹」手动选取", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
+                            } else if (sourceScripts.isEmpty()) {
+                                Text(
+                                    text = if (activeServer?.type == ServerType.LEMON_MUSIC) "服务端暂未部署音源脚本，请点击右上角「+」导入落雪音源脚本" else "连接柠檬音乐服务端后可集中管理落雪音源脚本",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             } else {
-                                // 统计与多选/批量导入操作栏
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    val isAllSelected = selectedFolderPaths.size == scannedFolderMap.size
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.clickable {
-                                            selectedFolderPaths = if (isAllSelected) emptySet() else scannedFolderMap.keys.toSet()
-                                        }
+                                sourceScripts.forEach { script ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                        border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                                     ) {
-                                        Checkbox(
-                                            checked = isAllSelected,
-                                            onCheckedChange = { checked ->
-                                                selectedFolderPaths = if (checked) scannedFolderMap.keys.toSet() else emptySet()
-                                            },
-                                            colors = CheckboxDefaults.colors(checkedColor = AppleRed),
-                                            modifier = Modifier.size(28.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            text = "全选 (${selectedFolderPaths.size}/${scannedFolderMap.size})",
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                    }
-
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        if (selectedFolderPaths.isNotEmpty()) {
-                                            FilledTonalButton(
-                                                onClick = {
-                                                    val songsToSave = scannedFolderMap.filterKeys { selectedFolderPaths.contains(it) }.values.flatten().distinctBy { it.localFilePath ?: it.id }
-                                                    coroutineScope.launch {
-                                                        val saved = LocalMediaScanner.saveScannedSongsToDatabase(database, songsToSave, effectiveDownloadDir)
-                                                        Toast.makeText(context, "成功导入 $saved 首本地歌曲！", Toast.LENGTH_LONG).show()
-                                                        onLocalScanCompleted()
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                                    if (script.version.isNotBlank()) {
+                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Text("v${script.version}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                     }
-                                                },
-                                                shape = RoundedCornerShape(8.dp),
-                                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = AppleRed.copy(alpha = 0.15f), contentColor = AppleRed),
-                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                                modifier = Modifier.height(32.dp)
-                                            ) {
-                                                Text("导入已选 ($selectedSongsCount 首)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                                }
+                                                if (script.author.isNotBlank()) {
+                                                    Text("作者: ${script.author}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                }
                                             }
-                                        }
 
-                                        Button(
-                                            onClick = {
-                                                val allSongsToSave = scannedFolderMap.values.flatten().distinctBy { it.localFilePath ?: it.id }
-                                                coroutineScope.launch {
-                                                    val saved = LocalMediaScanner.saveScannedSongsToDatabase(database, allSongsToSave, effectiveDownloadDir)
-                                                    Toast.makeText(context, "成功全量导入 $saved 首本地歌曲！", Toast.LENGTH_LONG).show()
-                                                    onLocalScanCompleted()
-                                                }
-                                            },
-                                            shape = RoundedCornerShape(8.dp),
-                                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                            modifier = Modifier.height(32.dp)
-                                        ) {
-                                            Text("一键添加全部 ($totalDiscoveredSongs 首)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                }
-
-                                HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-
-                                // 文件夹及歌曲列表 (折叠面板)
-                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    for ((folderPath, songs) in scannedFolderMap) {
-                                        val isChecked = selectedFolderPaths.contains(folderPath)
-                                        val isExpanded = expandedFolderPaths.contains(folderPath)
-                                        val folderFile = File(folderPath)
-                                        val folderName = folderFile.name.ifBlank { folderPath }
-
-                                        Surface(
-                                            shape = RoundedCornerShape(10.dp),
-                                            color = MaterialTheme.colorScheme.surface,
-                                            border = BorderStroke(0.5.dp, if (isChecked) AppleRed.copy(alpha = 0.4f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) {
-                                            Column {
-                                                Row(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .clickable {
-                                                            expandedFolderPaths = if (isExpanded) expandedFolderPaths - folderPath else expandedFolderPaths + folderPath
-                                                        }
-                                                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Checkbox(
-                                                        checked = isChecked,
-                                                        onCheckedChange = { checked ->
-                                                            selectedFolderPaths = if (checked) selectedFolderPaths + folderPath else selectedFolderPaths - folderPath
-                                                        },
-                                                        colors = CheckboxDefaults.colors(checkedColor = AppleRed),
-                                                        modifier = Modifier.size(24.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Icon(
-                                                        imageVector = Icons.Default.Folder,
-                                                        contentDescription = null,
-                                                        tint = if (isChecked) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                                                        modifier = Modifier.size(22.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(8.dp))
-                                                    Column(modifier = Modifier.weight(1f)) {
-                                                        Text(
-                                                            text = folderName,
-                                                            fontSize = 13.sp,
-                                                            fontWeight = FontWeight.Bold,
-                                                            color = MaterialTheme.colorScheme.onSurface,
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis
-                                                        )
-                                                        Text(
-                                                            text = folderPath,
-                                                            fontSize = 10.5.sp,
-                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis
-                                                        )
-                                                    }
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Surface(
-                                                        shape = RoundedCornerShape(4.dp),
-                                                        color = AppleRed.copy(alpha = 0.12f)
-                                                    ) {
-                                                        Text(
-                                                            text = "${songs.size} 首",
-                                                            fontSize = 11.sp,
-                                                            fontWeight = FontWeight.Bold,
-                                                            color = AppleRed,
-                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                        )
-                                                    }
-                                                    Spacer(modifier = Modifier.width(4.dp))
-                                                    Icon(
-                                                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                                        contentDescription = null,
-                                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                        modifier = Modifier.size(18.dp)
-                                                    )
-                                                }
-
-                                                // 展开展示歌曲列表
-                                                if (isExpanded) {
-                                                    HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
-                                                    Column(
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                                                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                                                    ) {
-                                                        songs.forEachIndexed { idx, s ->
-                                                            Row(
-                                                                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                                                                verticalAlignment = Alignment.CenterVertically
-                                                            ) {
-                                                                Text(
-                                                                    text = "${idx + 1}.",
-                                                                    fontSize = 11.sp,
-                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                                    modifier = Modifier.width(22.dp)
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Switch(
+                                                    checked = script.isActive,
+                                                    onCheckedChange = { enable ->
+                                                        if (activeServer != null) {
+                                                            coroutineScope.launch {
+                                                                val proto = LemonMusicProtocol(
+                                                                    NetworkClientFactory.createOkHttpClient(context),
+                                                                    activeServer.serverUrl,
+                                                                    activeServer.username,
+                                                                    activeServer.tokenOrApiKey
                                                                 )
-                                                                Icon(Icons.Default.MusicNote, contentDescription = null, tint = AppleRed.copy(alpha = 0.7f), modifier = Modifier.size(14.dp))
-                                                                Spacer(modifier = Modifier.width(6.dp))
-                                                                Text(
-                                                                    text = s.title,
-                                                                    fontSize = 12.sp,
-                                                                    fontWeight = FontWeight.Medium,
-                                                                    color = MaterialTheme.colorScheme.onSurface,
-                                                                    maxLines = 1,
-                                                                    overflow = TextOverflow.Ellipsis,
-                                                                    modifier = Modifier.weight(1f)
-                                                                )
-                                                                Spacer(modifier = Modifier.width(6.dp))
-                                                                Text(
-                                                                    text = s.artist,
-                                                                    fontSize = 11.sp,
-                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                                    maxLines = 1,
-                                                                    overflow = TextOverflow.Ellipsis
-                                                                )
-                                                                Spacer(modifier = Modifier.width(6.dp))
-                                                                Surface(
-                                                                    shape = RoundedCornerShape(3.dp),
-                                                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-                                                                ) {
-                                                                    Text(
-                                                                        text = s.format.uppercase(),
-                                                                        fontSize = 9.sp,
-                                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                                                    )
+                                                                val res = if (enable) proto.activateSource(script.id) else proto.deactivateSource(script.id)
+                                                                if (res.isSuccess) {
+                                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                                                    Toast.makeText(context, if (enable) "音源已激活" else "音源已停用", Toast.LENGTH_SHORT).show()
                                                                 }
                                                             }
                                                         }
                                                     }
+                                                )
+                                                IconButton(onClick = { scriptToDelete = script }, modifier = Modifier.size(28.dp)) {
+                                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed.copy(alpha = 0.8f), modifier = Modifier.size(16.dp))
                                                 }
                                             }
                                         }
@@ -555,756 +679,713 @@ fun SettingsScreen(
                     }
                 }
 
-                SettingsDivider()
-
-                // 2. 已添加的 NAS 服务器列表
-                SettingsSubSectionHeader(title = "已连接的 NAS 媒体服务器")
-                if (servers.isNotEmpty()) {
-                    servers.forEach { server ->
-                        val isCurrent = server.id == activeServerId || server.isCurrentActive
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelectServer(server) }
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            SettingsIconBadge(
-                                badgeColor = Color(0xFFF59E0B),
-                                icon = Icons.Default.MusicNote
+                // ==================== 3. 存储与路径 ====================
+                SettingsTab.LIBRARY_PATHS -> {
+                    // A. 服务器保存路径 (顶部第一项，复用服务端的选择方式)
+                    item {
+                        SettingsCard(title = "服务器保存路径", icon = Icons.Default.Dns) {
+                            Text(
+                                text = "柠檬音乐服务端下载与存储音频文件的远端路径 (复用服务端目录配置)：",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Spacer(modifier = Modifier.width(14.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(server.name, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                    if (isCurrent) {
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Surface(
-                                            shape = RoundedCornerShape(6.dp),
-                                            color = AppleRed.copy(alpha = 0.15f)
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text("服务端当前下载保存路径", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                            if (isLoadingServerPaths) "正在从服务器获取路径..."
+                                            else serverDownloadPath.ifBlank { "未指定路径 (使用柠檬服务端默认下载目录)" }
+                                        } else {
+                                            "当前未连接柠檬音乐服务器 (本地离线模式)"
+                                        },
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Button(
+                                    onClick = {
+                                        selectedServerPathChoice = serverDownloadPath
+                                        customServerPathInput = ""
+                                        showServerPathDialog = true
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("选择服务器保存路径", fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    // B. 本地下载目录 (放置在服务器路径下方，本地音乐路径上方)
+                    item {
+                        SettingsCard(title = "本地下载目录", icon = Icons.Default.DownloadForOffline) {
+                            Text(
+                                text = "本机离线下载歌曲与临时缓存的保存位置 (当前应用私有/公共存储)：",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text("当前本地离线保存路径", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = downloadSettings.customDownloadPath.ifBlank { "默认应用私有目录 (/Music)" },
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = onChooseDownloadDirectory,
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("更改本地下载目录", fontSize = 13.sp)
+                            }
+                        }
+                    }
+
+                    // C. 本地音乐路径 (放置在本地下载目录下方，清晰区分)
+                    item {
+                        SettingsCard(title = "本地音乐路径", icon = Icons.Default.LibraryMusic) {
+                            Text(
+                                text = "本机音乐文件夹扫描路径。扫描到的歌曲将与柠檬服务器曲库自动比对，线上模式优先播放本地文件，离线模式直接显示为本地歌曲：",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // 扫描目录列表
+                            localMusicPaths.forEach { p ->
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    border = BorderStroke(1.dp, borderColor),
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.Folder, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = p,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(
+                                            onClick = {
+                                                val updated = localMusicPaths.toMutableSet()
+                                                updated.remove(p)
+                                                localMusicPaths = updated
+                                                prefs.edit().putStringSet("local_music_scan_folders", updated).apply()
+                                            },
+                                            modifier = Modifier.size(24.dp)
                                         ) {
-                                            Text("当前连接", color = AppleRed, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp))
+                                            Icon(Icons.Default.Close, contentDescription = "移除路径", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
                                         }
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = "柠檬音乐 • ${server.serverUrl}",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
                             }
 
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = {
-                                        editingServer = server
-                                        showAddServerDialog = true
-                                    }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedButton(
+                                    onClick = { showAddLocalPathDialog = true },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.weight(1f),
+                                    border = BorderStroke(1.dp, borderColor)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Edit,
-                                        contentDescription = "编辑服务器",
-                                        tint = AppleRed,
-                                        modifier = Modifier.size(19.dp)
-                                    )
+                                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("添加扫描目录", fontSize = 13.sp)
                                 }
 
-                                IconButton(onClick = { onDeleteServer(server.id) }) {
-                                    Icon(
-                                        imageVector = Icons.Default.DeleteOutline,
-                                        contentDescription = "删除",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(19.dp)
-                                    )
+                                Button(
+                                    onClick = {
+                                        if (!isScanningLocalAndServer) {
+                                            isScanningLocalAndServer = true
+                                            coroutineScope.launch {
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
+                                                }
+                                                var totalScanned = 0
+                                                // 1. 扫描配置目录
+                                                for (path in localMusicPaths) {
+                                                    if (java.io.File(path).exists()) {
+                                                        totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                                    }
+                                                }
+                                                // 2. 扫描系统媒体库
+                                                totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
+
+                                                // 3. 与服务器曲库智能比对与真实性校验
+                                                val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                                val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                LocalMediaScanner.matchAndMergeLocalWithServer(database)
+
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
+                                                    onLocalScanCompleted()
+                                                    isScanningLocalAndServer = false
+                                                }
+                                            }
+                                        }
+                                    },
+                                    enabled = !isScanningLocalAndServer,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    if (isScanningLocalAndServer) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("比对中...", fontSize = 13.sp)
+                                    } else {
+                                        Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("立即扫描比对", fontSize = 13.sp)
+                                    }
                                 }
                             }
                         }
-                        SettingsDivider()
-                    }
-                }
-
-                // 3. 添加柠檬音乐服务器
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            editingServer = null
-                            showAddServerDialog = true
-                        }
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    SettingsIconBadge(badgeColor = AppleRed.copy(alpha = 0.15f), icon = Icons.Default.Add, iconTint = AppleRed)
-                    Spacer(modifier = Modifier.width(14.dp))
-                    Text("连接柠檬音乐服务端 (Lemon Music)", color = AppleRed, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-
-                SettingsDivider()
-
-                // 4. 在线模式音源与服务配置
-                SettingsSubSectionHeader(title = "在线模式与音源偏好")
-                SettingsActionRow(
-                    badgeColor = Color(0xFFF59E0B),
-                    icon = Icons.Default.Audiotrack,
-                    title = "在线模式默认操作音源",
-                    subtitle = "当前音源: ${currentOnlineSource.displayName} (${currentOnlineSource.key})，点击可自由切换",
-                    trailingContent = {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = AppleRed.copy(alpha = 0.12f),
-                            border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f))
-                        ) {
-                            Text(
-                                text = currentOnlineSource.displayName,
-                                color = AppleRed,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                            )
-                        }
-                    },
-                    onClick = {
-                        showOnlineSourceDialog = true
-                    }
-                )
-            }
-        }
-
-        // =========================================================================
-        // 分类 2: 🎨 界面与播放器主题
-        // =========================================================================
-        item {
-            val themeSummary = "播放风格: ${playerThemeStyle.displayName} • 外观: ${when(themeMode) { AppThemeMode.DARK -> "深色"; AppThemeMode.LIGHT -> "浅色"; else -> "跟随系统" }}"
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFFFA2D48),
-                icon = Icons.Default.Palette,
-                title = "界面与播放器主题",
-                summary = themeSummary,
-                isExpanded = expandTheme,
-                onToggleExpand = { expandTheme = !expandTheme }
-            ) {
-                // 1. 播放界面主题风格 (现代极简 vs 怀旧专辑 iPod Cover Flow)
-                SettingsSubSectionHeader(title = "播放界面与主题风格")
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SettingsIconBadge(badgeColor = AppleRed, icon = Icons.Default.Album)
-                        Spacer(modifier = Modifier.width(14.dp))
-                        Column {
-                            Text("播放界面主题风格", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text("横竖屏定制：现代极简分屏 vs 经典 iPod 3D 专辑流", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
                     }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        PlayerThemeStyle.entries.forEach { style ->
-                            val isSelected = playerThemeStyle == style
+                    item {
+                        SettingsCard(title = "本地存储使用信息", icon = Icons.Default.Storage) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
-                                color = if (isSelected) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                                border = if (isSelected) BorderStroke(1.5.dp, AppleRed) else BorderStroke(0.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        playerThemeStyle = style
-                                        lyricsPrefs.edit().putString("player_theme_style", style.id).apply()
-                                    }
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                border = BorderStroke(1.dp, borderColor),
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(
-                                            imageVector = if (style == PlayerThemeStyle.IPOD_RETRO) Icons.Default.Album else Icons.Default.MusicNote,
-                                            contentDescription = null,
-                                            tint = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
-                                            text = style.displayName,
-                                            fontSize = 13.sp,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
+                                            text = "设备与曲库存储占用",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
+                                        if (isCalculatingStorage) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp, color = AppleRed)
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("统计中...", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
                                     }
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = style.description,
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 2,
-                                        lineHeight = 14.sp
-                                    )
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+
+                                    // 3 列数据统计展示：歌曲数量 | 音乐总占用 | 设备剩余空间
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Text(
+                                                text = "$localSongCount 首",
+                                                fontSize = 17.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "已收录本地歌曲",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+
+                                        Box(
+                                            modifier = Modifier
+                                                .width(1.dp)
+                                                .height(32.dp)
+                                                .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                                        )
+
+                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Text(
+                                                text = formatStorageSize(localMusicSizeBytes),
+                                                fontSize = 17.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleRed
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "本地音乐总占用",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+
+                                        Box(
+                                            modifier = Modifier
+                                                .width(1.dp)
+                                                .height(32.dp)
+                                                .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                                        )
+
+                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Text(
+                                                text = formatStorageSize(storageFreeSizeBytes),
+                                                fontSize = 17.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "设备剩余可用",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
                                 }
                             }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            SettingActionRow(
+                                title = "清除资料库遗留数据",
+                                subtitle = "核对本地物理文件真实性，彻底移除已删除曲目、空专辑、孤立歌手及失效缓存记录",
+                                actionText = if (isPurgingLegacyData) "清理中..." else "立即清理",
+                                onAction = { showPurgeConfirmDialog = true }
+                            )
                         }
                     }
                 }
 
-                SettingsDivider()
-
-                // 2. 应用外观主题 (深色 / 浅色 / 跟随系统)
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SettingsIconBadge(
-                            badgeColor = Color(0xFFFF9500),
-                            icon = if (themeMode == AppThemeMode.LIGHT) Icons.Default.LightMode else Icons.Default.DarkMode
-                        )
-                        Spacer(modifier = Modifier.width(14.dp))
-                        Column {
-                            Text("应用界面外观", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text("播放器与全屏背景全局联动，高对比度防眩光", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(3.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            listOf(
-                                AppThemeMode.DARK to "纯黑深色",
-                                AppThemeMode.LIGHT to "纯白浅色",
-                                AppThemeMode.FOLLOW_SYSTEM to "跟随系统"
-                            ).forEach { (mode, label) ->
-                                val isSelected = themeMode == mode
-                                Surface(
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = if (isSelected) AppleRed else Color.Transparent,
-                                    shadowElevation = if (isSelected) 2.dp else 0.dp,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .clickable { onThemeModeChange(mode) }
-                                ) {
-                                    Text(
-                                        text = label,
-                                        color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                                        modifier = Modifier.padding(vertical = 8.dp)
-                                    )
+                // ==================== 4. 下载偏好 ====================
+                SettingsTab.DOWNLOAD -> {
+                    item {
+                        SettingsCard(title = "默认下载配置 (对标柠檬音乐 download.*)", icon = Icons.Default.Download) {
+                            SettingDropdownRow(
+                                title = "默认下载音质",
+                                subtitle = "歌曲与专辑下载时优先选取的音质规格",
+                                selectedValue = defaultDownloadQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    defaultDownloadQuality = q
+                                    prefs.edit().putString("default_download_quality", q.key).apply()
                                 }
-                            }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingDropdownRow(
+                                title = "默认下载目标",
+                                subtitle = "单曲与批量下载时的默认存储归属",
+                                selectedValue = defaultDownloadTarget,
+                                options = DownloadTarget.entries,
+                                getLabel = { it.displayName },
+                                onSelect = { target ->
+                                    defaultDownloadTarget = target
+                                    prefs.edit().putString("default_download_target", target.name).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            SettingSwitchRow(
+                                title = "内嵌高清专辑封面",
+                                subtitle = "下载音频文件时将封面写入 ID3 标签 (isEmbedPic)",
+                                checked = embedCoverMeta,
+                                onCheckedChange = {
+                                    embedCoverMeta = it
+                                    prefs.edit().putBoolean("download_embed_cover", it).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "内嵌歌词与翻译",
+                                subtitle = "将逐字/逐句歌词嵌入音频文件内部标签 (isEmbedLyric)",
+                                checked = embedLyricMeta,
+                                onCheckedChange = {
+                                    embedLyricMeta = it
+                                    prefs.edit().putBoolean("download_embed_lyric", it).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "同时保存 .lrc 独立歌词文件",
+                                subtitle = "在歌曲同级目录下保存独立同名 .lrc 歌词文件 (isDownloadLrc)",
+                                checked = downloadLrcFile,
+                                onCheckedChange = {
+                                    downloadLrcFile = it
+                                    prefs.edit().putBoolean("download_lrc_file", it).apply()
+                                }
+                            )
                         }
                     }
                 }
 
-                SettingsDivider()
+                // ==================== 5. 播放与外观 ====================
+                SettingsTab.PLAYBACK_UI -> {
+                    item {
+                        SettingsCard(title = "在线试听音质与缓存", icon = Icons.Default.HighQuality) {
+                            // 1. Wi-Fi 状态试听音质
+                            SettingDropdownRow(
+                                icon = Icons.Default.Wifi,
+                                title = "Wi-Fi 状态试听音质",
+                                subtitle = "连接无线局域网时流式播放音质",
+                                selectedValue = wifiStreamQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    wifiStreamQuality = q
+                                    prefs.edit().putString("wifi_stream_quality", q.key).apply()
+                                }
+                            )
 
-                // 3. 首页展示内容定制
-                SettingsSubSectionHeader(title = "首页内容展示定制")
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFFFF2D55),
-                    icon = Icons.Default.History,
-                    title = "最近播放 (Recently Played)",
-                    subtitle = "在首页展示最近播放过的曲目",
-                    checked = homeDisplayConfig.showRecentlyPlayed,
-                    onCheckedChange = { onHomeDisplayConfigChange(homeDisplayConfig.copy(showRecentlyPlayed = it)) }
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFFFF9500),
-                    icon = Icons.Default.NewReleases,
-                    title = "最近添加 (Recently Added)",
-                    subtitle = "在首页展示最新入库的音轨与专辑",
-                    checked = homeDisplayConfig.showRecentlyAdded,
-                    onCheckedChange = { onHomeDisplayConfigChange(homeDisplayConfig.copy(showRecentlyAdded = it)) }
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF34C759),
-                    icon = Icons.Default.Album,
-                    title = "专辑列表 (Albums)",
-                    subtitle = "在首页展示热门专辑大图横向展台",
-                    checked = homeDisplayConfig.showAlbums,
-                    onCheckedChange = { onHomeDisplayConfigChange(homeDisplayConfig.copy(showAlbums = it)) }
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF5856D6),
-                    icon = Icons.Default.Mic,
-                    title = "歌手列表 (Artists)",
-                    subtitle = "在首页展示推荐歌手圆形头像展台",
-                    checked = homeDisplayConfig.showArtists,
-                    onCheckedChange = { onHomeDisplayConfigChange(homeDisplayConfig.copy(showArtists = it)) }
-                )
+                            Spacer(modifier = Modifier.height(10.dp))
 
-                SettingsDivider()
+                            // 2. 移动流量状态试听音质
+                            SettingDropdownRow(
+                                icon = Icons.Default.SignalCellularAlt,
+                                title = "移动流量状态试听音质",
+                                subtitle = "使用蜂窝网络时播放音质 (建议标准/极高)",
+                                selectedValue = cellularStreamQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    cellularStreamQuality = q
+                                    prefs.edit().putString("cellular_stream_quality", q.key).apply()
+                                }
+                            )
 
-                // 4. 毛玻璃透明度与底栏动效
-                SettingsSubSectionHeader(title = "底栏视觉与动效控制")
-                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            SettingsIconBadge(badgeColor = Color(0xFF32ADE6), icon = Icons.Default.BlurOn)
-                            Spacer(modifier = Modifier.width(14.dp))
-                            Column {
-                                Text("底栏毛玻璃透明效果", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text("调节悬浮播放栏与导航底栏的磨砂透光度", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(modifier = Modifier.height(14.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f), thickness = 0.5.dp)
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // 3. 试听本地缓存开关
+                            SettingSwitchRow(
+                                title = "在线试听边听边存",
+                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已彻底关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
+                                checked = streamCacheEnabled,
+                                onCheckedChange = { isEnabled ->
+                                    streamCacheEnabled = isEnabled
+                                    prefs.edit().putBoolean("stream_cache_enabled", isEnabled).apply()
+                                    Media3Factory.setCacheEnabled(isEnabled)
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // 4. 清理试听缓存
+                            val formattedCacheSize = remember(cacheSizeBytes) {
+                                val mb = cacheSizeBytes.toDouble() / (1024 * 1024)
+                                if (mb >= 0.1) "%.1f MB".format(mb) else "${(cacheSizeBytes / 1024)} KB"
                             }
-                        }
-                        Text("${(blurAlpha * 100).toInt()}%", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = AppleRed)
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Slider(
-                        value = blurAlpha,
-                        onValueChange = onBlurAlphaChange,
-                        valueRange = 0.40f..0.98f,
-                        colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
-                    )
-                }
-
-                SettingsDivider()
-
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFFAF52DE),
-                    icon = Icons.Default.Animation,
-                    title = "底栏线性滑动缩放动效",
-                    subtitle = "滑动歌曲列表时平滑收缩，点按展开；关闭后常显完整底栏",
-                    checked = enableBottomBarAnimation,
-                    onCheckedChange = onEnableBottomBarAnimationChange
-                )
-            }
-        }
-
-        // =========================================================================
-        // 分类 3: 🎵 播放与车载音频控制
-        // =========================================================================
-        item {
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFF007AFF),
-                icon = Icons.Default.PlayCircleFilled,
-                title = "播放与车载音频控制",
-                summary = "开机自启 • 弱网容灾切本地 • 导航压音 • 蓝牙断开暂停",
-                isExpanded = expandPlayback,
-                onToggleExpand = { expandPlayback = !expandPlayback }
-            ) {
-                SettingsSubSectionHeader(title = "智能启播与离线调度")
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFFFA2D48),
-                    icon = Icons.Default.PlayCircleFilled,
-                    title = "启动应用时自动继续播放",
-                    subtitle = "打开应用时优先自动起播上次关闭界面时的歌曲并恢复进度",
-                    checked = autoPlayOnStartup,
-                    onCheckedChange = onAutoPlayOnStartupChange
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF32ADE6),
-                    icon = Icons.Default.SyncProblem,
-                    title = "在线歌曲缓冲失败自动切本地",
-                    subtitle = "当检测到服务器断开或在线音源无法缓冲时，自动无缝切换至本地已下载歌曲",
-                    checked = autoFallbackToLocal,
-                    onCheckedChange = onAutoFallbackToLocalChange
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF34C759),
-                    icon = Icons.Default.FileDownloadDone,
-                    title = "离线优先无缝起播",
-                    subtitle = "若本地存在已下载文件，优先使用本地存储播放以节约流量",
-                    checked = preferOfflineFirst,
-                    onCheckedChange = { preferOfflineFirst = it }
-                )
-                SettingsDivider()
-                SettingsSubSectionHeader(title = "车机音频焦点与输出响应")
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFFFF9500),
-                    icon = Icons.Default.DirectionsCar,
-                    title = "车机音频焦点与导航混音压音",
-                    subtitle = "导航提示音播报时自动降低音乐音量 (Audio Ducking)",
-                    checked = enableAudioDucking,
-                    onCheckedChange = { enableAudioDucking = it }
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF5856D6),
-                    icon = Icons.Default.Headphones,
-                    title = "耳机拔出/蓝牙断开自动暂停",
-                    subtitle = "设备断开音频输出时自动停止播放",
-                    checked = pauseOnUnplug,
-                    onCheckedChange = { pauseOnUnplug = it }
-                )
-            }
-        }
-
-        // =========================================================================
-        // 分类 4: 📐 屏幕分辨率与触控缩放
-        // =========================================================================
-        item {
-            val scaleLabel = when (currentScaleMode) {
-                UiScaleMode.AUTO -> "智能自适应"
-                UiScaleMode.STANDARD_PHONE -> "标准手机"
-                UiScaleMode.CAR_LARGE -> "车机大号"
-                UiScaleMode.CAR_EXTRA_LARGE -> "车机超大"
-            }
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFF32ADE6),
-                icon = Icons.Default.AspectRatio,
-                title = "屏幕分辨率与触控缩放",
-                summary = "当前模式: $scaleLabel",
-                isExpanded = expandScale,
-                onToggleExpand = { expandScale = !expandScale }
-            ) {
-                SettingsSubSectionHeader(title = "车载大屏触控与分辨率适配")
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("触控模式与字体大小", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text("针对车机大屏与各类设备分辨率自适应优化", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        ScaleOptionChip("智能自适应", currentScaleMode == UiScaleMode.AUTO) { onScaleModeChange(UiScaleMode.AUTO) }
-                        ScaleOptionChip("标准手机", currentScaleMode == UiScaleMode.STANDARD_PHONE) { onScaleModeChange(UiScaleMode.STANDARD_PHONE) }
-                        ScaleOptionChip("车机大号", currentScaleMode == UiScaleMode.CAR_LARGE) { onScaleModeChange(UiScaleMode.CAR_LARGE) }
-                        ScaleOptionChip("车机超大", currentScaleMode == UiScaleMode.CAR_EXTRA_LARGE) { onScaleModeChange(UiScaleMode.CAR_EXTRA_LARGE) }
-                    }
-                }
-            }
-        }
-
-        // =========================================================================
-        // 分类 5: 📥 离线缓存与存储设置
-        // =========================================================================
-        item {
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFF5856D6),
-                icon = Icons.Default.FolderSpecial,
-                title = "离线缓存与存储设置",
-                summary = "并发数: ${downloadSettings.maxConcurrent}个 • 自定义存储目录 • 临时缓存清理",
-                isExpanded = expandStorage,
-                onToggleExpand = { expandStorage = !expandStorage }
-            ) {
-                // 1. 同时下载缓存并发数量设置 (选项：1, 3, 5, 7, 10，默认 3)
-                SettingsSubSectionHeader(title = "下载队列与并发控制")
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            SettingsIconBadge(badgeColor = Color(0xFFFF9500), icon = Icons.Default.Download)
-                            Spacer(modifier = Modifier.width(14.dp))
-                            Column {
-                                Text(
-                                    text = "下载并发缓存数量",
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = "同时下载的最大任务数，超出部分自动排队下载",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                        Text(
-                            text = "${downloadSettings.maxConcurrent} 个任务",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = AppleRed
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    val concurrentOptions = listOf(1, 3, 5, 7, 10)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        concurrentOptions.forEach { count ->
-                            val isSelected = downloadSettings.maxConcurrent == count
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (isSelected) AppleRed else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                border = if (isSelected) null else BorderStroke(0.6.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .clickable {
-                                        onDownloadSettingsChange(downloadSettings.copy(maxConcurrent = count))
-                                    }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Box(
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                    contentAlignment = Alignment.Center
+                                Column {
+                                    Text("当前试听缓存占用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                    Text(formattedCacheSize, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        Media3Factory.clearStreamCache(context)
+                                        cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
+                                        Toast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
+                                    },
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(34.dp)
                                 ) {
-                                    Text(
-                                        text = "${count}个",
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface
-                                    )
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("清理试听缓存", fontSize = 12.sp)
                                 }
                             }
                         }
                     }
+
+                    item {
+                        SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
+                            SettingSwitchRow(
+                                title = "启动自动继续播放",
+                                subtitle = "打开应用时自动恢复上次关闭前的曲目并继续播放",
+                                checked = autoPlayOnStartup,
+                                onCheckedChange = onAutoPlayOnStartupChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "网络容灾自动回退本地",
+                                subtitle = "在线音频遇到网络超时或无法缓冲时，无缝切换至已下载的本地歌曲",
+                                checked = autoFallbackToLocal,
+                                onCheckedChange = onAutoFallbackToLocalChange
+                            )
+                        }
+                    }
+
+                    item {
+                        SettingsCard(title = "界面外观与特效", icon = Icons.Default.Palette) {
+                            SettingDropdownRow(
+                                title = "主题外观",
+                                subtitle = "选择系统全局视觉风格",
+                                selectedValue = themeMode,
+                                options = listOf(AppThemeMode.FOLLOW_SYSTEM, AppThemeMode.DARK, AppThemeMode.LIGHT),
+                                getLabel = { mode ->
+                                    when (mode) {
+                                        AppThemeMode.FOLLOW_SYSTEM -> "跟随系统"
+                                        AppThemeMode.DARK -> "深色模式"
+                                        AppThemeMode.LIGHT -> "浅色模式"
+                                    }
+                                },
+                                onSelect = { onThemeModeChange(it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Slider(
+                                value = blurAlpha,
+                                onValueChange = onBlurAlphaChange,
+                                valueRange = 0.2f..1.0f,
+                                colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "悬浮播放底栏自动收缩",
+                                subtitle = "页面向上滚动时自动收起导航栏，为列表展示释放最大可视区域",
+                                checked = enableBottomBarAnimation,
+                                onCheckedChange = onEnableBottomBarAnimationChange
+                            )
+                        }
+                    }
+
+                    item {
+                        Button(
+                            onClick = onExitAppCompletely,
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f)),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth().height(48.dp)
+                        ) {
+                            Icon(Icons.Default.PowerSettingsNew, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("彻底退出应用并停止后台服务", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
-
-                SettingsDivider()
-
-                // 基于仿资料库本地目录选择器选择文件夹存储
-                SettingsSubSectionHeader(title = "下载存储路径与元数据")
-                SettingsActionRow(
-                    badgeColor = Color(0xFFFF2D55),
-                    icon = Icons.Default.Folder,
-                    title = "离线歌曲下载存储目录",
-                    subtitle = if (downloadSettings.customDownloadPath.isNotBlank()) downloadSettings.customDownloadPath else "应用默认内部存储目录 (Android/data/.../music)",
-                    trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("更改目录", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
-                        }
-                    },
-                    onClick = { showFolderPickerDialog = true }
-                )
-
-                SettingsDivider()
-
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF007AFF),
-                    icon = Icons.Default.Wifi,
-                    title = "仅在 Wi-Fi 下下载",
-                    subtitle = "连接移动蜂窝数据时暂停下载任务",
-                    checked = downloadSettings.wifiOnly,
-                    onCheckedChange = { onDownloadSettingsChange(downloadSettings.copy(wifiOnly = it)) }
-                )
-                SettingsDivider()
-                SettingsSwitchItem(
-                    badgeColor = Color(0xFF5856D6),
-                    icon = Icons.Default.Tag,
-                    title = "下载时自动写入封面与 ID3 标签",
-                    subtitle = "保证离线文件在其他播放器中也可正确显示歌名与封面",
-                    checked = downloadSettings.autoTagging,
-                    onCheckedChange = { onDownloadSettingsChange(downloadSettings.copy(autoTagging = it)) }
-                )
-
-                SettingsDivider()
-
-                // 流媒体临时缓存清理
-                SettingsSubSectionHeader(title = "临时流媒体播放缓存")
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            Media3Factory.clearStreamCache(context)
-                            cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
-                            Toast.makeText(context, "流媒体播放缓存已清理", Toast.LENGTH_SHORT).show()
-                        }
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SettingsIconBadge(badgeColor = Color(0xFFFF3B30), icon = Icons.Default.CleaningServices)
-                        Spacer(modifier = Modifier.width(14.dp))
-                        Column {
-                            Text("流媒体临时播放缓存", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text("已缓存: ${(cacheSizeBytes / (1024 * 1024))} MB", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    Text("立即清理", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-
-        // =========================================================================
-        // 分类 6: ℹ️ 关于程序与系统
-        // =========================================================================
-        item {
-            SettingsCollapsibleCard(
-                badgeColor = Color(0xFFFF9500),
-                icon = Icons.Default.Info,
-                title = "关于程序与系统",
-                summary = "版本 v${AppUpdateManager.CURRENT_VERSION_NAME} • 检查更新 • 彻底退出程序",
-                isExpanded = expandAbout,
-                onToggleExpand = { expandAbout = !expandAbout }
-            ) {
-                // 1. 关于程序与开发者
-                SettingsSubSectionHeader(title = "开发者与应用信息")
-                SettingsActionRow(
-                    badgeColor = Color(0xFF007AFF),
-                    icon = Icons.Default.Info,
-                    title = "关于程序与开发者",
-                    subtitle = "LMPlayer v${AppUpdateManager.CURRENT_VERSION_NAME} • 作者: Zhou • 邮箱: 1390999045@qq.com",
-                    trailingContent = {
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
-                    },
-                    onClick = { showAboutDialog = true }
-                )
-
-                SettingsDivider()
-
-                // 2. 检查新版本更新 (原生直连 GitHub Releases)
-                SettingsSubSectionHeader(title = "云端更新与维护")
-                SettingsActionRow(
-                    badgeColor = Color(0xFF34C759),
-                    icon = if (isCheckingUpdate) Icons.Default.HourglassTop else Icons.Default.SystemUpdate,
-                    title = "检查新版本更新",
-                    subtitle = if (isCheckingUpdate) "正在请求云端最新版本信息..." else "在线检测升级并支持一键下载覆盖安装",
-                    trailingContent = {
-                        if (isCheckingUpdate) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AppleRed)
-                        } else {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("检查更新", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
-                            }
-                        }
-                    },
-                    onClick = {
-                        if (!isCheckingUpdate) {
-                            isCheckingUpdate = true
-                            coroutineScope.launch {
-                                val result = AppUpdateManager.checkForUpdates(context)
-                                isCheckingUpdate = false
-                                result.onSuccess { updateInfo ->
-                                    updateInfoState = updateInfo
-                                    showUpdateDialog = true
-                                }.onFailure { error ->
-                                    Toast.makeText(context, "检查更新失败: ${error.message}", Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        }
-                    }
-                )
-
-                SettingsDivider()
-
-                // 3. 彻底退出程序
-                SettingsSubSectionHeader(title = "系统资源管理")
-                SettingsActionRow(
-                    badgeColor = Color(0xFFFF3B30),
-                    icon = Icons.Default.PowerSettingsNew,
-                    title = "彻底退出程序",
-                    subtitle = "停止所有前台音频播放服务并彻底关闭释放系统内存",
-                    trailingContent = {
-                        Text("退出", color = Color(0xFFFF3B30), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    },
-                    onClick = {
-                        Toast.makeText(context, "正在彻底关闭程序...", Toast.LENGTH_SHORT).show()
-                        onExitAppCompletely()
-                    }
-                )
             }
         }
     }
 
-    // 弹窗：添加/编辑服务器
-    if (showAddServerDialog) {
-        ServerConfigDialog(
-            server = editingServer,
-            onDismiss = { showAddServerDialog = false },
-            onSave = { server ->
-                onAddOrUpdateServer(server)
-                showAddServerDialog = false
+    // 清除资料库遗留数据二次确认弹窗
+    if (showPurgeConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showPurgeConfirmDialog = false },
+            title = { Text("确认清除资料库遗留数据？", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "此操作将深度核验本地歌曲的物理文件：\n" +
+                    "1. 物理文件已被删除或丢失的歌曲记录将被清除；\n" +
+                    "2. 没有任何关联歌曲的空专辑、空歌手及遗留临时榜单将被安全移除；\n" +
+                    "3. 真实存在的已下载物理音频文件将完好保留。\n\n" +
+                    "清理后资料库将完全恢复清爽整洁。"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showPurgeConfirmDialog = false
+                        isPurgingLegacyData = true
+                        coroutineScope.launch {
+                            val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database)
+                            isPurgingLegacyData = false
+                            onLocalScanCompleted()
+                            Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                ) {
+                    Text("立即清除")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPurgeConfirmDialog = false }) {
+                    Text("取消")
+                }
             }
         )
     }
 
-    // 弹窗：在线模式操作音源切换
-    if (showOnlineSourceDialog) {
-        Dialog(onDismissRequest = { showOnlineSourceDialog = false }) {
-            Card(
+    // 服务器保存路径选择与切换弹窗 (复用柠檬服务端 /api/paths 与 /api/paths/download)
+    if (showServerPathDialog && activeServer != null) {
+        Dialog(onDismissRequest = { showServerPathDialog = false }) {
+            Surface(
                 shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                elevation = CardDefaults.cardElevation(8.dp),
-                modifier = Modifier.fillMaxWidth(0.92f).padding(16.dp)
+                color = cardBg,
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier.fillMaxWidth(0.95f).padding(16.dp)
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
                     Text(
-                        text = "选择在线模式操作音源",
-                        fontSize = 18.sp,
+                        text = "选择服务器下载保存路径",
+                        fontSize = 17.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "切换全网音乐搜索、每日推荐歌单与官方榜单的目标音源平台",
+                        text = "复用柠檬服务端的音乐保存目录配置 (/api/paths)：",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    OnlineMusicSource.entries.forEach { src ->
-                        val isSelected = src == currentOnlineSource
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (isSelected) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                            border = if (isSelected) BorderStroke(1.5.dp, AppleRed) else null,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    onOnlineSourceChange(src)
-                                    showOnlineSourceDialog = false
-                                }
+                    if (serverAvailablePaths.isNotEmpty()) {
+                        Text(
+                            text = "服务端已挂载音乐路径：",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LazyColumn(
+                            modifier = Modifier.heightIn(max = 160.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Column {
-                                    Text(
-                                        text = src.displayName,
-                                        fontSize = 15.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        text = "音源代号: ${src.key}",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                if (isSelected) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = "当前选中",
-                                        tint = AppleRed,
-                                        modifier = Modifier.size(20.dp)
-                                    )
+                            items(serverAvailablePaths) { pathItem ->
+                                val isSelected = selectedServerPathChoice == pathItem
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (isSelected) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    border = BorderStroke(1.dp, if (isSelected) AppleRed else Color.Transparent),
+                                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
+                                        selectedServerPathChoice = pathItem
+                                        customServerPathInput = ""
+                                    }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        RadioButton(
+                                            selected = isSelected,
+                                            onClick = {
+                                                selectedServerPathChoice = pathItem
+                                                customServerPathInput = ""
+                                            },
+                                            colors = RadioButtonDefaults.colors(selectedColor = AppleRed)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = pathItem,
+                                            fontSize = 12.sp,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                            color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
                                 }
                             }
                         }
+                        Spacer(modifier = Modifier.height(12.dp))
                     }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { showOnlineSourceDialog = false }) {
-                            Text("完成", color = AppleRed, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "或手动输入服务器绝对路径：",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedTextField(
+                        value = customServerPathInput,
+                        onValueChange = {
+                            customServerPathInput = it
+                            if (it.isNotBlank()) selectedServerPathChoice = it
+                        },
+                        placeholder = { Text("例如: /volume1/music/downloads", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { showServerPathDialog = false }) {
+                            Text("取消")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val target = customServerPathInput.trim().ifBlank { selectedServerPathChoice.trim() }
+                                if (target.isNotBlank()) {
+                                    coroutineScope.launch {
+                                        val proto = LemonMusicProtocol(
+                                            NetworkClientFactory.createOkHttpClient(context),
+                                            activeServer.serverUrl,
+                                            activeServer.username,
+                                            activeServer.tokenOrApiKey
+                                        )
+                                        val res = proto.updateServerDownloadPath(target)
+                                        if (res.isSuccess) {
+                                            serverDownloadPath = target
+                                            showServerPathDialog = false
+                                            Toast.makeText(context, "已成功更新服务端下载路径: $target", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                        ) {
+                            Text("确定保存")
                         }
                     }
                 }
@@ -1312,58 +1393,369 @@ fun SettingsScreen(
         }
     }
 
-    // 弹窗：关于程序
-    if (showAboutDialog) {
-        AboutProgramDialog(
-            onDismiss = { showAboutDialog = false },
-            onCheckUpdate = {
-                showAboutDialog = false
-                isCheckingUpdate = true
-                coroutineScope.launch {
-                    val result = AppUpdateManager.checkForUpdates(context)
-                    isCheckingUpdate = false
-                    result.onSuccess { updateInfo ->
-                        updateInfoState = updateInfo
-                        showUpdateDialog = true
-                    }.onFailure { error ->
-                        Toast.makeText(context, "检查更新失败: ${error.message}", Toast.LENGTH_LONG).show()
+    // 添加本地音乐扫描路径弹窗
+    if (showAddLocalPathDialog) {
+        Dialog(onDismissRequest = { showAddLocalPathDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = cardBg,
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier.fillMaxWidth(0.95f).padding(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        text = "添加本地音乐扫描目录",
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "输入本机绝对路径或从常见音乐目录中快捷选择：",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    val quickPresets = listOf(
+                        "/storage/emulated/0/Music",
+                        "/storage/emulated/0/Download",
+                        "/storage/emulated/0/Download/LMPlayer",
+                        "/storage/emulated/0/Tencent/QQfile_recv",
+                        "/storage/emulated/0/NetEase/CloudMusic"
+                    )
+
+                    Text(
+                        text = "快捷预设目录：",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LazyColumn(
+                        modifier = Modifier.heightIn(max = 130.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(quickPresets) { preset ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable {
+                                    newLocalPathInput = preset
+                                }
+                            ) {
+                                Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Folder, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(text = preset, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = newLocalPathInput,
+                        onValueChange = { newLocalPathInput = it },
+                        label = { Text("目录绝对路径", fontSize = 12.sp) },
+                        placeholder = { Text("/storage/emulated/0/Music", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    OutlinedButton(
+                        onClick = {
+                            showAddLocalPathDialog = false
+                            onImportCustomFolder()
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        border = BorderStroke(1.dp, borderColor)
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("打开系统文件夹选择器 (SAF)", fontSize = 12.sp)
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { showAddLocalPathDialog = false }) {
+                            Text("取消")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val path = newLocalPathInput.trim()
+                                if (path.isNotBlank()) {
+                                    val updated = localMusicPaths.toMutableSet()
+                                    updated.add(path)
+                                    localMusicPaths = updated
+                                    prefs.edit().putStringSet("local_music_scan_folders", updated).apply()
+                                    showAddLocalPathDialog = false
+                                    newLocalPathInput = ""
+                                    Toast.makeText(context, "已添加扫描目录: $path", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                        ) {
+                            Text("添加")
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    // 导入落雪脚本弹窗
+    if (showImportScriptDialog) {
+        Dialog(onDismissRequest = { showImportScriptDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = cardBg,
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier.fillMaxWidth(0.94f).padding(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text("导入落雪音源脚本", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        FilterChip(
+                            selected = isImportingUrl,
+                            onClick = { isImportingUrl = true },
+                            label = { Text("URL 在线导入") }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        FilterChip(
+                            selected = !isImportingUrl,
+                            onClick = { isImportingUrl = false },
+                            label = { Text("脚本代码直接粘贴") }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (isImportingUrl) {
+                        OutlinedTextField(
+                            value = importScriptUrl,
+                            onValueChange = { importScriptUrl = it },
+                            label = { Text("脚本远程地址 (URL)") },
+                            placeholder = { Text("https://example.com/source.js") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        OutlinedTextField(
+                            value = importScriptCode,
+                            onValueChange = { importScriptCode = it },
+                            label = { Text("脚本 JS 源码") },
+                            placeholder = { Text("粘贴落雪脚本 JavaScript 代码...") },
+                            modifier = Modifier.fillMaxWidth().height(140.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(20.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = { showImportScriptDialog = false }, modifier = Modifier.weight(1f)) {
+                            Text("取消")
+                        }
+                        Button(
+                            onClick = {
+                                if (activeServer != null) {
+                                    coroutineScope.launch {
+                                        val proto = LemonMusicProtocol(
+                                            NetworkClientFactory.createOkHttpClient(context),
+                                            activeServer.serverUrl,
+                                            activeServer.username,
+                                            activeServer.tokenOrApiKey
+                                        )
+                                        val res = if (isImportingUrl) {
+                                            proto.importSourceUrl(importScriptUrl.trim())
+                                        } else {
+                                            proto.importSourceScript(importScriptCode.trim())
+                                        }
+                                        if (res.isSuccess) {
+                                            Toast.makeText(context, "导入成功！", Toast.LENGTH_SHORT).show()
+                                            sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                            showImportScriptDialog = false
+                                        } else {
+                                            Toast.makeText(context, "导入失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("确定导入")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 删除脚本确认
+    if (scriptToDelete != null) {
+        val s = scriptToDelete!!
+        AlertDialog(
+            onDismissRequest = { scriptToDelete = null },
+            title = { Text("确认删除该音源脚本？") },
+            text = { Text("即将删除音源脚本「${s.name}」，删除后将无法从该脚本获取在线播放和搜索。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        scriptToDelete = null
+                        if (activeServer != null) {
+                            coroutineScope.launch {
+                                val proto = LemonMusicProtocol(
+                                    NetworkClientFactory.createOkHttpClient(context),
+                                    activeServer.serverUrl,
+                                    activeServer.username,
+                                    activeServer.tokenOrApiKey
+                                )
+                                proto.deleteSource(s.id)
+                                sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                Toast.makeText(context, "脚本已删除", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                ) {
+                    Text("确认删除")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { scriptToDelete = null }) { Text("取消") }
             }
         )
     }
 
-    // 弹窗：新版本更新与下载安装
-    if (showUpdateDialog && updateInfoState != null) {
-        val info = updateInfoState!!
+    // 添加/编辑服务器配置弹窗
+    if (showAddServerDialog) {
+        var serverNameInput by remember { mutableStateOf(editingServer?.name ?: "") }
+        var serverTypeInput by remember { mutableStateOf(editingServer?.type ?: ServerType.LEMON_MUSIC) }
+        var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
+        var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
+        var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
+
+        Dialog(onDismissRequest = { showAddServerDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = cardBg,
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier.fillMaxWidth(0.94f).padding(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(if (editingServer != null) "编辑服务器" else "添加新服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    OutlinedTextField(
+                        value = serverNameInput,
+                        onValueChange = { serverNameInput = it },
+                        label = { Text("服务器名称 (如 飞牛NAS/客厅柠檬)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = serverUrlInput,
+                        onValueChange = { serverUrlInput = it },
+                        label = { Text("服务器地址 (如 http://192.168.1.100:3000)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = usernameInput,
+                        onValueChange = { usernameInput = it },
+                        label = { Text("用户名 (可选)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = { tokenInput = it },
+                        label = { Text("登录令牌 Token / 密码") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(20.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = { showAddServerDialog = false }, modifier = Modifier.weight(1f)) {
+                            Text("取消")
+                        }
+                        Button(
+                            onClick = {
+                                if (serverUrlInput.isNotBlank()) {
+                                    val newConfig = ServerConfig(
+                                        id = editingServer?.id ?: "srv_${System.currentTimeMillis()}",
+                                        name = serverNameInput.ifBlank { "我的音乐服务器" },
+                                        type = serverTypeInput,
+                                        serverUrl = serverUrlInput.trim().removeSuffix("/"),
+                                        username = usernameInput.trim(),
+                                        tokenOrApiKey = tokenInput.trim(),
+                                        isCurrentActive = true
+                                    )
+                                    onAddOrUpdateServer(newConfig)
+                                    showAddServerDialog = false
+                                } else {
+                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("保存并连接")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 在线更新弹窗 (检测到新版本时展示)
+    if (showUpdateDialog && activeUpdateInfo != null) {
         AppUpdateDialog(
-            updateInfo = info,
-            isDownloading = isDownloadingApk,
-            downloadProgress = downloadProgress,
-            isDownloaded = downloadedApkFile != null && downloadedApkFile!!.exists(),
+            updateInfo = activeUpdateInfo!!,
+            isDownloading = isDownloadingUpdate,
+            downloadProgress = updateDownloadProgress,
+            isDownloaded = isUpdateDownloaded,
             onDismiss = { showUpdateDialog = false },
             onNeverUpdate = {
-                AppUpdateManager.setSkipVersion(context, info.latestVersion)
-                Toast.makeText(context, "已记录，不再提示 v${info.latestVersion} 更新", Toast.LENGTH_SHORT).show()
                 showUpdateDialog = false
+                AppUpdateManager.setNeverUpdate(context, true)
+                Toast.makeText(context, "已关闭自动更新提醒", Toast.LENGTH_SHORT).show()
             },
             onStartDownload = {
-                if (info.downloadUrl.isNotBlank() && !isDownloadingApk) {
-                    isDownloadingApk = true
-                    downloadProgress = 0f
+                if (activeUpdateInfo?.downloadUrl?.isNotBlank() == true && !isDownloadingUpdate) {
+                    isDownloadingUpdate = true
+                    updateDownloadProgress = 0f
                     coroutineScope.launch {
                         AppUpdateManager.downloadApk(
                             context = context,
-                            downloadUrl = info.downloadUrl,
-                            onProgress = { progress, _, _ -> downloadProgress = progress }
+                            downloadUrl = activeUpdateInfo!!.downloadUrl,
+                            onProgress = { progress, _, _ -> updateDownloadProgress = progress }
                         ).onSuccess { apkFile ->
-                            isDownloadingApk = false
+                            isDownloadingUpdate = false
+                            isUpdateDownloaded = true
                             downloadedApkFile = apkFile
                             Toast.makeText(context, "安装包下载完成，正在调起安装...", Toast.LENGTH_SHORT).show()
                             AppUpdateManager.installApk(context, apkFile)
-                        }.onFailure { err ->
-                            isDownloadingApk = false
-                            Toast.makeText(context, "下载安装包失败: ${err.message}", Toast.LENGTH_LONG).show()
+                        }.onFailure { error ->
+                            isDownloadingUpdate = false
+                            Toast.makeText(context, "下载更新失败: ${error.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }
@@ -1374,51 +1766,58 @@ fun SettingsScreen(
         )
     }
 
-    // 弹窗：选择指定文件夹进行本地扫描 (复用本地文件夹选择器)
-    if (showScanFolderPickerDialog) {
-        LocalFolderPickerDialog(
-            initialPath = "",
-            onDismiss = { showScanFolderPickerDialog = false },
-            onConfirm = { selectedPath ->
-                showScanFolderPickerDialog = false
-                if (selectedPath.isNotBlank()) {
-                    isScanningLocal = true
-                    expandLocalScanner = true
-                    coroutineScope.launch {
-                        val res = LocalMediaScanner.discoverLocalAudioFilesGrouped(context, selectedPath)
-                        scannedFolderMap = scannedFolderMap + res
-                        selectedFolderPaths = selectedFolderPaths + res.keys
-                        isScanningLocal = false
-                        Toast.makeText(context, "指定文件夹扫描完成！发现 ${res.values.sumOf { it.size }} 首歌曲", Toast.LENGTH_SHORT).show()
-                    }
+    // 版本更新日志与最新版本状态详情弹窗
+    if (showVersionNotesDialog && activeUpdateInfo != null) {
+        AlertDialog(
+            onDismissRequest = { showVersionNotesDialog = false },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.SystemUpdate, contentDescription = null, tint = AppleRed, modifier = Modifier.size(22.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("LMPlayer v${activeUpdateInfo?.latestVersion}", fontWeight = FontWeight.Bold)
                 }
-            }
-        )
-    }
-
-    // 弹窗：本地存储目录选择器 (仿资料库本地文件夹交互)
-    if (showFolderPickerDialog) {
-        LocalFolderPickerDialog(
-            initialPath = downloadSettings.customDownloadPath,
-            onDismiss = { showFolderPickerDialog = false },
-            onConfirm = { selectedPath ->
-                onDownloadSettingsChange(downloadSettings.copy(customDownloadPath = selectedPath))
-                showFolderPickerDialog = false
-                if (selectedPath.isNotBlank()) {
-                    val targetDir = File(selectedPath)
-                    if (targetDir.exists() && targetDir.isDirectory) {
-                        coroutineScope.launch {
-                            Toast.makeText(context, "已设定离线目录: $selectedPath，正在深度匹配本地歌曲...", Toast.LENGTH_SHORT).show()
-                            val count = LocalMediaScanner.scanCustomDirectory(context, targetDir.absolutePath, database)
-                            val merged = SongMatchingResolver.autoMatchAndSyncServer(database, targetDir, null)
-                            Toast.makeText(context, "离线目录扫描完成！导入 $count 首歌曲，自动匹配 $merged 首线上歌曲", Toast.LENGTH_LONG).show()
-                            onLocalScanCompleted()
-                        }
-                    } else {
-                        Toast.makeText(context, "已设定离线下载目录: $selectedPath", Toast.LENGTH_SHORT).show()
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = if (activeUpdateInfo?.hasUpdate == true) "发现新版本可用：" else "当前已是最新至臻发布版本，系统运行稳定！",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (activeUpdateInfo?.hasUpdate == true) AppleRed else MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = activeUpdateInfo?.releaseNotes ?: "",
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
                     }
-                } else {
-                    Toast.makeText(context, "已恢复默认离线存储目录", Toast.LENGTH_SHORT).show()
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "更新来源：GitHub (@${AppUpdateManager.DEFAULT_GITHUB_REPO})",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showVersionNotesDialog = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                ) {
+                    Text("确定")
                 }
             }
         )
@@ -1426,674 +1825,244 @@ fun SettingsScreen(
 }
 
 /**
- * 模块内部子分类小标题栏 (清晰区分下级子设置项与父级模块)
+ * 设置卡片容器
  */
 @Composable
-fun SettingsSubSectionHeader(
+private fun SettingsCard(
     title: String,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Surface(
-            shape = RoundedCornerShape(3.dp),
-            color = AppleRed,
-            modifier = Modifier
-                .width(3.5.dp)
-                .height(13.dp)
-        ) {}
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = title,
-            style = TextStyle(
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f)
-            )
-        )
-    }
-}
-
-/**
- * 现代分类折叠卡片组件 (带彩色徽标、摘要提示、微反差背景头部与旋转动画箭头)
- */
-@Composable
-fun SettingsCollapsibleCard(
-    badgeColor: Color,
     icon: ImageVector,
-    title: String,
-    summary: String,
-    isExpanded: Boolean,
-    onToggleExpand: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    val cardColor = MaterialTheme.colorScheme.surface
-    val headerBgColor = if (isDark) {
-        Color.White.copy(alpha = 0.04f)
-    } else {
-        Color.Black.copy(alpha = 0.025f)
-    }
-    val cardBorder = BorderStroke(0.6.dp, if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f))
-    val rotationAngle by animateFloatAsState(targetValue = if (isExpanded) 180f else 0f, label = "chevron_rotate")
+    val cardColor = if (isDark) Color(0xFF24242C) else Color.White
+    val borderCol = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.06f)
 
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = cardColor,
-        shadowElevation = 1.5.dp,
-        border = cardBorder,
+        border = BorderStroke(1.dp, borderCol),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column {
-            // 卡片头部 (带微反差背景，突出模块标题层级)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = if (isExpanded) 0.dp else 18.dp, bottomEnd = if (isExpanded) 0.dp else 18.dp))
-                    .background(headerBgColor)
-                    .clickable(onClick = onToggleExpand)
-                    .padding(horizontal = 16.dp, vertical = 15.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                    SettingsIconBadge(badgeColor = badgeColor, icon = icon)
-                    Spacer(modifier = Modifier.width(14.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = title,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = summary,
-                            fontSize = 11.5.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
+        Column(modifier = Modifier.padding(18.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = Icons.Default.KeyboardArrowDown,
-                    contentDescription = if (isExpanded) "折叠" else "展开",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .size(22.dp)
-                        .graphicsLayer { rotationZ = rotationAngle }
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = AppleRed,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = title,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
-
-            AnimatedVisibility(
-                visible = isExpanded,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                ) {
-                    SettingsDivider()
-                    content()
-                }
-            }
+            Spacer(modifier = Modifier.height(14.dp))
+            content()
         }
     }
 }
 
+/**
+ * 信息行
+ */
 @Composable
-fun SettingsIconBadge(badgeColor: Color, icon: ImageVector, iconTint: Color = Color.White) {
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = badgeColor,
-        modifier = Modifier.size(34.dp)
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(18.dp))
-        }
-    }
-}
-
-@Composable
-fun SettingsActionRow(
-    badgeColor: Color,
-    icon: ImageVector,
-    title: String,
-    subtitle: String,
-    trailingContent: @Composable () -> Unit,
-    onClick: () -> Unit
-) {
+private fun SettingInfoRow(label: String, value: String) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 13.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            SettingsIconBadge(badgeColor = badgeColor, icon = icon)
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-        trailingContent()
+        Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
+/**
+ * 开关行
+ */
 @Composable
-fun SettingsSwitchItem(
-    badgeColor: Color,
-    icon: ImageVector,
+private fun SettingSwitchRow(
     title: String,
     subtitle: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            SettingsIconBadge(badgeColor = badgeColor, icon = icon)
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, lineHeight = 15.sp)
-            }
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 14.sp)
         }
         Switch(
             checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = AppleRed)
+            onCheckedChange = onCheckedChange
         )
     }
 }
 
+/**
+ * 动作行
+ */
 @Composable
-fun ScaleOptionChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-        modifier = Modifier
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
+private fun SettingActionRow(
+    title: String,
+    subtitle: String,
+    actionText: String,
+    onAction: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-            color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-        )
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 14.sp)
+        }
+        OutlinedButton(
+            onClick = onAction,
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+            Text(actionText, fontSize = 12.sp)
+        }
     }
 }
 
-@Composable
-fun SettingsDivider() {
-    HorizontalDivider(
-        modifier = Modifier.padding(horizontal = 16.dp),
-        thickness = 0.5.dp,
-        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-    )
-}
-
 /**
- * 关于程序弹窗
+ * 现代轻奢原生下拉选择行
  */
 @Composable
-fun AboutProgramDialog(
-    onDismiss: () -> Unit,
-    onCheckUpdate: () -> Unit
+private fun <T> SettingDropdownRow(
+    title: String,
+    subtitle: String? = null,
+    icon: ImageVector? = null,
+    selectedValue: T,
+    options: List<T>,
+    getLabel: (T) -> String,
+    getSubtitle: ((T) -> String)? = null,
+    onSelect: (T) -> Unit
 ) {
+    var expanded by remember { mutableStateOf(false) }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    val primaryText = if (isDark) Color.White else Color.Black
-    val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = if (isDark) Color(0xFF1E1E24) else Color.White,
-            border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
-            shadowElevation = 24.dp,
-            modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth(0.92f).padding(16.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(22.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+            if (icon != null) {
+                Icon(icon, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+            }
+            Column {
+                Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                if (!subtitle.isNullOrBlank()) {
+                    Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 13.sp)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.width(10.dp))
+
+        Box {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7),
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { expanded = true }
             ) {
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = AppleRed.copy(alpha = 0.15f),
-                    modifier = Modifier.size(64.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(Icons.Default.MusicNote, contentDescription = null, tint = AppleRed, modifier = Modifier.size(36.dp))
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(14.dp))
-                Text("LMPlayer", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = primaryText)
-                Text("柠檬音乐车机客户端 (Lemon Music Edition)", fontSize = 12.sp, color = secondaryText)
-                Spacer(modifier = Modifier.height(6.dp))
-                Surface(shape = RoundedCornerShape(6.dp), color = AppleRed.copy(alpha = 0.15f)) {
-                    Text("v${AppUpdateManager.CURRENT_VERSION_NAME} (Build ${AppUpdateManager.CURRENT_VERSION_CODE})", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AppleRed, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-                Surface(shape = RoundedCornerShape(12.dp), color = if (isDark) Color(0xFF282830) else Color(0xFFF2F2F7), modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(AppUpdateManager.APP_DESCRIPTION, fontSize = 12.sp, color = primaryText, lineHeight = 16.sp)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("作者：", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = primaryText)
-                            Text(AppUpdateManager.AUTHOR_NAME, fontSize = 12.sp, color = secondaryText)
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("联系邮箱：", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = primaryText)
-                            Text(AppUpdateManager.AUTHOR_EMAIL, fontSize = 12.sp, color = secondaryText)
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(20.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f).height(42.dp), shape = RoundedCornerShape(12.dp)) {
-                        Text("关闭", fontSize = 13.sp)
-                    }
-                    Button(onClick = onCheckUpdate, modifier = Modifier.weight(1f).height(42.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = AppleRed)) {
-                        Text("检查更新", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * 新版本更新弹窗 (带滑动说明区、下载进度条与稍后/永不/立即更新 3 选操作)
- */
-@Composable
-fun AppUpdateDialog(
-    updateInfo: UpdateInfo,
-    isDownloading: Boolean,
-    downloadProgress: Float,
-    isDownloaded: Boolean,
-    onDismiss: () -> Unit,
-    onNeverUpdate: () -> Unit = {},
-    onStartDownload: () -> Unit,
-    onInstall: () -> Unit
-) {
-    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    val primaryText = if (isDark) Color.White else Color.Black
-    val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
-
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = if (isDark) Color(0xFF1E1E24) else Color.White,
-            border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
-            shadowElevation = 24.dp,
-            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth(0.92f).padding(16.dp)
-        ) {
-            Column(modifier = Modifier.fillMaxWidth().padding(22.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(shape = RoundedCornerShape(12.dp), color = Color(0xFF34C759).copy(alpha = 0.15f), modifier = Modifier.size(44.dp)) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.SystemUpdate, contentDescription = null, tint = Color(0xFF34C759), modifier = Modifier.size(24.dp))
-                        }
-                    }
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Text(if (updateInfo.hasUpdate) "发现新版本！" else "已是最新版本", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = primaryText)
-                        Text("当前版本: v${AppUpdateManager.CURRENT_VERSION_NAME} • 最新: v${updateInfo.latestVersion}", fontSize = 12.sp, color = secondaryText)
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 滑动展示更新说明，彻底杜绝内容过长挤压遮挡按键
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (isDark) Color(0xFF282830) else Color(0xFFF2F2F7),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Text("【更新内容说明】", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = AppleRed)
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 60.dp, max = 160.dp)
-                                .verticalScroll(rememberScrollState())
-                        ) {
-                            Text(
-                                text = updateInfo.releaseNotes.ifBlank { "包含性能优化、歌词微调、怀旧专辑主题与稳定性提升。" },
-                                fontSize = 12.sp,
-                                color = primaryText,
-                                lineHeight = 17.sp
-                            )
-                        }
-                    }
-                }
-
-                if (isDownloading) {
-                    Spacer(modifier = Modifier.height(16.dp))
-                    LinearProgressIndicator(
-                        progress = { downloadProgress },
-                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                        color = AppleRed,
-                        trackColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text("正在下载更新包: ${(downloadProgress * 100).toInt()}%", fontSize = 11.sp, color = secondaryText, modifier = Modifier.align(Alignment.CenterHorizontally))
-                }
-
-                Spacer(modifier = Modifier.height(20.dp))
-
-                // 操作按钮区：支持「稍后更新」「永不更新」「立即更新 / 安装」
-                if (updateInfo.hasUpdate) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedButton(
-                            onClick = onDismiss,
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                            modifier = Modifier.weight(1f).height(40.dp),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Text("稍后更新", fontSize = 11.sp)
-                        }
-
-                        OutlinedButton(
-                            onClick = onNeverUpdate,
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                            modifier = Modifier.weight(1f).height(40.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = secondaryText)
-                        ) {
-                            Text("永不更新", fontSize = 11.sp)
-                        }
-
-                        Button(
-                            onClick = { if (isDownloaded) onInstall() else onStartDownload() },
-                            enabled = !isDownloading,
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                            modifier = Modifier.weight(1.2f).height(40.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
-                        ) {
-                            Text(
-                                text = if (isDownloaded) "立即安装" else if (isDownloading) "下载中..." else "立即更新",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-                } else {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.fillMaxWidth().height(42.dp),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("关闭", fontSize = 13.sp)
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * 添加/编辑服务器弹窗 (支持连通性与鉴权一键实时测试)
- */
-@Composable
-fun ServerConfigDialog(
-    server: ServerConfig?,
-    onDismiss: () -> Unit,
-    onSave: (ServerConfig) -> Unit
-) {
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-
-    var name by remember { mutableStateOf(server?.name ?: "") }
-    var url by remember { mutableStateOf(server?.serverUrl ?: "") }
-    var username by remember { mutableStateOf(server?.username ?: "") }
-    var password by remember { mutableStateOf(server?.tokenOrApiKey ?: "") }
-    val serverType = ServerType.LEMON_MUSIC
-
-    // 连通性测试状态
-    var isTesting by remember { mutableStateOf(false) }
-    var testResultText by remember { mutableStateOf<String?>(null) }
-    var testResultSuccess by remember { mutableStateOf<Boolean?>(null) }
-
-    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    val primaryText = if (isDark) Color.White else Color.Black
-
-    val onTestConnection: () -> Unit = {
-        val trimmedUrl = url.trim().trimEnd('/')
-        if (trimmedUrl.isBlank()) {
-            Toast.makeText(context, "请输入柠檬音乐服务器地址 (URL)", Toast.LENGTH_SHORT).show()
-        } else {
-            isTesting = true
-            testResultText = null
-            testResultSuccess = null
-            val testConfig = ServerConfig(
-                id = server?.id ?: "test_server_id",
-                name = name.trim().ifBlank { "柠檬音乐" },
-                type = serverType,
-                serverUrl = trimmedUrl,
-                username = username.trim(),
-                tokenOrApiKey = password.trim(),
-                saltOrSecret = "",
-                syncMode = SyncMode.DIRECT,
-                isCurrentActive = false
-            )
-            coroutineScope.launch {
-                val startTime = System.currentTimeMillis()
-                try {
-                    val client = NetworkClientFactory.createOkHttpClient(context)
-                    val protocol = LemonMusicProtocol(client, testConfig.serverUrl, testConfig.username, testConfig.tokenOrApiKey)
-                    val authRes = protocol.authenticate(testConfig)
-                    val latency = System.currentTimeMillis() - startTime
-                    if (authRes.isSuccess) {
-                        testResultSuccess = true
-                        testResultText = "✓ 柠檬音乐服务端连接成功！响应延迟: ${latency}ms"
-                    } else {
-                        testResultSuccess = false
-                        val error = authRes.exceptionOrNull()?.message ?: "鉴权失败或服务不可达"
-                        testResultText = "✗ 连接失败: $error"
-                    }
-                } catch (e: Exception) {
-                    testResultSuccess = false
-                    testResultText = "✗ 连接异常: ${e.message ?: "网络超时"}"
-                } finally {
-                    isTesting = false
-                }
-            }
-        }
-    }
-
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = if (isDark) Color(0xFF1E1E24) else Color.White,
-            border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
-            shadowElevation = 24.dp,
-            modifier = Modifier.widthIn(max = 440.dp).fillMaxWidth(0.92f).padding(16.dp)
-        ) {
-            Column(modifier = Modifier.fillMaxWidth().padding(20.dp)) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (server == null) "连接柠檬音乐服务端" else "编辑柠檬音乐配置",
-                        fontSize = 18.sp,
+                        text = getLabel(selectedValue),
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
-                        color = primaryText
+                        color = AppleRed
                     )
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Close, contentDescription = "关闭", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "展开下拉选择",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
                 }
+            }
 
-                Spacer(modifier = Modifier.height(14.dp))
-
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("服务器备注名称") },
-                    placeholder = { Text("例如：我的柠檬音乐") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = {
-                        url = it
-                        testResultText = null
-                    },
-                    label = { Text("服务器地址 (URL)") },
-                    placeholder = { Text("例如：http://192.168.1.100:7983") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = {
-                        username = it
-                        testResultText = null
-                    },
-                    label = { Text("用户名") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = {
-                        password = it
-                        testResultText = null
-                    },
-                    label = { Text("登录密码 / Session Token") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                // 连通性测试结果提示条
-                if (testResultText != null) {
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (testResultSuccess == true) Color(0xFF34C759).copy(alpha = 0.15f) else Color(0xFFFF3B30).copy(alpha = 0.15f),
-                        border = BorderStroke(0.6.dp, if (testResultSuccess == true) Color(0xFF34C759).copy(alpha = 0.6f) else Color(0xFFFF3B30).copy(alpha = 0.6f)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = if (testResultSuccess == true) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
-                                contentDescription = null,
-                                tint = if (testResultSuccess == true) Color(0xFF34C759) else Color(0xFFFF3B30),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = testResultText ?: "",
-                                fontSize = 12.sp,
-                                color = if (testResultSuccess == true) (if (isDark) Color(0xFF70FF8A) else Color(0xFF1E8233)) else (if (isDark) Color(0xFFFF7A7A) else Color(0xFFD32F2F)),
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(18.dp))
-
-                // 操作按钮区 (取消 / 测试连接 / 保存)
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.weight(1f).height(42.dp),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("取消", fontSize = 12.sp)
-                    }
-
-                    OutlinedButton(
-                        onClick = onTestConnection,
-                        enabled = !isTesting,
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
-                        modifier = Modifier.weight(1f).height(42.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.6f)),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AppleRed)
-                    ) {
-                        if (isTesting) {
-                            CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp, color = AppleRed)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("测试中", fontSize = 11.sp)
-                        } else {
-                            Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(14.dp))
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text("测试", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            if (name.isNotBlank() && url.isNotBlank()) {
-                                onSave(
-                                    ServerConfig(
-                                        id = server?.id ?: java.util.UUID.randomUUID().toString(),
-                                        name = name.trim(),
-                                        type = serverType,
-                                        serverUrl = url.trim().trimEnd('/'),
-                                        username = username.trim(),
-                                        tokenOrApiKey = password.trim(),
-                                        saltOrSecret = "",
-                                        syncMode = SyncMode.DIRECT,
-                                        isCurrentActive = server?.isCurrentActive ?: true
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.widthIn(min = 180.dp, max = 280.dp)
+            ) {
+                options.forEach { option ->
+                    val isSelected = option == selectedValue
+                    DropdownMenuItem(
+                        text = {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = getLabel(option),
+                                        fontSize = 13.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
                                     )
-                                )
-                            } else {
-                                Toast.makeText(context, "请填写完整服务器备注与地址", Toast.LENGTH_SHORT).show()
+                                    getSubtitle?.invoke(option)?.let { sub ->
+                                        if (sub.isNotBlank()) {
+                                            Text(sub, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                }
+                                if (isSelected) {
+                                    Icon(
+                                        imageVector = Icons.Default.Check,
+                                        contentDescription = "已选",
+                                        tint = AppleRed,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         },
-                        modifier = Modifier.weight(1.3f).height(42.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
-                    ) {
-                        Text(if (server == null) "保存添加" else "保存修改", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
+                        onClick = {
+                            onSelect(option)
+                            expanded = false
+                        },
+                        modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(8.dp))
+                    )
                 }
             }
         }
+    }
+}
+
+private fun formatStorageSize(bytes: Long): String {
+    if (bytes <= 0) return "0.0 MB"
+    val gb = bytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+    return if (gb >= 1.0) {
+        String.format(java.util.Locale.getDefault(), "%.2f GB", gb)
+    } else {
+        val mb = bytes.toDouble() / (1024.0 * 1024.0)
+        String.format(java.util.Locale.getDefault(), "%.1f MB", mb)
     }
 }

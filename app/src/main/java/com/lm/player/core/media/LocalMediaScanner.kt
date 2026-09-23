@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.media
+package com.lm.player.core.media
 
 import android.content.ContentUris
 import android.content.Context
@@ -661,11 +661,23 @@ object LocalMediaScanner {
                     val isFav = matchedServerSong.isFavorite || local.isFavorite
                     val fileLength = try { if (localFile.exists()) localFile.length() else 1024L * 1024L } catch (_: Exception) { 1024L * 1024L }
 
+                    val effectiveTimestamp = when {
+                        matchedServerSong.addedTimestamp > 0 -> matchedServerSong.addedTimestamp
+                        local.addedTimestamp > 0 -> local.addedTimestamp
+                        else -> System.currentTimeMillis()
+                    }
+
                     database.songDao().matchAndLinkLocalFile(
                         songId = matchedServerSong.id,
                         status = DownloadStatus.DOWNLOADED,
                         localPath = localPath,
                         coverUrl = cover
+                    )
+                    database.songDao().updateDownloadStatusAndTimestamp(
+                        songId = matchedServerSong.id,
+                        status = DownloadStatus.DOWNLOADED,
+                        localPath = localPath,
+                        timestamp = effectiveTimestamp
                     )
                     if (isFav && !matchedServerSong.isFavorite) {
                         database.songDao().updateFavorite(matchedServerSong.id, true)
@@ -750,23 +762,27 @@ object LocalMediaScanner {
             val downloadRecords = database.downloadDao().getAllDownloadsList().associateBy { it.songId }
 
             for (server in serverSongs) {
+                val downloadRec = downloadRecords[server.id]
                 val currentPath = server.localFilePath
                 val isCurrentFileValid = !currentPath.isNullOrBlank() && File(currentPath).let { it.exists() && it.length() > 0 }
 
                 if (isCurrentFileValid) {
+                    val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
+                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, currentPath, finalTs)
                     if (server.downloadStatus != DownloadStatus.DOWNLOADED) {
-                        database.songDao().updateDownloadStatus(server.id, DownloadStatus.DOWNLOADED, currentPath)
                         updatedCount++
                     }
                     continue
                 }
 
-                val downloadRec = downloadRecords[server.id]
                 val recPath = downloadRec?.localFilePath
                 val isDownloadRecValid = !recPath.isNullOrBlank() && File(recPath).let { it.exists() && it.length() > 0 }
                 if (isDownloadRecValid && !recPath.isNullOrBlank()) {
-                    database.songDao().updateDownloadStatus(server.id, DownloadStatus.DOWNLOADED, recPath)
-                    updatedCount++
+                    val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
+                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, finalTs)
+                    if (server.downloadStatus != DownloadStatus.DOWNLOADED) {
+                        updatedCount++
+                    }
                     continue
                 }
 
@@ -790,7 +806,8 @@ object LocalMediaScanner {
 
                 if (matchedPhysicalFile != null) {
                     val filePath = matchedPhysicalFile.absolutePath
-                    database.songDao().updateDownloadStatus(server.id, DownloadStatus.DOWNLOADED, filePath)
+                    val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else System.currentTimeMillis()
+                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, filePath, finalTs)
                     database.downloadDao().insertOrUpdate(
                         DownloadEntity(
                             songId = server.id,
@@ -828,7 +845,8 @@ object LocalMediaScanner {
 
                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != null) {
                     val lFile = File(matchedLocalSong.localFilePath)
-                    database.songDao().updateDownloadStatus(server.id, DownloadStatus.DOWNLOADED, matchedLocalSong.localFilePath)
+                    val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else if (matchedLocalSong.addedTimestamp > 0) matchedLocalSong.addedTimestamp else System.currentTimeMillis()
+                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, matchedLocalSong.localFilePath, finalTs)
                     database.downloadDao().insertOrUpdate(
                         DownloadEntity(
                             songId = server.id,
@@ -882,5 +900,53 @@ object LocalMediaScanner {
         } catch (e: Exception) {
             Log.e(TAG, "Error in deleteLocalAudioFile for $filePath", e)
         }
+    }
+
+    /**
+     * 清理资料库中的遗留/无效数据
+     * 1. 清理本地物理文件已丢失的纯本地歌曲记录；
+     * 2. 清除失效服务器残留的未下载歌曲；
+     * 3. 清理残留的发现/推荐临时歌单；
+     * 4. 校验下载物理文件是否存在。
+     */
+    suspend fun purgeLegacyResidualData(database: ZdsDatabase, validServerIds: List<String> = emptyList()): Int = withContext(Dispatchers.IO) {
+        var purgedCount = 0
+        try {
+            // 清除残留的发现推荐歌单
+            database.playlistDao().clearDiscoverPlaylists()
+
+            // 清除不存在服务器的未下载孤立歌曲
+            if (validServerIds.isNotEmpty()) {
+                database.songDao().deleteOrphanSongs(validServerIds)
+            }
+
+            // 校验本地歌曲的实际物理文件是否存在
+            val allSongs = database.songDao().getAllSongsList()
+            val toDeleteIds = mutableListOf<String>()
+
+            for (song in allSongs) {
+                val isLocalOnly = song.serverId in listOf("local_storage", "local_folder", "local_saf") || song.id.startsWith("local_")
+                val path = song.localFilePath
+                val fileExists = !path.isNullOrBlank() && try { File(path).exists() } catch (_: Exception) { false }
+
+                if (isLocalOnly && !fileExists) {
+                    // 纯本地歌曲且文件已物理删除 -> 移除遗留孤立条目
+                    toDeleteIds.add(song.id)
+                } else if (!isLocalOnly && song.downloadStatus == DownloadStatus.DOWNLOADED && !fileExists) {
+                    // 线上曲目标记已下载但物理文件丢失 -> 还原为未下载
+                    database.songDao().updateDownloadStatus(song.id, DownloadStatus.NOT_DOWNLOADED, null)
+                    database.downloadDao().deleteDownload(song.id)
+                    purgedCount++
+                }
+            }
+
+            if (toDeleteIds.isNotEmpty()) {
+                database.songDao().deleteSongsByIds(toDeleteIds)
+                purgedCount += toDeleteIds.size
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in purgeLegacyResidualData", e)
+        }
+        purgedCount
     }
 }

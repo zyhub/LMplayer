@@ -54,11 +54,22 @@ object Media3Factory {
         } catch (_: Exception) {}
     }
 
+    @Volatile
+    private var isCacheEnabled = true
+
+    fun setCacheEnabled(enabled: Boolean) {
+        isCacheEnabled = enabled
+    }
+
+    fun isCacheEnabled(): Boolean = isCacheEnabled
+
     /**
      * 构建双协议自适应数据源工厂：
      * 1. 使用 DefaultDataSource.Factory 智能分发：
      *    - file:// 与 content:// 协议直通本地文件解码，彻底解决本地已下载歌曲播放无反应问题；
-     *    - http:// 与 https:// 协议由 OkHttpDataSource 与 SimpleCache 接管，支持 NAS 无损流媒体与断点续传。
+     *    - http:// 与 https:// 协议受 isCacheEnabled 控制：
+     *      * 开启缓存时由 OkHttpDataSource 与 SimpleCache 接管，支持高速流媒体与磁盘断点续传；
+     *      * 关闭缓存时直通 DefaultDataSource 纯内存流式试听，彻底不写磁盘缓存。
      */
     fun buildDataSourceFactory(context: Context, okHttpClient: OkHttpClient): DataSource.Factory {
         val httpDataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
@@ -67,11 +78,19 @@ object Media3Factory {
         val upstreamFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
 
         val cache = getSimpleCache(context)
-        return CacheDataSource.Factory()
+        val cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(cache)
             .setUpstreamDataSourceFactory(upstreamFactory)
             .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(cache))
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+        return DataSource.Factory {
+            if (isCacheEnabled) {
+                cacheDataSourceFactory.createDataSource()
+            } else {
+                upstreamFactory.createDataSource()
+            }
+        }
     }
 
     @Synchronized
@@ -134,6 +153,11 @@ object Media3Factory {
      */
     fun clearStreamCache(context: Context) {
         try {
+            simpleCacheInstance?.let { cache ->
+                for (key in cache.keys.toSet()) {
+                    try { cache.removeResource(key) } catch (_: Exception) {}
+                }
+            }
             val cacheDir = File(context.applicationContext.cacheDir, "media3_lru_stream_cache")
             if (cacheDir.exists()) {
                 cacheDir.deleteRecursively()
@@ -141,4 +165,6 @@ object Media3Factory {
             }
         } catch (_: Exception) {}
     }
+
+    fun clearCache(context: Context) = clearStreamCache(context)
 }

@@ -30,13 +30,13 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.0.0"
-    const val CURRENT_VERSION_CODE = 1
+    const val CURRENT_VERSION_NAME = "1.4.9"
+    const val CURRENT_VERSION_CODE = 14
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
 
-    // 预留的 GitHub 仓库全路径 (格式: "用户名/仓库名")
+    // 默认的 GitHub 仓库全路径 (格式: "用户名/仓库名")
     const val DEFAULT_GITHUB_REPO = "zyhub/LMplayer"
 
     /**
@@ -169,7 +169,7 @@ object AppUpdateManager {
                     hasUpdate = false,
                     latestVersion = CURRENT_VERSION_NAME,
                     latestVersionCode = CURRENT_VERSION_CODE,
-                    releaseNotes = "当前已是最新至臻发布版本 (v$CURRENT_VERSION_NAME)。\n\n1. 柠檬音乐登录后使用全新发现页作为主页（热门推荐歌单、官方权威榜单、新歌首发）\n2. 搜索全面融合在线曲库与本地媒体库，支持多音源无缝切换（酷我/网易云/QQ音乐/酷狗/咪咕）\n3. 资料库纯净还原与柠檬音乐曲目结构映射（剥离推荐歌单）\n4. 设置中心新增在线模式音源切换与偏好记忆\n5. 全局性能调优与沉浸式体验升级",
+                    releaseNotes = "当前已是最新至臻发布版本 (v$CURRENT_VERSION_NAME)。\n\n1. 播放界面喜欢按钮红心状态彻底修复，支持0ms即刻响应\n2. 设置中心所有配置项全面升级为轻奢下拉菜单选择\n3. 存储与路径重构，支持本地已下载与全盘曲库存储占用精准统计\n4. 新增本地已下载歌曲深度管理：支持多选、批量删除与详细存储信息查看\n5. 全套应用高清图标升级，全工程代码审计与性能优化",
                     downloadUrl = ""
                 )
             )

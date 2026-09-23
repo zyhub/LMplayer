@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.network
+package com.lm.player.core.network
 
 import android.util.Log
 import com.lm.player.core.media.LrcParser
@@ -46,9 +46,34 @@ class LemonMusicProtocol(
         private val songIdToPathMap = ConcurrentHashMap<String, String>()
         private val songIdToSongMap = ConcurrentHashMap<String, UnifiedSong>()
 
+        // 发现页短期内存快取 (缓存 5 分钟，显著提速主页切换与展示)
+        private val discoverPlaylistsCache = ConcurrentHashMap<String, Pair<Long, List<UnifiedPlaylist>>>()
+        private val discoverToplistsCache = ConcurrentHashMap<String, Pair<Long, List<LemonToplist>>>()
+        private val discoverNewSongsCache = ConcurrentHashMap<String, Pair<Long, List<UnifiedSong>>>()
+        private const val DISCOVER_CACHE_TTL_MS = 5 * 60 * 1000L
+
         fun md5(input: String): String {
             val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray())
             return bytes.joinToString("") { "%02x".format(it) }
+        }
+
+        fun getServerFilePath(songId: String, streamUrl: String? = null): String? {
+            songIdToPathMap[songId]?.let { return it }
+            val song = songIdToSongMap[songId]
+            val url = streamUrl ?: song?.streamUrl
+            if (url != null && url.contains("path=")) {
+                try {
+                    val enc = url.substringAfter("path=").substringBefore("&")
+                    return java.net.URLDecoder.decode(enc, "UTF-8")
+                } catch (_: Exception) {}
+            }
+            return null
+        }
+
+        fun registerServerFilePath(songId: String, filePath: String) {
+            if (songId.isNotBlank() && filePath.isNotBlank()) {
+                songIdToPathMap[songId] = filePath
+            }
         }
     }
 
@@ -152,10 +177,47 @@ class LemonMusicProtocol(
         }
     }
 
-    private fun checkAuth() {
-        if (authToken.isBlank() && tokenOrPasswordPlain.isNotBlank() && tokenOrPasswordPlain.length >= 20) {
-            authToken = tokenOrPasswordPlain
+    suspend fun testConnection(): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            val ok = ensureAuthenticated()
+            if (ok) Result.success(true) else Result.failure(Exception("鉴权失败"))
+        } catch (e: Exception) {
+            Result.failure(e)
         }
+    }
+
+    fun getAuthToken(): String = authToken
+
+    fun setAuthToken(token: String) {
+        if (token.isNotBlank()) authToken = token
+    }
+
+    suspend fun ensureAuthenticated(): Boolean = withContext(Dispatchers.IO) {
+        if (authToken.isNotBlank()) return@withContext true
+        if (tokenOrPasswordPlain.startsWith("lemon-") || tokenOrPasswordPlain.length >= 32) {
+            authToken = tokenOrPasswordPlain
+            return@withContext true
+        }
+        val config = ServerConfig(
+            id = "lemon_music",
+            name = "Lemon Music",
+            type = ServerType.LEMON_MUSIC,
+            serverUrl = serverUrl,
+            username = username,
+            tokenOrApiKey = tokenOrPasswordPlain
+        )
+        val res = authenticate(config)
+        res.isSuccess
+    }
+
+    private fun newAuthRequest(url: String): Request.Builder {
+        return Request.Builder()
+            .url(url)
+            .apply {
+                if (authToken.isNotBlank()) {
+                    header("Authorization", "Bearer $authToken")
+                }
+            }
     }
 
     /**
@@ -163,15 +225,9 @@ class LemonMusicProtocol(
      */
     override suspend fun getSongList(offset: Int, limit: Int): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val url = "$cleanBase/api/library/tracks?all=1"
-            val req = Request.Builder()
-                .url(url)
-                .apply {
-                    if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken")
-                }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -228,7 +284,53 @@ class LemonMusicProtocol(
                     resultList.add(song)
                 }
 
-                Log.i(TAG, "Lemon Music parsed ${resultList.size} tracks from library")
+                // 补充查询 /api/download/list 中已完成下载的任务，避免服务端后台刮削或扫描延迟导致曲目暂时缺失
+                try {
+                    val dlListReq = newAuthRequest("$cleanBase/api/download/list").get().build()
+                    client.newCall(dlListReq).execute().use { dlResp ->
+                        if (dlResp.isSuccessful) {
+                            val dlBody = dlResp.body?.string() ?: ""
+                            val dlArr = JSONArray(dlBody)
+                            val existingPaths = songIdToPathMap.values.toSet()
+                            for (j in 0 until dlArr.length()) {
+                                val dlItem = dlArr.optJSONObject(j) ?: continue
+                                val status = dlItem.optString("status")
+                                val filePath = dlItem.optString("filePath").trim()
+                                if ((status == "completed" || status == "finished") && filePath.isNotBlank() && !existingPaths.contains(filePath)) {
+                                    val name = dlItem.optString("name", "未命名歌曲")
+                                    val singer = dlItem.optString("singer", "未知歌手")
+                                    val album = dlItem.optString("album", "未知专辑")
+                                    val songId = "lemon_${md5(filePath)}"
+                                    val song = UnifiedSong(
+                                        id = songId,
+                                        title = name,
+                                        artist = singer,
+                                        artistId = "lemon_artist_${md5(singer)}",
+                                        album = album,
+                                        albumId = "lemon_album_${md5("$singer/$album")}",
+                                        durationMs = (dlItem.optDouble("interval", 0.0) * 1000).toLong(),
+                                        coverUrl = getCoverArtUrl(songId),
+                                        streamUrl = getStreamUrl(songId),
+                                        serverId = "lemon_music",
+                                        localFilePath = null,
+                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                        bitRate = 320,
+                                        format = filePath.substringAfterLast('.', "mp3").lowercase(),
+                                        isFavorite = false,
+                                        relativeFolderPath = extractRelativeFolderPath(filePath, singer, album)
+                                    )
+                                    songIdToPathMap[songId] = filePath
+                                    songIdToSongMap[songId] = song
+                                    resultList.add(song)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to merge completed tasks from /api/download/list", e)
+                }
+
+                Log.i(TAG, "Lemon Music parsed ${resultList.size} tracks from library (including completed download tasks)")
                 Result.success(resultList)
             }
         } catch (e: Exception) {
@@ -237,8 +339,99 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 触发服务端重新扫描音乐库 (/api/library/scan-start)
+     */
+    suspend fun triggerServerScan(): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/library/scan-start")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                Result.success(resp.isSuccessful)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 查询服务端后台扫描状态 (/api/library/scan-status)
+     */
+    suspend fun getServerScanStatus(): Result<LemonScanStatus> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/library/scan-status").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取扫描状态失败 (HTTP ${resp.code})"))
+                val body = resp.body?.string() ?: ""
+                val json = JSONObject(body)
+                val scanObj = json.optJSONObject("scan")
+                val isScanning = scanObj?.optBoolean("scanning", false) ?: scanObj?.optBoolean("active", false) ?: false
+                val cachedCount = scanObj?.optInt("current", 0) ?: scanObj?.optInt("cachedCount", 0) ?: 0
+                val pendingCount = scanObj?.optInt("pendingCount", 0) ?: 0
+                val total = scanObj?.optInt("total", cachedCount + pendingCount) ?: cachedCount
+                Result.success(
+                    LemonScanStatus(
+                        isScanning = isScanning,
+                        cachedCount = cachedCount,
+                        pendingCount = pendingCount,
+                        total = total
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取真实风格流派聚合列表 (/api/library/genres)
+     */
+    suspend fun getGenres(page: Int = 1, limit: Int = 100): Result<List<UnifiedGenre>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val url = "$cleanBase/api/library/genres?page=$page&limit=$limit"
+            val req = newAuthRequest(url).get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取风格流派失败 (HTTP ${resp.code})"))
+                val json = JSONObject(body)
+                val dataArr = json.optJSONArray("data") ?: JSONArray()
+                val genres = ArrayList<UnifiedGenre>(dataArr.length())
+                for (i in 0 until dataArr.length()) {
+                    val item = dataArr.optJSONObject(i) ?: continue
+                    val name = item.optString("name").trim()
+                    if (name.isBlank() || name == "未知风格") continue
+                    val id = item.optString("id").ifBlank { "genre_${name.hashCode()}" }
+                    val trackCount = item.optInt("trackCount", item.optInt("count", 0))
+                    val coverPath = item.optString("coverPath")
+                    val coverUrl = if (coverPath.isNotBlank()) {
+                        val sampleSongId = "lemon_${md5(coverPath)}"
+                        songIdToPathMap[sampleSongId] = coverPath
+                        getCoverArtUrl(sampleSongId)
+                    } else ""
+
+                    genres.add(
+                        UnifiedGenre(
+                            id = id,
+                            name = name,
+                            trackCount = trackCount,
+                            coverUrl = coverUrl
+                        )
+                    )
+                }
+                Result.success(genres)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to fetch Lemon Music genres", e)
+            Result.failure(e)
+        }
+    }
+
     fun getRecentlyAdded(limit: Int = 30): Result<List<UnifiedSong>> {
-        val list = songIdToSongMap.values.toList().takeLast(limit).reversed()
+        val list = songIdToSongMap.values.toList().take(limit)
         return Result.success(list)
     }
 
@@ -252,13 +445,9 @@ class LemonMusicProtocol(
      */
     override suspend fun getAlbums(offset: Int, limit: Int): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val url = "$cleanBase/api/library/albums?page=1&limit=500"
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -303,13 +492,9 @@ class LemonMusicProtocol(
      */
     override suspend fun getArtists(): Result<List<UnifiedArtist>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val url = "$cleanBase/api/library/artists?page=1&limit=500"
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -348,15 +533,11 @@ class LemonMusicProtocol(
      */
     override suspend fun getPlaylists(): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val playlists = ArrayList<UnifiedPlaylist>()
 
             // 仅获取用户自建歌单 (/api/library/playlists)，彻底还原纯净资料库
-            val customReq = Request.Builder()
-                .url("$cleanBase/api/library/playlists")
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
             client.newCall(customReq).execute().use { resp ->
                 if (resp.isSuccessful) {
                     val body = resp.body?.string() ?: ""
@@ -367,7 +548,7 @@ class LemonMusicProtocol(
                         val id = pl.optString("id", "lemon_pl_$i")
                         val name = pl.optString("name", "未命名歌单")
                         val coverUrl = pl.optString("coverUrl")
-                        val tracks = pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+                        val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                         playlists.add(
                             UnifiedPlaylist(
                                 id = id,
@@ -392,24 +573,49 @@ class LemonMusicProtocol(
 
     /**
      * 发现专属：获取在线推荐歌单 (/api/playlist/recommend)
+     * 支持自动平滑回退多平台 (kw -> tx -> wy)
      */
     suspend fun getDiscoverRecommendPlaylists(
         source: String = "kw",
         page: Int = 1,
         limit: Int = 30
     ): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
+        val cacheKey = "${cleanBase}_${source}_${page}_$limit"
+        val cached = discoverPlaylistsCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.first < DISCOVER_CACHE_TTL_MS) {
+            return@withContext Result.success(cached.second)
+        }
+
+        val res = fetchSingleSourceRecommendPlaylists(source, page, limit)
+        if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
+            discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+            return@withContext res
+        }
+
+        // 如果用户指定的源无数据，仅快速尝试默认的 kw，避免无谓的串行多源超时等待
+        if (source != "kw") {
+            val fallback = fetchSingleSourceRecommendPlaylists("kw", page, limit)
+            if (fallback.isSuccess && !fallback.getOrNull().isNullOrEmpty()) {
+                discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallback.getOrNull()!!)
+                return@withContext fallback
+            }
+        }
+        res
+    }
+
+    private suspend fun fetchSingleSourceRecommendPlaylists(
+        source: String,
+        page: Int,
+        limit: Int
+    ): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val url = "$cleanBase/api/playlist/recommend?source=$source&sort=hot&page=$page&limit=$limit"
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取推荐歌单失败"))
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取推荐歌单失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
                 val recData = json.optJSONObject("data")
                 val list = recData?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
@@ -418,8 +624,8 @@ class LemonMusicProtocol(
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("play_id") }
                     val name = item.optString("name").ifBlank { item.optString("title", "精选推荐") }
-                    val cover = item.optString("img").ifBlank { item.optString("pic", "") }
-                    val count = item.optInt("total", 30)
+                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    val count = item.optInt("total", item.optInt("count", 30))
                     if (id.isNotBlank()) {
                         playlists.add(
                             UnifiedPlaylist(
@@ -443,20 +649,40 @@ class LemonMusicProtocol(
 
     /**
      * 发现专属：获取官方排行榜列表 (/api/discover/toplists)
+     * 支持自动平滑回退多平台 (kw -> tx -> wy)
      */
     suspend fun getDiscoverToplists(source: String = "kw"): Result<List<LemonToplist>> = withContext(Dispatchers.IO) {
+        val cacheKey = "${cleanBase}_$source"
+        val cached = discoverToplistsCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.first < DISCOVER_CACHE_TTL_MS) {
+            return@withContext Result.success(cached.second)
+        }
+
+        val res = fetchSingleSourceToplists(source)
+        if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
+            discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+            return@withContext res
+        }
+
+        if (source != "kw") {
+            val fallback = fetchSingleSourceToplists("kw")
+            if (fallback.isSuccess && !fallback.getOrNull().isNullOrEmpty()) {
+                discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallback.getOrNull()!!)
+                return@withContext fallback
+            }
+        }
+        res
+    }
+
+    private suspend fun fetchSingleSourceToplists(source: String): Result<List<LemonToplist>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val url = "$cleanBase/api/discover/toplists?source=$source"
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取排行榜失败"))
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取排行榜失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
                 val dataObj = json.optJSONObject("data")
                 val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
@@ -465,8 +691,10 @@ class LemonMusicProtocol(
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("topId") }
                     val name = item.optString("name").ifBlank { item.optString("title", "热歌榜") }
-                    val cover = item.optString("img").ifBlank { item.optString("pic", "") }
-                    val updateFreq = item.optString("updateFrequency").ifBlank { item.optString("period", "每日更新") }
+                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    val updateFreq = item.optString("updateTime").ifBlank {
+                        item.optString("updateFrequency").ifBlank { item.optString("period", "每日更新") }
+                    }
                     if (id.isNotBlank()) {
                         toplists.add(
                             LemonToplist(
@@ -506,8 +734,17 @@ class LemonMusicProtocol(
         region: String = "",
         limit: Int = 30
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
+        val cacheKey = "${cleanBase}_${source}_${region}_$limit"
+        val cached = discoverNewSongsCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.first < DISCOVER_CACHE_TTL_MS) {
+            return@withContext Result.success(cached.second)
+        }
         val url = "$cleanBase/api/discover/new-songs?source=$source&region=$region&limit=$limit"
-        fetchOnlineSongList(url, source)
+        val res = fetchOnlineSongList(url, source)
+        if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
+            discoverNewSongsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+        }
+        res
     }
 
     /**
@@ -515,16 +752,12 @@ class LemonMusicProtocol(
      */
     private suspend fun fetchOnlineSongList(url: String, source: String): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            ensureAuthenticated()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取在线歌曲失败"))
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取在线歌曲失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
                 val dataObj = json.optJSONObject("data")
                 val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
@@ -536,7 +769,7 @@ class LemonMusicProtocol(
                     val singer = s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
                     val albumName = s.optString("albumName").ifBlank { s.optString("album", "在线精选") }
                     val duration = s.optDouble("interval", s.optDouble("duration", 0.0))
-                    val cover = s.optString("img").ifBlank { s.optString("pic", "") }
+                    val cover = s.optString("cover").ifBlank { s.optString("img").ifBlank { s.optString("pic", "") } }
                     val sSource = s.optString("source", source)
                     val unifiedId = "lemon_online_${sSource}_$songId"
 
@@ -550,7 +783,9 @@ class LemonMusicProtocol(
                             coverUrl = cover,
                             streamUrl = "", // 在线试听通过 resolveOnlineStreamUrl 换取
                             serverId = "lemon_online",
-                            format = "mp3"
+                            format = "mp3",
+                            relativeFolderPath = null,
+                            rawMetaJson = s.toString()
                         )
                     )
                 }
@@ -562,11 +797,78 @@ class LemonMusicProtocol(
     }
 
     /**
+     * 发现专属：获取新碟首发列表 (/api/discover/new-albums)
+     */
+    suspend fun getDiscoverNewAlbums(
+        source: String = "tx",
+        region: String = "",
+        page: Int = 1,
+        limit: Int = 20
+    ): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val url = "$cleanBase/api/discover/new-albums?source=$source&region=$region&page=$page&limit=$limit"
+            val req = newAuthRequest(url).get().build()
+
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取新碟失败 (HTTP ${resp.code})"))
+                val json = JSONObject(body)
+                val dataObj = json.optJSONObject("data")
+                val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
+                val albums = ArrayList<UnifiedAlbum>(list.length())
+
+                for (i in 0 until list.length()) {
+                    val item = list.optJSONObject(i) ?: continue
+                    val id = item.optString("id").ifBlank { item.optString("albumId", "album_$i") }
+                    val name = item.optString("name").ifBlank { item.optString("title", "最新专辑") }
+                    val artist = item.optString("artist").ifBlank { item.optString("singer", "未知歌手") }
+                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    val count = item.optInt("total", item.optInt("count", item.optInt("songCount", 0)))
+                    val yearStr = item.optString("publishTime").ifBlank { item.optString("year") }
+                    val year = yearStr.take(4).toIntOrNull()
+
+                    albums.add(
+                        UnifiedAlbum(
+                            id = "lemon_discover_album_${source}_$id",
+                            title = name,
+                            artist = artist,
+                            coverUrl = cover,
+                            songCount = count,
+                            year = year
+                        )
+                    )
+                }
+                Result.success(albums)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 外部歌单/单曲链接解析 (/api/playlist?url=...)
+     */
+    suspend fun parseExternalPlaylist(
+        urlOrId: String,
+        source: String = "kw"
+    ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val enc = try { URLEncoder.encode(urlOrId, "UTF-8") } catch (_: Exception) { urlOrId }
+            val url = "$cleanBase/api/playlist?source=$source&url=$enc"
+            fetchOnlineSongList(url, source)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
      * 获取指定歌单内的歌曲列表
      */
     override suspend fun getPlaylistSongs(playlistId: String): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             // A. 若是发现推荐歌单：调用 /api/playlist?url=id&source=...
             if (playlistId.startsWith("lemon_rec_")) {
                 val parts = playlistId.removePrefix("lemon_rec_").split("_", limit = 2)
@@ -585,12 +887,8 @@ class LemonMusicProtocol(
                 return@withContext fetchOnlineSongList(url, source)
             }
 
-            // B. 用户自建歌单：查出自建歌单的 paths，调用 /api/library/tracks/by-paths
-            val customReq = Request.Builder()
-                .url("$cleanBase/api/library/playlists")
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            // C. 用户自建歌单：查出自建歌单的 paths，调用 /api/library/tracks/by-paths
+            val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
             var targetPaths: List<String> = emptyList()
             client.newCall(customReq).execute().use { resp ->
                 if (resp.isSuccessful) {
@@ -600,12 +898,19 @@ class LemonMusicProtocol(
                     for (i in 0 until list.length()) {
                         val pl = list.optJSONObject(i) ?: continue
                         if (pl.optString("id") == playlistId) {
-                            val arr = pl.optJSONArray("paths") ?: pl.optJSONArray("tracks") ?: JSONArray()
+                            val arr = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("paths") ?: pl.optJSONArray("tracks") ?: JSONArray()
                             val pList = ArrayList<String>()
                             for (j in 0 until arr.length()) {
                                 val item = arr.opt(j)
-                                if (item is String) pList.add(item)
-                                else if (item is JSONObject) pList.add(item.optString("filePath"))
+                                val pathStr = when (item) {
+                                    is String -> item
+                                    is JSONObject -> item.optString("filePath").ifBlank { item.optString("localPath") }
+                                    else -> ""
+                                }
+                                val clean = pathStr.removePrefix("local:").trim()
+                                if (clean.isNotBlank()) {
+                                    pList.add(clean)
+                                }
                             }
                             targetPaths = pList
                             break
@@ -622,9 +927,7 @@ class LemonMusicProtocol(
             val payload = JSONObject().apply {
                 put("paths", JSONArray(targetPaths))
             }
-            val byPathsReq = Request.Builder()
-                .url("$cleanBase/api/library/tracks/by-paths")
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
+            val byPathsReq = newAuthRequest("$cleanBase/api/library/tracks/by-paths")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
@@ -755,7 +1058,7 @@ class LemonMusicProtocol(
      */
     override suspend fun getLyrics(songId: String): Result<LyricResult> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val song = songIdToSongMap[songId]
             val path = songIdToPathMap[songId] ?: ""
 
@@ -764,9 +1067,7 @@ class LemonMusicProtocol(
                 put("singer", song?.artist ?: "")
                 put("filePath", path)
             }
-            val req = Request.Builder()
-                .url("$cleanBase/api/play/lyric")
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
+            val req = newAuthRequest("$cleanBase/api/play/lyric")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
@@ -803,14 +1104,10 @@ class LemonMusicProtocol(
         limit: Int = 30
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val url = "$cleanBase/api/search?keyword=$encKw&source=$source&page=$page&limit=$limit"
-            val req = Request.Builder()
-                .url(url)
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
-                .get()
-                .build()
+            val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -828,7 +1125,7 @@ class LemonMusicProtocol(
                     val singer = s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
                     val albumName = s.optString("albumName").ifBlank { s.optString("album", "") }
                     val duration = s.optDouble("interval", s.optDouble("duration", 0.0))
-                    val cover = s.optString("img").ifBlank { s.optString("pic", "") }
+                    val cover = s.optString("cover").ifBlank { s.optString("img").ifBlank { s.optString("pic", "") } }
                     val sSource = s.optString("source", source)
 
                     val unifiedId = "lemon_online_${sSource}_$songId"
@@ -842,7 +1139,9 @@ class LemonMusicProtocol(
                             coverUrl = cover,
                             streamUrl = "", // 在线试听通过 resolveOnlineStreamUrl 换取
                             serverId = "lemon_online",
-                            format = "mp3"
+                            format = "mp3",
+                            relativeFolderPath = null,
+                            rawMetaJson = s.toString()
                         )
                     )
                 }
@@ -860,38 +1159,682 @@ class LemonMusicProtocol(
     suspend fun resolveOnlineStreamUrl(
         songId: String,
         source: String = "kw",
-        quality: String = "128k"
+        quality: String = "128k",
+        metaJson: String? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            checkAuth()
+            ensureAuthenticated()
             val cleanId = songId.removePrefix("lemon_online_")
             val actualSource = if (cleanId.contains("_")) cleanId.substringBefore("_") else source
             val rawId = if (cleanId.contains("_")) cleanId.substringAfter("_") else cleanId
-            val payload = JSONObject().apply {
-                put("songId", rawId)
-                put("source", actualSource)
-                put("quality", quality)
+            val payload = JSONObject()
+            if (!metaJson.isNullOrBlank()) {
+                try {
+                    val metaObj = JSONObject(metaJson)
+                    val keys = metaObj.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        payload.put(k, metaObj.opt(k))
+                    }
+                } catch (_: Exception) {}
             }
-            val req = Request.Builder()
-                .url("$cleanBase/api/play/url")
-                .apply { if (authToken.isNotBlank()) header("Authorization", "Bearer $authToken") }
+            if (!payload.has("source") || payload.optString("source").isBlank()) {
+                payload.put("source", actualSource)
+            }
+            if (!payload.has("songId") || payload.optString("songId").isBlank()) {
+                payload.put("songId", rawId)
+            }
+            if (!payload.has("songmid") && (actualSource == "tx" || actualSource == "kw")) {
+                payload.put("songmid", rawId)
+            }
+            payload.put("quality", quality)
+
+            val req = newAuthRequest("$cleanBase/api/play/url")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取在线播放地址失败"))
+                if (!resp.isSuccessful) {
+                    val errMsg = runCatching { JSONObject(body).optString("error") }.getOrNull()
+                    return@withContext Result.failure(Exception(errMsg?.ifBlank { null } ?: "获取在线播放地址失败 (HTTP ${resp.code})"))
+                }
                 val json = JSONObject(body)
                 val streamUrl = json.optString("url")
                 if (streamUrl.isNotBlank()) {
                     val finalUrl = if (streamUrl.startsWith("/")) "$cleanBase$streamUrl" else streamUrl
                     Result.success(finalUrl)
                 } else {
-                    Result.failure(Exception("未获得播放直链"))
+                    val msg = json.optString("msg", json.optString("error", "未获得播放直链"))
+                    Result.failure(Exception(msg))
                 }
             }
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
+
+    /**
+     * 向柠檬音乐服务端添加下载任务 (/api/download/add)
+     * 支持将歌曲直接缓存保存到服务器/NAS音乐库并自动刮削元数据
+     */
+    suspend fun addServerDownloadTasks(tasks: List<com.lm.player.core.model.LemonServerDownloadTask>): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val taskArray = JSONArray()
+            tasks.forEach { t ->
+                val obj = JSONObject()
+                if (t.raw.isNotBlank()) {
+                    try {
+                        val rawObj = JSONObject(t.raw)
+                        val keys = rawObj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            obj.put(k, rawObj.opt(k))
+                        }
+                    } catch (_: Exception) {}
+                }
+                obj.put("name", t.name)
+                obj.put("singer", t.singer)
+                obj.put("source", if (t.source.isNotBlank() && t.source != "kw") t.source else t.platform.ifBlank { "kw" })
+                if (t.album.isNotBlank()) obj.put("album", t.album)
+                if (t.interval.isNotBlank()) obj.put("interval", t.interval)
+                obj.put("quality", t.quality)
+                if (t.songId.isNotBlank()) obj.put("songId", t.songId)
+                if (t.songmid.isNotBlank()) obj.put("songmid", t.songmid)
+                if (t.hash.isNotBlank()) obj.put("hash", t.hash)
+                if (t.rid.isNotBlank()) obj.put("rid", t.rid)
+                if (t.copyrightId.isNotBlank()) obj.put("copyrightId", t.copyrightId)
+                if (t.img.isNotBlank()) obj.put("img", t.img)
+                if (t.pic.isNotBlank() && !obj.has("pic")) obj.put("pic", t.pic)
+                taskArray.put(obj)
+            }
+            val payload = JSONObject().apply {
+                put("tasks", taskArray)
+            }
+            val req = newAuthRequest("$cleanBase/api/download/add")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    val errMsg = runCatching { JSONObject(body).optString("error") }.getOrNull()
+                    return@withContext Result.failure(Exception(errMsg?.ifBlank { null } ?: "服务端添加下载任务失败 (${resp.code})"))
+                }
+                val json = JSONObject(body)
+                val added = json.optJSONArray("ids")?.length() ?: tasks.size
+                Result.success(added)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ==================== 音源与脚本管理 API (LX Music Source Scripts) ====================
+
+    /**
+     * 获取服务端安装的所有音源脚本列表 (/api/source/list)
+     */
+    suspend fun fetchSourceList(): Result<List<LemonSourceScriptInfo>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val url = "$cleanBase/api/source/list"
+            val req = newAuthRequest(url).get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取音源列表失败 (HTTP ${resp.code})"))
+                val trimmed = body.trim()
+                val arr = when {
+                    trimmed.startsWith("[") -> JSONArray(trimmed)
+                    trimmed.startsWith("{") -> {
+                        val json = JSONObject(trimmed)
+                        json.optJSONArray("data") ?: json.optJSONArray("list") ?: json.optJSONArray("rows") ?: JSONArray()
+                    }
+                    else -> JSONArray()
+                }
+
+                val list = ArrayList<LemonSourceScriptInfo>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val sourcesList = mutableListOf<String>()
+                    val sourcesObj = item.optJSONObject("sources")
+                    if (sourcesObj != null) {
+                        val keys = sourcesObj.keys()
+                        while (keys.hasNext()) {
+                            sourcesList.add(keys.next())
+                        }
+                    } else {
+                        val sourcesArr = item.optJSONArray("sources")
+                        if (sourcesArr != null) {
+                            for (k in 0 until sourcesArr.length()) {
+                                sourcesList.add(sourcesArr.optString(k))
+                            }
+                        }
+                    }
+                    list.add(
+                        LemonSourceScriptInfo(
+                            id = item.optString("id").ifBlank { (i + 1).toString() },
+                            name = item.optString("name", "自定义音源脚本"),
+                            description = item.optString("description", "外部导入的音乐解析脚本"),
+                            author = item.optString("author", "开源社区"),
+                            version = item.optString("version", "1.0.0"),
+                            supportedPlatforms = if (sourcesList.isNotEmpty()) sourcesList else listOf("kw", "wy", "tx"),
+                            isActive = item.optBoolean("active", true),
+                            healthSummary = item.optString("health", "就绪")
+                        )
+                    )
+                }
+
+                // 若服务端未导入第三方额外自定义脚本，自动展现服务器原生内置的 5 大就绪音源
+                if (list.isEmpty()) {
+                    list.add(LemonSourceScriptInfo(id = "builtin_kw", name = "酷我音乐 (服务端原生通道)", description = "服务端原生直连通道，支持 128K/320K/FLAC/Hi-Res 高解析解析与缓存", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("kw"), isActive = true, healthSummary = "连接正常"))
+                    list.add(LemonSourceScriptInfo(id = "builtin_wy", name = "网易云音乐 (服务端原生通道)", description = "服务端原生直连通道，支持全网榜单、热歌推荐与歌单同步", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("wy"), isActive = true, healthSummary = "连接正常"))
+                    list.add(LemonSourceScriptInfo(id = "builtin_tx", name = "QQ音乐 (服务端原生通道)", description = "服务端原生直连通道，支持海量正版流行曲目与新歌首发推荐", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("tx"), isActive = true, healthSummary = "连接正常"))
+                    list.add(LemonSourceScriptInfo(id = "builtin_kg", name = "酷狗音乐 (服务端原生通道)", description = "服务端原生直连通道，支持全景音效及经典老歌极速检索", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("kg"), isActive = true, healthSummary = "连接正常"))
+                    list.add(LemonSourceScriptInfo(id = "builtin_mg", name = "咪咕音乐 (服务端原生通道)", description = "服务端原生直连通道，无损超清品质与官方专属曲库通道", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("mg"), isActive = true, healthSummary = "连接正常"))
+                }
+                Result.success(list)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to fetch source list", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 从远程 URL 导入音源脚本 (/api/source/import-url)
+     */
+    suspend fun importSourceUrl(scriptUrl: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val payload = JSONObject().apply {
+                put("url", scriptUrl)
+            }
+            val req = newAuthRequest("$cleanBase/api/source/import-url")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("导入失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 直接导入音源脚本内容 (/api/source/import)
+     */
+    suspend fun importSourceScript(scriptContent: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val payload = JSONObject().apply {
+                put("script", scriptContent)
+            }
+            val req = newAuthRequest("$cleanBase/api/source/import")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("导入失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 启用指定音源脚本 (/api/source/activate/:id)
+     */
+    suspend fun activateSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/source/activate/$sourceId")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("激活音源失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 停用指定音源脚本 (/api/source/deactivate/:id)
+     */
+    suspend fun deactivateSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/source/deactivate/$sourceId")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("停用音源失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 删除指定音源脚本 (/api/source/:id)
+     */
+    suspend fun deleteSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/source/$sourceId")
+                .delete()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("删除音源失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取可用平台音源列表 (/api/playlist/sources)
+     */
+    suspend fun fetchDisplaySources(): Result<List<String>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/playlist/sources").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取可用平台失败"))
+                val json = JSONObject(body)
+                val sourcesObj = json.optJSONObject("data")?.optJSONObject("sources")
+                    ?: json.optJSONObject("sources")
+                val keys = sourcesObj?.keys() ?: return@withContext Result.success(listOf("kw", "tx", "wy", "kg", "mg"))
+                val list = ArrayList<String>()
+                while (keys.hasNext()) {
+                    list.add(keys.next())
+                }
+                Result.success(if (list.isEmpty()) listOf("kw", "tx", "wy", "kg", "mg") else list)
+            }
+        } catch (e: Exception) {
+            Result.success(listOf("kw", "tx", "wy", "kg", "mg"))
+        }
+    }
+
+    // ==================== 用户数据同步 (收藏、歌单) ====================
+
+    /**
+     * 获取用户资料库数据 (/api/library/user-data)
+     * 返回包含 playlists, favorites (曲目物理路径列表或ID), recentPlays
+     */
+    suspend fun getLibraryUserData(): Result<JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/library/user-data").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取用户数据失败 (HTTP ${resp.code})"))
+                val json = JSONObject(body)
+                val data = json.optJSONObject("data") ?: json
+                Result.success(data)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 保存/更新全部用户自定义歌单至服务器 (/api/library/playlists)
+     */
+    suspend fun saveCustomPlaylists(playlists: JSONArray): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val payload = JSONObject().apply {
+                put("playlists", playlists)
+            }
+            val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            val req = newAuthRequest("$cleanBase/api/library/playlists").put(body).build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("保存歌单失败 (HTTP ${resp.code})"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 在服务器端创建全新自定义歌单
+     */
+    suspend fun createCustomPlaylist(name: String, coverUrl: String = ""): Result<UnifiedPlaylist> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val existingPlaylists = ArrayList<JSONObject>()
+            val rawReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
+            client.newCall(rawReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val rawBody = resp.body?.string() ?: ""
+                    val json = JSONObject(rawBody)
+                    val arr = json.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { existingPlaylists.add(it) }
+                    }
+                }
+            }
+
+            val newId = "pl_${System.currentTimeMillis()}_${(1000..9999).random()}"
+            val newPlObj = JSONObject().apply {
+                put("id", newId)
+                put("name", name)
+                put("createdAt", System.currentTimeMillis())
+                put("trackKeys", JSONArray())
+                put("trackSnapshots", JSONObject())
+                put("coverUrl", coverUrl)
+                put("coverMode", if (coverUrl.isNotBlank()) "custom" else "auto")
+                put("playlistType", "custom")
+            }
+
+            existingPlaylists.add(0, newPlObj)
+            val saveArr = JSONArray()
+            existingPlaylists.forEach { saveArr.put(it) }
+
+            val saveRes = saveCustomPlaylists(saveArr)
+            if (saveRes.isSuccess) {
+                Result.success(
+                    UnifiedPlaylist(
+                        id = newId,
+                        name = name,
+                        coverUrl = coverUrl,
+                        songCount = 0,
+                        isOnline = true,
+                        serverId = "lemon_music",
+                        isDiscover = false
+                    )
+                )
+            } else {
+                Result.failure(saveRes.exceptionOrNull() ?: Exception("保存新建歌单失败"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 向服务器指定歌单追加曲目
+     */
+    suspend fun addTracksToCustomPlaylist(playlistId: String, songKeys: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val existingPlaylists = ArrayList<JSONObject>()
+            val rawReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
+            client.newCall(rawReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val rawBody = resp.body?.string() ?: ""
+                    val json = JSONObject(rawBody)
+                    val arr = json.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { existingPlaylists.add(it) }
+                    }
+                }
+            }
+
+            var found = false
+            for (pl in existingPlaylists) {
+                if (pl.optString("id") == playlistId) {
+                    val trackKeysArr = pl.optJSONArray("trackKeys") ?: JSONArray()
+                    val existingSet = HashSet<String>()
+                    for (k in 0 until trackKeysArr.length()) {
+                        existingSet.add(trackKeysArr.optString(k))
+                    }
+                    for (rawKey in songKeys) {
+                        val key = when {
+                            rawKey.startsWith("local:") || rawKey.contains(":") -> rawKey
+                            rawKey.startsWith("/") -> "local:$rawKey"
+                            else -> rawKey
+                        }
+                        if (!existingSet.contains(key)) {
+                            trackKeysArr.put(key)
+                            existingSet.add(key)
+                        }
+                    }
+                    pl.put("trackKeys", trackKeysArr)
+                    found = true
+                    break
+                }
+            }
+
+            if (!found) {
+                return@withContext Result.failure(Exception("服务器未找到指定歌单: $playlistId"))
+            }
+
+            val saveArr = JSONArray()
+            existingPlaylists.forEach { saveArr.put(it) }
+            saveCustomPlaylists(saveArr)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 从服务器删除指定歌单
+     */
+    suspend fun deleteCustomPlaylist(playlistId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val existingPlaylists = ArrayList<JSONObject>()
+            val rawReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
+            client.newCall(rawReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val rawBody = resp.body?.string() ?: ""
+                    val json = JSONObject(rawBody)
+                    val arr = json.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let {
+                            if (it.optString("id") != playlistId) {
+                                existingPlaylists.add(it)
+                            }
+                        }
+                    }
+                }
+            }
+
+            val saveArr = JSONArray()
+            existingPlaylists.forEach { saveArr.put(it) }
+            saveCustomPlaylists(saveArr)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取服务端音乐库曲目总数 (/api/library/tracks/count)
+     */
+    suspend fun getLibraryTracksCount(): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/library/tracks/count").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取曲库总数失败 (HTTP ${resp.code})"))
+                val json = JSONObject(body)
+                val total = json.optInt("total", 0)
+                Result.success(total)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 主动请求服务端对指定文件批量读取标签并写入索引缓存 (/api/library/scan-batch)
+     * 在下载完成或文件更新后调用，使服务端无需等待定时轮询即可立即索引曲目
+     */
+    suspend fun scanServerBatch(filePaths: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            if (filePaths.isEmpty()) return@withContext Result.success(true)
+            val cleanList = filePaths.map { it.removePrefix("local:").trim() }.filter { it.isNotBlank() }.distinct()
+            if (cleanList.isEmpty()) return@withContext Result.success(true)
+
+            val chunks = cleanList.chunked(50)
+            for (chunk in chunks) {
+                val filesArr = JSONArray()
+                chunk.forEach { path ->
+                    filesArr.put(JSONObject().apply { put("filePath", path) })
+                }
+                val payload = JSONObject().apply { put("files", filesArr) }
+                val req = newAuthRequest("$cleanBase/api/library/scan-batch")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "scanServerBatch failed with HTTP ${resp.code}")
+                    }
+                }
+            }
+            Result.success(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "scanServerBatch exception", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 将曲目的喜欢/收藏状态双向保存至服务器 (/api/library/user-data)
+     */
+    suspend fun toggleFavoriteOnServer(serverFilePath: String, isFavorite: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val cleanPath = serverFilePath.removePrefix("local:").trim()
+            if (cleanPath.isBlank()) return@withContext Result.success(false)
+
+            val userDataRes = getLibraryUserData()
+            val userData = userDataRes.getOrNull() ?: JSONObject()
+            val favArr = userData.optJSONArray("favorites") ?: JSONArray()
+            val favSet = LinkedHashSet<String>()
+            for (i in 0 until favArr.length()) {
+                val item = favArr.opt(i)
+                when (item) {
+                    is String -> favSet.add(item)
+                    is JSONObject -> {
+                        val p = item.optString("filePath").ifBlank { item.optString("id") }
+                        if (p.isNotBlank()) favSet.add(p)
+                    }
+                }
+            }
+
+            val serverKey = "local:$cleanPath"
+            if (isFavorite) {
+                favSet.add(serverKey)
+            } else {
+                favSet.remove(serverKey)
+                favSet.remove(cleanPath)
+            }
+
+            val newFavArr = JSONArray()
+            favSet.forEach { newFavArr.put(it) }
+
+            val payload = JSONObject().apply {
+                put("favorites", newFavArr)
+            }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("保存收藏失败 (HTTP ${resp.code})"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "toggleFavoriteOnServer failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取服务端下载保存路径及可用音乐目录 (/api/paths)
+     */
+    suspend fun getServerPaths(): Result<ServerPathConfig> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/paths").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取服务端路径失败 (HTTP ${resp.code})"))
+                val json = JSONObject(body)
+                val dataObj = json.optJSONObject("data")
+                val dlPath = dataObj?.optString("downloadPath")
+                    ?: json.optString("downloadPath", "")
+                val pathsArr = dataObj?.optJSONArray("musicPaths")
+                    ?: dataObj?.optJSONArray("paths")
+                    ?: json.optJSONArray("data")
+                    ?: json.optJSONArray("paths")
+                    ?: JSONArray()
+                val pathsList = ArrayList<String>()
+                for (i in 0 until pathsArr.length()) {
+                    val p = pathsArr.optString(i).trim()
+                    if (p.isNotBlank()) pathsList.add(p)
+                }
+                // 若接口未返回候选目录，从已有曲目路径中提取目录兜底
+                if (pathsList.isEmpty()) {
+                    val fromSongs = songIdToPathMap.values.mapNotNull {
+                        val norm = it.replace('\\', '/')
+                        val parent = norm.substringBeforeLast('/', "")
+                        if (parent.isNotBlank()) parent else null
+                    }.distinct().sorted()
+                    pathsList.addAll(fromSongs)
+                }
+                Result.success(ServerPathConfig(downloadPath = dlPath, availablePaths = pathsList))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getServerPaths failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 更新服务端下载保存目录 (/api/paths/download)
+     */
+    suspend fun updateServerDownloadPath(newPath: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val cleanPath = newPath.trim()
+            if (cleanPath.isBlank()) return@withContext Result.failure(Exception("保存路径不能为空"))
+            val payload = JSONObject().apply {
+                put("dirPath", cleanPath)
+                put("path", cleanPath)
+            }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val putReq = newAuthRequest("$cleanBase/api/paths/download").put(body).build()
+            client.newCall(putReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    // 若服务端支持 POST，进行降级重试
+                    val postReq = newAuthRequest("$cleanBase/api/paths/download").post(body).build()
+                    client.newCall(postReq).execute().use { postResp ->
+                        if (postResp.isSuccessful) Result.success(true)
+                        else Result.failure(Exception("更新服务端下载路径失败 (HTTP ${resp.code})"))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "updateServerDownloadPath failed", e)
+            Result.failure(e)
+        }
+    }
 }
+
+/**
+ * 柠檬音乐服务端路径配置模型
+ */
+data class ServerPathConfig(
+    val downloadPath: String = "",
+    val availablePaths: List<String> = emptyList()
+)

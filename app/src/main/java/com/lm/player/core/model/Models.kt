@@ -20,7 +20,9 @@ data class UnifiedSong(
     val bitRate: Int = 320,
     val format: String = "flac",
     val isFavorite: Boolean = false,
-    val relativeFolderPath: String? = null
+    val relativeFolderPath: String? = null,
+    val addedTimestamp: Long = 0L,
+    val rawMetaJson: String? = null
 )
 
 @Immutable
@@ -92,9 +94,9 @@ enum class DownloadStatus {
     FAILED
 }
 
-enum class ServerType {
-    LOCAL_OFFLINE,
-    LEMON_MUSIC
+enum class ServerType(val displayName: String) {
+    LOCAL_OFFLINE("本地离线模式"),
+    LEMON_MUSIC("柠檬音乐服务端")
 }
 
 enum class SyncMode(val displayName: String) {
@@ -195,3 +197,87 @@ enum class OnlineMusicSource(val key: String, val displayName: String) {
         }
     }
 }
+
+/**
+ * 柠檬音乐服务端导入的落雪/澜音音源脚本数据模型
+ */
+@Immutable
+data class LemonSourceScriptInfo(
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val author: String = "",
+    val version: String = "",
+    val homepage: String = "",
+    val supportedPlatforms: List<String> = emptyList(),
+    val isActive: Boolean = false,
+    val healthSummary: String = ""
+)
+
+enum class DownloadTarget(val displayName: String, val desc: String) {
+    LOCAL("缓存至本地", "保存到本设备内部存储，离线随时聆听"),
+    SERVER("缓存至服务器", "保存到飞牛/NAS曲库，全终端同步共享"),
+    BOTH("双方同步缓存", "同时推送到服务器曲库并下载到本地离线存储")
+}
+
+
+enum class AudioQuality(val key: String, val label: String, val format: String, val badge: String, val bitrate: Int) {
+    Q_128K("128k", "标准音质 128K (MP3)", "MP3", "128K", 128),
+    Q_320K("320k", "极高音质 320K (MP3)", "MP3", "320K", 320),
+    Q_FLAC("flac", "无损音质 (FLAC)", "FLAC", "FLAC", 960),
+    Q_HIRES("flac24bit", "Hi-Res 高解析母带 (24bit)", "FLAC", "Hi-Res", 1411);
+
+    companion object {
+        fun fromKey(key: String): AudioQuality {
+            return entries.firstOrNull { it.key.equals(key, ignoreCase = true) } ?: Q_320K
+        }
+    }
+}
+
+@Immutable
+data class LemonServerDownloadTask(
+    val id: String = "",
+    val name: String,
+    val singer: String,
+    val source: String = "kw",
+    val album: String = "",
+    val interval: String = "",
+    val quality: String = "320k",
+    val songId: String = "",
+    val songmid: String = "",
+    val hash: String = "",
+    val rid: String = "",
+    val copyrightId: String = "",
+    val img: String = "",
+    val platform: String = source,
+    val pic: String = img,
+    val raw: String = ""
+)
+
+@Immutable
+data class LemonDownloadPreferences(
+    val defaultTarget: DownloadTarget = DownloadTarget.LOCAL,
+    val defaultQuality: AudioQuality = AudioQuality.Q_320K,
+    val maxConcurrent: Int = 3,
+    val embedCover: Boolean = true,
+    val embedLyric: Boolean = true,
+    val downloadLrcFile: Boolean = true,
+    val existFileMode: String = "skip", // skip | overwrite
+    val groupByFolder: Boolean = false
+)
+
+@Immutable
+data class UnifiedGenre(
+    val id: String,
+    val name: String,
+    val trackCount: Int = 0,
+    val coverUrl: String = ""
+)
+
+@Immutable
+data class LemonScanStatus(
+    val isScanning: Boolean = false,
+    val cachedCount: Int = 0,
+    val pendingCount: Int = 0,
+    val total: Int = 0
+)
