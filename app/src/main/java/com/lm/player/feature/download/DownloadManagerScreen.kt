@@ -48,6 +48,8 @@ fun DownloadManagerScreen(
     onCancelTask: (String) -> Unit,
     onDeleteDownloadedSong: (UnifiedSong) -> Unit,
     onDeleteDownloadedSongs: (List<UnifiedSong>) -> Unit = {},
+    onReEmbedSong: (UnifiedSong) -> Unit = {},
+    onReEmbedAll: () -> Unit = {},
     downloadPath: String = "",
     onBack: () -> Unit,
     contentPadding: PaddingValues = PaddingValues(0.dp)
@@ -326,11 +328,26 @@ fun DownloadManagerScreen(
                                             Spacer(modifier = Modifier.width(6.dp))
                                             Text("本地下载存储看板", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                         }
-                                        Text(
-                                            text = if (isMultiSelectMode) "多选编辑中" else "正常模式",
-                                            fontSize = 11.sp,
-                                            color = if (isMultiSelectMode) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            if (!isMultiSelectMode && completedSongs.isNotEmpty()) {
+                                                OutlinedButton(
+                                                    onClick = onReEmbedAll,
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                                    modifier = Modifier.height(26.dp),
+                                                    border = BorderStroke(0.8.dp, borderColor)
+                                                ) {
+                                                    Icon(Icons.Default.AutoFixHigh, contentDescription = null, modifier = Modifier.size(12.dp), tint = AppleRed)
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text("补全全部标签", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
+                                                }
+                                            }
+                                            Text(
+                                                text = if (isMultiSelectMode) "多选编辑中" else "正常模式",
+                                                fontSize = 11.sp,
+                                                color = if (isMultiSelectMode) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                     }
 
                                     Spacer(modifier = Modifier.height(10.dp))
@@ -598,9 +615,12 @@ fun DownloadManagerScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // 存储信息详情
+                    val hasLrc = file?.let { File(it.parentFile, "${it.nameWithoutExtension}.lrc").exists() } ?: false
                     SettingDetailRow(label = "物理文件大小", value = fileSizeFormatted)
                     SettingDetailRow(label = "音频解码格式", value = song.format.uppercase())
                     SettingDetailRow(label = "音频规格码率", value = "${song.bitRate} kbps")
+                    SettingDetailRow(label = "伴随歌词文件", value = if (hasLrc) "已生成 (.lrc)" else "未生成")
+                    SettingDetailRow(label = "专辑封面状态", value = if (song.coverUrl.isNotBlank()) "已关联封面" else "默认底图")
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text("本地物理文件绝对路径:", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -619,7 +639,25 @@ fun DownloadManagerScreen(
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // 重新内嵌按钮
+                    OutlinedButton(
+                        onClick = {
+                            val targetSong = song
+                            songForDetailsDialog = null
+                            onReEmbedSong(targetSong)
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.6f))
+                    ) {
+                        Icon(Icons.Default.AutoFixHigh, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("重新嵌入封面与歌词标签", fontSize = 12.sp, color = AppleRed, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),

@@ -1087,6 +1087,39 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 获取原始歌词文本 (/api/play/lyric)
+     */
+    suspend fun getRawLyrics(songId: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val song = songIdToSongMap[songId]
+            val path = songIdToPathMap[songId] ?: ""
+
+            val payload = JSONObject().apply {
+                put("name", song?.title ?: "")
+                put("singer", song?.artist ?: "")
+                put("filePath", path)
+            }
+            val req = newAuthRequest("$cleanBase/api/play/lyric")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("歌词获取失败"))
+                val json = JSONObject(body)
+                val lyricStr = json.optString("lyric").ifBlank { json.optString("ylyric") }
+                if (lyricStr.isNotBlank()) {
+                    return@withContext Result.success(lyricStr)
+                }
+                Result.failure(Exception("歌词为空"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     override suspend fun scrobble(songId: String, submission: Boolean): Result<Unit> = withContext(Dispatchers.IO) {
         Result.success(Unit)
     }

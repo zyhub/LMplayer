@@ -303,6 +303,266 @@ object LyricsManager {
         result
     }
 
+    fun LyricResult.toLrcString(): String {
+        if (lines.isEmpty()) return ""
+        val sb = StringBuilder()
+        for (line in lines) {
+            val totalSec = line.timestampMs / 1000
+            val min = totalSec / 60
+            val sec = totalSec % 60
+            val ms = (line.timestampMs % 1000) / 10
+            sb.append(String.format(Locale.US, "[%02d:%02d.%02d]%s\n", min, sec, ms, line.text))
+        }
+        return sb.toString()
+    }
+
+    /**
+     * 深度拉取原始 LRC 歌词文本 (保留完整时间戳、多语言翻译与排版)
+     * 用于下载到本地时内嵌标签与生成伴随同名 .lrc 文件
+     */
+    suspend fun fetchRawLyrics(
+        song: UnifiedSong,
+        context: Context,
+        serverConfig: ServerConfig? = null
+    ): String? = withContext(Dispatchers.IO) {
+        val client = NetworkClientFactory.createOkHttpClient(context)
+        val isLocalSong = !song.localFilePath.isNullOrBlank()
+
+        // 1. 本地伴随 .lrc 或音频内置标签
+        if (isLocalSong) {
+            try {
+                val localFile = File(song.localFilePath!!)
+                if (localFile.exists()) {
+                    val lrcFile = File(localFile.parentFile, "${localFile.nameWithoutExtension}.lrc")
+                    if (lrcFile.exists() && lrcFile.length() > 0) {
+                        val text = lrcFile.readText(Charsets.UTF_8).trim()
+                        if (text.isNotBlank() && !text.equals("null", ignoreCase = true)) {
+                            return@withContext text
+                        }
+                    }
+                    val embeddedText = EmbeddedLyricsExtractor.extract(localFile)
+                    if (!embeddedText.isNullOrBlank() && !embeddedText.equals("null", ignoreCase = true)) {
+                        return@withContext embeddedText.trim()
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. 柠檬音乐服务端 API (/api/play/lyric)
+        try {
+            val effectiveServer = serverConfig ?: run {
+                try {
+                    val db = ZdsDatabase.getInstance(context)
+                    db.serverDao().getAllServers().firstOrNull { it.id == song.serverId || it.isCurrentActive }?.let {
+                        ServerConfig(
+                            id = it.id,
+                            name = it.name,
+                            type = it.type,
+                            serverUrl = it.serverUrl,
+                            username = it.username,
+                            tokenOrApiKey = it.tokenOrApiKey,
+                            saltOrSecret = it.saltOrSecret,
+                            syncMode = it.syncMode,
+                            isCurrentActive = it.isCurrentActive
+                        )
+                    }
+                } catch (_: Exception) { null }
+            }
+
+            if (effectiveServer != null && effectiveServer.serverUrl.isNotBlank()) {
+                val protocol = LemonMusicProtocol(client, effectiveServer.serverUrl, effectiveServer.username, effectiveServer.tokenOrApiKey)
+                if (effectiveServer.tokenOrApiKey.isBlank() || effectiveServer.tokenOrApiKey.length < 20) {
+                    protocol.authenticate(effectiveServer)
+                }
+                val rawResp = protocol.getRawLyrics(song.id).getOrNull()
+                if (!rawResp.isNullOrBlank() && !rawResp.equals("null", ignoreCase = true)) {
+                    return@withContext rawResp.trim()
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 3. 酷狗全球歌词云引擎
+        try {
+            val cleanTitle = cleanTrackTitle(song.title)
+            val cleanArtist = cleanTrackArtist(song.artist)
+            val durationSec = if (song.durationMs > 0) (song.durationMs / 1000).toInt() else 0
+
+            val searchQueries = mutableListOf<String>()
+            if (cleanArtist.isNotBlank()) searchQueries.add("$cleanTitle $cleanArtist")
+            searchQueries.add(cleanTitle)
+
+            for (kw in searchQueries) {
+                val kwEnc = URLEncoder.encode(kw, "UTF-8")
+                val durationParam = if (durationSec > 0) "&duration=$durationSec" else ""
+                val kugouSearchUrl = "https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword=$kwEnc$durationParam&hash="
+
+                val req = Request.Builder()
+                    .url(kugouSearchUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    .build()
+
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        if (body.startsWith("{")) {
+                            val json = JSONObject(body)
+                            val candidates = json.optJSONArray("candidates")
+                            if (candidates != null && candidates.length() > 0) {
+                                val firstCand = candidates.getJSONObject(0)
+                                val candId = firstCand.optString("id", "")
+                                val accessKey = firstCand.optString("accesskey", "")
+                                if (candId.isNotBlank() && accessKey.isNotBlank()) {
+                                    val downloadUrl = "https://lyrics.kugou.com/download?ver=1&client=pc&id=$candId&accesskey=$accessKey&fmt=lrc&charset=utf8"
+                                    val downReq = Request.Builder().url(downloadUrl).build()
+                                    client.newCall(downReq).execute().use { downResp ->
+                                        if (downResp.isSuccessful) {
+                                            val downBody = downResp.body?.string().orEmpty()
+                                            val downJson = JSONObject(downBody)
+                                            val base64Content = downJson.optString("content", "")
+                                            if (base64Content.isNotBlank()) {
+                                                val decodedBytes = Base64.decode(base64Content, Base64.DEFAULT)
+                                                val lrcText = String(decodedBytes, Charsets.UTF_8).trim()
+                                                if (lrcText.isNotBlank()) return@withContext lrcText
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 4. LRCLIB 全球开源同步歌词库
+        try {
+            val cleanTitle = cleanTrackTitle(song.title)
+            val cleanArtist = cleanTrackArtist(song.artist)
+            val titleEnc = URLEncoder.encode(cleanTitle, "UTF-8")
+            val artistEnc = URLEncoder.encode(cleanArtist, "UTF-8")
+            val durationSec = if (song.durationMs > 0) (song.durationMs / 1000).toInt() else 0
+            val durationParam = if (durationSec > 0) "&duration=$durationSec" else ""
+
+            val lrclibUrls = mutableListOf<String>()
+            if (cleanArtist.isNotBlank()) {
+                lrclibUrls.add("https://lrclib.net/api/get?track_name=$titleEnc&artist_name=$artistEnc$durationParam")
+                lrclibUrls.add("https://lrclib.net/api/search?q=$titleEnc+$artistEnc")
+            }
+            lrclibUrls.add("https://lrclib.net/api/get?track_name=$titleEnc$durationParam")
+            lrclibUrls.add("https://lrclib.net/api/search?q=$titleEnc")
+
+            for (url in lrclibUrls) {
+                try {
+                    val req = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "LMPlayer/1.0 (https://github.com/zyhub/LMplayer)")
+                        .build()
+
+                    client.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string().orEmpty()
+                            if (body.startsWith("{")) {
+                                val json = JSONObject(body)
+                                val synced = json.optString("syncedLyrics", "").ifBlank { json.optString("plainLyrics", "") }
+                                if (synced.isNotBlank() && !synced.equals("null", ignoreCase = true)) {
+                                    return@withContext synced.trim()
+                                }
+                            } else if (body.startsWith("[")) {
+                                val arr = JSONArray(body)
+                                if (arr.length() > 0) {
+                                    val synced = arr.getJSONObject(0).optString("syncedLyrics", "")
+                                    if (synced.isNotBlank() && !synced.equals("null", ignoreCase = true)) {
+                                        return@withContext synced.trim()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        // 5. 网易云音乐
+        try {
+            val cleanTitle = cleanTrackTitle(song.title)
+            val cleanArtist = cleanTrackArtist(song.artist)
+            val queries = mutableListOf<String>()
+            if (cleanArtist.isNotBlank()) queries.add("$cleanTitle $cleanArtist")
+            queries.add(cleanTitle)
+
+            for (q in queries) {
+                val searchUrl = "https://music.163.com/api/search/get/web?s=${URLEncoder.encode(q, "UTF-8")}&type=1&limit=3"
+                val searchReq = Request.Builder().url(searchUrl).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").build()
+                client.newCall(searchReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        val json = JSONObject(body)
+                        val songsArr = json.optJSONObject("result")?.optJSONArray("songs")
+                        if (songsArr != null && songsArr.length() > 0) {
+                            val nId = songsArr.getJSONObject(0).optLong("id", 0L)
+                            if (nId > 0) {
+                                val lyricUrl = "https://music.163.com/api/song/lyric?os=pc&id=$nId&lv=-1&kv=-1&tv=-1"
+                                val lyricReq = Request.Builder().url(lyricUrl).header("User-Agent", "Mozilla/5.0").build()
+                                client.newCall(lyricReq).execute().use { lResp ->
+                                    if (lResp.isSuccessful) {
+                                        val lBody = lResp.body?.string().orEmpty()
+                                        val lJson = JSONObject(lBody)
+                                        val lyricContent = lJson.optJSONObject("lrc")?.optString("lyric", "") ?: ""
+                                        if (lyricContent.isNotBlank() && !lyricContent.equals("null", ignoreCase = true)) {
+                                            return@withContext lyricContent.trim()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 6. QQ 音乐
+        try {
+            val cleanTitle = cleanTrackTitle(song.title)
+            val cleanArtist = cleanTrackArtist(song.artist)
+            val query = if (cleanArtist.isNotBlank()) "$cleanTitle $cleanArtist" else cleanTitle
+            val qqSearchUrl = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?p=1&n=3&w=${URLEncoder.encode(query, "UTF-8")}&format=json"
+            val qqSearchReq = Request.Builder().url(qqSearchUrl).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").build()
+            client.newCall(qqSearchReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    val json = JSONObject(body)
+                    val songList = json.optJSONObject("data")?.optJSONObject("song")?.optJSONArray("list")
+                    if (songList != null && songList.length() > 0) {
+                        val songMid = songList.getJSONObject(0).optString("songmid", "")
+                        if (songMid.isNotBlank()) {
+                            val qqLyricUrl = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=$songMid&format=json&nobase64=0"
+                            val qqLyricReq = Request.Builder()
+                                .url(qqLyricUrl)
+                                .header("Referer", "https://y.qq.com")
+                                .header("User-Agent", "Mozilla/5.0")
+                                .build()
+                            client.newCall(qqLyricReq).execute().use { lResp ->
+                                if (lResp.isSuccessful) {
+                                    val lBody = lResp.body?.string().orEmpty()
+                                    val lJson = JSONObject(lBody)
+                                    val base64Lyric = lJson.optString("lyric", "")
+                                    if (base64Lyric.isNotBlank()) {
+                                        val decodedBytes = Base64.decode(base64Lyric, Base64.DEFAULT)
+                                        val lrcText = String(decodedBytes, Charsets.UTF_8).trim()
+                                        if (lrcText.isNotBlank()) return@withContext lrcText
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 7. 若未匹配到在线歌词，生成曲目信息展示卡
+        generateFallbackLyrics(song).toLrcString()
+    }
+
     private suspend fun fetchLyricsInternal(
         song: UnifiedSong,
         context: Context,

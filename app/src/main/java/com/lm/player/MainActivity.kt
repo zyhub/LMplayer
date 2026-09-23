@@ -1416,6 +1416,25 @@ class MainActivity : ComponentActivity() {
                                         onDeleteDownloadedSongs = { songsToDelete ->
                                             downloadEngine.deleteDownloadedSongs(songsToDelete)
                                         },
+                                        onReEmbedSong = { songToFix ->
+                                            lifecycleScope.launch(Dispatchers.IO) {
+                                                val ok = downloadEngine.reEmbedSongMetadata(songToFix)
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(this@MainActivity, if (ok) "已成功为《${songToFix.title}》重新嵌入封面与歌词" else "重新嵌入失败，文件未找到", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        },
+                                        onReEmbedAll = {
+                                            lifecycleScope.launch(Dispatchers.IO) {
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(this@MainActivity, "正在批量为所有已下载歌曲补全封面与歌词标签...", Toast.LENGTH_SHORT).show()
+                                                }
+                                                val (success, fail) = downloadEngine.reEmbedAllDownloadedSongs()
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(this@MainActivity, "标签补全完成：成功 $success 首，失败 $fail 首", Toast.LENGTH_LONG).show()
+                                                }
+                                            }
+                                        },
                                         downloadPath = downloadSettings.customDownloadPath.ifBlank { getExternalFilesDir(null)?.absolutePath ?: "" },
                                         onBack = { currentScreen = Screen.LIBRARY },
                                         contentPadding = innerPadding

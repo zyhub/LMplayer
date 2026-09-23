@@ -364,9 +364,14 @@ class DownloadEngine(
                         }
                     }
 
-                    // 4. 下载成功完成 - 持久化到 downloads 表与 songs 表
+                    // 4. 后置元数据处理：拉取高清封面、原始同步歌词、生成伴随 .lrc 以及音频内嵌 ID3/FLAC/M4A 标签
+                    val localCoverPath = postProcessDownloadedFile(actualDestFile, song)
+                    val effectiveCover = if (!localCoverPath.isNullOrBlank() && song.coverUrl.isBlank()) localCoverPath else song.coverUrl
+
+                    // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表
                     val completedEntity = initialEntity.copy(
                         status = DownloadStatus.DOWNLOADED,
+                        coverUrl = effectiveCover,
                         localFilePath = actualDestFile.absolutePath,
                         remoteUrl = effectiveStreamUrl,
                         bytesDownloaded = actualDestFile.length(),
@@ -374,12 +379,12 @@ class DownloadEngine(
                         completedTimestamp = System.currentTimeMillis()
                     )
                     downloadDao.insertOrUpdate(completedEntity)
-                    saveOrUpdateSongEntity(song.copy(streamUrl = effectiveStreamUrl), actualDestFile.absolutePath)
+                    saveOrUpdateSongEntity(song.copy(streamUrl = effectiveStreamUrl, coverUrl = effectiveCover), actualDestFile.absolutePath)
                     removeTask(song.id)
-                    Log.i(TAG, "Song ${song.title} downloaded successfully to ${actualDestFile.absolutePath}")
+                    Log.i(TAG, "Song ${song.title} downloaded and tagged successfully to ${actualDestFile.absolutePath}")
 
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "「${song.title}」已完成离线下载", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "「${song.title}」已完成离线下载与标签内嵌", Toast.LENGTH_SHORT).show()
                     }
 
                 } catch (e: Exception) {
@@ -406,6 +411,164 @@ class DownloadEngine(
     }
 
     /**
+     * 音频下载后置处理管道：
+     * 1. 根据设置拉取高清封面图片二进制字节；
+     * 2. 根据设置拉取高精度同步 LRC 歌词文本；
+     * 3. 若开启 download_lrc_file：在音频同级目录输出同名 .lrc 文件；
+     * 4. 在专辑同级目录保存 cover.jpg 方便车载系统与文件管理器显示；
+     * 5. 若开启 download_embed_cover 或 download_embed_lyric：调用 AudioMetadataEmbedder 写入 ID3v2.3/FLAC/M4A 标签；
+     * 6. 返回可能落盘的本地封面路径。
+     */
+    suspend fun postProcessDownloadedFile(
+        file: File,
+        song: UnifiedSong
+    ): String? = withContext(Dispatchers.IO) {
+        val lemonPrefs = context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+        val embedCover = lemonPrefs.getBoolean("download_embed_cover", true)
+        val embedLyric = lemonPrefs.getBoolean("download_embed_lyric", true)
+        val downloadLrc = lemonPrefs.getBoolean("download_lrc_file", true)
+
+        var localCoverPath: String? = null
+        var coverBytes: ByteArray? = null
+
+        // 1. 获取封面字节
+        if (embedCover || downloadLrc) {
+            try {
+                if (song.coverUrl.isNotBlank()) {
+                    if (song.coverUrl.startsWith("http://") || song.coverUrl.startsWith("https://")) {
+                        val req = Request.Builder().url(song.coverUrl).build()
+                        okHttpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                coverBytes = resp.body?.bytes()
+                            }
+                        }
+                    } else {
+                        val localCover = File(song.coverUrl)
+                        if (localCover.exists() && localCover.isFile) {
+                            coverBytes = localCover.readBytes()
+                            localCoverPath = localCover.absolutePath
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to fetch cover bytes for ${song.title}: ${e.message}")
+            }
+        }
+
+        // 保存 cover.jpg 到歌曲所在专辑目录（若不存在）
+        if (coverBytes != null && coverBytes!!.isNotEmpty()) {
+            try {
+                val albumDir = file.parentFile
+                if (albumDir != null && albumDir.exists()) {
+                    val coverJpg = File(albumDir, "cover.jpg")
+                    if (!coverJpg.exists()) {
+                        coverJpg.writeBytes(coverBytes!!)
+                    }
+                    localCoverPath = coverJpg.absolutePath
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. 获取原始歌词文本
+        var rawLrc: String? = null
+        if (embedLyric || downloadLrc) {
+            try {
+                rawLrc = LyricsManager.fetchRawLyrics(song, context)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to fetch raw lyrics for ${song.title}: ${e.message}")
+            }
+        }
+
+        // 3. 伴随 .lrc 独立歌词文件生成
+        if (downloadLrc && !rawLrc.isNullOrBlank()) {
+            try {
+                val lrcFile = File(file.parentFile, "${file.nameWithoutExtension}.lrc")
+                lrcFile.writeText(rawLrc!!, Charsets.UTF_8)
+                Log.i(TAG, "Saved companion .lrc: ${lrcFile.absolutePath}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to write companion .lrc: ${e.message}")
+            }
+        }
+
+        // 4. 音频文件内部标签内嵌 (ID3v2.3 / FLAC / M4A)
+        if (embedCover || embedLyric) {
+            try {
+                val success = AudioMetadataEmbedder.embedMetadata(
+                    file = file,
+                    title = song.title,
+                    artist = song.artist,
+                    album = song.album,
+                    coverBytes = if (embedCover) coverBytes else null,
+                    lyrics = if (embedLyric) rawLrc else null
+                )
+                if (success) {
+                    Log.i(TAG, "Successfully embedded metadata into ${file.name}")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to embed metadata into ${file.name}", e)
+            }
+        }
+
+        localCoverPath
+    }
+
+    /**
+     * 为单首已下载歌曲重新嵌入元数据、封面与歌词标签
+     */
+    suspend fun reEmbedSongMetadata(song: UnifiedSong): Boolean = withContext(Dispatchers.IO) {
+        val targetPath = song.localFilePath ?: downloadDao.getDownloadRecord(song.id)?.localFilePath
+        if (targetPath.isNullOrBlank()) return@withContext false
+        val file = File(targetPath)
+        if (!file.exists() || file.length() < 32) return@withContext false
+
+        val localCover = postProcessDownloadedFile(file, song)
+        if (localCover != null && song.coverUrl.isBlank()) {
+            songDao.updateDownloadStatusAndTimestamp(song.id, DownloadStatus.DOWNLOADED, file.absolutePath, System.currentTimeMillis())
+        }
+        true
+    }
+
+    /**
+     * 批量为所有已下载的歌曲重新补全内嵌封面与歌词标签
+     */
+    suspend fun reEmbedAllDownloadedSongs(
+        onProgress: (Int, Int) -> Unit = { _, _ -> }
+    ): Pair<Int, Int> = withContext(Dispatchers.IO) {
+        val records = downloadDao.getAllDownloadsList().filter { it.status == DownloadStatus.DOWNLOADED }
+        var successCount = 0
+        var failCount = 0
+        val total = records.size
+
+        for ((index, r) in records.withIndex()) {
+            onProgress(index + 1, total)
+            if (r.localFilePath.isNullOrBlank()) {
+                failCount++
+                continue
+            }
+            val f = File(r.localFilePath)
+            if (!f.exists() || f.length() < 32) {
+                failCount++
+                continue
+            }
+            val songEntity = songDao.getSongById(r.songId)
+            val unifiedSong = UnifiedSong(
+                id = r.songId,
+                title = r.title,
+                artist = r.artist,
+                album = songEntity?.album ?: "精选专辑",
+                durationMs = songEntity?.durationMs ?: 0L,
+                coverUrl = r.coverUrl ?: songEntity?.coverUrl ?: "",
+                streamUrl = r.remoteUrl ?: "",
+                localFilePath = r.localFilePath,
+                format = f.extension
+            )
+            val ok = reEmbedSongMetadata(unifiedSong)
+            if (ok) successCount++ else failCount++
+        }
+        Pair(successCount, failCount)
+    }
+
+    /**
      * 取消/停止正在进行的下载，并彻底清理未完成的临时文件
      */
     fun cancelDownload(songId: String) {
@@ -417,6 +580,8 @@ class DownloadEngine(
             if (record?.localFilePath != null) {
                 val f = File(record.localFilePath)
                 if (f.exists()) f.delete()
+                val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                if (lrcFile.exists()) lrcFile.delete()
             }
             val dir = getDownloadDir()
             dir.listFiles { _, name -> name.startsWith(songId) }?.forEach { it.delete() }
@@ -445,10 +610,14 @@ class DownloadEngine(
             if (record?.localFilePath != null) {
                 val f = File(record.localFilePath)
                 if (f.exists()) f.delete()
+                val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                if (lrcFile.exists()) lrcFile.delete()
             }
             if (!song.localFilePath.isNullOrBlank()) {
                 val f = File(song.localFilePath)
                 if (f.exists()) f.delete()
+                val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                if (lrcFile.exists()) lrcFile.delete()
             }
             val defaultDest = File(getDownloadDir(), "${song.id}.${song.format}")
             if (defaultDest.exists()) defaultDest.delete()
@@ -483,6 +652,8 @@ class DownloadEngine(
                         freedBytes += f.length()
                         f.delete()
                     }
+                    val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                    if (lrcFile.exists()) lrcFile.delete()
                 }
                 if (!song.localFilePath.isNullOrBlank()) {
                     val f = File(song.localFilePath)
@@ -490,6 +661,8 @@ class DownloadEngine(
                         freedBytes += f.length()
                         f.delete()
                     }
+                    val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                    if (lrcFile.exists()) lrcFile.delete()
                 }
                 val defaultDest = File(downloadDir, "${song.id}.${song.format}")
                 if (defaultDest.exists()) {
