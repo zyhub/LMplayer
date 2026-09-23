@@ -40,6 +40,35 @@ object AppUpdateManager {
     const val DEFAULT_GITHUB_REPO = "zyhub/LMplayer"
 
     /**
+     * 动态获取当前应用安装版本号名称
+     */
+    fun getAppVersionName(context: Context): String {
+        return try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            pInfo.versionName?.ifBlank { null } ?: CURRENT_VERSION_NAME
+        } catch (_: Exception) {
+            CURRENT_VERSION_NAME
+        }
+    }
+
+    /**
+     * 动态获取当前应用安装版本代码 (VersionCode)
+     */
+    fun getAppVersionCode(context: Context): Long {
+        return try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                pInfo.versionCode.toLong()
+            }
+        } catch (_: Exception) {
+            CURRENT_VERSION_CODE.toLong()
+        }
+    }
+
+    /**
      * 获取更新偏好配置
      */
     fun getUpdatePrefs(context: Context): android.content.SharedPreferences {
@@ -82,6 +111,8 @@ object AppUpdateManager {
      */
     suspend fun checkForUpdates(context: Context, customUrlOrRepo: String? = null): Result<UpdateInfo> = withContext(Dispatchers.IO) {
         try {
+            val currentVersionName = getAppVersionName(context)
+            val currentVersionCode = getAppVersionCode(context)
             val targetTarget = customUrlOrRepo?.ifBlank { null } ?: DEFAULT_GITHUB_REPO
 
             if (targetTarget.isNotBlank()) {
@@ -125,12 +156,12 @@ object AppUpdateManager {
                                 }
                             }
 
-                            val hasUpdate = isVersionNewer(cleanVersion, CURRENT_VERSION_NAME)
+                            val hasUpdate = isVersionNewer(cleanVersion, currentVersionName)
                             return@withContext Result.success(
                                 UpdateInfo(
                                     hasUpdate = hasUpdate,
                                     latestVersion = cleanVersion,
-                                    latestVersionCode = CURRENT_VERSION_CODE + (if (hasUpdate) 1 else 0),
+                                    latestVersionCode = currentVersionCode.toInt() + (if (hasUpdate) 1 else 0),
                                     releaseNotes = notes,
                                     downloadUrl = apkDownloadUrl,
                                     apkSizeBytes = apkSize,
@@ -139,14 +170,14 @@ object AppUpdateManager {
                             )
                         } else {
                             // 2. 解析通用自定义 API JSON
-                            val vCode = json.optInt("versionCode", CURRENT_VERSION_CODE)
-                            val vName = json.optString("versionName", CURRENT_VERSION_NAME)
+                            val vCode = json.optInt("versionCode", currentVersionCode.toInt())
+                            val vName = json.optString("versionName", currentVersionName)
                             val notes = json.optString("releaseNotes", "性能优化与功能增强")
                             val url = json.optString("downloadUrl", "")
                             val size = json.optLong("apkSizeBytes", 0L)
                             val force = json.optBoolean("isForceUpdate", false)
 
-                            val hasUpdate = vCode > CURRENT_VERSION_CODE || isVersionNewer(vName, CURRENT_VERSION_NAME)
+                            val hasUpdate = vCode.toLong() > currentVersionCode || isVersionNewer(vName, currentVersionName)
                             return@withContext Result.success(
                                 UpdateInfo(
                                     hasUpdate = hasUpdate,
@@ -167,9 +198,9 @@ object AppUpdateManager {
             Result.success(
                 UpdateInfo(
                     hasUpdate = false,
-                    latestVersion = CURRENT_VERSION_NAME,
-                    latestVersionCode = CURRENT_VERSION_CODE,
-                    releaseNotes = "当前已是最新至臻发布版本 (v$CURRENT_VERSION_NAME)。\n\n1. 播放界面喜欢按钮红心状态彻底修复，支持0ms即刻响应\n2. 设置中心所有配置项全面升级为轻奢下拉菜单选择\n3. 存储与路径重构，支持本地已下载与全盘曲库存储占用精准统计\n4. 新增本地已下载歌曲深度管理：支持多选、批量删除与详细存储信息查看\n5. 全套应用高清图标升级，全工程代码审计与性能优化",
+                    latestVersion = currentVersionName,
+                    latestVersionCode = currentVersionCode.toInt(),
+                    releaseNotes = "当前已是最新至臻发布版本 (v$currentVersionName)。\n\n1. 本地下载音频歌词与封面标签内嵌\n2. 伴随LRC生成与历史曲目补全\n3. 关联柠檬音乐服务端仓库\n4. 安装包调起与版本检测优化",
                     downloadUrl = ""
                 )
             )
@@ -253,15 +284,24 @@ object AppUpdateManager {
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val hasInstallPermission = context.packageManager.canRequestPackageInstalls()
+                val hasInstallPermission = try {
+                    context.packageManager.canRequestPackageInstalls()
+                } catch (e: Exception) {
+                    Log.w(TAG, "canRequestPackageInstalls error: ${e.message}")
+                    true
+                }
                 if (!hasInstallPermission) {
-                    val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                        data = Uri.parse("package:${context.packageName}")
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        }
+                        context.startActivity(intent)
+                        Toast.makeText(context, "请在设置中开启「允许安装未知应用」权限后重试", Toast.LENGTH_LONG).show()
+                        return
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to launch ACTION_MANAGE_UNKNOWN_APP_SOURCES, fallback to direct install", e)
                     }
-                    context.startActivity(intent)
-                    Toast.makeText(context, "请授予安装未知应用权限后重试", Toast.LENGTH_LONG).show()
-                    return
                 }
             }
 
