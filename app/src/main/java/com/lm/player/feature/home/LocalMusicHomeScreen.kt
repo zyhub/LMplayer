@@ -253,7 +253,7 @@ fun LocalMusicHomeScreen(
     homeDisplayConfig: HomeScreenDisplayConfig = HomeScreenDisplayConfig(),
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     activeDownloadCount: Int = 0,
-    onSongClick: (UnifiedSong) -> Unit,
+    onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
     onSelectLocalServer: () -> Unit = {},
@@ -433,7 +433,7 @@ fun LocalMusicHomeScreen(
                                 RecentlyAddedSongCard(
                                     song = song,
                                     isLocalOfflineMode = true,
-                                    onClick = { onSongClick(song) }
+                                    onClick = { onSongClick(song, recentSongs.take(20)) }
                                 )
                             }
                         }
@@ -462,8 +462,8 @@ fun LocalMusicHomeScreen(
                                 AlbumCardItem(
                                     album = album,
                                     onClick = {
-                                        val matched = activeSongSource.firstOrNull { it.album == album.title }
-                                        if (matched != null) onSongClick(matched)
+                                        val albumSongs = activeSongSource.filter { it.album == album.title }
+                                        albumSongs.firstOrNull()?.let { onSongClick(it, albumSongs) }
                                     }
                                 )
                             }
@@ -493,8 +493,8 @@ fun LocalMusicHomeScreen(
                                 ArtistCircleItem(
                                     artist = artist,
                                     onClick = {
-                                        val matched = activeSongSource.firstOrNull { it.artist == artist.name }
-                                        if (matched != null) onSongClick(matched)
+                                        val artistSongs = activeSongSource.filter { it.artist == artist.name }
+                                        artistSongs.firstOrNull()?.let { onSongClick(it, artistSongs) }
                                     }
                                 )
                             }
@@ -522,7 +522,7 @@ fun LocalMusicHomeScreen(
                     isLocalOfflineMode = true,
                     activeDownloadTasks = activeDownloadTasks,
                     isServerConnected = isServerOk,
-                    onClick = { onSongClick(song) },
+                    onClick = { onSongClick(song, activeSongSource) },
                     onDownloadClick = { songForDownloadChoice = song },
                     onDownloadWithOptions = { s, target, quality ->
                         onDownloadSongWithOptions(s, target, quality)

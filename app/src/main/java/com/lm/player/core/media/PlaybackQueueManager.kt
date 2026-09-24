@@ -39,6 +39,26 @@ object PlaybackQueueManager {
 
     private var isListenerAttached = false
 
+    fun setQueue(songs: List<UnifiedSong>) {
+        _playlistFlow.value = songs
+    }
+
+    fun updateMetadata(songs: List<UnifiedSong>) {
+        if (_playlistFlow.value.isEmpty()) {
+            _playlistFlow.value = songs
+        } else {
+            val songMap = songs.associateBy { it.id }
+            _playlistFlow.value = _playlistFlow.value.map { songMap[it.id] ?: it }
+        }
+        val current = _currentSongFlow.value
+        if (current != null) {
+            val updated = songs.firstOrNull { it.id == current.id }
+            if (updated != null && updated != current) {
+                _currentSongFlow.value = updated
+            }
+        }
+    }
+
     fun updatePlaylist(songs: List<UnifiedSong>) {
         _playlistFlow.value = songs
         val current = _currentSongFlow.value

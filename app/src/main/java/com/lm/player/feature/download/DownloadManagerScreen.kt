@@ -45,7 +45,7 @@ import java.util.Locale
 fun DownloadManagerScreen(
     activeTasks: List<DownloadTask>,
     completedSongs: List<UnifiedSong>,
-    onSongClick: (UnifiedSong) -> Unit,
+    onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onCancelTask: (String) -> Unit,
     onPauseTask: (String) -> Unit = {},
     onResumeTask: (String) -> Unit = {},
@@ -551,6 +551,35 @@ fun DownloadManagerScreen(
                         }
 
                         // 已下载歌曲列表
+                        if (completedSongs.isNotEmpty()) {
+                            item {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "已下载歌曲 (${completedSongs.size} 首)",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Button(
+                                        onClick = {
+                                            completedSongs.firstOrNull()?.let { onSongClick(it, completedSongs) }
+                                        },
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(15.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("播放全部", fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
+
                         items(
                             items = completedSongs,
                             key = { it.id },
@@ -568,7 +597,7 @@ fun DownloadManagerScreen(
                                     if (isMultiSelectMode) {
                                         if (isSelected) selectedSongIds.remove(song.id) else selectedSongIds.add(song.id)
                                     } else {
-                                        onSongClick(song)
+                                        onSongClick(song, completedSongs)
                                     }
                                 },
                                 onDelete = { singleSongToDelete = song },

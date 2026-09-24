@@ -101,7 +101,7 @@
 
 👉 **[前往下载最新发布版 APK](https://github.com/zyhub/LMplayer/releases)**
 
-- 最新版本：`v1.5.2`
+- 最新版本：`v1.5.3`
 - 架构支持：`armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64` (通用全架构)
 - 最低系统要求：Android 8.0 (API Level 26) 及以上车载车机或智能手机
 

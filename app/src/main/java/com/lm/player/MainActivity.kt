@@ -231,6 +231,7 @@ class MainActivity : ComponentActivity() {
             val isPlaying by PlaybackQueueManager.isPlayingFlow.collectAsState()
             val isShuffle by PlaybackQueueManager.isShuffleFlow.collectAsState()
             val isRepeat by PlaybackQueueManager.isRepeatFlow.collectAsState()
+            val currentQueue by PlaybackQueueManager.playlistFlow.collectAsState()
 
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
             var isFullPlayerVisible by remember { mutableStateOf(false) }
@@ -592,7 +593,7 @@ class MainActivity : ComponentActivity() {
                         Pair(mapped, rec)
                     }
                     songList = mappedSongs
-                    PlaybackQueueManager.updatePlaylist(mappedSongs)
+                    PlaybackQueueManager.updateMetadata(mappedSongs)
                     recentlyAddedSongs = recAdded
                     if (recentlyPlayedSongs.isEmpty() && mappedSongs.isNotEmpty()) {
                         recentlyPlayedSongs = mappedSongs.take(10)
@@ -607,7 +608,11 @@ class MainActivity : ComponentActivity() {
 
             // 核心业务函数：播放指定歌曲 (委托至 PlaybackQueueManager 调度，支持动态上下文队列与全局本地优先调用)
             val playSongWithQueue: (UnifiedSong, List<UnifiedSong>?) -> Unit = { targetSong, contextQueue ->
-                val activeQueue = if (!contextQueue.isNullOrEmpty()) contextQueue else songList
+                val activeQueue = when {
+                    !contextQueue.isNullOrEmpty() -> contextQueue
+                    PlaybackQueueManager.playlistFlow.value.isNotEmpty() -> PlaybackQueueManager.playlistFlow.value
+                    else -> songList
+                }
 
                 // 核心调度：无论歌曲来自线上模式、全网搜索还是资料库，播放前统一优先核验本地物理文件
                 val validDirectPath = if (!targetSong.localFilePath.isNullOrBlank() && java.io.File(targetSong.localFilePath).let { it.exists() && it.length() > 0 }) {
@@ -1241,7 +1246,7 @@ class MainActivity : ComponentActivity() {
                                             homeDisplayConfig = homeDisplayConfig,
                                             activeDownloadTasks = activeDownloadTasks,
                                             activeDownloadCount = activeDownloadTasks.size,
-                                            onSongClick = playSong,
+                                            onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                             onDownloadSong = handleDownloadSong,
                                             onDownloadSongWithOptions = handleDownloadWithOptions,
                                             onSelectLocalServer = {
@@ -1546,7 +1551,7 @@ class MainActivity : ComponentActivity() {
                                     DownloadManagerScreen(
                                         activeTasks = activeDownloadTasks,
                                         completedSongs = completedDownloadedSongs,
-                                        onSongClick = playSong,
+                                        onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                         onCancelTask = { downloadEngine.cancelTask(it) },
                                         onPauseTask = { downloadEngine.pauseTask(it) },
                                         onResumeTask = { downloadEngine.resumeTask(it) },
@@ -1709,8 +1714,8 @@ class MainActivity : ComponentActivity() {
                                     ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                                 LibrarySearchDialog(
                                     allSongs = songList,
-                                    onSongClick = { targetSong ->
-                                        playSong(targetSong)
+                                    onSongClick = { targetSong, queue ->
+                                        playSongWithQueue(targetSong, queue)
                                     },
                                     onDownloadSong = handleDownloadSong,
                                     onDownloadSongWithOptions = handleDownloadWithOptions,
@@ -1764,10 +1769,10 @@ class MainActivity : ComponentActivity() {
                                         // 智能切歌预热：播放进度达到 85% 且本曲尚未预热时，后台异步预热下一首歌曲解析与歌词
                                         if (pos.toFloat() / dur > 0.85f && prebufferedSongId != song.id && songList.isNotEmpty()) {
                                             prebufferedSongId = song.id
-                                            val currentQueue = songList
+                                            val currentQueueList = currentQueue.ifEmpty { songList }
                                             launch(Dispatchers.Default) {
-                                                val nextIndex = (currentQueue.indexOfFirst { it.id == song.id } + 1).takeIf { it < currentQueue.size } ?: 0
-                                                val nextCandidate = if (isShuffle) (currentQueue.filter { it.id != song.id }.randomOrNull() ?: song) else currentQueue[nextIndex]
+                                                val nextIndex = (currentQueueList.indexOfFirst { it.id == song.id } + 1).takeIf { it < currentQueueList.size } ?: 0
+                                                val nextCandidate = if (isShuffle) (currentQueueList.filter { it.id != song.id }.randomOrNull() ?: song) else currentQueueList[nextIndex]
                                                 try {
                                                     val activeServer = serversList.firstOrNull { it.isCurrentActive }
                                                     LyricsManager.loadLyrics(nextCandidate, this@MainActivity, activeServer)
@@ -1783,7 +1788,7 @@ class MainActivity : ComponentActivity() {
 
                             FullscreenPlayerSheet(
                                 song = song,
-                                playlist = songList,
+                                playlist = currentQueue.ifEmpty { songList },
                                 isPlaying = isPlaying,
                                 progressMs = localProgressMs,
                                 totalDurationMs = localTotalDurationMs,
@@ -1803,7 +1808,7 @@ class MainActivity : ComponentActivity() {
                                     localProgressMs = seekPosition
                                 },
                                 onSelectSongFromQueue = { queueSong ->
-                                    playSong(queueSong)
+                                    playSongWithQueue(queueSong, currentQueue.ifEmpty { songList })
                                 },
                                 onToggleLyricsMode = { isLyricsMode = it },
                                 onToggleFavorite = {

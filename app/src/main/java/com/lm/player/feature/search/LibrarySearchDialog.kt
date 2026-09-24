@@ -39,7 +39,7 @@ import com.lm.player.feature.home.SongListItemRow
 @Composable
 fun LibrarySearchDialog(
     allSongs: List<UnifiedSong>,
-    onSongClick: (UnifiedSong) -> Unit,
+    onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
     initialOnlineSource: OnlineMusicSource = OnlineMusicSource.KUWO,
@@ -314,7 +314,7 @@ fun LibrarySearchDialog(
                                 isServerConnected = isServerConnected,
                                 onClick = {
                                     // 播放歌曲并保持留在搜索页面
-                                    onSongClick(song)
+                                    onSongClick(song, searchResults)
                                 },
                                 onDownloadClick = { songForDownloadChoice = song },
                                 onDownloadWithOptions = { s, target, quality ->
@@ -355,7 +355,7 @@ fun LibrarySearchDialog(
                                 isServerConnected = isServerConnected,
                                 onClick = {
                                     // 播放在线歌曲并保持留在搜索页面
-                                    onSongClick(song)
+                                    onSongClick(song, resolvedOnlineResults)
                                 },
                                 onDownloadClick = { songForDownloadChoice = song },
                                 onDownloadWithOptions = { s, target, quality ->

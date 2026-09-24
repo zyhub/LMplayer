@@ -56,6 +56,15 @@ data class UnifiedPlaylist(
 )
 
 @Immutable
+data class UnifiedFolder(
+    val id: String,
+    val name: String,
+    val path: String = "",
+    val songCount: Int = 0,
+    val songs: List<UnifiedSong> = emptyList()
+)
+
+@Immutable
 data class ServerFolderItem(
     val id: String,
     val name: String,

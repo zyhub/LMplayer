@@ -113,6 +113,38 @@ fun LocalLibraryScreen(
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingSubView by remember { mutableStateOf(false) }
     var isFromAllPlaylists by remember { mutableStateOf(false) }
+    var isFromAllFolders by remember { mutableStateOf(false) }
+
+    // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名)
+    val localFolders = remember(allSongs) {
+        allSongs.mapNotNull { song ->
+            val folderName = when {
+                !song.relativeFolderPath.isNullOrBlank() -> {
+                    val p = song.relativeFolderPath.trim().replace('\\', '/')
+                    p.trimEnd('/').substringAfterLast('/')
+                }
+                !song.localFilePath.isNullOrBlank() -> {
+                    try {
+                        val f = File(song.localFilePath)
+                        f.parentFile?.name
+                    } catch (_: Exception) { null }
+                }
+                else -> null
+            }?.trim()?.ifBlank { null }
+            if (folderName != null && folderName !in listOf("0", "emulated", "sdcard", "storage")) {
+                folderName to song
+            } else null
+        }.groupBy({ it.first }, { it.second })
+        .map { (folderName, songs) ->
+            UnifiedFolder(
+                id = "folder_${folderName.hashCode()}",
+                name = folderName,
+                path = songs.firstOrNull()?.let { it.relativeFolderPath ?: it.localFilePath } ?: "",
+                songCount = songs.size,
+                songs = songs
+            )
+        }.sortedByDescending { it.songCount }
+    }
 
     // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 兜底聚合
     val finalDownloadedSongs = remember(allSongs, downloadedSongs) {
@@ -141,7 +173,7 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 层级返回调度器：如果从「全部歌单」进入某个歌单，先返回「全部歌单」，再返回资料库首页
+    // 层级返回调度器：如果从「全部歌单」或「全部文件夹」进入某个歌单/目录，先返回上层网格，再返回资料库首页
     val handleSubViewBack: () -> Unit = {
         if (isDownloadManagementMode) {
             isDownloadManagementMode = false
@@ -150,9 +182,14 @@ fun LocalLibraryScreen(
             activeSubViewTitle = "全部歌单"
             activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
             isFromAllPlaylists = false
+        } else if (activeSubViewTitle != "全部文件夹" && isFromAllFolders) {
+            activeSubViewTitle = "全部文件夹"
+            activeSubViewSubtitle = "共 ${localFolders.size} 个本地文件夹"
+            isFromAllFolders = false
         } else {
             activeSubViewTitle = null
             isFromAllPlaylists = false
+            isFromAllFolders = false
         }
     }
 
@@ -623,6 +660,55 @@ fun LocalLibraryScreen(
                                     RecentAddedSongCard(
                                         song = song,
                                         onClick = { onSongClick(song, recentAddedSongs) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3.5 【本地文件夹】板块 (Local Folders Section)
+                if (localFolders.isNotEmpty()) {
+                    item {
+                        Column {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "本地文件夹",
+                                    fontSize = 19.sp * dimensions.fontScale,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onBackground
+                                )
+                                Text(
+                                    text = "全部 ${localFolders.size} 个",
+                                    fontSize = 12.sp,
+                                    color = AppleRed,
+                                    modifier = Modifier.clickable {
+                                        activeSubViewTitle = "全部文件夹"
+                                        activeSubViewSubtitle = "共 ${localFolders.size} 个本地文件夹"
+                                        isFromAllFolders = false
+                                    }
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                contentPadding = PaddingValues(horizontal = 2.dp)
+                            ) {
+                                items(localFolders.take(12), key = { it.id }) { folder ->
+                                    FolderCardItem(
+                                        folder = folder,
+                                        onClick = {
+                                            activeSubViewTitle = "文件夹 · ${folder.name}"
+                                            activeSubViewSubtitle = "本地目录 · 共 ${folder.songCount} 首歌曲"
+                                            activeSubViewSongs = folder.songs
+                                            isFromAllFolders = false
+                                        }
                                     )
                                 }
                             }
@@ -1281,6 +1367,30 @@ fun LocalLibraryScreen(
                             )
                         }
                     }
+                } else if (activeSubViewTitle == "全部文件夹") {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 160.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = 8.dp,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(localFolders, key = { it.id }) { folder ->
+                            FolderCardItem(
+                                folder = folder,
+                                onClick = {
+                                    isFromAllFolders = true
+                                    activeSubViewTitle = "文件夹 · ${folder.name}"
+                                    activeSubViewSubtitle = "本地目录 · 共 ${folder.songCount} 首歌曲"
+                                    activeSubViewSongs = folder.songs
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
                 } else if (isLoadingSubView) {
                     Box(
                         modifier = Modifier
@@ -1519,6 +1629,63 @@ fun LocalLibraryScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * 本地文件夹卡片 (极简优雅，展示目录名与歌曲数量)
+ */
+@Composable
+private fun FolderCardItem(
+    folder: UnifiedFolder,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = BorderStroke(1.dp, borderColor),
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Brush.linearGradient(listOf(Color(0xFFFF9500), Color(0xFFFF5E3A)))),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Folder,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f, fill = false)) {
+                Text(
+                    text = folder.name,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${folder.songCount} 首歌曲",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
