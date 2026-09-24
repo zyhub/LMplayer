@@ -108,9 +108,16 @@ fun LemonDiscoverHomeScreen(
         else SongMatchingResolver.resolveSongList(newSongs, allCachedSongs, activeDownloadTasks)
     }
 
-    val resolvedCollectionSongs = remember(activeCollectionSongs, allCachedSongs, activeDownloadTasks) {
-        if (allCachedSongs.isEmpty()) activeCollectionSongs
-        else SongMatchingResolver.resolveSongList(activeCollectionSongs, allCachedSongs, activeDownloadTasks)
+    val resolvedCollectionSongs = remember(activeCollectionSongs, allCachedSongs, activeDownloadTasks, activeCollectionCover) {
+        val songsWithCover = activeCollectionSongs.map { s ->
+            if (s.coverUrl.isNullOrBlank() && !activeCollectionCover.isNullOrBlank()) {
+                s.copy(coverUrl = activeCollectionCover)
+            } else {
+                s
+            }
+        }
+        if (allCachedSongs.isEmpty()) songsWithCover
+        else SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, activeDownloadTasks)
     }
 
     // 动态拉取发现页内容：分块独立异步加载与流式渐进呈现，大幅提速首页载入

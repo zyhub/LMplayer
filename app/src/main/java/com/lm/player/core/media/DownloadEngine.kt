@@ -223,6 +223,7 @@ class DownloadEngine(
             } else song
 
             val destFile = getTargetDownloadFile(songToDownload, effectiveFolderHierarchy)
+            val tempFile = File("${destFile.absolutePath}.download")
 
             // 1. 防重复下载检测与核对：检查 Room 数据库与本地文件真实性
             val record = downloadDao.getDownloadRecord(song.id)
@@ -230,8 +231,9 @@ class DownloadEngine(
                     !record.localFilePath.isNullOrBlank() &&
                     File(record.localFilePath).let { it.exists() && it.length() > 0 }
 
-            val isDestFileValid = destFile.exists() && destFile.length() > 0
-            val isLocalPathValid = !song.localFilePath.isNullOrBlank() && File(song.localFilePath).let { it.exists() && it.length() > 0 }
+            val isDestFileValid = destFile.exists() && destFile.length() > 0 && !tempFile.exists()
+            val isLocalPathValid = !song.localFilePath.isNullOrBlank() &&
+                    File(song.localFilePath).let { it.exists() && it.length() > 0 && it.name != tempFile.name }
 
             if (isRecordDownloaded || isDestFileValid || isLocalPathValid) {
                 val validPath = when {
@@ -311,32 +313,43 @@ class DownloadEngine(
                         actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$detectedExt")
                     }
 
-                    if (actualDestFile.exists()) {
-                        actualDestFile.delete()
-                    }
+                    val tempDestFile = File("${actualDestFile.absolutePath}.download")
+                    val existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
 
-                    val request = Request.Builder()
+                    val requestBuilder = Request.Builder()
                         .url(effectiveStreamUrl)
                         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                         .header("Accept", "*/*")
-                        .build()
+
+                    if (existingBytes > 0L) {
+                        requestBuilder.header("Range", "bytes=$existingBytes-")
+                    }
+
+                    val request = requestBuilder.build()
                     val response = okHttpClient.newCall(request).execute()
 
-                    if (!response.isSuccessful) {
+                    if (!response.isSuccessful && response.code != 416) {
                         throw Exception("HTTP 下载失败: ${response.code}")
                     }
 
+                    val isRangeOk = response.code == 206
+                    val append = isRangeOk && existingBytes > 0L
                     val body = response.body ?: throw Exception("响应体为空")
-                    val totalLength = body.contentLength()
+                    val totalLength = if (isRangeOk) {
+                        existingBytes + body.contentLength()
+                    } else {
+                        if (!append && tempDestFile.exists()) tempDestFile.delete()
+                        body.contentLength()
+                    }
 
                     var lastTime = System.currentTimeMillis()
-                    var lastBytes = 0L
+                    var lastBytes = if (append) existingBytes else 0L
+                    var totalRead = if (append) existingBytes else 0L
 
                     body.byteStream().use { input ->
-                        FileOutputStream(actualDestFile).use { output ->
+                        FileOutputStream(tempDestFile, append).use { output ->
                             val buffer = ByteArray(8 * 1024)
                             var bytesRead: Int
-                            var totalRead = 0L
 
                             while (input.read(buffer).also { bytesRead = it } != -1) {
                                 output.write(buffer, 0, bytesRead)
@@ -364,6 +377,15 @@ class DownloadEngine(
                         }
                     }
 
+                    // 下载完成，原子化重命名临时文件为正式音频文件
+                    if (actualDestFile.exists()) {
+                        actualDestFile.delete()
+                    }
+                    if (!tempDestFile.renameTo(actualDestFile)) {
+                        tempDestFile.copyTo(actualDestFile, overwrite = true)
+                        tempDestFile.delete()
+                    }
+
                     // 4. 后置元数据处理：拉取高清封面、原始同步歌词、生成伴随 .lrc 以及音频内嵌 ID3/FLAC/M4A 标签
                     val localCoverPath = postProcessDownloadedFile(actualDestFile, song)
                     val effectiveCover = if (!localCoverPath.isNullOrBlank() && song.coverUrl.isBlank()) localCoverPath else song.coverUrl
@@ -388,19 +410,27 @@ class DownloadEngine(
                     }
 
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to download song ${song.title}", e)
-                    if (actualDestFile.exists() && actualDestFile.length() == 0L) {
-                        actualDestFile.delete()
-                    }
-                    val failedEntity = initialEntity.copy(
-                        status = DownloadStatus.FAILED,
-                        errorMessage = e.message
-                    )
-                    downloadDao.insertOrUpdate(failedEntity)
-                    songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null)
-                    removeTask(song.id)
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    if (e is kotlinx.coroutines.CancellationException) {
+                        Log.i(TAG, "Download job for ${song.title} cancelled/paused by user")
+                    } else {
+                        Log.e(TAG, "Failed to download song ${song.title}", e)
+                        val tempDestFile = File("${actualDestFile.absolutePath}.download")
+                        if (tempDestFile.exists() && tempDestFile.length() == 0L) {
+                            tempDestFile.delete()
+                        }
+                        if (actualDestFile.exists() && actualDestFile.length() == 0L) {
+                            actualDestFile.delete()
+                        }
+                        val failedEntity = initialEntity.copy(
+                            status = DownloadStatus.FAILED,
+                            errorMessage = e.message
+                        )
+                        downloadDao.insertOrUpdate(failedEntity)
+                        songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null)
+                        removeTask(song.id)
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 } finally {
                     jobMap.remove(song.id)
@@ -408,6 +438,113 @@ class DownloadEngine(
             }
         }
         jobMap[song.id] = job
+    }
+
+    /**
+     * 暂停单曲下载任务 (保留断点文件，更新任务状态)
+     */
+    fun pauseTask(songId: String) {
+        val task = _activeTasksMap.value[songId] ?: return
+        jobMap[songId]?.cancel()
+        jobMap.remove(songId)
+        updateTask(task.copy(status = DownloadStatus.PAUSED, speedKbps = 0L))
+        coroutineScope.launch(Dispatchers.IO) {
+            downloadDao.getDownloadRecord(songId)?.let {
+                downloadDao.insertOrUpdate(it.copy(status = DownloadStatus.PAUSED))
+            }
+        }
+    }
+
+    /**
+     * 恢复/继续已暂停的下载任务 (基于 HTTP Range 断点续传)
+     */
+    fun resumeTask(songId: String) {
+        val task = _activeTasksMap.value[songId] ?: return
+        if (task.status == DownloadStatus.PAUSED || !jobMap.containsKey(songId)) {
+            startDownload(task.song)
+        }
+    }
+
+    /**
+     * 取消单曲下载任务 (彻底取消协程、清理残余临时文件并删除任务)
+     */
+    fun cancelTask(songId: String) {
+        val task = _activeTasksMap.value[songId]
+        jobMap[songId]?.cancel()
+        jobMap.remove(songId)
+        removeTask(songId)
+        coroutineScope.launch(Dispatchers.IO) {
+            val record = downloadDao.getDownloadRecord(songId)
+            if (record?.localFilePath != null) {
+                val f = File(record.localFilePath)
+                if (f.exists()) f.delete()
+                val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                if (lrcFile.exists()) lrcFile.delete()
+                val tempFile = File("${f.absolutePath}.download")
+                if (tempFile.exists()) tempFile.delete()
+            }
+            val existingSong = songDao.getSongById(songId)
+            if (existingSong?.serverId == "local_storage") {
+                songDao.deleteSongById(songId)
+            } else {
+                songDao.updateDownloadStatus(songId, DownloadStatus.NOT_DOWNLOADED, null)
+            }
+            downloadDao.deleteDownload(songId)
+            task?.let {
+                val f = getTargetDownloadFile(it.song)
+                if (f.exists()) f.delete()
+                val tempFile = File("${f.absolutePath}.download")
+                if (tempFile.exists()) tempFile.delete()
+            }
+            val dir = getDownloadDir()
+            dir.listFiles { _, name -> name.startsWith(songId) }?.forEach { it.delete() }
+        }
+    }
+
+    /**
+     * 批量暂停下载任务
+     */
+    fun pauseTasks(ids: Set<String>) {
+        ids.forEach { pauseTask(it) }
+    }
+
+    /**
+     * 批量继续下载任务
+     */
+    fun resumeTasks(ids: Set<String>) {
+        ids.forEach { resumeTask(it) }
+    }
+
+    /**
+     * 批量取消下载任务
+     */
+    fun cancelTasks(ids: Set<String>) {
+        ids.forEach { cancelTask(it) }
+    }
+
+    /**
+     * 全部暂停
+     */
+    fun pauseAll() {
+        _activeTasksMap.value.values
+            .filter { it.status == DownloadStatus.DOWNLOADING }
+            .forEach { pauseTask(it.song.id) }
+    }
+
+    /**
+     * 全部继续
+     */
+    fun resumeAll() {
+        _activeTasksMap.value.values
+            .filter { it.status == DownloadStatus.PAUSED }
+            .forEach { resumeTask(it.song.id) }
+    }
+
+    /**
+     * 全部取消
+     */
+    fun cancelAll() {
+        _activeTasksMap.value.keys.toList().forEach { cancelTask(it) }
     }
 
     /**
@@ -572,31 +709,9 @@ class DownloadEngine(
      * 取消/停止正在进行的下载，并彻底清理未完成的临时文件
      */
     fun cancelDownload(songId: String) {
-        val job = jobMap.remove(songId)
-        job?.cancel()
-        removeTask(songId)
-        coroutineScope.launch(Dispatchers.IO) {
-            val record = downloadDao.getDownloadRecord(songId)
-            if (record?.localFilePath != null) {
-                val f = File(record.localFilePath)
-                if (f.exists()) f.delete()
-                val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
-                if (lrcFile.exists()) lrcFile.delete()
-            }
-            val dir = getDownloadDir()
-            dir.listFiles { _, name -> name.startsWith(songId) }?.forEach { it.delete() }
-
-            val existingSong = songDao.getSongById(songId)
-            if (existingSong?.serverId == "local_storage") {
-                songDao.deleteSongById(songId)
-            } else {
-                songDao.updateDownloadStatus(songId, DownloadStatus.NOT_DOWNLOADED, null)
-            }
-            downloadDao.deleteDownload(songId)
-
-            withContext(Dispatchers.Main) {
-                Toast.makeText(context, "已停止并移除下载任务", Toast.LENGTH_SHORT).show()
-            }
+        cancelTask(songId)
+        coroutineScope.launch(Dispatchers.Main) {
+            Toast.makeText(context, "已停止并移除下载任务", Toast.LENGTH_SHORT).show()
         }
     }
 

@@ -456,7 +456,9 @@ fun SettingsScreen(
                     // 3. 软件版本与在线更新 (更新源: 用户仓库 zyhub/LMplayer)
                     item {
                         SettingsCard(title = "软件版本与在线更新", icon = Icons.Default.SystemUpdate) {
-                            SettingInfoRow(label = "当前版本", value = "v${AppUpdateManager.CURRENT_VERSION_NAME} (Build ${AppUpdateManager.CURRENT_VERSION_CODE})")
+                            val curVerName = AppUpdateManager.getAppVersionName(context)
+                            val curVerCode = AppUpdateManager.getAppVersionCode(context)
+                            SettingInfoRow(label = "当前版本", value = "v$curVerName (Build $curVerCode)")
                             SettingInfoRow(label = "更新来源", value = AppUpdateManager.DEFAULT_GITHUB_REPO)
                             SettingInfoRow(label = "开源地址", value = "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
 
@@ -506,14 +508,14 @@ fun SettingsScreen(
                                     onClick = {
                                         activeUpdateInfo = UpdateInfo(
                                             hasUpdate = false,
-                                            latestVersion = AppUpdateManager.CURRENT_VERSION_NAME,
-                                            latestVersionCode = AppUpdateManager.CURRENT_VERSION_CODE,
-                                            releaseNotes = "【v${AppUpdateManager.CURRENT_VERSION_NAME} 最新更新日志】\n\n" +
-                                                "1. 播放界面喜欢按钮红心状态彻底修复，支持0ms即刻响应\n" +
-                                                "2. 设置中心全部配置项升级为现代轻奢下拉菜单 (Dropdown)\n" +
-                                                "3. 存储与路径重构，升级为本地存储使用信息看板\n" +
-                                                "4. 新增本地已下载歌曲深度管理：支持多选、批量删除、文件详情与路径复制\n" +
-                                                "5. 账号及服务中集成 GitHub 在线更新窗口与官方发布通道\n" +
+                                            latestVersion = curVerName,
+                                            latestVersionCode = curVerCode.toInt(),
+                                            releaseNotes = "【v${curVerName} 最新更新日志】\n\n" +
+                                                "1. 修复资料库本地模式新建歌单丢失问题，优化多端同步保护机制\n" +
+                                                "2. 修复资料库歌单组中点击全部无法展示歌单列表的问题，重构为自适应网格画廊\n" +
+                                                "3. 修复首页新碟首发封面未正常加载问题，兼容多音源网络防盗链与图床解析\n" +
+                                                "4. 全面支持本地已下载歌曲关联本地文件、历史内嵌标签与伴随歌词同步生成\n" +
+                                                "5. 版本号与构建号动态读取展示与自动化在线更新通道接入\n" +
                                                 "6. 针对车载大屏与手机全屏进行了硬件级与分辨率级深度调优",
                                             downloadUrl = ""
                                         )
@@ -1644,15 +1646,29 @@ fun SettingsScreen(
         var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
         var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
         var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
+        var isTestingConnection by remember { mutableStateOf(false) }
+        var testResultMsg by remember { mutableStateOf<String?>(null) }
+        var isTestSuccess by remember { mutableStateOf<Boolean?>(null) }
+
+        fun normalizeServerUrl(raw: String): String {
+            val trimmed = raw.trim()
+            if (trimmed.isBlank()) return ""
+            val withProto = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+                "http://$trimmed"
+            } else {
+                trimmed
+            }
+            return withProto.trimEnd('/')
+        }
 
         Dialog(onDismissRequest = { showAddServerDialog = false }) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = cardBg,
                 border = BorderStroke(1.dp, borderColor),
-                modifier = Modifier.fillMaxWidth(0.94f).padding(16.dp)
+                modifier = Modifier.fillMaxWidth(0.96f).padding(12.dp)
             ) {
-                Column(modifier = Modifier.padding(20.dp)) {
+                Column(modifier = Modifier.padding(18.dp)) {
                     Text(if (editingServer != null) "编辑服务器" else "添加新服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(14.dp))
 
@@ -1667,8 +1683,11 @@ fun SettingsScreen(
 
                     OutlinedTextField(
                         value = serverUrlInput,
-                        onValueChange = { serverUrlInput = it },
-                        label = { Text("服务器地址 (如 http://192.168.1.100:3000)") },
+                        onValueChange = { 
+                            serverUrlInput = it
+                            testResultMsg = null
+                        },
+                        label = { Text("服务器地址 (支持内网IP如 192.168.1.100:3000)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -1691,19 +1710,106 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    Spacer(modifier = Modifier.height(20.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        OutlinedButton(onClick = { showAddServerDialog = false }, modifier = Modifier.weight(1f)) {
-                            Text("取消")
+                    if (testResultMsg != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = testResultMsg ?: "",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (isTestSuccess == true) Color(0xFF34C759) else MaterialTheme.colorScheme.error,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 测试连接按钮
+                        OutlinedButton(
+                            onClick = {
+                                val cleanUrl = normalizeServerUrl(serverUrlInput)
+                                if (cleanUrl.isBlank()) {
+                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
+                                    return@OutlinedButton
+                                }
+                                serverUrlInput = cleanUrl
+                                isTestingConnection = true
+                                testResultMsg = null
+                                isTestSuccess = null
+                                coroutineScope.launch {
+                                    val startTime = System.currentTimeMillis()
+                                    try {
+                                        val testConfig = ServerConfig(
+                                            id = "test_conn",
+                                            name = serverNameInput.ifBlank { "测试服务器" },
+                                            type = serverTypeInput,
+                                            serverUrl = cleanUrl,
+                                            username = usernameInput.trim(),
+                                            tokenOrApiKey = tokenInput.trim(),
+                                            isCurrentActive = false
+                                        )
+                                        val client = NetworkClientFactory.createOkHttpClient(context)
+                                        val proto = LemonMusicProtocol(client, cleanUrl, testConfig.username, testConfig.tokenOrApiKey)
+                                        val authRes = proto.authenticate(testConfig)
+                                        val latency = System.currentTimeMillis() - startTime
+                                        if (authRes.isSuccess) {
+                                            isTestSuccess = true
+                                            testResultMsg = "✓ 连接成功 (耗时 ${latency}ms)"
+                                            Toast.makeText(context, "连接成功 (耗时 ${latency}ms)", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            isTestSuccess = false
+                                            val err = authRes.exceptionOrNull()?.message ?: "鉴权失败"
+                                            testResultMsg = "✕ 连接失败: $err"
+                                            Toast.makeText(context, "连接失败: $err", Toast.LENGTH_SHORT).show()
+                                        }
+                                    } catch (e: Exception) {
+                                        isTestSuccess = false
+                                        val err = e.localizedMessage ?: "无法访问服务器"
+                                        testResultMsg = "✕ 无法访问: $err"
+                                        Toast.makeText(context, "无法访问: $err", Toast.LENGTH_SHORT).show()
+                                    } finally {
+                                        isTestingConnection = false
+                                    }
+                                }
+                            },
+                            enabled = !isTestingConnection,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            if (isTestingConnection) {
+                                CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp, color = AppleRed)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("测试中", fontSize = 13.sp, maxLines = 1)
+                            } else {
+                                Text("测试连接", fontSize = 13.sp, maxLines = 1)
+                            }
                         }
+
+                        // 取消按钮
+                        OutlinedButton(
+                            onClick = { showAddServerDialog = false },
+                            modifier = Modifier.weight(0.75f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("取消", fontSize = 13.sp, maxLines = 1)
+                        }
+
+                        // 保存按钮 (不分行，文字为保存)
                         Button(
                             onClick = {
-                                if (serverUrlInput.isNotBlank()) {
+                                val cleanUrl = normalizeServerUrl(serverUrlInput)
+                                if (cleanUrl.isNotBlank()) {
                                     val newConfig = ServerConfig(
                                         id = editingServer?.id ?: "srv_${System.currentTimeMillis()}",
                                         name = serverNameInput.ifBlank { "我的音乐服务器" },
                                         type = serverTypeInput,
-                                        serverUrl = serverUrlInput.trim().removeSuffix("/"),
+                                        serverUrl = cleanUrl,
                                         username = usernameInput.trim(),
                                         tokenOrApiKey = tokenInput.trim(),
                                         isCurrentActive = true
@@ -1715,9 +1821,11 @@ fun SettingsScreen(
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(0.85f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+                            shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("保存并连接")
+                            Text("保存", fontSize = 13.sp, maxLines = 1)
                         }
                     }
                 }

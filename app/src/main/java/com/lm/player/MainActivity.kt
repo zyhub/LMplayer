@@ -20,12 +20,17 @@ import androidx.annotation.OptIn
 import androidx.compose.animation.*
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
@@ -124,6 +129,9 @@ class MainActivity : ComponentActivity() {
     @kotlin.OptIn(ExperimentalMaterial3WindowSizeClassApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 系统底层接管：将实体按键音量控制通道绑定为媒体音量 (解决应用内音量键无效问题)
+        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
 
         // 1. 初始化核心数据库、路由与下载引擎
         database = ZdsDatabase.getInstance(this)
@@ -251,6 +259,48 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // 极速同步服务器歌单 (轻量级秒级同步，完全解耦于大体量歌曲全量同步)
+            val syncServerPlaylists: (ServerConfig) -> Unit = { config ->
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                        val protocol = LemonMusicProtocol(client, config.serverUrl, config.username, config.tokenOrApiKey)
+                        val authRes = protocol.authenticate(config)
+                        val effectiveToken = authRes.getOrNull() ?: config.tokenOrApiKey
+                        val activeProto = if (effectiveToken.isNotBlank() && effectiveToken != config.tokenOrApiKey) {
+                            LemonMusicProtocol(client, config.serverUrl, config.username, effectiveToken)
+                        } else protocol
+
+                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
+                        if (playlistRes.isSuccess) {
+                            val plList = playlistRes.getOrNull() ?: emptyList()
+                            val incomingIds = plList.map { it.id }.toSet()
+                            val existingPlaylists = database.playlistDao().getAllPlaylists()
+                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
+                            for (oldPl in existingPlaylists) {
+                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
+                                    database.playlistDao().deletePlaylist(oldPl.id)
+                                }
+                            }
+                            val plEntities = plList.map { pl ->
+                                com.lm.player.core.database.entity.PlaylistEntity(
+                                    id = pl.id,
+                                    name = pl.name,
+                                    coverUrl = pl.coverUrl,
+                                    serverId = config.id,
+                                    isOnline = true,
+                                    songCount = pl.songCount
+                                )
+                            }
+                            database.playlistDao().insertPlaylists(plEntities)
+                            Log.i("MainActivity", "Successfully synced ${plEntities.size} server playlists for server ${config.id}")
+                        }
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "syncServerPlaylists failed", e)
+                    }
+                }
+            }
+
             // 同步远程柠檬音乐歌曲至本地 Room 数据库 (并行异步加速，全量同步)
             val syncServerSongs: (ServerConfig) -> Unit = { config ->
                 lifecycleScope.launch(Dispatchers.IO) {
@@ -259,7 +309,7 @@ class MainActivity : ComponentActivity() {
                     val authRes = protocol.authenticate(config)
                     if (authRes.isSuccess) {
                         val token = authRes.getOrNull() ?: ""
-                        if (token.isNotBlank() && token != config.tokenOrApiKey) {
+                        val activeProto = if (token.isNotBlank() && token != config.tokenOrApiKey) {
                             val updatedConfig = config.copy(tokenOrApiKey = token)
                             database.serverDao().insertServer(
                                 ServerEntity(
@@ -274,10 +324,40 @@ class MainActivity : ComponentActivity() {
                                     isCurrentActive = updatedConfig.isCurrentActive
                                 )
                             )
+                            LemonMusicProtocol(client, updatedConfig.serverUrl, updatedConfig.username, updatedConfig.tokenOrApiKey)
+                        } else protocol
+
+                        // 优先瞬时同步服务器歌单 (不等大体积曲库请求，秒级完成并更新界面)
+                        try {
+                            val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
+                            if (playlistRes.isSuccess) {
+                                val plList = playlistRes.getOrNull() ?: emptyList()
+                                val incomingIds = plList.map { it.id }.toSet()
+                                val existingPlaylists = database.playlistDao().getAllPlaylists()
+                                    .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
+                                for (oldPl in existingPlaylists) {
+                                    if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
+                                        database.playlistDao().deletePlaylist(oldPl.id)
+                                    }
+                                }
+                                val plEntities = plList.map { pl ->
+                                    com.lm.player.core.database.entity.PlaylistEntity(
+                                        id = pl.id,
+                                        name = pl.name,
+                                        coverUrl = pl.coverUrl,
+                                        serverId = config.id,
+                                        isOnline = true,
+                                        songCount = pl.songCount
+                                    )
+                                }
+                                database.playlistDao().insertPlaylists(plEntities)
+                            }
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Pre-sync playlists failed", e)
                         }
 
                         // 极速轻量化同步全量歌曲与最近添加、最近播放
-                        val songsRes = protocol.getSongList(offset = 0, limit = 0)
+                        val songsRes = activeProto.getSongList(offset = 0, limit = 0)
                         if (songsRes.isSuccess) {
                             val list = songsRes.getOrNull() ?: emptyList()
                             if (list.isNotEmpty()) {
@@ -314,7 +394,7 @@ class MainActivity : ComponentActivity() {
 
                         // 同步用户收藏与用户数据 (/api/library/user-data)
                         try {
-                            val userDataRes = protocol.getLibraryUserData()
+                            val userDataRes = activeProto.getLibraryUserData()
                             if (userDataRes.isSuccess) {
                                 val userDataObj = userDataRes.getOrNull()
                                 val favArr = userDataObj?.optJSONArray("favorites")
@@ -339,21 +419,21 @@ class MainActivity : ComponentActivity() {
                             Log.w("MainActivity", "Syncing user favorites failed", e)
                         }
 
-                        val addedList = protocol.getRecentlyAdded(limit = 30).getOrNull() ?: emptyList()
+                        val addedList = activeProto.getRecentlyAdded(limit = 30).getOrNull() ?: emptyList()
                         if (addedList.isNotEmpty()) recentlyAddedSongs = addedList
 
-                        val playedList = protocol.getRecentlyPlayed(limit = 30).getOrNull() ?: emptyList()
+                        val playedList = activeProto.getRecentlyPlayed(limit = 30).getOrNull() ?: emptyList()
                         if (playedList.isNotEmpty()) recentlyPlayedSongs = playedList
 
-                        // 同步服务器播放列表至数据库（含差量清理）
-                        val playlistRes = protocol.getPlaylists()
+                        // 再次对齐服务器播放列表至数据库（含差量清理）
+                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
                         if (playlistRes.isSuccess) {
                             val plList = playlistRes.getOrNull() ?: emptyList()
                             val incomingIds = plList.map { it.id }.toSet()
                             val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                .filter { it.serverId == config.id || it.serverId == "lemon_music" }
+                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
                             for (oldPl in existingPlaylists) {
-                                if (!incomingIds.contains(oldPl.id)) {
+                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
                                     database.playlistDao().deletePlaylist(oldPl.id)
                                 }
                             }
@@ -447,6 +527,7 @@ class MainActivity : ComponentActivity() {
                                         withContext(Dispatchers.Main) {
                                             activeServerName = active.name
                                         }
+                                        syncServerPlaylists(active)
                                         syncServerSongs(active)
                                     } else {
                                         Log.w("MainActivity", "Startup server check: ${active.name} is unreachable. Remaining in local mode.")
@@ -844,23 +925,31 @@ class MainActivity : ComponentActivity() {
             val handleCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { playlistName, songToAdd ->
                 lifecycleScope.launch(Dispatchers.IO) {
                     try {
-                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        val isCurrentLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                        val active = if (isCurrentLocalMode) null else serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                         var newPlId = "pl_${System.currentTimeMillis()}"
                         var isOnlinePl = active != null
 
                         if (isOnlinePl && active != null) {
-                            val protocol = LemonMusicProtocol(
-                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
-                                active.serverUrl,
-                                active.username,
-                                active.tokenOrApiKey
-                            )
-                            val res = protocol.createCustomPlaylist(playlistName)
-                            if (res.isSuccess) {
-                                res.getOrNull()?.let {
-                                    newPlId = it.id
-                                    isOnlinePl = true
+                            try {
+                                val protocol = LemonMusicProtocol(
+                                    NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                    active.serverUrl,
+                                    active.username,
+                                    active.tokenOrApiKey
+                                )
+                                val res = protocol.createCustomPlaylist(playlistName)
+                                if (res.isSuccess) {
+                                    res.getOrNull()?.let {
+                                        newPlId = it.id
+                                        isOnlinePl = true
+                                    }
+                                } else {
+                                    isOnlinePl = false
                                 }
+                            } catch (e: Exception) {
+                                Log.w("MainActivity", "Create server playlist failed, fallback to local", e)
+                                isOnlinePl = false
                             }
                         }
 
@@ -962,8 +1051,82 @@ class MainActivity : ComponentActivity() {
 
             CompositionLocalProvider(LocalAppDimensions provides appDimensions) {
                 ZDSPlayerTheme(themeMode = currentThemeMode) {
-                    // 响应式脚手架 (横屏大屏与竖屏手机统一使用底部悬浮一体化播放导航栏)
-                    AdaptiveAppScaffold(
+                    // 全局触屏边缘向右滑动返回手势监听 (适配现代全面屏返回手势)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                awaitPointerEventScope {
+                                    val edgeThreshold = 44.dp.toPx()
+                                    while (true) {
+                                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                        if (down.position.x <= edgeThreshold) {
+                                            var totalDx = 0f
+                                            var totalDy = 0f
+                                            var triggered = false
+                                            while (true) {
+                                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                val drag = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                totalDx += (drag.position.x - drag.previousPosition.x)
+                                                totalDy += (drag.position.y - drag.previousPosition.y)
+
+                                                if (!triggered && totalDx > 65.dp.toPx() && totalDx > kotlin.math.abs(totalDy) * 1.4f) {
+                                                    triggered = true
+                                                    drag.consume()
+                                                    onBackPressedDispatcher.onBackPressed()
+                                                    break
+                                                }
+                                                if (drag.changedToUp() || !drag.pressed) break
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                    ) {
+                        val allDownloads by database.downloadDao().getAllDownloadsFlow().collectAsState(initial = emptyList())
+                        val completedDownloadedSongs = remember(songList, allDownloads) {
+                            val downloadedFromSongList = songList.filter {
+                                (it.downloadStatus == DownloadStatus.DOWNLOADED ||
+                                 it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
+                                 !it.localFilePath.isNullOrBlank()) &&
+                                (it.localFilePath?.let { p -> File(p).exists() } ?: (it.downloadStatus == DownloadStatus.DOWNLOADED))
+                            }
+
+                            val songIdsInList = downloadedFromSongList.map { it.id }.toSet()
+                            val localPathsInList = downloadedFromSongList.mapNotNull { it.localFilePath }.toSet()
+
+                            val complementaryFromDownloads = allDownloads.filter { record ->
+                                record.status == DownloadStatus.DOWNLOADED &&
+                                !songIdsInList.contains(record.songId) &&
+                                (record.localFilePath == null || !localPathsInList.contains(record.localFilePath)) &&
+                                (record.localFilePath != null && File(record.localFilePath).exists())
+                            }.map { record ->
+                                val file = record.localFilePath?.let { File(it) }
+                                val ext = file?.extension?.ifBlank { "mp3" } ?: "mp3"
+                                UnifiedSong(
+                                    id = record.songId,
+                                    title = record.title,
+                                    artist = record.artist,
+                                    artistId = "artist_${record.artist.hashCode()}",
+                                    album = "已下载歌曲",
+                                    albumId = "album_downloaded",
+                                    durationMs = 0L,
+                                    coverUrl = record.coverUrl,
+                                    streamUrl = record.localFilePath ?: record.remoteUrl,
+                                    serverId = "local_storage",
+                                    localFilePath = record.localFilePath,
+                                    downloadStatus = DownloadStatus.DOWNLOADED,
+                                    bitRate = 320,
+                                    format = ext,
+                                    isFavorite = false
+                                )
+                            }
+
+                            downloadedFromSongList + complementaryFromDownloads
+                        }
+
+                        // 响应式脚手架 (横屏大屏与竖屏手机统一使用底部悬浮一体化播放导航栏)
+                        AdaptiveAppScaffold(
                         windowSizeClass = windowSizeClass.widthSizeClass,
                         currentScreen = if (currentScreen == Screen.DOWNLOADS) Screen.LIBRARY else currentScreen,
                         currentPlayingSong = currentSong,
@@ -1018,6 +1181,7 @@ class MainActivity : ComponentActivity() {
                                                 activeServerId = selectedServer.id
                                                 lifecycleScope.launch(Dispatchers.IO) {
                                                     database.serverDao().setActiveServer(selectedServer.id)
+                                                    syncServerPlaylists(selectedServer)
                                                     syncServerSongs(selectedServer)
                                                 }
                                             },
@@ -1139,12 +1303,13 @@ class MainActivity : ComponentActivity() {
                                     }
                                     LocalLibraryScreen(
                                         allSongs = librarySongs,
+                                        downloadedSongs = completedDownloadedSongs,
                                         playlists = if (isLocalMode) {
-                                            playlistsList.filter { !it.isOnline }
+                                            playlistsList.filter { !it.isDiscover && !it.id.startsWith("discover_") && !it.id.startsWith("lemon_rec_") }
                                         } else {
                                             playlistsList.filter {
                                                 !it.isDiscover && !it.id.startsWith("discover_") && !it.id.startsWith("lemon_rec_") &&
-                                                (it.serverId == activeConfig?.id || !it.isOnline)
+                                                (it.serverId == activeConfig?.id || it.serverId == "lemon_music" || it.serverId.startsWith("lemon_") || it.serverId == activeConfig?.serverUrl || !it.isOnline)
                                             }
                                         },
                                         activeServerConfig = activeConfig,
@@ -1161,6 +1326,7 @@ class MainActivity : ComponentActivity() {
                                             activeServerId = selectedServer.id
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 database.serverDao().setActiveServer(selectedServer.id)
+                                                syncServerPlaylists(selectedServer)
                                                 syncServerSongs(selectedServer)
                                             }
                                         },
@@ -1168,6 +1334,7 @@ class MainActivity : ComponentActivity() {
                                             val active = serversList.firstOrNull { it.isCurrentActive }
                                             if (active != null) {
                                                 Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库...", Toast.LENGTH_SHORT).show()
+                                                syncServerPlaylists(active)
                                                 syncServerSongs(active)
                                             } else {
                                                 Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
@@ -1177,6 +1344,9 @@ class MainActivity : ComponentActivity() {
                                         onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                         onDownloadSong = handleDownloadSong,
                                         onDownloadSongWithOptions = handleDownloadWithOptions,
+                                        onDeleteDownloadedSongs = { songsToDelete ->
+                                            downloadEngine.deleteDownloadedSongs(songsToDelete)
+                                        },
                                         onToggleFavorite = { songToToggle ->
                                             val updated = songToToggle.copy(isFavorite = !songToToggle.isFavorite)
                                             songList = songList.map { if (it.id == updated.id) updated else it }
@@ -1203,7 +1373,7 @@ class MainActivity : ComponentActivity() {
                                         onRefreshPlaylists = {
                                             if (activeConfig != null) {
                                                 Toast.makeText(this@MainActivity, "正在同步在线播放列表...", Toast.LENGTH_SHORT).show()
-                                                syncServerSongs(activeConfig)
+                                                syncServerPlaylists(activeConfig)
                                             } else {
                                                 Toast.makeText(this@MainActivity, "当前处于本地模式，暂无在线歌单", Toast.LENGTH_SHORT).show()
                                             }
@@ -1211,8 +1381,8 @@ class MainActivity : ComponentActivity() {
                                         onCreatePlaylist = { name, isOnline ->
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 var finalId = "pl_${System.currentTimeMillis()}"
-                                                var finalIsOnline = isOnline
-                                                if (isOnline && activeConfig != null) {
+                                                var finalIsOnline = isOnline && activeConfig != null
+                                                if (finalIsOnline && activeConfig != null) {
                                                     try {
                                                         val protocol = LemonMusicProtocol(
                                                             NetworkClientFactory.createOkHttpClient(this@MainActivity),
@@ -1227,9 +1397,12 @@ class MainActivity : ComponentActivity() {
                                                                 finalId = pl.id
                                                                 finalIsOnline = true
                                                             }
+                                                        } else {
+                                                            finalIsOnline = false
                                                         }
                                                     } catch (e: Exception) {
                                                         Log.w("MainActivity", "Create server playlist failed", e)
+                                                        finalIsOnline = false
                                                     }
                                                 }
                                                 database.playlistDao().insertPlaylist(
@@ -1241,6 +1414,9 @@ class MainActivity : ComponentActivity() {
                                                         songCount = 0
                                                     )
                                                 )
+                                                if (finalIsOnline && activeConfig != null) {
+                                                    syncServerPlaylists(activeConfig)
+                                                }
                                             }
                                         },
                                         onDeletePlaylist = { playlistId ->
@@ -1259,6 +1435,9 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                                 database.playlistDao().deletePlaylist(playlistId)
+                                                if (activeConfig != null) {
+                                                    syncServerPlaylists(activeConfig)
+                                                }
                                             }
                                         },
                                         onFetchPlaylistSongs = { playlistId, isOnline ->
@@ -1364,52 +1543,18 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 Screen.DOWNLOADS -> {
-                                    val allDownloads by database.downloadDao().getAllDownloadsFlow().collectAsState(initial = emptyList())
-                                    val completedList = remember(songList, allDownloads) {
-                                        val downloadedFromSongList = songList.filter {
-                                            (it.downloadStatus == DownloadStatus.DOWNLOADED ||
-                                             it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
-                                             !it.localFilePath.isNullOrBlank()) &&
-                                            (it.localFilePath?.let { p -> File(p).exists() } ?: (it.downloadStatus == DownloadStatus.DOWNLOADED))
-                                        }
-
-                                        val songIdsInList = downloadedFromSongList.map { it.id }.toSet()
-                                        val localPathsInList = downloadedFromSongList.mapNotNull { it.localFilePath }.toSet()
-
-                                        val complementaryFromDownloads = allDownloads.filter { record ->
-                                            record.status == DownloadStatus.DOWNLOADED &&
-                                            !songIdsInList.contains(record.songId) &&
-                                            (record.localFilePath == null || !localPathsInList.contains(record.localFilePath)) &&
-                                            (record.localFilePath != null && File(record.localFilePath).exists())
-                                        }.map { record ->
-                                            val file = record.localFilePath?.let { File(it) }
-                                            val ext = file?.extension?.ifBlank { "mp3" } ?: "mp3"
-                                            UnifiedSong(
-                                                id = record.songId,
-                                                title = record.title,
-                                                artist = record.artist,
-                                                artistId = "artist_${record.artist.hashCode()}",
-                                                album = "已下载歌曲",
-                                                albumId = "album_downloaded",
-                                                durationMs = 0L,
-                                                coverUrl = record.coverUrl,
-                                                streamUrl = record.localFilePath ?: record.remoteUrl,
-                                                serverId = "local_storage",
-                                                localFilePath = record.localFilePath,
-                                                downloadStatus = DownloadStatus.DOWNLOADED,
-                                                bitRate = 320,
-                                                format = ext,
-                                                isFavorite = false
-                                            )
-                                        }
-
-                                        downloadedFromSongList + complementaryFromDownloads
-                                    }
                                     DownloadManagerScreen(
                                         activeTasks = activeDownloadTasks,
-                                        completedSongs = completedList,
+                                        completedSongs = completedDownloadedSongs,
                                         onSongClick = playSong,
-                                        onCancelTask = { downloadEngine.cancelDownload(it) },
+                                        onCancelTask = { downloadEngine.cancelTask(it) },
+                                        onPauseTask = { downloadEngine.pauseTask(it) },
+                                        onResumeTask = { downloadEngine.resumeTask(it) },
+                                        onPauseTasks = { downloadEngine.pauseTasks(it) },
+                                        onResumeTasks = { downloadEngine.resumeTasks(it) },
+                                        onCancelTasks = { downloadEngine.cancelTasks(it) },
+                                        onPauseAll = { downloadEngine.pauseAll() },
+                                        onResumeAll = { downloadEngine.resumeAll() },
                                         onDeleteDownloadedSong = { songToDelete ->
                                             downloadEngine.deleteDownloadedSong(songToDelete)
                                         },
@@ -1749,6 +1894,7 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
 
     /**
      * 彻底关闭程序与播放服务
@@ -1840,8 +1986,40 @@ class MainActivity : ComponentActivity() {
                 if (p.isPlaying) PlaybackQueueManager.togglePlay(this@MainActivity)
                 return true
             }
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                audioManager?.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_RAISE,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                audioManager?.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_LOWER,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_MUTE -> {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                audioManager?.adjustStreamVolume(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.ADJUST_TOGGLE_MUTE,
+                    android.media.AudioManager.FLAG_SHOW_UI
+                )
+                return true
+            }
         }
         return false
+    }
+
+    override fun onResume() {
+        super.onResume()
+        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {

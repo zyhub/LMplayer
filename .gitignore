@@ -10,7 +10,8 @@ captures
 .externalNativeBuild
 .cxx
 *.apk
-!LMPlayer-v1.0.0.apk
+!LMPlayer-release.apk
+!LMPlayer-v*.apk
 *github-token*.txt
 *.log
 app.tgz

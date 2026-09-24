@@ -531,37 +531,131 @@ class LemonMusicProtocol(
     /**
      * 获取歌单列表：包含柠檬自建歌单与发现推荐歌单
      */
-    override suspend fun getPlaylists(): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
+    /**
+     * 获取歌单列表：包含用户资料库数据 (/api/library/user-data) 中的 playlists 与 favorites，
+     * 以及用户自建歌单接口 (/api/library/playlists)
+     */
+    override suspend fun getPlaylists(): Result<List<UnifiedPlaylist>> = getPlaylists("lemon_music")
+
+    suspend fun getPlaylists(targetServerId: String): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
             val playlists = ArrayList<UnifiedPlaylist>()
+            val seenIds = HashSet<String>()
 
-            // 仅获取用户自建歌单 (/api/library/playlists)，彻底还原纯净资料库
-            val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
-            client.newCall(customReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string() ?: ""
-                    val json = JSONObject(body)
-                    val list = json.optJSONArray("data") ?: JSONArray()
-                    for (i in 0 until list.length()) {
-                        val pl = list.optJSONObject(i) ?: continue
-                        val id = pl.optString("id", "lemon_pl_$i")
-                        val name = pl.optString("name", "未命名歌单")
-                        val coverUrl = pl.optString("coverUrl")
-                        val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+            // 1. 优先拉取 /api/library/user-data (包含用户全量歌单、收藏与配置)
+            try {
+                val userDataRes = getLibraryUserData()
+                if (userDataRes.isSuccess) {
+                    val userData = userDataRes.getOrNull()
+                    // A. 服务端「我的收藏」智能歌单 (放置在置顶首位)
+                    val favArr = userData?.optJSONArray("favorites")
+                    if (favArr != null && favArr.length() > 0) {
                         playlists.add(
                             UnifiedPlaylist(
-                                id = id,
-                                name = name,
-                                coverUrl = coverUrl,
-                                songCount = tracks.length(),
+                                id = "lemon_favorites",
+                                name = "我的收藏",
+                                coverUrl = "",
+                                songCount = favArr.length(),
                                 isOnline = true,
-                                serverId = "lemon_music",
+                                serverId = targetServerId,
                                 isDiscover = false
                             )
                         )
+                        seenIds.add("lemon_favorites")
+                    }
+
+                    // B. user-data 中的 playlists 自定义歌单
+                    val plArr = userData?.optJSONArray("playlists")
+                    if (plArr != null) {
+                        for (i in 0 until plArr.length()) {
+                            val pl = plArr.optJSONObject(i) ?: continue
+                            val id = pl.optString("id", "lemon_pl_$i")
+                            if (seenIds.add(id)) {
+                                val name = pl.optString("name", "未命名歌单")
+                                var coverUrl = pl.optString("coverUrl")
+                                val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+                                val snapshots = pl.optJSONObject("trackSnapshots")
+                                if (coverUrl.isBlank() && snapshots != null) {
+                                    val it = snapshots.keys()
+                                    while (it.hasNext()) {
+                                        val k = it.next()
+                                        val sn = snapshots.optJSONObject(k)
+                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        if (p.isNotBlank()) {
+                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
+                                            break
+                                        }
+                                    }
+                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
+                                    coverUrl = "$cleanBase$coverUrl"
+                                }
+                                playlists.add(
+                                    UnifiedPlaylist(
+                                        id = id,
+                                        name = name,
+                                        coverUrl = coverUrl,
+                                        songCount = tracks.length(),
+                                        isOnline = true,
+                                        serverId = targetServerId,
+                                        isDiscover = false
+                                    )
+                                )
+                            }
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Fetching /api/library/user-data for playlists error", e)
+            }
+
+            // 2. 兼容拉取 /api/library/playlists (旧版或特定端歌单接口)
+            try {
+                val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
+                client.newCall(customReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: ""
+                        val json = JSONObject(body)
+                        val list = json.optJSONArray("data") ?: JSONArray()
+                        for (i in 0 until list.length()) {
+                            val pl = list.optJSONObject(i) ?: continue
+                            val id = pl.optString("id", "lemon_pl_$i")
+                            if (seenIds.add(id)) {
+                                val name = pl.optString("name", "未命名歌单")
+                                var coverUrl = pl.optString("coverUrl")
+                                val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+                                val snapshots = pl.optJSONObject("trackSnapshots")
+                                if (coverUrl.isBlank() && snapshots != null) {
+                                    val it = snapshots.keys()
+                                    while (it.hasNext()) {
+                                        val k = it.next()
+                                        val sn = snapshots.optJSONObject(k)
+                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        if (p.isNotBlank()) {
+                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
+                                            break
+                                        }
+                                    }
+                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
+                                    coverUrl = "$cleanBase$coverUrl"
+                                }
+                                playlists.add(
+                                    UnifiedPlaylist(
+                                        id = id,
+                                        name = name,
+                                        coverUrl = coverUrl,
+                                        songCount = tracks.length(),
+                                        isOnline = true,
+                                        serverId = targetServerId,
+                                        isDiscover = false
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Fetching /api/library/playlists fallback error", e)
             }
 
             Result.success(playlists)
@@ -674,6 +768,17 @@ class LemonMusicProtocol(
         res
     }
 
+    private fun normalizeImageUrl(rawUrl: String?, cleanBase: String): String {
+        if (rawUrl.isNullOrBlank()) return ""
+        var url = rawUrl.trim()
+        if (url.startsWith("//")) {
+            url = "https:$url"
+        } else if (url.startsWith("/") && !url.startsWith("/data")) {
+            url = "$cleanBase$url"
+        }
+        return url
+    }
+
     private suspend fun fetchSingleSourceToplists(source: String): Result<List<LemonToplist>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
@@ -691,7 +796,13 @@ class LemonMusicProtocol(
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("topId") }
                     val name = item.optString("name").ifBlank { item.optString("title", "热歌榜") }
-                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    var cover = item.optString("cover")
+                        .ifBlank { item.optString("img") }
+                        .ifBlank { item.optString("pic") }
+                        .ifBlank { item.optString("picUrl") }
+                        .ifBlank { item.optString("pic_url") }
+                        .ifBlank { item.optString("coverUrl") }
+                    cover = normalizeImageUrl(cover, cleanBase)
                     val updateFreq = item.optString("updateTime").ifBlank {
                         item.optString("updateFrequency").ifBlank { item.optString("period", "每日更新") }
                     }
@@ -762,6 +873,16 @@ class LemonMusicProtocol(
                 val dataObj = json.optJSONObject("data")
                 val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
                 val songs = ArrayList<UnifiedSong>(list.length())
+
+                // 尝试提取专辑或榜单层级的兜底封面
+                val infoObj = dataObj?.optJSONObject("info")
+                var fallbackCover = infoObj?.optString("img")
+                    ?.ifBlank { infoObj.optString("pic") }
+                    ?.ifBlank { infoObj.optString("picUrl") }
+                    ?.ifBlank { infoObj.optString("cover") }
+                    ?: ""
+                fallbackCover = normalizeImageUrl(fallbackCover, cleanBase)
+
                 for (i in 0 until list.length()) {
                     val s = list.optJSONObject(i) ?: continue
                     val songId = s.optString("songmid").ifBlank { s.optString("id", "online_$i") }
@@ -769,7 +890,17 @@ class LemonMusicProtocol(
                     val singer = s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
                     val albumName = s.optString("albumName").ifBlank { s.optString("album", "在线精选") }
                     val duration = s.optDouble("interval", s.optDouble("duration", 0.0))
-                    val cover = s.optString("cover").ifBlank { s.optString("img").ifBlank { s.optString("pic", "") } }
+                    var cover = s.optString("cover")
+                        .ifBlank { s.optString("img") }
+                        .ifBlank { s.optString("pic") }
+                        .ifBlank { s.optString("picUrl") }
+                        .ifBlank { s.optString("pic_url") }
+                        .ifBlank { s.optString("albumpic") }
+                        .ifBlank { s.optString("album_pic") }
+                        .ifBlank { s.optString("albumPic") }
+                        .ifBlank { s.optString("imgurl") }
+                        .ifBlank { s.optString("coverUrl") }
+                    cover = normalizeImageUrl(cover, cleanBase).ifBlank { fallbackCover }
                     val sSource = s.optString("source", source)
                     val unifiedId = "lemon_online_${sSource}_$songId"
 
@@ -823,7 +954,17 @@ class LemonMusicProtocol(
                     val id = item.optString("id").ifBlank { item.optString("albumId", "album_$i") }
                     val name = item.optString("name").ifBlank { item.optString("title", "最新专辑") }
                     val artist = item.optString("artist").ifBlank { item.optString("singer", "未知歌手") }
-                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    var cover = item.optString("cover")
+                        .ifBlank { item.optString("img") }
+                        .ifBlank { item.optString("pic") }
+                        .ifBlank { item.optString("picUrl") }
+                        .ifBlank { item.optString("pic_url") }
+                        .ifBlank { item.optString("album_pic") }
+                        .ifBlank { item.optString("albumpic") }
+                        .ifBlank { item.optString("albumPic") }
+                        .ifBlank { item.optString("imgurl") }
+                        .ifBlank { item.optString("coverUrl") }
+                    cover = normalizeImageUrl(cover, cleanBase)
                     val count = item.optInt("total", item.optInt("count", item.optInt("songCount", 0)))
                     val yearStr = item.optString("publishTime").ifBlank { item.optString("year") }
                     val year = yearStr.take(4).toIntOrNull()
@@ -887,85 +1028,286 @@ class LemonMusicProtocol(
                 return@withContext fetchOnlineSongList(url, source)
             }
 
-            // C. 用户自建歌单：查出自建歌单的 paths，调用 /api/library/tracks/by-paths
-            val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
-            var targetPaths: List<String> = emptyList()
-            client.newCall(customReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string() ?: ""
-                    val json = JSONObject(body)
-                    val list = json.optJSONArray("data") ?: JSONArray()
-                    for (i in 0 until list.length()) {
-                        val pl = list.optJSONObject(i) ?: continue
-                        if (pl.optString("id") == playlistId) {
-                            val arr = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("paths") ?: pl.optJSONArray("tracks") ?: JSONArray()
-                            val pList = ArrayList<String>()
-                            for (j in 0 until arr.length()) {
-                                val item = arr.opt(j)
-                                val pathStr = when (item) {
-                                    is String -> item
-                                    is JSONObject -> item.optString("filePath").ifBlank { item.optString("localPath") }
-                                    else -> ""
+            // C. 若是发现新碟首发专辑：调用 /api/album?source=...&id=...
+            if (playlistId.startsWith("lemon_discover_album_")) {
+                val parts = playlistId.removePrefix("lemon_discover_album_").split("_", limit = 2)
+                val source = parts.getOrNull(0) ?: "tx"
+                val rawId = parts.getOrNull(1) ?: playlistId
+                val url = "$cleanBase/api/album?source=$source&id=${URLEncoder.encode(rawId, "UTF-8")}"
+                return@withContext fetchOnlineSongList(url, source)
+            }
+
+            val songs = ArrayList<UnifiedSong>()
+            val missingPaths = ArrayList<String>()
+
+            // C. 若是「我的收藏」智能歌单：直接从 /api/library/user-data 提取 favorites
+            if (playlistId == "lemon_favorites") {
+                try {
+                    val userDataRes = getLibraryUserData()
+                    val userData = userDataRes.getOrNull()
+                    val favArr = userData?.optJSONArray("favorites")
+                    if (favArr != null) {
+                        for (j in 0 until favArr.length()) {
+                            val item = favArr.opt(j)
+                            if (item is JSONObject) {
+                                val sName = item.optString("name").ifBlank { item.optString("title") }
+                                val sSinger = item.optString("singer").ifBlank { item.optString("artist", "未知歌手") }
+                                val sAlbum = item.optString("album", "未知专辑")
+                                val sLocalPath = item.optString("localPath").ifBlank { item.optString("filePath") }
+                                var sPic = item.optString("picUrl").ifBlank { item.optString("img") }
+                                val sSource = item.optString("source").ifBlank { item.optString("platform") }
+                                val sSongId = item.optString("songId").ifBlank { item.optString("id") }
+                                val durMs = (item.optDouble("interval", item.optDouble("duration", 0.0)) * 1000).toLong()
+
+                                if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
+                                    sPic = "$cleanBase$sPic"
                                 }
+
+                                if (sLocalPath.isNotBlank() || item.optString("key").startsWith("local:")) {
+                                    val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else item.optString("key").removePrefix("local:")).trim()
+                                    val songId = "lemon_${md5(cleanPath)}"
+                                    val streamUrl = "$cleanBase/api/play/stream?path=${URLEncoder.encode(cleanPath, "UTF-8")}"
+                                    val coverUrl = if (sPic.isNotBlank()) sPic else "$cleanBase/api/tag/cover?path=${URLEncoder.encode(cleanPath, "UTF-8")}"
+                                    val song = UnifiedSong(
+                                        id = songId,
+                                        title = sName.ifBlank { cleanPath.substringAfterLast('/').substringBeforeLast('.') },
+                                        artist = sSinger,
+                                        artistId = "artist_${sSinger.hashCode()}",
+                                        album = sAlbum,
+                                        albumId = "album_${sAlbum.hashCode()}",
+                                        durationMs = durMs,
+                                        coverUrl = coverUrl,
+                                        streamUrl = streamUrl,
+                                        serverId = "lemon_music",
+                                        localFilePath = null,
+                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                        bitRate = 320,
+                                        format = cleanPath.substringAfterLast('.', "flac").lowercase(),
+                                        isFavorite = true,
+                                        relativeFolderPath = cleanPath
+                                    )
+                                    songIdToPathMap[songId] = cleanPath
+                                    songIdToSongMap[songId] = song
+                                    songs.add(song)
+                                } else if (sSource.isNotBlank() && sSource != "local") {
+                                    val platform = sSource.ifBlank { "kw" }
+                                    val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_${sSongId.ifBlank { item.optString("key") }}"
+                                    val song = UnifiedSong(
+                                        id = onlineId,
+                                        title = sName.ifBlank { "在线曲目" },
+                                        artist = sSinger,
+                                        artistId = "artist_${sSinger.hashCode()}",
+                                        album = sAlbum,
+                                        albumId = "album_${sAlbum.hashCode()}",
+                                        durationMs = durMs,
+                                        coverUrl = sPic,
+                                        streamUrl = "lemon_online://$platform/${sSongId.ifBlank { item.optString("key") }}",
+                                        serverId = "lemon_online",
+                                        localFilePath = null,
+                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                        bitRate = 320,
+                                        format = "mp3",
+                                        isFavorite = true,
+                                        rawMetaJson = item.toString()
+                                    )
+                                    songs.add(song)
+                                }
+                            } else {
+                                val pathStr = item?.toString() ?: ""
                                 val clean = pathStr.removePrefix("local:").trim()
                                 if (clean.isNotBlank()) {
-                                    pList.add(clean)
+                                    missingPaths.add(clean)
                                 }
                             }
-                            targetPaths = pList
-                            break
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to get favorites from user-data", e)
+                }
+            } else {
+                // D. 用户自建与云端歌单：优先查 user-data 中的 playlists
+                var targetPl: JSONObject? = null
+                try {
+                    val userDataRes = getLibraryUserData()
+                    val userData = userDataRes.getOrNull()
+                    val plArr = userData?.optJSONArray("playlists")
+                    if (plArr != null) {
+                        for (i in 0 until plArr.length()) {
+                            val pl = plArr.optJSONObject(i) ?: continue
+                            if (pl.optString("id") == playlistId) {
+                                targetPl = pl
+                                break
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Search playlist in user-data failed", e)
+                }
+
+                // 若 user-data 中未匹配，回退从 /api/library/playlists 查询
+                if (targetPl == null) {
+                    try {
+                        val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
+                        client.newCall(customReq).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val body = resp.body?.string() ?: ""
+                                val json = JSONObject(body)
+                                val list = json.optJSONArray("data") ?: JSONArray()
+                                for (i in 0 until list.length()) {
+                                    val pl = list.optJSONObject(i) ?: continue
+                                    if (pl.optString("id") == playlistId) {
+                                        targetPl = pl
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Search playlist in /api/library/playlists failed", e)
+                    }
+                }
+
+                val finalPl = targetPl
+                if (finalPl != null) {
+                    val trackKeys = finalPl.optJSONArray("trackKeys") ?: finalPl.optJSONArray("paths") ?: finalPl.optJSONArray("tracks") ?: JSONArray()
+                    val snapshots = finalPl.optJSONObject("trackSnapshots")
+
+                    for (j in 0 until trackKeys.length()) {
+                        val rawKey = when (val item = trackKeys.opt(j)) {
+                            is String -> item
+                            is JSONObject -> item.optString("key").ifBlank { item.optString("filePath").ifBlank { item.optString("id") } }
+                            else -> ""
+                        }
+                        if (rawKey.isBlank()) continue
+
+                        val snapshot = snapshots?.optJSONObject(rawKey)
+                            ?: (if (trackKeys.opt(j) is JSONObject) trackKeys.opt(j) as JSONObject else null)
+
+                        if (snapshot != null) {
+                            val sName = snapshot.optString("name").ifBlank { snapshot.optString("title") }
+                            val sSinger = snapshot.optString("singer").ifBlank { snapshot.optString("artist", "未知歌手") }
+                            val sAlbum = snapshot.optString("album", "未知专辑")
+                            val sLocalPath = snapshot.optString("localPath").ifBlank { snapshot.optString("filePath") }
+                            val sSource = snapshot.optString("source").ifBlank { snapshot.optString("platform") }
+                            var sPic = snapshot.optString("picUrl").ifBlank { snapshot.optString("img") }
+                            val sSongId = snapshot.optString("songId").ifBlank { snapshot.optString("id") }
+                            val interval = snapshot.optDouble("interval", snapshot.optDouble("duration", 0.0))
+                            val durMs = (interval * 1000).toLong()
+
+                            if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
+                                sPic = "$cleanBase$sPic"
+                            }
+
+                            if (sLocalPath.isNotBlank() || rawKey.startsWith("local:")) {
+                                val cleanLocalPath = (if (sLocalPath.isNotBlank()) sLocalPath else rawKey.removePrefix("local:")).trim()
+                                val songId = "lemon_${md5(cleanLocalPath)}"
+                                val streamUrl = "$cleanBase/api/play/stream?path=${URLEncoder.encode(cleanLocalPath, "UTF-8")}"
+                                val coverUrl = if (sPic.isNotBlank()) sPic else "$cleanBase/api/tag/cover?path=${URLEncoder.encode(cleanLocalPath, "UTF-8")}"
+                                val ext = cleanLocalPath.substringAfterLast('.', "flac").lowercase()
+                                val song = UnifiedSong(
+                                    id = songId,
+                                    title = sName.ifBlank { cleanLocalPath.substringAfterLast('/').substringBeforeLast('.') },
+                                    artist = sSinger,
+                                    artistId = "artist_${sSinger.hashCode()}",
+                                    album = sAlbum,
+                                    albumId = "album_${sAlbum.hashCode()}",
+                                    durationMs = durMs,
+                                    coverUrl = coverUrl,
+                                    streamUrl = streamUrl,
+                                    serverId = "lemon_music",
+                                    localFilePath = null,
+                                    downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                    bitRate = 320,
+                                    format = ext,
+                                    isFavorite = false,
+                                    relativeFolderPath = cleanLocalPath
+                                )
+                                songIdToPathMap[songId] = cleanLocalPath
+                                songIdToSongMap[songId] = song
+                                songs.add(song)
+                            } else {
+                                val platform = sSource.ifBlank { "kw" }
+                                val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_${sSongId.ifBlank { rawKey }}"
+                                val song = UnifiedSong(
+                                    id = onlineId,
+                                    title = sName.ifBlank { "在线曲目" },
+                                    artist = sSinger,
+                                    artistId = "artist_${sSinger.hashCode()}",
+                                    album = sAlbum,
+                                    albumId = "album_${sAlbum.hashCode()}",
+                                    durationMs = durMs,
+                                    coverUrl = sPic,
+                                    streamUrl = "lemon_online://$platform/${sSongId.ifBlank { rawKey }}",
+                                    serverId = "lemon_online",
+                                    localFilePath = null,
+                                    downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                    bitRate = 320,
+                                    format = "mp3",
+                                    isFavorite = false,
+                                    rawMetaJson = snapshot.toString()
+                                )
+                                songs.add(song)
+                            }
+                        } else {
+                            val clean = rawKey.removePrefix("local:").trim()
+                            if (clean.isNotBlank()) {
+                                missingPaths.add(clean)
+                            }
                         }
                     }
                 }
             }
 
-            if (targetPaths.isEmpty()) {
-                return@withContext Result.success(emptyList())
-            }
+            // 若有未通过 snapshots 补全的纯本地路径，向 /api/library/tracks/by-paths 批量请求
+            if (missingPaths.isNotEmpty()) {
+                try {
+                    val payload = JSONObject().apply {
+                        put("paths", JSONArray(missingPaths))
+                    }
+                    val byPathsReq = newAuthRequest("$cleanBase/api/library/tracks/by-paths")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
 
-            // 批量获取路径曲目元数据
-            val payload = JSONObject().apply {
-                put("paths", JSONArray(targetPaths))
-            }
-            val byPathsReq = newAuthRequest("$cleanBase/api/library/tracks/by-paths")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .build()
+                    client.newCall(byPathsReq).execute().use { resp ->
+                        val body = resp.body?.string() ?: ""
+                        if (resp.isSuccessful) {
+                            val json = JSONObject(body)
+                            val arr = json.optJSONArray("data") ?: JSONArray()
+                            for (i in 0 until arr.length()) {
+                                val item = arr.optJSONObject(i) ?: continue
+                                val filePath = item.optString("filePath").trim()
+                                if (filePath.isBlank()) continue
+                                val fileName = item.optString("fileName")
+                                val title = item.optString("title").ifBlank { fileName.substringBeforeLast('.', fileName) }
+                                val artist = item.optString("artist", "未知歌手")
+                                val album = item.optString("album", "未知专辑")
+                                val durationMs = (item.optDouble("duration", 0.0) * 1000).toLong()
+                                val songId = "lemon_${md5(filePath)}"
 
-            client.newCall(byPathsReq).execute().use { resp ->
-                val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取歌单曲目失败"))
-                val json = JSONObject(body)
-                val arr = json.optJSONArray("data") ?: JSONArray()
-                val songs = ArrayList<UnifiedSong>(arr.length())
-                for (i in 0 until arr.length()) {
-                    val item = arr.optJSONObject(i) ?: continue
-                    val filePath = item.optString("filePath").trim()
-                    if (filePath.isBlank()) continue
-                    val fileName = item.optString("fileName")
-                    val title = item.optString("title").ifBlank { fileName.substringBeforeLast('.', fileName) }
-                    val artist = item.optString("artist", "未知歌手")
-                    val album = item.optString("album", "未知专辑")
-                    val durationMs = (item.optDouble("duration", 0.0) * 1000).toLong()
-                    val songId = "lemon_${md5(filePath)}"
-
-                    val song = UnifiedSong(
-                        id = songId,
-                        title = title,
-                        artist = artist,
-                        album = album,
-                        durationMs = durationMs,
-                        coverUrl = getCoverArtUrl(songId),
-                        streamUrl = getStreamUrl(songId),
-                        serverId = "lemon_music",
-                        format = item.optString("format", "flac"),
-                        relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
-                    )
-                    songIdToPathMap[songId] = filePath
-                    songIdToSongMap[songId] = song
-                    songs.add(song)
+                                val song = UnifiedSong(
+                                    id = songId,
+                                    title = title,
+                                    artist = artist,
+                                    album = album,
+                                    durationMs = durationMs,
+                                    coverUrl = getCoverArtUrl(songId),
+                                    streamUrl = getStreamUrl(songId),
+                                    serverId = "lemon_music",
+                                    format = item.optString("format", "flac"),
+                                    relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
+                                )
+                                songIdToPathMap[songId] = filePath
+                                songIdToSongMap[songId] = song
+                                songs.add(song)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to query tracks by paths fallback", e)
                 }
-                Result.success(songs)
             }
+
+            Result.success(songs)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get playlist songs", e)
             Result.failure(e)

@@ -91,7 +91,8 @@ enum class DownloadStatus {
     NOT_DOWNLOADED,
     DOWNLOADING,
     DOWNLOADED,
-    FAILED
+    FAILED,
+    PAUSED
 }
 
 enum class ServerType(val displayName: String) {

@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.network
+package com.lm.player.core.network
 
 import android.content.Context
 import android.os.Build
@@ -53,6 +53,19 @@ object NetworkClientFactory {
             level = HttpLoggingInterceptor.Level.BASIC
         }
         builder.addInterceptor(logging)
+
+        // 统一注入现代主流 User-Agent，杜绝网易云、酷我、QQ音乐等封面 CDN 403 防盗链拦截
+        builder.addInterceptor { chain ->
+            val request = chain.request()
+            val reqBuilder = request.newBuilder()
+            if (request.header("User-Agent").isNullOrBlank()) {
+                reqBuilder.header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
+            chain.proceed(reqBuilder.build())
+        }
 
         // API 23~28 专属 SSLContext 配置
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {

@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.designsystem.component
+package com.lm.player.core.designsystem.component
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -56,8 +56,15 @@ fun AlbumArtworkImage(
     seedId: String = "",
     targetSize: Int = 160 // 默认按列表高保真 160px 解码，大幅减少 75% 显存
 ) {
-    val gradientColors = remember(seedId, model) {
-        getGradientForId(if (seedId.isNotBlank()) seedId else (model ?: "seed"))
+    val cleanModel = remember(model) {
+        if (model.isNullOrBlank()) null
+        else {
+            val trimmed = model.trim()
+            if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
+        }
+    }
+    val gradientColors = remember(seedId, cleanModel) {
+        getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "seed"))
     }
     val context = LocalContext.current
 
@@ -68,11 +75,11 @@ fun AlbumArtworkImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!model.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
-                model = remember(model, targetSize) {
+                model = remember(cleanModel, targetSize) {
                     ImageRequest.Builder(context)
-                        .data(model)
+                        .data(cleanModel)
                         .size(targetSize, targetSize)
                         .crossfade(false)
                         .build()

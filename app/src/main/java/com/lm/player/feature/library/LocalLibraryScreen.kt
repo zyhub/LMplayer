@@ -1,6 +1,11 @@
 package com.lm.player.feature.library
 
+import android.util.Log
 import android.widget.Toast
+import java.io.File
+import androidx.activity.compose.BackHandler
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -10,6 +15,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -58,6 +66,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
+    downloadedSongs: List<UnifiedSong> = emptyList(),
     playlists: List<UnifiedPlaylist> = emptyList(),
     activeServerConfig: ServerConfig? = null,
     activeDownloadTasks: List<DownloadTask> = emptyList(),
@@ -77,6 +86,7 @@ fun LocalLibraryScreen(
     onFetchServerScanStatus: (suspend () -> LemonScanStatus?)? = null,
     onTriggerServerScan: (suspend () -> Unit)? = null,
     onDeleteLocalFilePath: (suspend (String) -> Unit)? = null,
+    onDeleteDownloadedSongs: ((List<UnifiedSong>) -> Unit)? = null,
     initialCategory: LibraryCategory? = null,
     currentServerName: String = "本地模式",
     configuredServers: List<ServerConfig> = emptyList(),
@@ -102,6 +112,54 @@ fun LocalLibraryScreen(
     var activeSubViewSubtitle by remember { mutableStateOf<String>("") }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingSubView by remember { mutableStateOf(false) }
+    var isFromAllPlaylists by remember { mutableStateOf(false) }
+
+    // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 兜底聚合
+    val finalDownloadedSongs = remember(allSongs, downloadedSongs) {
+        if (downloadedSongs.isNotEmpty()) {
+            downloadedSongs
+        } else {
+            allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || (!it.localFilePath.isNullOrBlank() && File(it.localFilePath).exists()) }
+        }
+    }
+    var isDownloadManagementMode by remember { mutableStateOf(false) }
+    val selectedDownloadSongIds = remember { mutableStateListOf<String>() }
+    var showBatchDeleteLocalDialog by remember { mutableStateOf(false) }
+
+    // 当处于本地下载视图时，若下载任务完成或变动，实时响应刷新
+    LaunchedEffect(finalDownloadedSongs) {
+        if (activeSubViewTitle == "本地下载") {
+            activeSubViewSongs = finalDownloadedSongs
+            activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
+        }
+    }
+
+    // 自动同步服务器歌单 (进入资料库或服务器配置就绪时自动拉取)
+    LaunchedEffect(activeServerConfig?.id) {
+        if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
+            onRefreshPlaylists()
+        }
+    }
+
+    // 层级返回调度器：如果从「全部歌单」进入某个歌单，先返回「全部歌单」，再返回资料库首页
+    val handleSubViewBack: () -> Unit = {
+        if (isDownloadManagementMode) {
+            isDownloadManagementMode = false
+            selectedDownloadSongIds.clear()
+        } else if (activeSubViewTitle != "全部歌单" && isFromAllPlaylists) {
+            activeSubViewTitle = "全部歌单"
+            activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
+            isFromAllPlaylists = false
+        } else {
+            activeSubViewTitle = null
+            isFromAllPlaylists = false
+        }
+    }
+
+    // 触屏滑动返回或物理按键退出下钻视图与多选模式
+    BackHandler(enabled = activeSubViewTitle != null) {
+        handleSubViewBack()
+    }
 
     // 下载选择弹窗
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
@@ -109,8 +167,16 @@ fun LocalLibraryScreen(
     // 创建歌单弹窗
     var isCreatePlaylistDialogOpen by remember { mutableStateOf(false) }
     var newPlaylistName by remember { mutableStateOf("") }
-    var newPlaylistIsOnline by remember { mutableStateOf(activeServerConfig != null) }
+    var newPlaylistIsOnline by remember { mutableStateOf(activeServerConfig != null && !currentServerName.contains("本地") && !currentServerName.contains("已下载")) }
     val isServerOk = activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC
+
+    // 监听新建歌单弹窗打开事件，动态同步在线开关
+    LaunchedEffect(isCreatePlaylistDialogOpen) {
+        if (isCreatePlaylistDialogOpen) {
+            newPlaylistName = ""
+            newPlaylistIsOnline = (activeServerConfig != null && !currentServerName.contains("本地") && !currentServerName.contains("已下载"))
+        }
+    }
 
     // 动态聚合数据
     val artists = remember(allSongs) {
@@ -403,16 +469,34 @@ fun LocalLibraryScreen(
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
-                            Text(
-                                text = "全部 ${playlists.size + 2} 个",
-                                fontSize = 12.sp,
-                                color = AppleRed,
-                                modifier = Modifier.clickable {
-                                    activeSubViewTitle = "全部歌单"
-                                    activeSubViewSubtitle = "共 ${playlists.size + 2} 个歌单"
-                                    activeSubViewSongs = allSongs
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
+                                    IconButton(
+                                        onClick = { onRefreshPlaylists() },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Refresh,
+                                            contentDescription = "同步歌单",
+                                            tint = AppleRed,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                 }
-                            )
+                                Text(
+                                    text = "全部 ${playlists.size + 3} 个",
+                                    fontSize = 12.sp,
+                                    color = AppleRed,
+                                    modifier = Modifier.clickable {
+                                        activeSubViewTitle = "全部歌单"
+                                        activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
+                                        isFromAllPlaylists = false
+                                    }
+                                )
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
@@ -456,6 +540,25 @@ fun LocalLibraryScreen(
                                         activeSubViewTitle = "最近播放"
                                         activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentSongs.size} 首"
                                         activeSubViewSongs = recentSongs
+                                        isDownloadManagementMode = false
+                                        selectedDownloadSongIds.clear()
+                                    }
+                                )
+                            }
+
+                            // D. 本地下载 (Downloaded Folder Card)
+                            item {
+                                PlaylistSpecialCard(
+                                    title = "本地下载",
+                                    subtitle = "${finalDownloadedSongs.size} 首歌曲",
+                                    icon = Icons.Default.Folder,
+                                    gradient = listOf(Color(0xFF007AFF), Color(0xFF5AC8FA)),
+                                    onClick = {
+                                        activeSubViewTitle = "本地下载"
+                                        activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
+                                        activeSubViewSongs = finalDownloadedSongs
+                                        isDownloadManagementMode = false
+                                        selectedDownloadSongIds.clear()
                                     }
                                 )
                             }
@@ -915,7 +1018,7 @@ fun LocalLibraryScreen(
                         .padding(vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { activeSubViewTitle = null }) {
+                    IconButton(onClick = handleSubViewBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "返回",
@@ -941,8 +1044,56 @@ fun LocalLibraryScreen(
                         )
                     }
 
-                    // 播放全部按键
-                    if (activeSubViewSongs.isNotEmpty()) {
+                    // 播放全部与管理按键
+                    if (activeSubViewTitle == "全部歌单") {
+                        Button(
+                            onClick = { isCreatePlaylistDialogOpen = true },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("新建歌单", fontSize = 12.sp)
+                        }
+                    } else if (activeSubViewTitle == "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (!isDownloadManagementMode) {
+                                OutlinedButton(
+                                    onClick = { isDownloadManagementMode = true },
+                                    shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    border = BorderStroke(1.dp, borderColor)
+                                ) {
+                                    Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurface)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("管理", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
+                                }
+                                Button(
+                                    onClick = {
+                                        activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
+                                    },
+                                    shape = RoundedCornerShape(16.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("播放全部", fontSize = 12.sp)
+                                }
+                            } else {
+                                TextButton(
+                                    onClick = {
+                                        isDownloadManagementMode = false
+                                        selectedDownloadSongIds.clear()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("完成", fontSize = 13.sp, color = AppleRed, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    } else if (activeSubViewSongs.isNotEmpty()) {
                         Button(
                             onClick = {
                                 activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
@@ -958,9 +1109,179 @@ fun LocalLibraryScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
+                if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        border = BorderStroke(1.dp, borderColor),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val isAllSelected = selectedDownloadSongIds.size == activeSubViewSongs.size && activeSubViewSongs.isNotEmpty()
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.clickable {
+                                    if (isAllSelected) {
+                                        selectedDownloadSongIds.clear()
+                                    } else {
+                                        selectedDownloadSongIds.clear()
+                                        selectedDownloadSongIds.addAll(activeSubViewSongs.map { it.id })
+                                    }
+                                }
+                            ) {
+                                Checkbox(
+                                    checked = isAllSelected,
+                                    onCheckedChange = { checked ->
+                                        if (checked) {
+                                            selectedDownloadSongIds.clear()
+                                            selectedDownloadSongIds.addAll(activeSubViewSongs.map { it.id })
+                                        } else {
+                                            selectedDownloadSongIds.clear()
+                                        }
+                                    },
+                                    colors = CheckboxDefaults.colors(checkedColor = AppleRed)
+                                )
+                                Text(
+                                    text = if (isAllSelected) "取消全选" else "全选",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "已选 ${selectedDownloadSongIds.size} 首",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
 
-                if (isLoadingSubView) {
+                            Button(
+                                onClick = { showBatchDeleteLocalDialog = true },
+                                enabled = selectedDownloadSongIds.isNotEmpty(),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("删除 (${selectedDownloadSongIds.size})", fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                if (activeSubViewTitle == "全部歌单") {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 136.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = 8.dp,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        // A. 新建歌单快捷卡片
+                        item {
+                            CreatePlaylistActionCard(
+                                onClick = { isCreatePlaylistDialogOpen = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.85f)
+                            )
+                        }
+
+                        // B. 我喜欢的音乐
+                        item {
+                            val favSongs = allSongs.filter { it.isFavorite }
+                            PlaylistSpecialCard(
+                                title = "我喜欢的音乐",
+                                subtitle = "${favSongs.size} 首歌曲",
+                                icon = Icons.Default.Favorite,
+                                gradient = listOf(Color(0xFFFA233B), Color(0xFFFF5E3A)),
+                                onClick = {
+                                    isFromAllPlaylists = true
+                                    activeSubViewTitle = "我喜欢的音乐"
+                                    activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
+                                    activeSubViewSongs = favSongs
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.85f)
+                            )
+                        }
+
+                        // C. 最近播放
+                        item {
+                            val recentSongs = allSongs.take(30)
+                            PlaylistSpecialCard(
+                                title = "最近播放",
+                                subtitle = "${recentSongs.size} 首歌曲",
+                                icon = Icons.Default.History,
+                                gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
+                                onClick = {
+                                    isFromAllPlaylists = true
+                                    activeSubViewTitle = "最近播放"
+                                    activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentSongs.size} 首"
+                                    activeSubViewSongs = recentSongs
+                                    isDownloadManagementMode = false
+                                    selectedDownloadSongIds.clear()
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.85f)
+                            )
+                        }
+
+                        // D. 本地下载
+                        item {
+                            PlaylistSpecialCard(
+                                title = "本地下载",
+                                subtitle = "${finalDownloadedSongs.size} 首歌曲",
+                                icon = Icons.Default.Folder,
+                                gradient = listOf(Color(0xFF007AFF), Color(0xFF5AC8FA)),
+                                onClick = {
+                                    isFromAllPlaylists = true
+                                    activeSubViewTitle = "本地下载"
+                                    activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
+                                    activeSubViewSongs = finalDownloadedSongs
+                                    isDownloadManagementMode = false
+                                    selectedDownloadSongIds.clear()
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.85f)
+                            )
+                        }
+
+                        // E. 自建与服务端歌单
+                        items(playlists, key = { it.id }) { pl ->
+                            PlaylistCardItem(
+                                playlist = pl,
+                                onClick = {
+                                    isFromAllPlaylists = true
+                                    activeSubViewTitle = pl.name
+                                    activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
+                                    if (onFetchPlaylistSongs != null) {
+                                        isLoadingSubView = true
+                                        coroutineScope.launch {
+                                            activeSubViewSongs = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                            isLoadingSubView = false
+                                        }
+                                    } else {
+                                        activeSubViewSongs = allSongs.filter { it.album == pl.name }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                } else if (isLoadingSubView) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -991,22 +1312,123 @@ fun LocalLibraryScreen(
                             key = { it.id },
                             contentType = { "subview_song_row" }
                         ) { song ->
-                            SongListItemRow(
-                                song = song,
-                                activeDownloadTasks = activeDownloadTasks,
-                                isServerConnected = isServerOk,
-                                onClick = { onSongClick(song, activeSubViewSongs) },
-                                onDownloadClick = { songForDownloadChoice = song },
-                                onDownloadWithOptions = { s, target, quality ->
-                                    onDownloadSongWithOptions(s, target, quality)
-                                },
-                                onOpenDownloads = onOpenDownloads
-                            )
+                            if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
+                                val isSelected = song.id in selectedDownloadSongIds
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (isSelected) AppleRed.copy(alpha = 0.08f) else Color.Transparent,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            if (isSelected) selectedDownloadSongIds.remove(song.id) else selectedDownloadSongIds.add(song.id)
+                                        }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Checkbox(
+                                            checked = isSelected,
+                                            onCheckedChange = { checked ->
+                                                if (checked) selectedDownloadSongIds.add(song.id) else selectedDownloadSongIds.remove(song.id)
+                                            },
+                                            colors = CheckboxDefaults.colors(checkedColor = AppleRed)
+                                        )
+                                        Box(modifier = Modifier.weight(1f)) {
+                                            SongListItemRow(
+                                                song = song,
+                                                activeDownloadTasks = activeDownloadTasks,
+                                                isServerConnected = isServerOk,
+                                                onClick = {
+                                                    if (isSelected) selectedDownloadSongIds.remove(song.id) else selectedDownloadSongIds.add(song.id)
+                                                },
+                                                onDownloadClick = {},
+                                                onDownloadWithOptions = { _, _, _ -> },
+                                                onOpenDownloads = onOpenDownloads
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                SongListItemRow(
+                                    song = song,
+                                    activeDownloadTasks = activeDownloadTasks,
+                                    isServerConnected = isServerOk,
+                                    onClick = { onSongClick(song, activeSubViewSongs) },
+                                    onDownloadClick = { songForDownloadChoice = song },
+                                    onDownloadWithOptions = { s, target, quality ->
+                                        onDownloadSongWithOptions(s, target, quality)
+                                    },
+                                    onOpenDownloads = onOpenDownloads
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    // 确认删除本地下载歌曲弹窗
+    if (showBatchDeleteLocalDialog) {
+        AlertDialog(
+            onDismissRequest = { showBatchDeleteLocalDialog = false },
+            title = { Text("确认删除本地下载歌曲？", fontWeight = FontWeight.Bold) },
+            text = {
+                Text("您即将从设备中彻底删除选中的 ${selectedDownloadSongIds.size} 首已下载歌曲及伴随歌词文件。此操作将彻底释放手机空间，确定继续吗？")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showBatchDeleteLocalDialog = false
+                        val idsToDelete = selectedDownloadSongIds.toList()
+                        coroutineScope.launch(Dispatchers.IO) {
+                            val songsToDelete = idsToDelete.mapNotNull { id ->
+                                activeSubViewSongs.find { it.id == id } ?: allSongs.find { it.id == id }
+                            }
+                            if (onDeleteDownloadedSongs != null && songsToDelete.isNotEmpty()) {
+                                try {
+                                    onDeleteDownloadedSongs.invoke(songsToDelete)
+                                } catch (e: Exception) {
+                                    Log.e("LocalLibraryScreen", "Failed to invoke onDeleteDownloadedSongs", e)
+                                }
+                            }
+                            var deletedCount = 0
+                            for (song in songsToDelete) {
+                                val path = song.localFilePath
+                                if (!path.isNullOrBlank()) {
+                                    try {
+                                        val f = File(path)
+                                        if (f.exists()) f.delete()
+                                        val lrc = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
+                                        if (lrc.exists()) lrc.delete()
+                                        onDeleteLocalFilePath?.invoke(path)
+                                        deletedCount++
+                                    } catch (e: Exception) {
+                                        Log.e("LocalLibraryScreen", "Failed to delete file $path", e)
+                                    }
+                                }
+                            }
+                            withContext(Dispatchers.Main) {
+                                activeSubViewSongs = activeSubViewSongs.filter { it.id !in idsToDelete }
+                                selectedDownloadSongIds.clear()
+                                isDownloadManagementMode = false
+                                val displayCount = if (deletedCount > 0) deletedCount else songsToDelete.size
+                                Toast.makeText(context, "已成功删除 $displayCount 首歌曲并释放空间", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("确认删除")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchDeleteLocalDialog = false }) {
+                    Text("取消")
+                }
+            }
+        )
     }
 
     // 全局下载音质与目标（服务器/本地）选择弹窗
@@ -1111,13 +1533,14 @@ private fun PlaylistSpecialCard(
     subtitle: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     gradient: List<Color>,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+        .width(148.dp)
+        .height(148.dp)
 ) {
     Surface(
         shape = RoundedCornerShape(16.dp),
-        modifier = Modifier
-            .width(148.dp)
-            .height(148.dp)
+        modifier = modifier
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
         shadowElevation = 4.dp
@@ -1163,18 +1586,19 @@ private fun PlaylistSpecialCard(
 @Composable
 private fun PlaylistCardItem(
     playlist: UnifiedPlaylist,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier.width(136.dp)
 ) {
     Column(
-        modifier = Modifier
-            .width(136.dp)
+        modifier = modifier
             .clickable(onClick = onClick)
     ) {
         AlbumArtworkImage(
             model = playlist.coverUrl,
             seedId = playlist.id,
             modifier = Modifier
-                .size(136.dp)
+                .aspectRatio(1f)
+                .fillMaxWidth()
                 .shadow(3.dp, RoundedCornerShape(14.dp)),
             cornerRadius = 14.dp
         )
@@ -1188,11 +1612,27 @@ private fun PlaylistCardItem(
             color = MaterialTheme.colorScheme.onSurface
         )
         Spacer(modifier = Modifier.height(2.dp))
-        Text(
-            text = if (playlist.songCount > 0) "${playlist.songCount} 首" else "歌单",
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (playlist.isOnline) {
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = AppleRed.copy(alpha = 0.12f),
+                    modifier = Modifier.padding(end = 4.dp)
+                ) {
+                    Text(
+                        text = "云端",
+                        fontSize = 9.sp,
+                        color = AppleRed,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                    )
+                }
+            }
+            Text(
+                text = if (playlist.songCount > 0) "${playlist.songCount} 首" else "歌单",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -1201,15 +1641,16 @@ private fun PlaylistCardItem(
  */
 @Composable
 private fun CreatePlaylistActionCard(
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+        .width(136.dp)
+        .height(180.dp)
 ) {
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
         border = BorderStroke(1.5.dp, AppleRed.copy(alpha = 0.45f)),
-        modifier = Modifier
-            .width(136.dp)
-            .height(180.dp)
+        modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
     ) {

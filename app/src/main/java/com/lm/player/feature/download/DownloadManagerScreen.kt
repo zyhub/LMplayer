@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.theme.AppleRed
+import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.DownloadTask
 import com.lm.player.core.model.UnifiedSong
 import java.io.File
@@ -46,6 +47,13 @@ fun DownloadManagerScreen(
     completedSongs: List<UnifiedSong>,
     onSongClick: (UnifiedSong) -> Unit,
     onCancelTask: (String) -> Unit,
+    onPauseTask: (String) -> Unit = {},
+    onResumeTask: (String) -> Unit = {},
+    onPauseTasks: (Set<String>) -> Unit = {},
+    onResumeTasks: (Set<String>) -> Unit = {},
+    onCancelTasks: (Set<String>) -> Unit = {},
+    onPauseAll: () -> Unit = {},
+    onResumeAll: () -> Unit = {},
     onDeleteDownloadedSong: (UnifiedSong) -> Unit,
     onDeleteDownloadedSongs: (List<UnifiedSong>) -> Unit = {},
     onReEmbedSong: (UnifiedSong) -> Unit = {},
@@ -58,6 +66,9 @@ fun DownloadManagerScreen(
     var selectedTab by remember { mutableIntStateOf(1) } // 0: 正在下载, 1: 已下载完成 (默认)
     var isMultiSelectMode by remember { mutableStateOf(false) }
     val selectedSongIds = remember { mutableStateListOf<String>() }
+
+    var isMultiSelectActiveMode by remember { mutableStateOf(false) }
+    val selectedActiveTaskIds = remember { mutableStateListOf<String>() }
 
     // 弹窗状态
     var showBatchDeleteConfirmDialog by remember { mutableStateOf(false) }
@@ -124,14 +135,67 @@ fun DownloadManagerScreen(
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBackIosNew, contentDescription = "返回", tint = AppleRed)
                     }
+                    val isAnyMultiSelect = if (selectedTab == 0) isMultiSelectActiveMode else isMultiSelectMode
+                    val currentSelectCount = if (selectedTab == 0) selectedActiveTaskIds.size else selectedSongIds.size
                     Text(
-                        text = if (isMultiSelectMode) "批量管理 (${selectedSongIds.size})" else "下载管理",
+                        text = if (isAnyMultiSelect) "批量管理 (${currentSelectCount})" else "下载管理",
                         style = TextStyle(
                             fontSize = 24.sp,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onBackground
                         )
                     )
+                }
+
+                // 正在下载 Tab 批量管理操作
+                if (selectedTab == 0 && activeTasks.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isMultiSelectActiveMode) {
+                            TextButton(
+                                onClick = {
+                                    if (selectedActiveTaskIds.size == activeTasks.size) {
+                                        selectedActiveTaskIds.clear()
+                                    } else {
+                                        selectedActiveTaskIds.clear()
+                                        selectedActiveTaskIds.addAll(activeTasks.map { it.song.id })
+                                    }
+                                }
+                            ) {
+                                Text(
+                                    text = if (selectedActiveTaskIds.size == activeTasks.size) "取消全选" else "全选",
+                                    color = AppleRed,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+
+                            Button(
+                                onClick = {
+                                    isMultiSelectActiveMode = false
+                                    selectedActiveTaskIds.clear()
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text("完成", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = {
+                                    isMultiSelectActiveMode = true
+                                    selectedActiveTaskIds.clear()
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, borderColor),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("批量管理", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
+                    }
                 }
 
                 // 仅在已下载 Tab 展示批量管理操作
@@ -222,7 +286,11 @@ fun DownloadManagerScreen(
                         .fillMaxHeight()
                         .clip(RoundedCornerShape(17.dp))
                         .background(if (selectedTab == 1) MaterialTheme.colorScheme.surface else Color.Transparent)
-                        .clickable { selectedTab = 1 },
+                        .clickable {
+                            selectedTab = 1
+                            isMultiSelectActiveMode = false
+                            selectedActiveTaskIds.clear()
+                        },
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -262,20 +330,84 @@ fun DownloadManagerScreen(
                         }
                     }
                 } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        contentPadding = PaddingValues(bottom = 80.dp)
-                    ) {
-                        items(
-                            items = activeTasks,
-                            key = { it.song.id },
-                            contentType = { "active_download_task" }
-                        ) { task ->
-                            ActiveDownloadTaskRow(
-                                task = task,
-                                onCancel = { onCancelTask(task.song.id) }
-                            )
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        if (!isMultiSelectActiveMode) {
+                            val downloadingCount = activeTasks.count { it.status == DownloadStatus.DOWNLOADING }
+                            val pausedCount = activeTasks.count { it.status == DownloadStatus.PAUSED }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = buildString {
+                                        if (downloadingCount > 0) append("${downloadingCount} 首下载中")
+                                        if (downloadingCount > 0 && pausedCount > 0) append("，")
+                                        if (pausedCount > 0) append("${pausedCount} 首已暂停")
+                                        if (downloadingCount == 0 && pausedCount == 0) append("${activeTasks.size} 个任务")
+                                    },
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (downloadingCount > 0) {
+                                        OutlinedButton(
+                                            onClick = onPauseAll,
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.height(28.dp),
+                                            border = BorderStroke(0.8.dp, borderColor)
+                                        ) {
+                                            Icon(Icons.Default.Pause, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurface)
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("全部暂停", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
+                                        }
+                                    }
+                                    if (pausedCount > 0) {
+                                        Button(
+                                            onClick = onResumeAll,
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.height(28.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                                        ) {
+                                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("全部继续", fontSize = 11.sp, color = Color.White)
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            contentPadding = PaddingValues(bottom = if (isMultiSelectActiveMode) 100.dp else 80.dp)
+                        ) {
+                            items(
+                                items = activeTasks,
+                                key = { it.song.id },
+                                contentType = { "active_download_task" }
+                            ) { task ->
+                                val isSelected = task.song.id in selectedActiveTaskIds
+                                ActiveDownloadTaskRow(
+                                    task = task,
+                                    isMultiSelectMode = isMultiSelectActiveMode,
+                                    isSelected = isSelected,
+                                    onToggleSelect = {
+                                        if (isSelected) selectedActiveTaskIds.remove(task.song.id) else selectedActiveTaskIds.add(task.song.id)
+                                    },
+                                    onPause = { onPauseTask(task.song.id) },
+                                    onResume = { onResumeTask(task.song.id) },
+                                    onCancel = { onCancelTask(task.song.id) }
+                                )
+                            }
                         }
                     }
                 }
@@ -448,7 +580,102 @@ fun DownloadManagerScreen(
             }
         }
 
-        // 4. 多选模式下底部浮动批量操作条
+        // 4.1 正在下载多选模式下底部浮动批量操作条
+        AnimatedVisibility(
+            visible = isMultiSelectActiveMode && selectedTab == 0,
+            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = if (isDark) Color(0xFF1E1E26) else Color.White,
+                shadowElevation = 8.dp,
+                border = BorderStroke(1.dp, borderColor)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "已选 ${selectedActiveTaskIds.size} 项任务",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "共 ${activeTasks.size} 个正在进行",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        val selectedTasks = activeTasks.filter { it.song.id in selectedActiveTaskIds }
+                        val hasDownloading = selectedTasks.any { it.status == DownloadStatus.DOWNLOADING }
+                        val hasPaused = selectedTasks.any { it.status == DownloadStatus.PAUSED }
+
+                        if (hasDownloading) {
+                            OutlinedButton(
+                                onClick = {
+                                    val toPause = selectedTasks.filter { it.status == DownloadStatus.DOWNLOADING }.map { it.song.id }.toSet()
+                                    onPauseTasks(toPause)
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                border = BorderStroke(1.dp, borderColor)
+                            ) {
+                                Icon(Icons.Default.Pause, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("暂停", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
+
+                        if (hasPaused) {
+                            Button(
+                                onClick = {
+                                    val toResume = selectedTasks.filter { it.status == DownloadStatus.PAUSED }.map { it.song.id }.toSet()
+                                    onResumeTasks(toResume)
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("继续", fontSize = 12.sp, color = Color.White)
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                val toCancel = selectedActiveTaskIds.toSet()
+                                onCancelTasks(toCancel)
+                                selectedActiveTaskIds.clear()
+                                isMultiSelectActiveMode = false
+                            },
+                            enabled = selectedActiveTaskIds.isNotEmpty(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("取消", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4.2 已下载多选模式下底部浮动批量操作条
         AnimatedVisibility(
             visible = isMultiSelectMode && selectedTab == 1,
             enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
@@ -718,19 +945,37 @@ private fun SettingDetailRow(label: String, value: String) {
 @Composable
 private fun ActiveDownloadTaskRow(
     task: DownloadTask,
-    onCancel: () -> Unit
+    isMultiSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onToggleSelect: () -> Unit = {},
+    onPause: () -> Unit = {},
+    onResume: () -> Unit = {},
+    onCancel: () -> Unit = {}
 ) {
     Surface(
         shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = if (isSelected) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surface,
+        border = if (isSelected) BorderStroke(1.dp, AppleRed) else null,
         shadowElevation = 1.dp,
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = isMultiSelectMode, onClick = onToggleSelect)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                if (isMultiSelectMode) {
+                    Checkbox(
+                        checked = isSelected,
+                        onCheckedChange = { onToggleSelect() },
+                        colors = CheckboxDefaults.colors(checkedColor = AppleRed),
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                }
+
                 AlbumArtworkImage(
                     model = task.song.coverUrl,
                     seedId = task.song.id,
@@ -757,8 +1002,19 @@ private fun ActiveDownloadTaskRow(
                     )
                 }
 
-                IconButton(onClick = onCancel) {
-                    Icon(Icons.Default.Close, contentDescription = "取消下载", tint = Color.Gray, modifier = Modifier.size(20.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (task.status == DownloadStatus.PAUSED) {
+                        IconButton(onClick = onResume, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "继续下载", tint = AppleRed, modifier = Modifier.size(22.dp))
+                        }
+                    } else {
+                        IconButton(onClick = onPause, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Default.Pause, contentDescription = "暂停下载", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+                        }
+                    }
+                    IconButton(onClick = onCancel, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "取消下载", tint = Color.Gray, modifier = Modifier.size(20.dp))
+                    }
                 }
             }
 
@@ -770,7 +1026,7 @@ private fun ActiveDownloadTaskRow(
                     .fillMaxWidth()
                     .height(4.dp)
                     .clip(RoundedCornerShape(2.dp)),
-                color = AppleRed,
+                color = if (task.status == DownloadStatus.PAUSED) MaterialTheme.colorScheme.outlineVariant else AppleRed,
                 trackColor = MaterialTheme.colorScheme.surfaceVariant
             )
 
@@ -780,7 +1036,27 @@ private fun ActiveDownloadTaskRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                if (task.totalBytes == 0L && task.bytesDownloaded == 0L && task.speedKbps == 0L) {
+                if (task.status == DownloadStatus.PAUSED) {
+                    val downloadedMb = task.bytesDownloaded.toFloat() / (1024 * 1024)
+                    val totalMb = task.totalBytes.toFloat() / (1024 * 1024)
+                    val progressPercent = (task.progress * 100).toInt()
+                    if (task.totalBytes > 0) {
+                        Text(
+                            text = String.format(Locale.getDefault(), "已暂停 • %.1f MB / %.1f MB (%d%%)", downloadedMb, totalMb, progressPercent),
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Text(text = "已暂停", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(
+                        text = "继续下载",
+                        fontSize = 11.sp,
+                        color = AppleRed,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable { onResume() }
+                    )
+                } else if (task.totalBytes == 0L && task.bytesDownloaded == 0L && task.speedKbps == 0L) {
                     Text(text = "排队等待中...", fontSize = 11.sp, color = AppleRed, fontWeight = FontWeight.Medium)
                     Text(text = "等待队列", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
