@@ -40,7 +40,8 @@ data class UnifiedArtist(
     val id: String,
     val name: String,
     val avatarUrl: String = "",
-    val albumCount: Int = 0
+    val albumCount: Int = 0,
+    val songCount: Int = 0
 )
 
 @Immutable

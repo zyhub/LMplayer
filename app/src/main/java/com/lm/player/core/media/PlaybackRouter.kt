@@ -79,6 +79,9 @@ class PlaybackRouter(
 
         var finalStreamUrl = song.streamUrl
 
+        val isServerSong = song.serverId != "lemon_online" &&
+                song.serverId !in listOf("local_storage", "local_folder", "local_saf")
+
         if (resolvedLocalPath != null) {
             // 本地文件命中，同步更新队列与当前曲目状态
             val updated = song.copy(
@@ -87,6 +90,43 @@ class PlaybackRouter(
                 downloadStatus = DownloadStatus.DOWNLOADED
             )
             PlaybackQueueManager.updateCurrentSong(updated)
+        } else if (isServerSong) {
+            // 服务端歌曲：动态绑定当前活跃服务端的有效 BaseURL 与 Token
+            withContext(Dispatchers.IO) {
+                try {
+                    val db = ZdsDatabase.getInstance(context)
+                    val active = db.serverDao().getActiveServer()
+                        ?: db.serverDao().getAllServers().firstOrNull { it.id == song.serverId || it.type == ServerType.LEMON_MUSIC }
+                    if (active != null && active.type == ServerType.LEMON_MUSIC) {
+                        val cleanBase = active.serverUrl.trimEnd('/')
+                        val token = active.tokenOrApiKey
+                        if (finalStreamUrl.contains("/api/play/local")) {
+                            val pathParam = finalStreamUrl.substringAfter("path=").substringBefore("&")
+                            finalStreamUrl = if (token.isNotBlank()) {
+                                "$cleanBase/api/play/local?path=$pathParam&token=$token"
+                            } else {
+                                "$cleanBase/api/play/local?path=$pathParam"
+                            }
+                        } else if (finalStreamUrl.isBlank()) {
+                            val cachedPath = LemonMusicProtocol.getServerFilePath(song.id, null)
+                            val candidatePath = cachedPath ?: song.relativeFolderPath
+                            if (!candidatePath.isNullOrBlank()) {
+                                val client = NetworkClientFactory.createOkHttpClient(context)
+                                val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
+                                finalStreamUrl = protocol.getStreamUrlForPath(candidatePath)
+                            }
+                        }
+                        if (finalStreamUrl.isNotBlank() && finalStreamUrl != song.streamUrl) {
+                            val updated = song.copy(streamUrl = finalStreamUrl)
+                            PlaybackQueueManager.updateCurrentSong(updated)
+                        }
+                    }
+                    Unit
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to resolve server stream URL for ${song.title}", e)
+                }
+                Unit
+            }
         } else if (finalStreamUrl.isBlank() || finalStreamUrl.startsWith("lemon_online://") || song.serverId == "lemon_online") {
             // 在线音频流未就绪，通过网络协议异步解析真实播放流
             withContext(Dispatchers.IO) {

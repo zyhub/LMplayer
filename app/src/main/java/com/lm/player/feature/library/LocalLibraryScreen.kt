@@ -114,6 +114,8 @@ fun LocalLibraryScreen(
     var isLoadingSubView by remember { mutableStateOf(false) }
     var isFromAllPlaylists by remember { mutableStateOf(false) }
     var isFromAllFolders by remember { mutableStateOf(false) }
+    var isFromAllArtists by remember { mutableStateOf(false) }
+    var isFromAllAlbums by remember { mutableStateOf(false) }
 
     // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名)
     val localFolders = remember(allSongs) {
@@ -166,6 +168,35 @@ fun LocalLibraryScreen(
         }
     }
 
+    // 动态聚合数据
+    val artists = remember(allSongs) {
+        val countMap = allSongs.groupingBy { it.artist.ifBlank { "未知歌手" } }.eachCount()
+        allSongs.groupBy { it.artist.ifBlank { "未知歌手" } }
+            .map { (artistName, songs) ->
+                val sCount = countMap[artistName] ?: songs.size
+                UnifiedArtist(
+                    id = "artist_${artistName.hashCode()}",
+                    name = artistName,
+                    avatarUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
+                    albumCount = songs.map { it.album }.distinct().size,
+                    songCount = sCount
+                )
+            }.sortedByDescending { it.songCount }
+    }
+
+    val albums = remember(allSongs) {
+        allSongs.groupBy { it.album.ifBlank { "单曲精选" } }
+            .map { (albumName, songs) ->
+                UnifiedAlbum(
+                    id = "album_${albumName.hashCode()}",
+                    title = albumName,
+                    artist = songs.firstOrNull()?.artist ?: "各种艺术家",
+                    coverUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
+                    songCount = songs.size
+                )
+            }.sortedByDescending { it.songCount }
+    }
+
     // 自动同步服务器歌单 (进入资料库或服务器配置就绪时自动拉取)
     LaunchedEffect(activeServerConfig?.id) {
         if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
@@ -173,7 +204,7 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 层级返回调度器：如果从「全部歌单」或「全部文件夹」进入某个歌单/目录，先返回上层网格，再返回资料库首页
+    // 层级返回调度器：如果从「全部歌单」、「全部文件夹」、「全部歌手」或「全部专辑」进入下级详情，先返回上层网格，再返回资料库首页
     val handleSubViewBack: () -> Unit = {
         if (isDownloadManagementMode) {
             isDownloadManagementMode = false
@@ -186,10 +217,20 @@ fun LocalLibraryScreen(
             activeSubViewTitle = "全部文件夹"
             activeSubViewSubtitle = "共 ${localFolders.size} 个本地文件夹"
             isFromAllFolders = false
+        } else if (activeSubViewTitle != "全部歌手" && isFromAllArtists) {
+            activeSubViewTitle = "全部歌手"
+            activeSubViewSubtitle = "共 ${artists.size} 位歌手"
+            isFromAllArtists = false
+        } else if (activeSubViewTitle != "全部专辑" && isFromAllAlbums) {
+            activeSubViewTitle = "全部专辑"
+            activeSubViewSubtitle = "共 ${albums.size} 张专辑"
+            isFromAllAlbums = false
         } else {
             activeSubViewTitle = null
             isFromAllPlaylists = false
             isFromAllFolders = false
+            isFromAllArtists = false
+            isFromAllAlbums = false
         }
     }
 
@@ -213,33 +254,6 @@ fun LocalLibraryScreen(
             newPlaylistName = ""
             newPlaylistIsOnline = (activeServerConfig != null && !currentServerName.contains("本地") && !currentServerName.contains("已下载"))
         }
-    }
-
-    // 动态聚合数据
-    val artists = remember(allSongs) {
-        allSongs.groupBy { it.artist.ifBlank { "未知歌手" } }
-            .map { (artistName, songs) ->
-                UnifiedArtist(
-                    id = "artist_${artistName.hashCode()}",
-                    name = artistName,
-                    avatarUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
-                    albumCount = songs.map { it.album }.distinct().size
-                ) to songs.size
-            }.sortedByDescending { it.second }
-            .map { it.first }
-    }
-
-    val albums = remember(allSongs) {
-        allSongs.groupBy { it.album.ifBlank { "单曲精选" } }
-            .map { (albumName, songs) ->
-                UnifiedAlbum(
-                    id = "album_${albumName.hashCode()}",
-                    title = albumName,
-                    artist = songs.firstOrNull()?.artist ?: "各种艺术家",
-                    coverUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
-                    songCount = songs.size
-                )
-            }.sortedByDescending { it.songCount }
     }
 
     // 常用风格流派列表 (本地离线兜底)
@@ -856,7 +870,7 @@ fun LocalLibraryScreen(
                                                     overflow = TextOverflow.Ellipsis
                                                 )
                                                 Text(
-                                                    text = "${allSongs.count { it.artist == artist.name }} 首",
+                                                    text = "${artist.songCount} 首",
                                                     fontSize = 11.sp,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
@@ -1389,6 +1403,118 @@ fun LocalLibraryScreen(
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             )
+                        }
+                    }
+                } else if (activeSubViewTitle == "全部歌手") {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 150.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = 8.dp,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(artists, key = { it.id }) { artist ->
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                border = BorderStroke(1.dp, borderColor),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable {
+                                        val artistSongs = allSongs.filter { it.artist == artist.name }
+                                        isFromAllArtists = true
+                                        activeSubViewTitle = artist.name
+                                        activeSubViewSubtitle = "歌手专栏 · 共 ${artistSongs.size} 首歌曲"
+                                        activeSubViewSongs = artistSongs
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    AlbumArtworkImage(
+                                        model = artist.avatarUrl,
+                                        seedId = artist.name,
+                                        modifier = Modifier.size(48.dp),
+                                        cornerRadius = 24.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = artist.name,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = "${artist.songCount} 首 · ${artist.albumCount} 张专辑",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (activeSubViewTitle == "全部专辑") {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 140.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = 8.dp,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        items(albums, key = { it.id }) { album ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable {
+                                        val albumSongs = allSongs.filter { it.album == album.title }
+                                        isFromAllAlbums = true
+                                        activeSubViewTitle = album.title
+                                        activeSubViewSubtitle = "${album.artist} · 共 ${albumSongs.size} 首"
+                                        activeSubViewSongs = albumSongs
+                                    }
+                            ) {
+                                AlbumArtworkImage(
+                                    model = album.coverUrl,
+                                    seedId = album.title,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .shadow(2.dp, RoundedCornerShape(12.dp)),
+                                    cornerRadius = 12.dp
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = album.title,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${album.artist} · ${album.songCount} 首",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 } else if (isLoadingSubView) {

@@ -260,6 +260,7 @@ class LemonMusicProtocol(
                     }
 
                     val songId = "lemon_${md5(filePath)}"
+                    songIdToPathMap[songId] = filePath
                     val song = UnifiedSong(
                         id = songId,
                         title = title,
@@ -278,8 +279,6 @@ class LemonMusicProtocol(
                         isFavorite = false,
                         relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
                     )
-
-                    songIdToPathMap[songId] = filePath
                     songIdToSongMap[songId] = song
                     resultList.add(song)
                 }
@@ -301,6 +300,7 @@ class LemonMusicProtocol(
                                     val singer = dlItem.optString("singer", "未知歌手")
                                     val album = dlItem.optString("album", "未知专辑")
                                     val songId = "lemon_${md5(filePath)}"
+                                    songIdToPathMap[songId] = filePath
                                     val song = UnifiedSong(
                                         id = songId,
                                         title = name,
@@ -319,7 +319,6 @@ class LemonMusicProtocol(
                                         isFavorite = false,
                                         relativeFolderPath = extractRelativeFolderPath(filePath, singer, album)
                                     )
-                                    songIdToPathMap[songId] = filePath
                                     songIdToSongMap[songId] = song
                                     resultList.add(song)
                                 }
@@ -1283,6 +1282,7 @@ class LemonMusicProtocol(
                                 val album = item.optString("album", "未知专辑")
                                 val durationMs = (item.optDouble("duration", 0.0) * 1000).toLong()
                                 val songId = "lemon_${md5(filePath)}"
+                                songIdToPathMap[songId] = filePath
 
                                 val song = UnifiedSong(
                                     id = songId,
@@ -1296,7 +1296,6 @@ class LemonMusicProtocol(
                                     format = item.optString("format", "flac"),
                                     relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
                                 )
-                                songIdToPathMap[songId] = filePath
                                 songIdToSongMap[songId] = song
                                 songs.add(song)
                             }
@@ -1368,12 +1367,11 @@ class LemonMusicProtocol(
     }
 
     /**
-     * 获取音频 Range 流媒体播放链接
+     * 获取指定路径的音频 Range 流媒体播放链接
      */
-    override fun getStreamUrl(songId: String, maxBitrate: Int?): String {
-        val path = songIdToPathMap[songId] ?: ""
+    fun getStreamUrlForPath(path: String): String {
         if (path.isBlank()) return ""
-        val enc = try { URLEncoder.encode(path, "UTF-8") } catch (_: Exception) { path }
+        val enc = try { URLEncoder.encode(path, "UTF-8").replace("+", "%20") } catch (_: Exception) { path }
         return if (authToken.isNotBlank()) {
             "$cleanBase/api/play/local?path=$enc&token=$authToken"
         } else {
@@ -1381,18 +1379,31 @@ class LemonMusicProtocol(
         }
     }
 
+    override fun getStreamUrl(songId: String, maxBitrate: Int?): String {
+        val path = songIdToPathMap[songId] ?: ""
+        return if (path.isNotBlank()) {
+            getStreamUrlForPath(path)
+        } else ""
+    }
+
     /**
-     * 获取内嵌专辑封面图链接
+     * 获取指定路径的内嵌专辑封面图链接
      */
-    override fun getCoverArtUrl(mediaId: String, size: Int): String {
-        val path = songIdToPathMap[mediaId] ?: ""
+    fun getCoverArtUrlForPath(path: String): String {
         if (path.isBlank()) return ""
-        val enc = try { URLEncoder.encode(path, "UTF-8") } catch (_: Exception) { path }
+        val enc = try { URLEncoder.encode(path, "UTF-8").replace("+", "%20") } catch (_: Exception) { path }
         return if (authToken.isNotBlank()) {
             "$cleanBase/api/tag/cover?path=$enc&token=$authToken"
         } else {
             "$cleanBase/api/tag/cover?path=$enc"
         }
+    }
+
+    override fun getCoverArtUrl(mediaId: String, size: Int): String {
+        val path = songIdToPathMap[mediaId] ?: ""
+        return if (path.isNotBlank()) {
+            getCoverArtUrlForPath(path)
+        } else ""
     }
 
     /**

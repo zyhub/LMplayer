@@ -39,22 +39,46 @@ object NetworkClientFactory {
         }
     }
 
+    @Volatile
+    private var sharedClient: OkHttpClient? = null
+
     fun createOkHttpClient(context: Context): OkHttpClient {
+        return getSharedClient(context)
+    }
+
+    @Synchronized
+    fun getSharedClient(context: Context): OkHttpClient {
+        sharedClient?.let { return it }
+
         installSecurityProvider()
 
+        val appContext = context.applicationContext
+        val cacheDir = appContext.cacheDir.resolve("okhttp_http_cache")
+        val cache = try {
+            okhttp3.Cache(cacheDir, 64L * 1024 * 1024)
+        } catch (_: Exception) {
+            null
+        }
+
+        val pool = okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES)
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 16
+        }
+
         val builder = OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
+            .connectionPool(pool)
+            .dispatcher(dispatcher)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .writeTimeout(25, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
 
-        // 日志拦截器
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
+        if (cache != null) {
+            builder.cache(cache)
         }
-        builder.addInterceptor(logging)
 
-        // 统一注入现代主流 User-Agent，杜绝网易云、酷我、QQ音乐等封面 CDN 403 防盗链拦截
+        // 统一注入现代主流 User-Agent 与自动补齐 Authorization 头
         builder.addInterceptor { chain ->
             val request = chain.request()
             val reqBuilder = request.newBuilder()
@@ -63,6 +87,11 @@ object NetworkClientFactory {
                     "User-Agent",
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 )
+            }
+            // 若 URL 中携带 token 参数且未显式指定 Authorization 请求头，自动补充 Bearer Token
+            val tokenParam = request.url.queryParameter("token")
+            if (!tokenParam.isNullOrBlank() && request.header("Authorization").isNullOrBlank()) {
+                reqBuilder.header("Authorization", "Bearer $tokenParam")
             }
             chain.proceed(reqBuilder.build())
         }
@@ -81,6 +110,8 @@ object NetworkClientFactory {
             }
         }
 
-        return builder.build()
+        val client = builder.build()
+        sharedClient = client
+        return client
     }
 }

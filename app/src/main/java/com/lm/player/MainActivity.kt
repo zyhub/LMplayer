@@ -1032,20 +1032,30 @@ class MainActivity : ComponentActivity() {
                 val listener = object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
                         Log.e("MainActivity", "Player Error encountered: ${error.message}", error)
-                        if (autoFallbackToLocal) {
-                            val localCandidates = songList.filter {
-                                it.downloadStatus == DownloadStatus.DOWNLOADED ||
-                                it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
-                                !it.localFilePath.isNullOrBlank()
+                        val targetSong = currentSong
+                        if (targetSong != null && autoFallbackToLocal) {
+                            // 仅当本地确有【本首歌曲】的离线文件或同名匹配时，才无缝切换至本地版本
+                            val normTitle = SongMatchingResolver.normalizeTrackTitle(targetSong.title)
+                            val normArtist = SongMatchingResolver.normalizeArtist(targetSong.artist)
+                            val matchedLocalSong = songList.firstOrNull {
+                                val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                                hasFile && (it.id == targetSong.id || (
+                                    normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
+                                    (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(it.artist) == normArtist)
+                                ))
                             }
-                            if (localCandidates.isNotEmpty()) {
+                            if (matchedLocalSong != null && matchedLocalSong.id != targetSong.id) {
                                 Toast.makeText(this@MainActivity, "在线音频无法缓冲，已自动为您无缝切换至本地歌曲", Toast.LENGTH_SHORT).show()
-                                val fallbackSong = localCandidates.firstOrNull { it.id != currentSong?.id } ?: localCandidates.first()
-                                playSong(fallbackSong)
-                            } else {
-                                Toast.makeText(this@MainActivity, "播放出错，且本地暂无已下载歌曲", Toast.LENGTH_SHORT).show()
+                                val localSong = targetSong.copy(
+                                    localFilePath = matchedLocalSong.localFilePath,
+                                    streamUrl = matchedLocalSong.localFilePath ?: "",
+                                    downloadStatus = DownloadStatus.DOWNLOADED
+                                )
+                                playSong(localSong)
+                                return
                             }
                         }
+                        Toast.makeText(this@MainActivity, "当前歌曲《${currentSong?.title ?: "未知"}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
                     }
                 }
                 exoPlayer?.addListener(listener)

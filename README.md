@@ -32,6 +32,8 @@
 
 ## 📸 应用界面截图 (Screenshots)
 
+### 📱 竖屏界面预览 (Portrait UI)
+
 <div align="center">
 
 | 1. 发现 · 在线云端推荐 | 2. 播放器 · 超大高清封面 |
@@ -41,6 +43,24 @@
 | <img src="docs/screenshots/03_lyrics_adjust.png" width="360" /> | <img src="docs/screenshots/04_library_screen.png" width="360" /> |
 | **5. 设置中心 · 轻奢下拉选择** | |
 | <img src="docs/screenshots/05_settings_screen.png" width="360" /> | |
+
+</div>
+
+### 🚗 车载中控大屏与横屏沉浸体验 (Landscape & In-Car UI)
+
+<div align="center">
+
+| 1. 横屏 · 在线发现推荐与权威官方榜单 |
+| :---: |
+| <img src="docs/screenshots/landscape_discover.png" width="750" /> |
+
+| 2. 横屏 · 沉浸式高保真播放器与实时双列歌词 |
+| :---: |
+| <img src="docs/screenshots/landscape_player.png" width="750" /> |
+
+| 3. 横屏 · 资料库聚合、歌单与最近添加 |
+| :---: |
+| <img src="docs/screenshots/landscape_library.png" width="750" /> |
 
 </div>
 
@@ -101,7 +121,7 @@
 
 👉 **[前往下载最新发布版 APK](https://github.com/zyhub/LMplayer/releases)**
 
-- 最新版本：`v1.5.3`
+- 最新版本：`v1.5.4`
 - 架构支持：`armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64` (通用全架构)
 - 最低系统要求：Android 8.0 (API Level 26) 及以上车载车机或智能手机
 
