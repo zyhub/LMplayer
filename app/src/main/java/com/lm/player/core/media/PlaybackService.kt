@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.media
+package com.lm.player.core.media
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -25,12 +25,20 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.lm.player.MainActivity
 import com.lm.player.R
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 @OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
 
     private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSession? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     companion object {
         private const val TAG = "PlaybackService"
@@ -252,17 +260,89 @@ class PlaybackService : MediaSessionService() {
                 .setCallback(sessionCallback)
                 .build()
 
-            // 3. 立即发布初始前台通知（彻底杜绝 Android 8.0+ 5秒启动超时闪退）
+            // 3. 挂载全品牌安卓灵动岛 MediaNotification.Provider (澎湃OS超级岛/ColorOS流体云/OriginOS原子岛/MagicOS灵动胶囊)
+            DynamicIslandManager.ensureInitialized(this)
+            setMediaNotificationProvider(DynamicIslandManager.createMediaNotificationProvider(this))
+
+            // 4. 立即发布初始前台通知（彻底杜绝 Android 8.0+ 5秒启动超时闪退）
             startImmediateForeground()
 
-            // 4. 监听播放状态动态刷新通知
+            // 5. 监听播放状态与曲目切换动态刷新灵动岛
             exoPlayer?.addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     updateForegroundNotification(isPlaying)
                 }
+
+                override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                    DynamicIslandManager.clearLyrics()
+                    updateForegroundNotification(exoPlayer?.isPlaying == true)
+                }
             })
+
+            // 6. 启动后台灵动岛实时歌词与高清封面同步引擎
+            startIslandLyricSyncLoop()
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to initialize PlaybackService", e)
+        }
+    }
+
+    private fun startIslandLyricSyncLoop() {
+        var loadedSongIdForIsland = ""
+        serviceScope.launch {
+            while (isActive) {
+                try {
+                    val song = PlaybackQueueManager.currentSongFlow.value
+                    val player = exoPlayer
+                    if (song != null && player != null) {
+                        // 切换新歌时后台预热高清封面 Bitmap 与同步歌词
+                        if (loadedSongIdForIsland != song.id) {
+                            loadedSongIdForIsland = song.id
+                            launch(Dispatchers.IO) {
+                                try {
+                                    DynamicIslandManager.loadSongArtworkBitmap(this@PlaybackService, song)
+                                    LyricsManager.loadLyrics(song, this@PlaybackService, null)
+                                    kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                        DynamicIslandManager.notifySystemIsland(
+                                            context = this@PlaybackService,
+                                            mediaSession = mediaSession,
+                                            exoPlayer = exoPlayer,
+                                            force = true
+                                        )
+                                    }
+                                } catch (_: Exception) {}
+                            }
+                        }
+
+                        if (player.isPlaying) {
+                            val posMs = player.currentPosition.coerceAtLeast(0L)
+                            val cachedLyrics = LyricsManager.getCachedLyrics(song.id)
+                            if (cachedLyrics != null && cachedLyrics.lines.isNotEmpty()) {
+                                val lines = cachedLyrics.lines
+                                val idx = lines.indexOfLast { it.timestampMs <= posMs }.coerceAtLeast(0)
+                                val currentText = lines.getOrNull(idx)?.text.orEmpty()
+                                val nextText = lines.getOrNull(idx + 1)?.text.orEmpty()
+                                val prevLyric = DynamicIslandManager.currentLyricLineFlow.value
+                                DynamicIslandManager.updateRealtimeLyrics(
+                                    context = this@PlaybackService,
+                                    song = song,
+                                    currentLine = currentText,
+                                    nextLine = nextText,
+                                    isPlaying = true
+                                )
+                                if (currentText != prevLyric && currentText.isNotBlank()) {
+                                    DynamicIslandManager.notifySystemIsland(
+                                        context = this@PlaybackService,
+                                        mediaSession = mediaSession,
+                                        exoPlayer = player,
+                                        force = false
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+                delay(450L)
+            }
         }
     }
 
@@ -292,6 +372,35 @@ class PlaybackService : MediaSessionService() {
                 stopSelf()
             } catch (_: Exception) {}
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_MEDIA_COMMAND) {
+            val cmd = intent.getStringExtra(EXTRA_COMMAND)
+            when (cmd) {
+                CMD_NEXT -> {
+                    PlaybackQueueManager.playNext(this)
+                    dispatchBroadcast(CMD_NEXT)
+                }
+                CMD_PREV -> {
+                    PlaybackQueueManager.playPrevious(this)
+                    dispatchBroadcast(CMD_PREV)
+                }
+                CMD_TOGGLE -> {
+                    PlaybackQueueManager.togglePlay(this)
+                    dispatchBroadcast(CMD_TOGGLE)
+                }
+                CMD_PLAY -> {
+                    val p = Media3Factory.getSharedExoPlayer(this)
+                    if (!p.isPlaying) PlaybackQueueManager.togglePlay(this)
+                    dispatchBroadcast(CMD_PLAY)
+                }
+                CMD_PAUSE -> {
+                    val p = Media3Factory.getSharedExoPlayer(this)
+                    if (p.isPlaying) PlaybackQueueManager.togglePlay(this)
+                    dispatchBroadcast(CMD_PAUSE)
+                }
+            }
+            updateForegroundNotification(exoPlayer?.isPlaying == true)
+            return START_STICKY
         }
         startImmediateForeground()
         return super.onStartCommand(intent, flags, startId)
@@ -332,29 +441,11 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun buildNotification(isPlaying: Boolean): Notification {
-        val currentMediaItem = exoPlayer?.currentMediaItem
-        val title = currentMediaItem?.mediaMetadata?.title ?: getString(R.string.app_name)
-        val artist = currentMediaItem?.mediaMetadata?.artist ?: "NAS 音乐播放器"
-
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        return DynamicIslandManager.buildIslandNotification(
+            context = this,
+            mediaSession = mediaSession,
+            exoPlayer = exoPlayer
         )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(artist)
-            .setContentIntent(pendingIntent)
-            .setOngoing(isPlaying)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
     }
 
     private fun startImmediateForeground() {
@@ -373,9 +464,12 @@ class PlaybackService : MediaSessionService() {
 
     private fun updateForegroundNotification(isPlaying: Boolean) {
         try {
-            val notification = buildNotification(isPlaying)
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.notify(NOTIFICATION_ID, notification)
+            DynamicIslandManager.notifySystemIsland(
+                context = this,
+                mediaSession = mediaSession,
+                exoPlayer = exoPlayer,
+                force = true
+            )
         } catch (e: Throwable) {
             Log.e(TAG, "Error updating foreground notification", e)
         }
@@ -383,6 +477,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         try {
+            serviceScope.cancel()
             mediaSession?.run {
                 release()
                 mediaSession = null

@@ -196,8 +196,11 @@ class PlaybackRouter(
 
         val isOffline = uri.scheme == "file" || uri.scheme == "content"
 
-        val metadata = MediaMetadata.Builder()
+        val cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(song.id)
+
+        val metadataBuilder = MediaMetadata.Builder()
             .setTitle(song.title)
+            .setDisplayTitle(song.title)
             .setArtist(song.artist)
             .setAlbumTitle(song.album)
             .setArtworkUri(if (song.coverUrl.isNotEmpty()) Uri.parse(song.coverUrl) else null)
@@ -207,12 +210,15 @@ class PlaybackRouter(
                 putString("KEY_SERVER_ID", song.serverId)
                 putInt("KEY_BITRATE", song.bitRate)
             })
-            .build()
+
+        if (cachedArtworkBytes != null) {
+            metadataBuilder.setArtworkData(cachedArtworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        }
 
         return MediaItem.Builder()
             .setMediaId(song.id)
             .setUri(uri)
-            .setMediaMetadata(metadata)
+            .setMediaMetadata(metadataBuilder.build())
             .build()
     }
 }

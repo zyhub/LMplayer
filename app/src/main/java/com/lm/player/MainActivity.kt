@@ -42,11 +42,13 @@ import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.designsystem.theme.AppThemeMode
+import com.lm.player.core.designsystem.component.DynamicIslandOverlay
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.designsystem.theme.UiScaleMode
 import com.lm.player.core.designsystem.theme.ZDSPlayerTheme
 import com.lm.player.core.designsystem.theme.rememberAppDimensions
 import com.lm.player.core.media.DownloadEngine
+import com.lm.player.core.media.DynamicIslandManager
 import com.lm.player.core.media.LocalMediaScanner
 import com.lm.player.core.media.LyricsManager
 import com.lm.player.core.media.Media3Factory
@@ -1011,8 +1013,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            var globalProgressMs by remember { mutableStateOf(0L) }
+            var globalTotalDurationMs by remember { mutableStateOf(0L) }
+
             // 歌曲切换时动态从音乐文件/NAS提取解析歌词 (支持秒级内存预载与防并发竞争)
             LaunchedEffect(currentSong?.id) {
+                DynamicIslandManager.ensureInitialized(this@MainActivity)
+                DynamicIslandManager.clearLyrics()
+                globalProgressMs = exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                globalTotalDurationMs = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
                 val targetSong = currentSong ?: return@LaunchedEffect
                 val cached = LyricsManager.getCachedLyrics(targetSong.id)
                 if (cached != null && cached.lines.isNotEmpty()) {
@@ -1024,6 +1033,32 @@ class MainActivity : ComponentActivity() {
                     if (currentSong?.id == targetSong.id) {
                         currentLyrics = loaded
                     }
+                }
+            }
+
+            // 全局实时播放进度与灵动岛同步歌词驱动器
+            LaunchedEffect(isPlaying, currentSong?.id, currentLyrics) {
+                val song = currentSong ?: return@LaunchedEffect
+                while (isActive && isPlaying) {
+                    val pos = exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    val dur = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
+                    globalProgressMs = pos
+                    if (dur > 0L) globalTotalDurationMs = dur
+
+                    val lines = currentLyrics.lines
+                    if (lines.isNotEmpty()) {
+                        val idx = lines.indexOfLast { it.timestampMs <= pos }.coerceAtLeast(0)
+                        val curLine = lines.getOrNull(idx)?.text.orEmpty()
+                        val nxtLine = lines.getOrNull(idx + 1)?.text.orEmpty()
+                        DynamicIslandManager.updateRealtimeLyrics(
+                            context = this@MainActivity,
+                            song = song,
+                            currentLine = curLine,
+                            nextLine = nxtLine,
+                            isPlaying = true
+                        )
+                    }
+                    delay(420L)
                 }
             }
 
@@ -1763,6 +1798,40 @@ class MainActivity : ComponentActivity() {
                         }
                         }
                     }
+
+                    // 全局安卓灵动岛交互胶囊与展开播控面板 (非全屏播放器状态下顶部居中灵动呈现)
+                    DynamicIslandOverlay(
+                        currentSong = currentSong,
+                        isPlaying = isPlaying,
+                        progressMs = globalProgressMs,
+                        totalDurationMs = globalTotalDurationMs,
+                        isVisibleAllowed = !isFullPlayerVisible && !isSplashVisible && !isSearchDialogOpen,
+                        onPlayPauseToggle = togglePlayPause,
+                        onPrevious = playPrevious,
+                        onNext = playNext,
+                        onToggleFavorite = { favTarget ->
+                            val updatedSong = favTarget.copy(isFavorite = !favTarget.isFavorite)
+                            songList = songList.map { if (it.id == favTarget.id) updatedSong else it }
+                            PlaybackQueueManager.updateCurrentSong(updatedSong)
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                database.songDao().updateFavorite(favTarget.id, updatedSong.isFavorite)
+                                val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                                if (activeServer != null) {
+                                    val serverPath = LemonMusicProtocol.getServerFilePath(favTarget.id, favTarget.streamUrl)
+                                    if (!serverPath.isNullOrBlank()) {
+                                        val protocol = LemonMusicProtocol(
+                                            NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                            activeServer.serverUrl,
+                                            activeServer.username,
+                                            activeServer.tokenOrApiKey
+                                        )
+                                        protocol.toggleFavoriteOnServer(serverPath, updatedSong.isFavorite)
+                                    }
+                                }
+                            }
+                        },
+                        onOpenFullPlayer = { isFullPlayerVisible = true }
+                    )
 
                     // 全屏现代高保真音乐播放器弹窗 (支持横屏分屏歌词与多主题联动)
                     AnimatedVisibility(

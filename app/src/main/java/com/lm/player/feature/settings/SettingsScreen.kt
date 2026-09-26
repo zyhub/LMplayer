@@ -34,6 +34,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.designsystem.theme.*
+import com.lm.player.core.media.DynamicIslandManager
+import com.lm.player.core.media.IslandDisplayMode
 import com.lm.player.core.media.LocalMediaScanner
 import com.lm.player.core.media.Media3Factory
 import com.lm.player.core.model.*
@@ -511,10 +513,11 @@ fun SettingsScreen(
                                             latestVersion = curVerName,
                                             latestVersionCode = curVerCode.toInt(),
                                             releaseNotes = "【v${curVerName} 最新更新日志】\n\n" +
-                                                "1. 资料库「本地文件夹」UI 显示修复：修复横向滚动列表与全部文件夹网格中卡片宽度约束与文本排版折叠问题，过滤服务端元数据干扰\n" +
-                                                "2. 资料库「歌手」与「最新添加专辑」点击全部优化：新增自适应网格画廊展示，支持二级平滑返回\n" +
-                                                "3. 服务端曲目流解析与播放容灾优化：修复服务端音乐流与鉴权 Token 绑定逻辑，严格限制同名本地歌曲无缝降级\n" +
-                                                "4. 全局代码审计与性能提升：优化搜索回调重组缓存、本地首页最近添加待播队列一致性及全局 HTTP 连接池复用",
+                                                "1. 全品牌安卓灵动岛上岛适配：深度适配小米澎湃OS超级岛/焦点通知、OPPO流体云、vivo原子岛、荣耀灵动胶囊与魅族状态栏歌词\n" +
+                                                "2. 系统级媒体会话封面与进度直推：自动提取内嵌/云端高清封面注入 MediaSession 与 MediaStyle 通知，解决系统灵动岛无封面或不识别问题\n" +
+                                                "3. 内置交互式灵动岛胶囊与展开播控面板：支持旋转黑胶封面、四柱音频律动波纹、实时双行歌词翻滚及左右滑动切歌\n" +
+                                                "4. 灵动岛与状态栏实时歌词推送：后台播放服务毫秒级驱动同步歌词上岛与蓝牙车载仪表盘广播\n" +
+                                                "5. 设置中心新增「安卓灵动岛与实时歌词上岛」配置专区：支持智能上岛/常驻胶囊/仅系统上岛多模式切换与动效预览",
                                             downloadUrl = ""
                                         )
                                         showVersionNotesDialog = true
@@ -1163,6 +1166,104 @@ fun SettingsScreen(
                                 checked = autoFallbackToLocal,
                                 onCheckedChange = onAutoFallbackToLocalChange
                             )
+                        }
+                    }
+
+                    item {
+                        val systemIslandEnabled by DynamicIslandManager.systemIslandEnabledFlow.collectAsState()
+                        val liveLyricsOnIsland by DynamicIslandManager.liveLyricsOnIslandFlow.collectAsState()
+                        val islandDisplayMode by DynamicIslandManager.islandDisplayModeFlow.collectAsState()
+                        val showLyricsInPill by DynamicIslandManager.showLyricsInPillFlow.collectAsState()
+                        val deviceIslandProfile = remember { DynamicIslandManager.getDeviceIslandProfile() }
+
+                        SettingsCard(title = "安卓灵动岛与实时歌词上岛", icon = Icons.Default.AutoAwesome) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = AppleRed.copy(alpha = 0.10f),
+                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.25f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Verified,
+                                        contentDescription = null,
+                                        tint = AppleRed,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "当前设备灵动岛协议识别",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = deviceIslandProfile,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            SettingSwitchRow(
+                                title = "系统级原生上岛引擎",
+                                subtitle = "适配小米澎湃OS超级岛/焦点通知、OPPO流体云、vivo原子岛、荣耀灵动胶囊及系统媒体中心高清封面同步",
+                                checked = systemIslandEnabled,
+                                onCheckedChange = { DynamicIslandManager.setSystemIslandEnabled(context, it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingSwitchRow(
+                                title = "灵动岛与状态栏实时歌词推送",
+                                subtitle = "将当前同步歌词实时推送至系统灵动岛、状态栏 Ticker (Flyme/OriginOS/ColorOS) 及车载蓝牙仪表盘",
+                                checked = liveLyricsOnIsland,
+                                onCheckedChange = { DynamicIslandManager.setLiveLyricsOnIsland(context, it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            SettingDropdownRow(
+                                title = "灵动岛展示模式",
+                                subtitle = "控制应用内顶部灵动胶囊与系统原生灵动岛的协同方式",
+                                selectedValue = islandDisplayMode,
+                                options = IslandDisplayMode.entries,
+                                getLabel = { it.label },
+                                getSubtitle = { it.subtitle },
+                                onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingSwitchRow(
+                                title = "紧凑胶囊优先滚动同步歌词",
+                                subtitle = "在顶部灵动胶囊中优先翻滚显示当前同步歌词，无歌词时展示歌名与歌手",
+                                checked = showLyricsInPill,
+                                onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            OutlinedButton(
+                                onClick = {
+                                    DynamicIslandManager.triggerIslandPreview(context)
+                                    Toast.makeText(context, "已触发灵动岛展开动效（播放歌曲时将在屏幕顶部居中展开）", Toast.LENGTH_SHORT).show()
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("立即测试并展开顶部灵动岛面板", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
 
