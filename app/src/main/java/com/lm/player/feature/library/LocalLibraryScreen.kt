@@ -117,12 +117,21 @@ fun LocalLibraryScreen(
     var isFromAllArtists by remember { mutableStateOf(false) }
     var isFromAllAlbums by remember { mutableStateOf(false) }
 
-    // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名)
+    // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名，过滤服务端 JSON 元数据)
     val localFolders = remember(allSongs) {
         allSongs.mapNotNull { song ->
+            val rawRelPath = song.relativeFolderPath?.trim()
+            val validRelPath = if (
+                !rawRelPath.isNullOrBlank() &&
+                !rawRelPath.startsWith("{") &&
+                !rawRelPath.contains("\"") &&
+                !rawRelPath.contains("_id__") &&
+                !rawRelPath.startsWith("http")
+            ) rawRelPath else null
+
             val folderName = when {
-                !song.relativeFolderPath.isNullOrBlank() -> {
-                    val p = song.relativeFolderPath.trim().replace('\\', '/')
+                validRelPath != null -> {
+                    val p = validRelPath.replace('\\', '/')
                     p.trimEnd('/').substringAfterLast('/')
                 }
                 !song.localFilePath.isNullOrBlank() -> {
@@ -141,7 +150,10 @@ fun LocalLibraryScreen(
             UnifiedFolder(
                 id = "folder_${folderName.hashCode()}",
                 name = folderName,
-                path = songs.firstOrNull()?.let { it.relativeFolderPath ?: it.localFilePath } ?: "",
+                path = songs.firstOrNull()?.let { s ->
+                    val rp = s.relativeFolderPath?.trim()
+                    if (!rp.isNullOrBlank() && !rp.startsWith("{") && !rp.contains("\"")) rp else s.localFilePath
+                } ?: "",
                 songCount = songs.size,
                 songs = songs
             )
@@ -1767,7 +1779,7 @@ fun LocalLibraryScreen(
 private fun FolderCardItem(
     folder: UnifiedFolder,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier.width(176.dp)
 ) {
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
@@ -1776,11 +1788,14 @@ private fun FolderCardItem(
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
         border = BorderStroke(1.dp, borderColor),
         modifier = modifier
+            .height(64.dp)
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
@@ -1798,7 +1813,10 @@ private fun FolderCardItem(
                 )
             }
             Spacer(modifier = Modifier.width(10.dp))
-            Column(modifier = Modifier.weight(1f, fill = false)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.Center
+            ) {
                 Text(
                     text = folder.name,
                     fontSize = 13.sp,
@@ -1807,10 +1825,13 @@ private fun FolderCardItem(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = "${folder.songCount} 首歌曲",
                     fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }

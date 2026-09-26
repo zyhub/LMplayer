@@ -433,7 +433,7 @@ fun LocalMusicHomeScreen(
                                 RecentlyAddedSongCard(
                                     song = song,
                                     isLocalOfflineMode = true,
-                                    onClick = { onSongClick(song, recentSongs.take(20)) }
+                                    onClick = { onSongClick(song, effectiveRecentlyAdded) }
                                 )
                             }
                         }

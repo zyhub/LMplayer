@@ -1720,39 +1720,47 @@ class MainActivity : ComponentActivity() {
 
                         // 全屏全局沉浸式搜索面板 (内嵌于脚手架内容层中，保持底栏播放器常显并可交互)
                         if (isSearchDialogOpen) {
-                                val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                                LibrarySearchDialog(
-                                    allSongs = songList,
-                                    onSongClick = { targetSong, queue ->
-                                        playSongWithQueue(targetSong, queue)
-                                    },
-                                    onDownloadSong = handleDownloadSong,
-                                    onDownloadSongWithOptions = handleDownloadWithOptions,
-                                    initialOnlineSource = currentOnlineSource,
-                                    onOnlineSourceChanged = { newSrc ->
-                                        currentOnlineSource = newSrc
-                                        onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
-                                    },
-                                    onOnlineSearch = if (activeServer != null) {
-                                        { keyword, source ->
-                                            val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                            val protocol = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                            protocol.searchOnline(keyword, source = source.key).getOrNull() ?: emptyList()
-                                        }
-                                    } else null,
-                                    onParseExternalPlaylist = if (activeServer != null) {
-                                        { url, source ->
-                                            val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                            val protocol = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                            protocol.parseExternalPlaylist(urlOrId = url, source = source.key).getOrNull() ?: emptyList()
-                                        }
-                                    } else null,
-                                    isServerConnected = (activeServer != null),
-                                    contentPadding = innerPadding,
-                                    onDismiss = { isSearchDialogOpen = false }
-                                )
+                            val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                                ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                            val onlineSearchCallback: (suspend (String, OnlineMusicSource) -> List<UnifiedSong>)? = remember(activeServer) {
+                                val srv = activeServer
+                                if (srv != null) {
+                                    { keyword, source ->
+                                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                        val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
+                                        protocol.searchOnline(keyword, source = source.key).getOrNull() ?: emptyList()
+                                    }
+                                } else null
                             }
+                            val parsePlaylistCallback: (suspend (String, OnlineMusicSource) -> List<UnifiedSong>)? = remember(activeServer) {
+                                val srv = activeServer
+                                if (srv != null) {
+                                    { url, source ->
+                                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                        val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
+                                        protocol.parseExternalPlaylist(urlOrId = url, source = source.key).getOrNull() ?: emptyList()
+                                    }
+                                } else null
+                            }
+                            LibrarySearchDialog(
+                                allSongs = songList,
+                                onSongClick = { targetSong, queue ->
+                                    playSongWithQueue(targetSong, queue)
+                                },
+                                onDownloadSong = handleDownloadSong,
+                                onDownloadSongWithOptions = handleDownloadWithOptions,
+                                initialOnlineSource = currentOnlineSource,
+                                onOnlineSourceChanged = { newSrc ->
+                                    currentOnlineSource = newSrc
+                                    onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
+                                },
+                                onOnlineSearch = onlineSearchCallback,
+                                onParseExternalPlaylist = parsePlaylistCallback,
+                                isServerConnected = (activeServer != null),
+                                contentPadding = innerPadding,
+                                onDismiss = { isSearchDialogOpen = false }
+                            )
+                        }
                         }
                     }
 
