@@ -309,6 +309,54 @@ class MainActivity : ComponentActivity() {
             var recentlyAddedSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
             var recentlyPlayedSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
 
+            val allDownloads by database.downloadDao().getAllDownloadsFlow().collectAsState(initial = emptyList())
+            val completedDownloadedSongs by produceState(
+                initialValue = emptyList<UnifiedSong>(),
+                key1 = songList,
+                key2 = allDownloads
+            ) {
+                value = withContext(Dispatchers.IO) {
+                    val downloadedFromSongList = songList.filter {
+                        (it.downloadStatus == DownloadStatus.DOWNLOADED ||
+                         it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
+                         !it.localFilePath.isNullOrBlank()) &&
+                        (it.localFilePath?.let { p -> p.startsWith("content://") || File(p).exists() } ?: (it.downloadStatus == DownloadStatus.DOWNLOADED))
+                    }
+
+                    val songIdsInList = downloadedFromSongList.map { it.id }.toSet()
+                    val localPathsInList = downloadedFromSongList.mapNotNull { it.localFilePath }.toSet()
+
+                    val complementaryFromDownloads = allDownloads.filter { record ->
+                        record.status == DownloadStatus.DOWNLOADED &&
+                        !songIdsInList.contains(record.songId) &&
+                        (record.localFilePath == null || !localPathsInList.contains(record.localFilePath)) &&
+                        (record.localFilePath != null && File(record.localFilePath).exists())
+                    }.map { record ->
+                        val file = record.localFilePath?.let { File(it) }
+                        val ext = file?.extension?.ifBlank { "mp3" } ?: "mp3"
+                        UnifiedSong(
+                            id = record.songId,
+                            title = record.title,
+                            artist = record.artist,
+                            artistId = "artist_${record.artist.hashCode()}",
+                            album = "已下载歌曲",
+                            albumId = "album_downloaded",
+                            durationMs = 0L,
+                            coverUrl = record.coverUrl,
+                            streamUrl = record.localFilePath ?: record.remoteUrl,
+                            serverId = "local_storage",
+                            localFilePath = record.localFilePath,
+                            downloadStatus = DownloadStatus.DOWNLOADED,
+                            bitRate = 320,
+                            format = ext,
+                            isFavorite = false
+                        )
+                    }
+
+                    downloadedFromSongList + complementaryFromDownloads
+                }
+            }
+
             // 全局播放状态委托至 PlaybackQueueManager
             val currentSong by PlaybackQueueManager.currentSongFlow.collectAsState()
             val isPlaying by PlaybackQueueManager.isPlayingFlow.collectAsState()
@@ -725,16 +773,122 @@ class MainActivity : ComponentActivity() {
                     if (recentlyPlayedSongs.isEmpty() && mappedSongs.isNotEmpty()) {
                         recentlyPlayedSongs = mappedSongs.take(10)
                     }
-                    if (currentSong == null && mappedSongs.isNotEmpty()) {
-                        val lastPlayedSongId = autoPlayPrefs.getString("last_played_song_id", "") ?: ""
-                        val targetSong = mappedSongs.firstOrNull { it.id == lastPlayedSongId } ?: mappedSongs.first()
-                        PlaybackQueueManager.setInitialSongIfAbsent(targetSong, mappedSongs)
+                    if (currentSong == null) {
+                        val savedSong = PlaybackQueueManager.getSavedLastSong(this@MainActivity)
+                        val savedQueue = PlaybackQueueManager.getSavedQueue(this@MainActivity)
+                        val lastPlayedSongId = autoPlayPrefs.getString("last_played_song_id", "")?.trim().orEmpty()
+                        val targetSong = savedSong
+                            ?: (if (lastPlayedSongId.isNotEmpty()) mappedSongs.firstOrNull { it.id == lastPlayedSongId } else null)
+                            ?: (if (lastPlayedSongId.isEmpty()) mappedSongs.firstOrNull() else null)
+                        if (targetSong != null) {
+                            PlaybackQueueManager.setInitialSongIfAbsent(
+                                targetSong,
+                                savedQueue.ifEmpty { mappedSongs }
+                            )
+                        }
                     }
                 }
             }
 
-            // 核心业务函数：播放指定歌曲 (委托至 PlaybackQueueManager 调度，支持动态上下文队列与全局本地优先调用)
-            val playSongWithQueue: (UnifiedSong, List<UnifiedSong>?) -> Unit = { targetSong, contextQueue ->
+            // 统一解析上次关闭前正在播放的歌曲与所属播放列表（兼容本地曲库、已下载列表、发现页/搜索在线曲目及云端歌单）
+            val resolveSavedSongAndQueue: (List<UnifiedSong>) -> Pair<UnifiedSong?, List<UnifiedSong>> = { candidates ->
+                val savedSong = PlaybackQueueManager.getSavedLastSong(this@MainActivity)
+                val savedQueue = PlaybackQueueManager.getSavedQueue(this@MainActivity)
+                val lastPlayedId = autoPlayPrefs.getString("last_played_song_id", "")?.trim().orEmpty()
+                    .ifEmpty { savedSong?.id.orEmpty() }
+                val lastPlayedTitle = autoPlayPrefs.getString("last_played_song_title", "")?.trim().orEmpty()
+                    .ifEmpty { savedSong?.title.orEmpty() }
+                val lastPlayedArtist = autoPlayPrefs.getString("last_played_song_artist", "")?.trim().orEmpty()
+                    .ifEmpty { savedSong?.artist.orEmpty() }
+
+                val matchedById = if (lastPlayedId.isNotEmpty()) {
+                    candidates.firstOrNull { it.id == lastPlayedId }
+                } else null
+
+                val matchedByMeta = if (matchedById == null && lastPlayedTitle.isNotEmpty()) {
+                    val normTitle = SongMatchingResolver.normalizeTrackTitle(lastPlayedTitle)
+                    val normArtist = SongMatchingResolver.normalizeArtist(lastPlayedArtist)
+                    if (normTitle.isNotEmpty()) {
+                        val allMatches = candidates.filter { s ->
+                            SongMatchingResolver.normalizeTrackTitle(s.title) == normTitle &&
+                            (normArtist.isEmpty() ||
+                             SongMatchingResolver.normalizeArtist(s.artist).let { a ->
+                                 a.isEmpty() || a == normArtist || a.contains(normArtist) || normArtist.contains(a)
+                             })
+                        }
+                        allMatches.firstOrNull { s ->
+                            !s.localFilePath.isNullOrBlank() &&
+                            (s.localFilePath.startsWith("content://") || File(s.localFilePath).exists())
+                        } ?: allMatches.firstOrNull()
+                    } else null
+                } else null
+
+                val matchedCandidate = matchedById ?: matchedByMeta
+
+                val resolvedTarget: UnifiedSong? = when {
+                    savedSong != null && matchedCandidate != null -> {
+                        val validCandidateLocal = matchedCandidate.localFilePath?.takeIf {
+                            it.isNotBlank() && (it.startsWith("content://") || File(it).exists())
+                        }
+                        val validSavedLocal = savedSong.localFilePath?.takeIf {
+                            it.isNotBlank() && (it.startsWith("content://") || File(it).exists())
+                        }
+                        val effectiveLocal = validCandidateLocal ?: validSavedLocal
+                        val effectiveStream = when {
+                            !effectiveLocal.isNullOrBlank() -> effectiveLocal
+                            matchedCandidate.streamUrl.isNotBlank() && !matchedCandidate.streamUrl.startsWith("lemon_online://") -> matchedCandidate.streamUrl
+                            savedSong.streamUrl.isNotBlank() -> savedSong.streamUrl
+                            else -> matchedCandidate.streamUrl
+                        }
+                        savedSong.copy(
+                            localFilePath = effectiveLocal,
+                            streamUrl = effectiveStream,
+                            downloadStatus = if (!effectiveLocal.isNullOrBlank()) DownloadStatus.DOWNLOADED else matchedCandidate.downloadStatus,
+                            coverUrl = savedSong.coverUrl.ifBlank { matchedCandidate.coverUrl },
+                            durationMs = if (savedSong.durationMs > 0L) savedSong.durationMs else matchedCandidate.durationMs,
+                            rawMetaJson = savedSong.rawMetaJson ?: matchedCandidate.rawMetaJson
+                        )
+                    }
+                    savedSong != null -> savedSong
+                    matchedCandidate != null -> matchedCandidate
+                    lastPlayedId.isEmpty() -> candidates.firstOrNull()
+                    else -> candidates.firstOrNull()
+                }
+
+                val resolvedQueue: List<UnifiedSong> = when {
+                    savedQueue.isNotEmpty() -> {
+                        val enriched = if (candidates.isNotEmpty()) {
+                            SongMatchingResolver.resolveSongList(
+                                incomingSongs = savedQueue,
+                                allCachedSongs = candidates
+                            )
+                        } else {
+                            savedQueue
+                        }
+                        if (resolvedTarget != null && enriched.none { it.id == resolvedTarget.id }) {
+                            listOf(resolvedTarget) + enriched
+                        } else if (resolvedTarget != null) {
+                            enriched.map { if (it.id == resolvedTarget.id) resolvedTarget else it }
+                        } else {
+                            enriched
+                        }
+                    }
+                    candidates.isNotEmpty() -> {
+                        if (resolvedTarget != null && candidates.none { it.id == resolvedTarget.id }) {
+                            listOf(resolvedTarget) + candidates
+                        } else {
+                            candidates
+                        }
+                    }
+                    resolvedTarget != null -> listOf(resolvedTarget)
+                    else -> emptyList()
+                }
+
+                Pair(resolvedTarget, resolvedQueue)
+            }
+
+            // 核心业务函数：播放指定歌曲 (委托至 PlaybackQueueManager 调度，支持动态上下文队列、断点进度与全局本地优先调用)
+            val playSongWithQueueAndPosition: (UnifiedSong, List<UnifiedSong>?, Long) -> Unit = { targetSong, contextQueue, startPositionMs ->
                 if (currentScreen == Screen.HOME || currentScreen == Screen.LIBRARY) {
                     playingListScreen = currentScreen
                 }
@@ -749,11 +903,12 @@ class MainActivity : ComponentActivity() {
                     targetSong.localFilePath
                 } else null
 
-                // 若未直接携带本地路径，快速从当前已收录歌曲库匹配（如从在线搜索或云端列表点击）
+                // 若未直接携带本地路径，快速从当前已收录歌曲库与已下载列表匹配（如从在线搜索或云端列表点击）
                 val resolvedLocalPath = validDirectPath ?: run {
                     val normTitle = SongMatchingResolver.normalizeTrackTitle(targetSong.title)
                     val normArtist = SongMatchingResolver.normalizeArtist(targetSong.artist)
-                    val matchedLocal = songList.firstOrNull {
+                    val allLocalCandidates = songList + completedDownloadedSongs
+                    val matchedLocal = allLocalCandidates.firstOrNull {
                         val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
                         hasFile && (it.id == targetSong.id || (
                             normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
@@ -771,14 +926,43 @@ class MainActivity : ComponentActivity() {
                     )
                     recentlyPlayedSongs = listOf(localSong) + recentlyPlayedSongs.filter { it.id != localSong.id }
                     val resolvedQueue = activeQueue.map { if (it.id == localSong.id) localSong else it }
-                    PlaybackQueueManager.playSong(localSong, this@MainActivity, resolvedQueue)
+                    PlaybackQueueManager.playSong(
+                        targetSong = localSong,
+                        context = this@MainActivity,
+                        newPlaylist = resolvedQueue,
+                        startPositionMs = startPositionMs
+                    )
                 } else if (
                     (targetSong.serverId == "lemon_online" || targetSong.id.startsWith("lemon_online_")) &&
-                    (targetSong.streamUrl.isBlank() || targetSong.streamUrl.startsWith("lemon_online://") || targetSong.streamUrl.contains("/api/play/proxy"))
+                    !targetSong.streamUrl.contains("/api/play/local")
                 ) {
+                    // 立即同步当前歌曲状态与持久化，确保异步解析流地址期间界面与状态一致
+                    PlaybackQueueManager.updateCurrentSong(targetSong)
+                    if (!contextQueue.isNullOrEmpty()) {
+                        PlaybackQueueManager.setQueue(contextQueue)
+                    }
                     lifecycleScope.launch(Dispatchers.IO) {
                         val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                             ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                            ?: run {
+                                val entity = try {
+                                    database.serverDao().getActiveServer()
+                                        ?: database.serverDao().getAllServers().firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                                } catch (_: Exception) { null }
+                                entity?.let {
+                                    ServerConfig(
+                                        id = it.id,
+                                        name = it.name,
+                                        type = it.type,
+                                        serverUrl = it.serverUrl,
+                                        username = it.username,
+                                        tokenOrApiKey = it.tokenOrApiKey,
+                                        saltOrSecret = it.saltOrSecret,
+                                        syncMode = it.syncMode,
+                                        isCurrentActive = it.isCurrentActive
+                                    )
+                                }
+                            }
                         if (active != null) {
                             val protocol = LemonMusicProtocol(
                                 NetworkClientFactory.createOkHttpClient(this@MainActivity),
@@ -838,24 +1022,43 @@ class MainActivity : ComponentActivity() {
                                 withContext(Dispatchers.Main) {
                                     recentlyPlayedSongs = listOf(resolvedSong) + recentlyPlayedSongs.filter { it.id != resolvedSong.id }
                                     val resolvedQueue = activeQueue.map { if (it.id == resolvedSong.id) resolvedSong else it }
-                                    PlaybackQueueManager.playSong(resolvedSong, this@MainActivity, resolvedQueue)
+                                    PlaybackQueueManager.playSong(
+                                        targetSong = resolvedSong,
+                                        context = this@MainActivity,
+                                        newPlaylist = resolvedQueue,
+                                        startPositionMs = startPositionMs
+                                    )
                                 }
                                 return@launch
                             }
                         }
                         withContext(Dispatchers.Main) {
                             recentlyPlayedSongs = listOf(targetSong) + recentlyPlayedSongs.filter { it.id != targetSong.id }
-                            PlaybackQueueManager.playSong(targetSong, this@MainActivity, activeQueue)
+                            PlaybackQueueManager.playSong(
+                                targetSong = targetSong,
+                                context = this@MainActivity,
+                                newPlaylist = activeQueue,
+                                startPositionMs = startPositionMs
+                            )
                         }
                     }
                 } else {
                     recentlyPlayedSongs = listOf(targetSong) + recentlyPlayedSongs.filter { it.id != targetSong.id }
-                    PlaybackQueueManager.playSong(targetSong, this@MainActivity, activeQueue)
+                    PlaybackQueueManager.playSong(
+                        targetSong = targetSong,
+                        context = this@MainActivity,
+                        newPlaylist = activeQueue,
+                        startPositionMs = startPositionMs
+                    )
                 }
             }
 
+            val playSongWithQueue: (UnifiedSong, List<UnifiedSong>?) -> Unit = { targetSong, contextQueue ->
+                playSongWithQueueAndPosition(targetSong, contextQueue, 0L)
+            }
+
             val playSong: (UnifiedSong) -> Unit = { targetSong ->
-                playSongWithQueue(targetSong, null)
+                playSongWithQueueAndPosition(targetSong, null, 0L)
             }
 
             // 多选音质与下载端点调度 (支持缓存至本地 / 缓存至服务器 / 双方同步缓存)
@@ -1316,13 +1519,32 @@ class MainActivity : ComponentActivity() {
                 togglePlayAction = togglePlayPause
             }
 
-            // 启动自动播放与断点恢复逻辑 (启动时优先播放上一次关闭界面时的歌曲)
-            LaunchedEffect(songList) {
-                if (autoPlayOnStartup && !hasAutoPlayedOnStartup && songList.isNotEmpty()) {
+            // 启动自动播放与断点恢复逻辑 (启动时精准恢复并继续播放上一次关闭前的那一首歌曲与进度)
+            LaunchedEffect(songList, completedDownloadedSongs, autoPlayOnStartup) {
+                if (!autoPlayOnStartup || hasAutoPlayedOnStartup) return@LaunchedEffect
+                if (exoPlayer?.isPlaying == true && currentSong != null) {
                     hasAutoPlayedOnStartup = true
-                    val lastPlayedSongId = autoPlayPrefs.getString("last_played_song_id", "") ?: ""
-                    val targetSong = songList.firstOrNull { it.id == lastPlayedSongId } ?: songList.first()
-                    playSong(targetSong)
+                    return@LaunchedEffect
+                }
+                if (songList.isEmpty() && completedDownloadedSongs.isEmpty()) {
+                    delay(300L)
+                }
+                if (hasAutoPlayedOnStartup) return@LaunchedEffect
+                val combinedCandidates = (songList + completedDownloadedSongs).distinctBy { it.id }
+                val (targetSong, targetQueue) = resolveSavedSongAndQueue(combinedCandidates)
+                if (targetSong != null) {
+                    hasAutoPlayedOnStartup = true
+                    val savedPos = PlaybackQueueManager.getSavedPositionMs(this@MainActivity)
+                    val resumePos = if (targetSong.durationMs > 0L && savedPos >= targetSong.durationMs - 2000L) {
+                        0L
+                    } else {
+                        savedPos.coerceAtLeast(0L)
+                    }
+                    playSongWithQueueAndPosition(
+                        targetSong,
+                        targetQueue.ifEmpty { listOf(targetSong) },
+                        resumePos
+                    )
                 }
             }
 
@@ -1359,7 +1581,7 @@ class MainActivity : ComponentActivity() {
 
                             if (autoFallbackToLocal) {
                                 // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度
-                                val matchedLocalSong = songList.firstOrNull {
+                                val matchedLocalSong = (songList + completedDownloadedSongs).firstOrNull {
                                     val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
                                     hasFile && (it.id == targetSong.id || (
                                         normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
@@ -1464,54 +1686,6 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                     ) {
-                        val allDownloads by database.downloadDao().getAllDownloadsFlow().collectAsState(initial = emptyList())
-                        val completedDownloadedSongs by produceState(
-                            initialValue = emptyList<UnifiedSong>(),
-                            key1 = songList,
-                            key2 = allDownloads
-                        ) {
-                            value = withContext(Dispatchers.IO) {
-                                val downloadedFromSongList = songList.filter {
-                                    (it.downloadStatus == DownloadStatus.DOWNLOADED ||
-                                     it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
-                                     !it.localFilePath.isNullOrBlank()) &&
-                                    (it.localFilePath?.let { p -> p.startsWith("content://") || File(p).exists() } ?: (it.downloadStatus == DownloadStatus.DOWNLOADED))
-                                }
-
-                                val songIdsInList = downloadedFromSongList.map { it.id }.toSet()
-                                val localPathsInList = downloadedFromSongList.mapNotNull { it.localFilePath }.toSet()
-
-                                val complementaryFromDownloads = allDownloads.filter { record ->
-                                    record.status == DownloadStatus.DOWNLOADED &&
-                                    !songIdsInList.contains(record.songId) &&
-                                    (record.localFilePath == null || !localPathsInList.contains(record.localFilePath)) &&
-                                    (record.localFilePath != null && File(record.localFilePath).exists())
-                                }.map { record ->
-                                    val file = record.localFilePath?.let { File(it) }
-                                    val ext = file?.extension?.ifBlank { "mp3" } ?: "mp3"
-                                    UnifiedSong(
-                                        id = record.songId,
-                                        title = record.title,
-                                        artist = record.artist,
-                                        artistId = "artist_${record.artist.hashCode()}",
-                                        album = "已下载歌曲",
-                                        albumId = "album_downloaded",
-                                        durationMs = 0L,
-                                        coverUrl = record.coverUrl,
-                                        streamUrl = record.localFilePath ?: record.remoteUrl,
-                                        serverId = "local_storage",
-                                        localFilePath = record.localFilePath,
-                                        downloadStatus = DownloadStatus.DOWNLOADED,
-                                        bitRate = 320,
-                                        format = ext,
-                                        isFavorite = false
-                                    )
-                                }
-
-                                downloadedFromSongList + complementaryFromDownloads
-                            }
-                        }
-
                         var globalSearchQuery by remember { mutableStateOf("") }
                         var currentSearchType by remember { mutableStateOf(SearchContentType.SONG) }
                         val activeLemonServerForSearch = remember(serversList) {
@@ -2626,6 +2800,8 @@ class MainActivity : ComponentActivity() {
      */
     private fun exitAppCompletely() {
         try {
+            val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
             exoPlayer?.stop()
             exoPlayer?.clearMediaItems()
             PlaybackService.stopServiceAndPlayback(this)
@@ -2792,7 +2968,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        super.onPause()
+    }
+
     override fun onStop() {
+        val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
         super.onStop()
         if (!isChangingConfigurations) {
             DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = true)
@@ -2858,6 +3042,8 @@ class MainActivity : ComponentActivity() {
         }
         if (isFinishing) {
             try {
+                val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+                PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 PlaybackService.stopServiceAndPlayback(this)

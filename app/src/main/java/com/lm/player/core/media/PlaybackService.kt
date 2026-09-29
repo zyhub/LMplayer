@@ -61,6 +61,8 @@ class PlaybackService : MediaSessionService() {
             try {
                 BackgroundIslandOverlayController.destroy()
                 val player = Media3Factory.getSharedExoPlayer(context)
+                val currentPos = player.currentPosition.takeIf { it > 0L }
+                PlaybackQueueManager.savePlaybackState(context, positionMs = currentPos, commitSync = true)
                 player.stop()
                 player.clearMediaItems()
                 val stopIntent = Intent(context, PlaybackService::class.java).apply {
@@ -364,6 +366,8 @@ class PlaybackService : MediaSessionService() {
         if (intent?.action == ACTION_STOP_SERVICE) {
             try {
                 BackgroundIslandOverlayController.destroy()
+                val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+                PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -413,6 +417,8 @@ class PlaybackService : MediaSessionService() {
         super.onTaskRemoved(rootIntent)
         try {
             BackgroundIslandOverlayController.destroy()
+            val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
             exoPlayer?.stop()
             exoPlayer?.clearMediaItems()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {

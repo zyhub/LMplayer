@@ -7,22 +7,31 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 
 @OptIn(UnstableApi::class)
 object PlaybackQueueManager {
 
     private const val TAG = "PlaybackQueueManager"
+    private const val AUTO_PLAY_PREFS = "zds_auto_play_prefs"
+    private const val MAX_PERSISTED_QUEUE_SIZE = 120
+
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var playJob: Job? = null
+    private var positionSaveJob: Job? = null
 
     private val _playlistFlow = MutableStateFlow<List<UnifiedSong>>(emptyList())
     val playlistFlow: StateFlow<List<UnifiedSong>> = _playlistFlow.asStateFlow()
@@ -42,6 +51,156 @@ object PlaybackQueueManager {
     private var isListenerAttached = false
     private var appContext: Context? = null
 
+    private fun songToJson(song: UnifiedSong): JSONObject {
+        return JSONObject().apply {
+            put("id", song.id)
+            put("title", song.title)
+            put("artist", song.artist)
+            put("artistId", song.artistId)
+            put("album", song.album)
+            put("albumId", song.albumId)
+            put("durationMs", song.durationMs)
+            put("coverUrl", song.coverUrl)
+            put("streamUrl", song.streamUrl)
+            put("serverId", song.serverId)
+            put("localFilePath", song.localFilePath ?: "")
+            put("downloadStatus", song.downloadStatus.name)
+            put("bitRate", song.bitRate)
+            put("format", song.format)
+            put("isFavorite", song.isFavorite)
+            put("relativeFolderPath", song.relativeFolderPath ?: "")
+            put("addedTimestamp", song.addedTimestamp)
+            put("rawMetaJson", song.rawMetaJson ?: "")
+        }
+    }
+
+    private fun jsonToSong(obj: JSONObject): UnifiedSong? {
+        val id = obj.optString("id", "").trim()
+        val title = obj.optString("title", "").trim()
+        if (id.isEmpty() && title.isEmpty()) return null
+        val dlStatusStr = obj.optString("downloadStatus", DownloadStatus.NOT_DOWNLOADED.name)
+        val dlStatus = try {
+            DownloadStatus.valueOf(dlStatusStr)
+        } catch (_: Exception) {
+            DownloadStatus.NOT_DOWNLOADED
+        }
+        return UnifiedSong(
+            id = id.ifEmpty { "restored_${title.hashCode()}" },
+            title = title.ifEmpty { "未知曲目" },
+            artist = obj.optString("artist", "未知歌手"),
+            artistId = obj.optString("artistId", ""),
+            album = obj.optString("album", ""),
+            albumId = obj.optString("albumId", ""),
+            durationMs = obj.optLong("durationMs", 0L),
+            coverUrl = obj.optString("coverUrl", ""),
+            streamUrl = obj.optString("streamUrl", ""),
+            serverId = obj.optString("serverId", "default"),
+            localFilePath = obj.optString("localFilePath", "").ifBlank { null },
+            downloadStatus = dlStatus,
+            bitRate = obj.optInt("bitRate", 320),
+            format = obj.optString("format", "flac"),
+            isFavorite = obj.optBoolean("isFavorite", false),
+            relativeFolderPath = obj.optString("relativeFolderPath", "").ifBlank { null },
+            addedTimestamp = obj.optLong("addedTimestamp", 0L),
+            rawMetaJson = obj.optString("rawMetaJson", "").ifBlank { null }
+        )
+    }
+
+    private fun queueToJson(queue: List<UnifiedSong>, currentSongId: String?): String {
+        if (queue.isEmpty()) return "[]"
+        val windowed = if (queue.size <= MAX_PERSISTED_QUEUE_SIZE) {
+            queue
+        } else {
+            val idx = queue.indexOfFirst { it.id == currentSongId }.coerceAtLeast(0)
+            val half = MAX_PERSISTED_QUEUE_SIZE / 2
+            val start = (idx - half).coerceAtLeast(0)
+            val end = (start + MAX_PERSISTED_QUEUE_SIZE).coerceAtMost(queue.size)
+            val adjustedStart = (end - MAX_PERSISTED_QUEUE_SIZE).coerceAtLeast(0)
+            queue.subList(adjustedStart, end)
+        }
+        val arr = JSONArray()
+        for (s in windowed) {
+            arr.put(songToJson(s))
+        }
+        return arr.toString()
+    }
+
+    fun getSavedLastSong(context: Context): UnifiedSong? {
+        return try {
+            val prefs = context.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+            val rawJson = prefs.getString("last_played_song_json", null)
+            if (!rawJson.isNullOrBlank()) {
+                jsonToSong(JSONObject(rawJson))
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse saved last song", e)
+            null
+        }
+    }
+
+    fun getSavedQueue(context: Context): List<UnifiedSong> {
+        return try {
+            val prefs = context.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+            val rawJson = prefs.getString("last_played_queue_json", null)
+            if (!rawJson.isNullOrBlank()) {
+                val arr = JSONArray(rawJson)
+                val list = ArrayList<UnifiedSong>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    jsonToSong(obj)?.let { list.add(it) }
+                }
+                list
+            } else {
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse saved queue", e)
+            emptyList()
+        }
+    }
+
+    fun getSavedPositionMs(context: Context): Long {
+        return try {
+            val prefs = context.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+            prefs.getLong("last_played_position_ms", 0L).coerceAtLeast(0L)
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    fun savePlaybackState(
+        context: Context? = appContext,
+        song: UnifiedSong? = _currentSongFlow.value,
+        positionMs: Long? = null,
+        commitSync: Boolean = false
+    ) {
+        val ctx = context ?: appContext ?: return
+        val target = song ?: _currentSongFlow.value ?: return
+        try {
+            val prefs = ctx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+            val editor = prefs.edit()
+                .putString("last_played_song_id", target.id)
+                .putString("last_played_song_title", target.title)
+                .putString("last_played_song_artist", target.artist)
+                .putString("last_played_song_json", songToJson(target).toString())
+            if (_playlistFlow.value.isNotEmpty()) {
+                editor.putString("last_played_queue_json", queueToJson(_playlistFlow.value, target.id))
+            }
+            if (positionMs != null && positionMs >= 0L) {
+                editor.putLong("last_played_position_ms", positionMs)
+            }
+            if (commitSync) {
+                editor.commit()
+            } else {
+                editor.apply()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to save playback state", e)
+        }
+    }
+
     fun initFromPrefs(context: Context) {
         appContext = context.applicationContext
         try {
@@ -49,10 +208,22 @@ object PlaybackQueueManager {
             _isShuffleFlow.value = prefs.getBoolean("playback_is_shuffle", false)
             _isRepeatFlow.value = prefs.getBoolean("playback_is_repeat", false)
         } catch (_: Exception) {}
+
+        try {
+            val savedQueue = getSavedQueue(context)
+            if (_playlistFlow.value.isEmpty() && savedQueue.isNotEmpty()) {
+                _playlistFlow.value = savedQueue
+            }
+            val savedSong = getSavedLastSong(context)
+            if (_currentSongFlow.value == null && savedSong != null) {
+                _currentSongFlow.value = savedSong
+            }
+        } catch (_: Exception) {}
     }
 
     fun setQueue(songs: List<UnifiedSong>) {
         _playlistFlow.value = songs
+        savePlaybackState(commitSync = false)
     }
 
     fun setInitialSongIfAbsent(song: UnifiedSong, playlist: List<UnifiedSong>) {
@@ -64,18 +235,47 @@ object PlaybackQueueManager {
         }
     }
 
+    private fun mergeSongMetadata(existing: UnifiedSong, incoming: UnifiedSong): UnifiedSong {
+        val validExistingLocal = existing.localFilePath?.takeIf {
+            it.isNotBlank() && (it.startsWith("content://") || java.io.File(it).exists())
+        }
+        val validIncomingLocal = incoming.localFilePath?.takeIf {
+            it.isNotBlank() && (it.startsWith("content://") || java.io.File(it).exists())
+        }
+        val effectiveLocal = validIncomingLocal ?: validExistingLocal
+        val effectiveStream = when {
+            !effectiveLocal.isNullOrBlank() -> effectiveLocal
+            incoming.streamUrl.isNotBlank() && !incoming.streamUrl.startsWith("lemon_online://") -> incoming.streamUrl
+            existing.streamUrl.isNotBlank() -> existing.streamUrl
+            else -> incoming.streamUrl
+        }
+        return incoming.copy(
+            localFilePath = effectiveLocal,
+            streamUrl = effectiveStream,
+            downloadStatus = if (!effectiveLocal.isNullOrBlank()) DownloadStatus.DOWNLOADED else incoming.downloadStatus,
+            rawMetaJson = incoming.rawMetaJson ?: existing.rawMetaJson
+        )
+    }
+
     fun updateMetadata(songs: List<UnifiedSong>) {
         if (_playlistFlow.value.isEmpty()) {
             _playlistFlow.value = songs
         } else {
             val songMap = songs.associateBy { it.id }
-            _playlistFlow.value = _playlistFlow.value.map { songMap[it.id] ?: it }
+            _playlistFlow.value = _playlistFlow.value.map { existing ->
+                val matched = songMap[existing.id]
+                if (matched != null) mergeSongMetadata(existing, matched) else existing
+            }
         }
         val current = _currentSongFlow.value
         if (current != null) {
             val updated = songs.firstOrNull { it.id == current.id }
-            if (updated != null && updated != current) {
-                _currentSongFlow.value = updated
+            if (updated != null) {
+                val merged = mergeSongMetadata(current, updated)
+                if (merged != current) {
+                    _currentSongFlow.value = merged
+                    savePlaybackState(song = merged, commitSync = false)
+                }
             }
         }
     }
@@ -86,14 +286,16 @@ object PlaybackQueueManager {
         if (current != null) {
             val updated = songs.firstOrNull { it.id == current.id }
             if (updated != null && updated != current) {
-                _currentSongFlow.value = updated
+                _currentSongFlow.value = mergeSongMetadata(current, updated)
             }
         }
+        savePlaybackState(commitSync = false)
     }
 
     fun updateCurrentSong(song: UnifiedSong) {
         _currentSongFlow.value = song
         _playlistFlow.value = _playlistFlow.value.map { if (it.id == song.id) song else it }
+        savePlaybackState(song = song, commitSync = false)
     }
 
     fun setShuffle(shuffle: Boolean) {
@@ -112,6 +314,21 @@ object PlaybackQueueManager {
         } catch (_: Exception) {}
     }
 
+    private fun startPeriodicPositionSave(context: Context, player: Player) {
+        positionSaveJob?.cancel()
+        positionSaveJob = coroutineScope.launch {
+            while (isActive && _isPlayingFlow.value) {
+                delay(5000L)
+                if (player.isPlaying) {
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    if (pos > 0L) {
+                        savePlaybackState(context, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                    }
+                }
+            }
+        }
+    }
+
     fun ensurePlayerListener(context: Context) {
         if (appContext == null) {
             appContext = context.applicationContext
@@ -121,6 +338,15 @@ object PlaybackQueueManager {
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
+                if (playing) {
+                    startPeriodicPositionSave(context.applicationContext, player)
+                } else {
+                    positionSaveJob?.cancel()
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    if (pos > 0L) {
+                        savePlaybackState(context.applicationContext, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                    }
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -149,12 +375,17 @@ object PlaybackQueueManager {
             _playlistFlow.value = newPlaylist
         } else if (_playlistFlow.value.isEmpty()) {
             _playlistFlow.value = listOf(targetSong)
+        } else if (_playlistFlow.value.none { it.id == targetSong.id }) {
+            _playlistFlow.value = listOf(targetSong) + _playlistFlow.value
         }
 
-        try {
-            val prefs = context.getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putString("last_played_song_id", targetSong.id).apply()
-        } catch (_: Exception) {}
+        // 立即同步持久化当前播放歌曲完整元数据、播放队列与起始进度，确保任意时刻关闭应用均可精准恢复
+        savePlaybackState(
+            context = context,
+            song = targetSong,
+            positionMs = startPositionMs.coerceAtLeast(0L),
+            commitSync = true
+        )
 
         playJob?.cancel()
         playJob = coroutineScope.launch {
@@ -200,7 +431,7 @@ object PlaybackQueueManager {
                 list.first()
             }
         }
-        Log.i(TAG, "playNext: switching to ")
+        Log.i(TAG, "playNext: switching to ${nextSong.title}")
         playSong(nextSong, context)
     }
 
@@ -225,7 +456,7 @@ object PlaybackQueueManager {
                 list.last()
             }
         }
-        Log.i(TAG, "playPrevious: switching to ")
+        Log.i(TAG, "playPrevious: switching to ${prevSong.title}")
         playSong(prevSong, context)
     }
 
@@ -236,7 +467,8 @@ object PlaybackQueueManager {
             player.pause()
         } else {
             if (player.currentMediaItem == null && _currentSongFlow.value != null) {
-                playSong(_currentSongFlow.value!!, context)
+                val savedPos = getSavedPositionMs(context)
+                playSong(_currentSongFlow.value!!, context, startPositionMs = savedPos)
             } else {
                 player.play()
             }
