@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.6.9"
-    const val CURRENT_VERSION_CODE = 34
+    const val CURRENT_VERSION_NAME = "1.7.0"
+    const val CURRENT_VERSION_CODE = 35
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -200,7 +200,10 @@ object AppUpdateManager {
                     hasUpdate = false,
                     latestVersion = currentVersionName,
                     latestVersionCode = currentVersionCode.toInt(),
-                    releaseNotes = "当前已是最新版本 (v$currentVersionName)：\n\n1. 播放页与断点续播：还原大尺寸封面、放大 5 行滚动渐变歌词，修复启动自动续播未恢复关闭前曲目与进度的问题\n2. 导航与主题：全面修复深色模式二级页面标题隐形及系统返回键/手势失效问题\n3. 曲库与下载：支持歌单/榜单/曲库多选全选批量下载，精准展示音质规格与文件大小\n4. 灵动岛与交互：优化后台灵动岛悬浮胶囊、歌单秒级同步与在线音源切换体验",
+                    releaseNotes = "当前已是最新版本 (v$currentVersionName)：\n\n" +
+                        "1. 多版本精准识别：严格区分同名歌曲的 Live、演唱会现场、黑胶、伴奏等版本，彻底修复跨版本误高亮、误标已缓存与点击串播问题\n" +
+                        "2. 播放与断点续播：还原大尺寸封面与 5 行滚动歌词，修复启动自动续播未恢复关闭前曲目与进度的问题\n" +
+                        "3. 界面与交互优化：自动清理歌名转义字符，修复深色模式二级页面标题可见度及系统返回键逐级返回逻辑",
                     downloadUrl = ""
                 )
             )

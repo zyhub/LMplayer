@@ -26,29 +26,134 @@ object SongMatchingResolver {
 
     // 预编译正则表达式，彻底消除高频调用时成千上万次 Regex 实例分配与编译开销
     private val TRACK_NUM_REGEX = Regex("""^\d{1,3}[\.\-\s_]+""")
-    private val BRACKET_SUFFIX_REGEX = Regex("""[\(\[\{（【][^\)\]\}）】]*[\)\]\}）】]""")
-    private val AUDIO_EXT_REGEX = Regex("""\.(mp3|flac|wav|m4a|aac|ogg|opus|ape|dsd|dsf)$""")
+    private val BRACKET_GROUP_REGEX = Regex("""[\(\[\{（【]([^\)\]\}）】]*)[\)\]\}）】]""")
+    private val AUDIO_EXT_REGEX = Regex("""\.(mp3|flac|wav|m4a|aac|ogg|opus|ape|dsd|dsf|alac|wma)$""", RegexOption.IGNORE_CASE)
+    private val MULTI_SPACE_REGEX = Regex("""\s+""")
+
+    // 仅属于纯音频编码/音质/官方MV/脏标等非版本属性的括号内容正则
+    // 仅剥离此类纯技术标签，完整保留 (Live)、(xxx演唱会现场)、(黑胶版)、(伴奏)、(Single Version)、(R&B版)、(Remix) 等音乐版本标识
+    private val TECHNICAL_BRACKET_INNER_REGEX = Regex(
+        """^(?:flac|mp3|wav|ape|aac|m4a|ogg|opus|dsd|dsf|dff|alac|wma|pcm|hires|hi-res|hr|sq|hq|mq|cd|sacd|master|无损|無損|极高|超高|标准|高品质|高品質|高音质|母带|母帶|臻品|全景声|dolby|atmos|explicit|clean|脏标|官方版|official|mv|mv版|audio|video|hd|4k|\d{2,4}k|\d{2,4}kbps|\d{1,2}bit|\d{2,3}(?:\.\d)?khz|[\s\-\/\.\,\|\+·•])+?$""",
+        RegexOption.IGNORE_CASE
+    )
+
+    // 标题末尾以连字符表示的版本后缀（如 " - Live", " - 伴奏", " - 现场版"），统一规整为标准括号版本格式
+    private val TRAILING_DASH_VERSION_REGEX = Regex(
+        """\s+[-—–]\s*(live|现场|现场版|演唱会|伴奏|纯音乐|inst\.?|instrumental|remix|acoustic|不插电|黑胶版|黑胶|vinyl|demo|小样|粤语版|国语版|日语版|英文版|single\s+version|album\s+version|radio\s+edit)$""",
+        RegexOption.IGNORE_CASE
+    )
 
     // 高并发内存记忆化缓存，避免同一曲库重复执行字符串正则替换
     private val normalizedTitleCache = java.util.concurrent.ConcurrentHashMap<String, String>(2048)
     private val normalizedArtistCache = java.util.concurrent.ConcurrentHashMap<String, String>(1024)
 
+    fun unescapeMusicText(raw: String): String {
+        if (raw.isEmpty()) return ""
+        return raw
+            .replace("\\&", "&")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&nbsp;", " ")
+            .trim()
+    }
+
     /**
-     * 规范化曲目标题
+     * 规范化曲目标题（版本感知型）：
      * - 去除开头的音轨编号（如 "01. ", "01 - ", "1. ", "1 - ", "01_"）
-     * - 去除各类修饰性括号（如 "(Live)", "[FLAC]", "(feat. xxx)", "（官方版）", "【Hi-Res】", "[320k]" 等）
-     * - 去除音频文件扩展名
+     * - 去除音频文件扩展名（.flac, .mp3 等）
+     * - 仅剥离纯技术规格括号（如 "[FLAC]", "【Hi-Res】", "[320k]", "(无损)", "(Explicit)", "(官方版)"）
+     * - 完整保留并规整所有音乐版本括号与后缀（如 "(live)", "(single version)", "(2005飞跃红馆香港演唱会现场)", "(黑胶版)", "(伴奏)", "(r&b版)" 等），
+     *   坚决杜绝将同名歌曲的不同现场/伴奏/黑胶/翻唱/混音版本误判为同一首歌！
      */
     fun normalizeTrackTitle(title: String): String {
         if (title.isBlank()) return ""
         normalizedTitleCache[title]?.let { return it }
-        var t = title.trim().lowercase()
-        t = t.replace(TRACK_NUM_REGEX, "").trim()
-        t = t.replace(BRACKET_SUFFIX_REGEX, "").trim()
+        var t = unescapeMusicText(title).lowercase()
         t = t.replace(AUDIO_EXT_REGEX, "").trim()
+        t = t.replace(TRACK_NUM_REGEX, "").trim()
+        t = BRACKET_GROUP_REGEX.replace(t) { matchResult ->
+            val inner = matchResult.groupValues[1].trim().replace(MULTI_SPACE_REGEX, " ")
+            if (inner.isEmpty() || TECHNICAL_BRACKET_INNER_REGEX.matches(inner)) {
+                " "
+            } else {
+                " ($inner) "
+            }
+        }
+        t = TRAILING_DASH_VERSION_REGEX.replace(t) { matchResult ->
+            val ver = matchResult.groupValues[1].trim().replace(MULTI_SPACE_REGEX, " ")
+            " ($ver)"
+        }
+        t = t.replace(MULTI_SPACE_REGEX, " ").trim()
         if (normalizedTitleCache.size > 8192) normalizedTitleCache.clear()
         normalizedTitleCache[title] = t
         return t
+    }
+
+    /**
+     * 提取歌曲标题与所属专辑中的特殊版本维度特征（现场/黑胶/伴奏/混音/不插电/小样等）
+     * 防止标题未标注但专辑名标注了 "xxx演唱会" 或 "xxx（黑胶版）" 的曲目与录音室原版混淆
+     */
+    fun extractEditionMarkers(title: String, album: String = ""): Set<String> {
+        val combined = "${unescapeMusicText(title)} ${unescapeMusicText(album)}".lowercase()
+        if (combined.isBlank()) return emptySet()
+        val markers = LinkedHashSet<String>(4)
+        if (combined.contains("live") || combined.contains("现场") || combined.contains("演唱会") ||
+            combined.contains("音乐会") || combined.contains("嘉年华") || combined.contains("巡演") ||
+            combined.contains("音乐节") || combined.contains("跨年")
+        ) {
+            markers.add("live")
+        }
+        if (combined.contains("黑胶") || combined.contains("vinyl")) {
+            markers.add("vinyl")
+        }
+        if (combined.contains("伴奏") || combined.contains("instrumental") ||
+            Regex("""\binst\b""").containsMatchIn(combined) ||
+            combined.contains("卡拉ok") || combined.contains("karaoke") ||
+            combined.contains("消音") || combined.contains("纯音乐")
+        ) {
+            markers.add("inst")
+        }
+        if (combined.contains("remix") || Regex("""\bdj\b""").containsMatchIn(combined) ||
+            combined.contains("dj版") || combined.contains("慢摇") ||
+            combined.contains("加快") || combined.contains("慢速") ||
+            combined.contains("sped up") || combined.contains("slowed") ||
+            combined.contains("0.8x") || combined.contains("1.2x")
+        ) {
+            markers.add("remix")
+        }
+        if (combined.contains("acoustic") || combined.contains("不插电") ||
+            combined.contains("钢琴版") || combined.contains("吉他版")
+        ) {
+            markers.add("acoustic")
+        }
+        if (combined.contains("demo") || combined.contains("小样")) {
+            markers.add("demo")
+        }
+        if (combined.contains("r&b")) {
+            markers.add("rnb")
+        }
+        if (combined.contains("single version")) {
+            markers.add("single_version")
+        }
+        if (combined.contains("album version")) {
+            markers.add("album_version")
+        }
+        return markers
+    }
+
+    fun hasEditionConflict(
+        title1: String,
+        album1: String = "",
+        title2: String,
+        album2: String = ""
+    ): Boolean {
+        return extractEditionMarkers(title1, album1) != extractEditionMarkers(title2, album2)
     }
 
     /**
@@ -57,7 +162,7 @@ object SongMatchingResolver {
     fun normalizeArtist(artist: String): String {
         if (artist.isBlank()) return ""
         normalizedArtistCache[artist]?.let { return it }
-        val a = artist.trim().lowercase()
+        val a = unescapeMusicText(artist).lowercase()
         val result = if (a.contains("<unknown>") || a.contains("未知") || a == "local_storage" || a == "local_folder" || a == "local_saf") "" else a
         if (normalizedArtistCache.size > 4096) normalizedArtistCache.clear()
         normalizedArtistCache[artist] = result
@@ -65,7 +170,56 @@ object SongMatchingResolver {
     }
 
     /**
-     * 统一判断两首歌曲是否在语义上为同一首歌曲
+     * 精确匹配物理磁盘文件名（不含扩展名）与目标曲目：
+     * 支持 "歌名"、"歌手 - 歌名"、"歌名 - 歌手"、"01. 歌名" 格式，
+     * 严禁使用模糊子串 contains 导致 "我不难过.flac" 误匹配 "我不难过 (Live)" 或 "我不难过 (黑胶版)"
+     */
+    fun matchFileNameToTrack(
+        fileNameWithoutExt: String,
+        targetTitle: String,
+        targetArtist: String,
+        targetAlbum: String = ""
+    ): Boolean {
+        val normTargetTitle = normalizeTrackTitle(targetTitle)
+        if (normTargetTitle.isBlank()) return false
+        val normTargetArtist = normalizeArtist(targetArtist)
+
+        val rawClean = unescapeMusicText(fileNameWithoutExt).replace(TRACK_NUM_REGEX, "").trim()
+        if (rawClean.isBlank()) return false
+
+        val wholeNorm = normalizeTrackTitle(rawClean)
+        if (wholeNorm == normTargetTitle && !hasEditionConflict(rawClean, "", targetTitle, targetAlbum)) {
+            return true
+        }
+
+        if (rawClean.contains(" - ")) {
+            val parts = rawClean.split(" - ", limit = 2)
+            if (parts.size == 2) {
+                val p0Title = normalizeTrackTitle(parts[0])
+                val p1Title = normalizeTrackTitle(parts[1])
+                val p0Artist = normalizeArtist(parts[0])
+                val p1Artist = normalizeArtist(parts[1])
+
+                // 格式 1: "歌手 - 歌名"
+                val artistMatchesP0 = normTargetArtist.isBlank() || p0Artist == normTargetArtist ||
+                        p0Artist.contains(normTargetArtist) || normTargetArtist.contains(p0Artist)
+                if (p1Title == normTargetTitle && artistMatchesP0 && !hasEditionConflict(parts[1], "", targetTitle, targetAlbum)) {
+                    return true
+                }
+
+                // 格式 2: "歌名 - 歌手"
+                val artistMatchesP1 = normTargetArtist.isBlank() || p1Artist == normTargetArtist ||
+                        p1Artist.contains(normTargetArtist) || normTargetArtist.contains(p1Artist)
+                if (p0Title == normTargetTitle && artistMatchesP1 && !hasEditionConflict(parts[0], "", targetTitle, targetAlbum)) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * 统一判断两首歌曲是否在语义与版本上为同一首歌曲
      */
     fun isSongMatch(
         title1: String,
@@ -73,30 +227,28 @@ object SongMatchingResolver {
         durationMs1: Long = 0L,
         title2: String,
         artist2: String,
-        durationMs2: Long = 0L
+        durationMs2: Long = 0L,
+        album1: String = "",
+        album2: String = ""
     ): Boolean {
         val normTitle1 = normalizeTrackTitle(title1)
         val normTitle2 = normalizeTrackTitle(title2)
         if (normTitle1.isBlank() || normTitle2.isBlank()) return false
+        if (normTitle1 != normTitle2) return false
+        if (hasEditionConflict(title1, album1, title2, album2)) return false
+
+        // 若双方均有有效时长且差距超过 5 秒，说明为不同编曲/现场/电台剪辑版本，绝不混用
+        if (durationMs1 > 0L && durationMs2 > 0L && kotlin.math.abs(durationMs1 - durationMs2) > 5000L) {
+            return false
+        }
 
         val normArtist1 = normalizeArtist(artist1)
         val normArtist2 = normalizeArtist(artist2)
 
-        val titleStrictMatch = normTitle1 == normTitle2
-        val artistMatch = normArtist1.isBlank() || normArtist2.isBlank() ||
+        return normArtist1.isBlank() || normArtist2.isBlank() ||
                 normArtist1 == normArtist2 ||
                 normArtist1.contains(normArtist2) ||
                 normArtist2.contains(normArtist1)
-
-        if (titleStrictMatch && artistMatch) return true
-
-        // 标题模糊包含且时长在 3.5 秒误差范围内
-        val titleFuzzyMatch = (normTitle1.contains(normTitle2) || normTitle2.contains(normTitle1)) &&
-                normTitle1.length >= 2 && normTitle2.length >= 2
-        val durationMatch = durationMs1 > 0 && durationMs2 > 0 &&
-                kotlin.math.abs(durationMs1 - durationMs2) < 3500
-
-        return titleFuzzyMatch && durationMatch && artistMatch
     }
 
     /**
@@ -125,10 +277,9 @@ object SongMatchingResolver {
             }
         }
 
-        // 1. 预构建内存快速哈希索引表
+        // 1. 预构建内存快速哈希索引表（支持同 (normTitle, normArtist) 下按版本/专辑精确区分）
         val cachedById = HashMap<String, UnifiedSong>(allCachedSongs.size)
-        val cachedByNormalizedKey = HashMap<String, UnifiedSong>(allCachedSongs.size)
-        val cachedByLocalPath = HashMap<String, UnifiedSong>(allCachedSongs.size)
+        val cachedByNormalizedKey = HashMap<String, MutableList<UnifiedSong>>(allCachedSongs.size)
 
         for (song in allCachedSongs) {
             cachedById[song.id] = song
@@ -136,19 +287,7 @@ object SongMatchingResolver {
             val normArtist = normalizeArtist(song.artist)
             if (normTitle.isNotBlank()) {
                 val normKey = "$normTitle|||$normArtist"
-                val existing = cachedByNormalizedKey[normKey]
-                val songHasValidLocal = isLocalPathValidFast(song.localFilePath, song.downloadStatus)
-                val existingHasValidLocal = existing != null && isLocalPathValidFast(existing.localFilePath, existing.downloadStatus)
-                if (existing == null ||
-                    (songHasValidLocal && !existingHasValidLocal) ||
-                    (song.streamUrl.isNotBlank() && existing.streamUrl.isBlank())
-                ) {
-                    cachedByNormalizedKey[normKey] = song
-                }
-            }
-            val path = song.localFilePath
-            if (!path.isNullOrBlank()) {
-                cachedByLocalPath[path] = song
+                cachedByNormalizedKey.getOrPut(normKey) { ArrayList(2) }.add(song)
             }
         }
 
@@ -177,7 +316,28 @@ object SongMatchingResolver {
             val isDownloading = activeTask?.status == DownloadStatus.DOWNLOADING
 
             val normKey = "${normalizeTrackTitle(rawSong.title)}|||${normalizeArtist(rawSong.artist)}"
-            val match = cachedById[rawSong.id] ?: cachedByNormalizedKey[normKey]
+            val match = cachedById[rawSong.id] ?: run {
+                val candidates = cachedByNormalizedKey[normKey]
+                if (candidates.isNullOrEmpty()) {
+                    null
+                } else {
+                    val compatible = candidates.filter { cand ->
+                        isSongMatch(
+                            title1 = rawSong.title,
+                            artist1 = rawSong.artist,
+                            durationMs1 = rawSong.durationMs,
+                            title2 = cand.title,
+                            artist2 = cand.artist,
+                            durationMs2 = cand.durationMs,
+                            album1 = rawSong.album,
+                            album2 = cand.album
+                        )
+                    }
+                    compatible.firstOrNull { isLocalPathValidFast(it.localFilePath, it.downloadStatus) }
+                        ?: compatible.firstOrNull { it.streamUrl.isNotBlank() }
+                        ?: compatible.firstOrNull()
+                }
+            }
 
             // 检查本地离线物理文件真实有效性（防止指向已删除或空路径导致播放失败）
             val selfPathValid = isLocalPathValidFast(rawSong.localFilePath, rawSong.downloadStatus)
@@ -189,15 +349,15 @@ object SongMatchingResolver {
                 (match.serverId.isNotBlank() && match.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online"))
             ) && (!match.id.startsWith("lemon_online_") || match.streamUrl.isNotBlank())
 
-            // 物理磁盘匹配（兜底）
+            // 物理磁盘匹配（兜底，严格校验文件名与版本一致性，杜绝 contains 子串误匹配）
             var matchedPhysicalPath: String? = null
             if (!selfPathValid && !matchHasLocal && physicalFiles.isNotEmpty()) {
-                val normTitle = normalizeTrackTitle(rawSong.title)
                 val normArtist = normalizeArtist(rawSong.artist)
                 val matchedFile = physicalFiles.firstOrNull { f ->
-                    val fName = normalizeTrackTitle(f.nameWithoutExtension)
-                    val titleMatch = normTitle.isNotBlank() && (fName == normTitle || fName.contains(normTitle) || normTitle.contains(fName))
-                    val artistMatch = normArtist.isBlank() || f.absolutePath.lowercase().contains(normArtist) || fName.contains(normArtist)
+                    val titleMatch = matchFileNameToTrack(f.nameWithoutExtension, rawSong.title, rawSong.artist, rawSong.album)
+                    val artistMatch = normArtist.isBlank() ||
+                            f.absolutePath.lowercase().contains(normArtist) ||
+                            f.nameWithoutExtension.lowercase().contains(normArtist)
                     titleMatch && artistMatch
                 }
                 if (matchedFile != null) {
@@ -276,6 +436,9 @@ object SongMatchingResolver {
             }
 
             rawSong.copy(
+                title = unescapeMusicText(rawSong.title),
+                artist = unescapeMusicText(rawSong.artist),
+                album = unescapeMusicText(rawSong.album),
                 serverId = effectiveServerId,
                 streamUrl = effectiveStreamUrl,
                 localFilePath = effectiveLocalPath,
@@ -373,7 +536,9 @@ object SongMatchingResolver {
                         durationMs1 = incoming.durationMs,
                         title2 = local.title,
                         artist2 = local.artist,
-                        durationMs2 = local.durationMs
+                        durationMs2 = local.durationMs,
+                        album1 = incoming.album,
+                        album2 = local.album
                     )
                 }
                 if (matchedLocal?.localFilePath != null && checkFileExists(matchedLocal.localFilePath)) {
@@ -389,7 +554,9 @@ object SongMatchingResolver {
                         durationMs1 = incoming.durationMs,
                         title2 = it.title,
                         artist2 = it.artist,
-                        durationMs2 = it.durationMs
+                        durationMs2 = it.durationMs,
+                        album1 = incoming.album,
+                        album2 = it.album
                     )
                 }
             } else null

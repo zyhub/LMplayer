@@ -816,18 +816,56 @@ fun BatchDownloadQualityChoiceDialog(
 }
 
 /**
- * 判断列表项歌曲是否为当前正在播放的歌曲 (支持 ID 精确匹配或标准化的 歌名+歌手 匹配)
+ * 判断列表项歌曲是否为当前正在播放的歌曲 (支持 ID 精确匹配及跨端同版本精确匹配，杜绝 Live/黑胶/伴奏/不同版本误高亮)
  */
 fun isSamePlayingSong(song: UnifiedSong, currentPlayingSong: UnifiedSong?): Boolean {
     if (currentPlayingSong == null) return false
     if (song.id == currentPlayingSong.id) return true
-    if (!song.localFilePath.isNullOrBlank() && song.localFilePath == currentPlayingSong.localFilePath) return true
-    val normTitleA = com.lm.player.core.media.SongMatchingResolver.normalizeTrackTitle(song.title)
-    val normTitleB = com.lm.player.core.media.SongMatchingResolver.normalizeTrackTitle(currentPlayingSong.title)
-    if (normTitleA.isBlank() || normTitleA != normTitleB) return false
-    val normArtistA = com.lm.player.core.media.SongMatchingResolver.normalizeArtist(song.artist)
-    val normArtistB = com.lm.player.core.media.SongMatchingResolver.normalizeArtist(currentPlayingSong.artist)
-    return normArtistA.isBlank() || normArtistB.isBlank() || normArtistA == normArtistB
+    if (!song.localFilePath.isNullOrBlank() && song.localFilePath == currentPlayingSong.localFilePath) {
+        return com.lm.player.core.media.SongMatchingResolver.isSongMatch(
+            title1 = song.title,
+            artist1 = song.artist,
+            durationMs1 = song.durationMs,
+            title2 = currentPlayingSong.title,
+            artist2 = currentPlayingSong.artist,
+            durationMs2 = currentPlayingSong.durationMs,
+            album1 = song.album,
+            album2 = currentPlayingSong.album
+        )
+    }
+    if (!song.streamUrl.isNullOrBlank() &&
+        !song.streamUrl.startsWith("lemon_online://") &&
+        song.streamUrl == currentPlayingSong.streamUrl
+    ) {
+        return com.lm.player.core.media.SongMatchingResolver.isSongMatch(
+            title1 = song.title,
+            artist1 = song.artist,
+            durationMs1 = song.durationMs,
+            title2 = currentPlayingSong.title,
+            artist2 = currentPlayingSong.artist,
+            durationMs2 = currentPlayingSong.durationMs,
+            album1 = song.album,
+            album2 = currentPlayingSong.album
+        )
+    }
+    // 若两首均为在线搜索/发现曲目但 ID 不同，或同属一个服务端曲库但 ID 不同，则必定为列表中的不同条目，绝不交叉高亮
+    val bothOnline = song.id.startsWith("lemon_online_") && currentPlayingSong.id.startsWith("lemon_online_")
+    if (bothOnline) return false
+    val bothSameServer = song.serverId.isNotBlank() &&
+            song.serverId == currentPlayingSong.serverId &&
+            song.serverId != "lemon_online"
+    if (bothSameServer) return false
+
+    return com.lm.player.core.media.SongMatchingResolver.isSongMatch(
+        title1 = song.title,
+        artist1 = song.artist,
+        durationMs1 = song.durationMs,
+        title2 = currentPlayingSong.title,
+        artist2 = currentPlayingSong.artist,
+        durationMs2 = currentPlayingSong.durationMs,
+        album1 = song.album,
+        album2 = currentPlayingSong.album
+    )
 }
 
 /**

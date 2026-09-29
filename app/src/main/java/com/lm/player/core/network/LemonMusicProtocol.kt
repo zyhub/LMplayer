@@ -4,6 +4,7 @@ import android.util.Log
 import com.lm.player.core.media.EmbeddedLyricsExtractor
 import com.lm.player.core.media.LrcParser
 import com.lm.player.core.media.SmartCharsetDecoder
+import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -80,8 +81,10 @@ class LemonMusicProtocol(
         }
 
         fun getServerFilePath(songId: String, streamUrl: String? = null, coverUrl: String? = null): String? {
-            songIdToPathMap[songId]?.let { return it }
-            val song = songIdToSongMap[songId]
+            if (!songId.startsWith("lemon_online_")) {
+                songIdToPathMap[songId]?.let { return it }
+            }
+            val song = if (!songId.startsWith("lemon_online_")) songIdToSongMap[songId] else null
             val candidateUrls = listOfNotNull(streamUrl, coverUrl, song?.streamUrl, song?.coverUrl)
             for (url in candidateUrls) {
                 if (url.contains("path=")) {
@@ -89,7 +92,9 @@ class LemonMusicProtocol(
                         val enc = url.substringAfter("path=").substringBefore("&")
                         val decoded = java.net.URLDecoder.decode(enc, "UTF-8").trim()
                         if (decoded.isNotBlank()) {
-                            songIdToPathMap[songId] = decoded
+                            if (!songId.startsWith("lemon_online_")) {
+                                songIdToPathMap[songId] = decoded
+                            }
                             return decoded
                         }
                     } catch (_: Exception) {}
@@ -101,10 +106,10 @@ class LemonMusicProtocol(
         fun getServerTrackId(songId: String): String? = songIdToTrackIdMap[songId]
 
         fun registerServerFilePath(songId: String, filePath: String, trackId: String? = null) {
-            if (songId.isNotBlank() && filePath.isNotBlank()) {
+            if (songId.isNotBlank() && filePath.isNotBlank() && !songId.startsWith("lemon_online_")) {
                 songIdToPathMap[songId] = filePath
             }
-            if (songId.isNotBlank() && !trackId.isNullOrBlank()) {
+            if (songId.isNotBlank() && !trackId.isNullOrBlank() && !songId.startsWith("lemon_online_")) {
                 songIdToTrackIdMap[songId] = trackId
             }
         }
@@ -366,10 +371,12 @@ class LemonMusicProtocol(
 
                     val fileName = item.optString("fileName")
                     val rawTitle = item.optString("title").ifBlank { item.optString("parsedTitle") }
-                    val title = rawTitle.ifBlank { fileName.substringBeforeLast('.', fileName) }
+                    val title = SongMatchingResolver.unescapeMusicText(
+                        rawTitle.ifBlank { fileName.substringBeforeLast('.', fileName) }
+                    )
                     val rawArtist = item.optString("artist").ifBlank { item.optString("parsedArtist") }
-                    val artist = rawArtist.ifBlank { "未知歌手" }
-                    val album = item.optString("album").ifBlank { "未知专辑" }
+                    val artist = SongMatchingResolver.unescapeMusicText(rawArtist.ifBlank { "未知歌手" })
+                    val album = SongMatchingResolver.unescapeMusicText(item.optString("album").ifBlank { "未知专辑" })
                     val durationSec = item.optDouble("duration", 0.0)
                     val durationMs = (durationSec * 1000).toLong()
                     val format = item.optString("format", "flac").lowercase()
@@ -429,9 +436,9 @@ class LemonMusicProtocol(
                                 val status = dlItem.optString("status")
                                 val filePath = dlItem.optString("filePath").trim()
                                 if ((status == "completed" || status == "finished") && filePath.isNotBlank() && !existingPaths.contains(filePath)) {
-                                    val name = dlItem.optString("name", "未命名歌曲")
-                                    val singer = dlItem.optString("singer", "未知歌手")
-                                    val album = dlItem.optString("album", "未知专辑")
+                                    val name = SongMatchingResolver.unescapeMusicText(dlItem.optString("name", "未命名歌曲"))
+                                    val singer = SongMatchingResolver.unescapeMusicText(dlItem.optString("singer", "未知歌手"))
+                                    val album = SongMatchingResolver.unescapeMusicText(dlItem.optString("album", "未知专辑"))
                                     val songId = "lemon_${md5(filePath)}"
                                     songIdToPathMap[songId] = filePath
                                     val song = UnifiedSong(
@@ -849,7 +856,7 @@ class LemonMusicProtocol(
                 for (i in 0 until list.length()) {
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("play_id") }
-                    val name = item.optString("name").ifBlank { item.optString("title", "精选推荐") }
+                    val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "精选推荐") })
                     val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
                     val count = item.optInt("total", item.optInt("count", 30))
                     if (id.isNotBlank()) {
@@ -927,7 +934,7 @@ class LemonMusicProtocol(
                 for (i in 0 until list.length()) {
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("topId") }
-                    val name = item.optString("name").ifBlank { item.optString("title", "热歌榜") }
+                    val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "热歌榜") })
                     var cover = item.optString("cover")
                         .ifBlank { item.optString("img") }
                         .ifBlank { item.optString("pic") }
@@ -1035,9 +1042,15 @@ class LemonMusicProtocol(
                 for (i in 0 until list.length()) {
                     val s = list.optJSONObject(i) ?: continue
                     val songId = s.optString("songmid").ifBlank { s.optString("id", "online_$i") }
-                    val title = s.optString("name").ifBlank { s.optString("title", "未知曲目") }
-                    val singer = s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
-                    val albumName = s.optString("albumName").ifBlank { s.optString("album", "在线精选") }
+                    val title = SongMatchingResolver.unescapeMusicText(
+                        s.optString("name").ifBlank { s.optString("title", "未知曲目") }
+                    )
+                    val singer = SongMatchingResolver.unescapeMusicText(
+                        s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
+                    )
+                    val albumName = SongMatchingResolver.unescapeMusicText(
+                        s.optString("albumName").ifBlank { s.optString("album", "在线精选") }
+                    )
                     val durationMs = parseDurationMs(s)
                     var cover = s.optString("cover")
                         .ifBlank { s.optString("img") }
@@ -1106,8 +1119,8 @@ class LemonMusicProtocol(
                 for (i in 0 until list.length()) {
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("albumId", "album_$i") }
-                    val name = item.optString("name").ifBlank { item.optString("title", "最新专辑") }
-                    val artist = item.optString("artist").ifBlank { item.optString("singer", "未知歌手") }
+                    val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "最新专辑") })
+                    val artist = SongMatchingResolver.unescapeMusicText(item.optString("artist").ifBlank { item.optString("singer", "未知歌手") })
                     var cover = item.optString("cover")
                         .ifBlank { item.optString("img") }
                         .ifBlank { item.optString("pic") }
@@ -1213,9 +1226,9 @@ class LemonMusicProtocol(
                         for (j in 0 until favArr.length()) {
                             val item = favArr.opt(j)
                             if (item is JSONObject) {
-                                val sName = item.optString("name").ifBlank { item.optString("title") }
-                                val sSinger = item.optString("singer").ifBlank { item.optString("artist", "未知歌手") }
-                                val sAlbum = item.optString("album", "未知专辑")
+                                val sName = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title") })
+                                val sSinger = SongMatchingResolver.unescapeMusicText(item.optString("singer").ifBlank { item.optString("artist", "未知歌手") })
+                                val sAlbum = SongMatchingResolver.unescapeMusicText(item.optString("album", "未知专辑"))
                                 val sLocalPath = item.optString("localPath").ifBlank { item.optString("filePath") }
                                 var sPic = item.optString("picUrl").ifBlank { item.optString("img") }
                                 val sSource = item.optString("source").ifBlank { item.optString("platform") }
@@ -1347,9 +1360,9 @@ class LemonMusicProtocol(
                             ?: (if (trackKeys.opt(j) is JSONObject) trackKeys.opt(j) as JSONObject else null)
 
                         if (snapshot != null) {
-                            val sName = snapshot.optString("name").ifBlank { snapshot.optString("title") }
-                            val sSinger = snapshot.optString("singer").ifBlank { snapshot.optString("artist", "未知歌手") }
-                            val sAlbum = snapshot.optString("album", "未知专辑")
+                            val sName = SongMatchingResolver.unescapeMusicText(snapshot.optString("name").ifBlank { snapshot.optString("title") })
+                            val sSinger = SongMatchingResolver.unescapeMusicText(snapshot.optString("singer").ifBlank { snapshot.optString("artist", "未知歌手") })
+                            val sAlbum = SongMatchingResolver.unescapeMusicText(snapshot.optString("album", "未知专辑"))
                             val sLocalPath = snapshot.optString("localPath").ifBlank { snapshot.optString("filePath") }
                             val sSource = snapshot.optString("source").ifBlank { snapshot.optString("platform") }
                             var sPic = snapshot.optString("picUrl").ifBlank { snapshot.optString("img") }
@@ -1441,9 +1454,9 @@ class LemonMusicProtocol(
                                 val filePath = item.optString("filePath").trim()
                                 if (filePath.isBlank()) continue
                                 val fileName = item.optString("fileName")
-                                val title = item.optString("title").ifBlank { fileName.substringBeforeLast('.', fileName) }
-                                val artist = item.optString("artist", "未知歌手")
-                                val album = item.optString("album", "未知专辑")
+                                val title = SongMatchingResolver.unescapeMusicText(item.optString("title").ifBlank { fileName.substringBeforeLast('.', fileName) })
+                                val artist = SongMatchingResolver.unescapeMusicText(item.optString("artist", "未知歌手"))
+                                val album = SongMatchingResolver.unescapeMusicText(item.optString("album", "未知专辑"))
                                 val durationMs = (item.optDouble("duration", 0.0) * 1000).toLong()
                                 val songId = "lemon_${md5(filePath)}"
                                 songIdToPathMap[songId] = filePath
@@ -1895,10 +1908,16 @@ class LemonMusicProtocol(
                         .ifBlank { s.optString("hash") }
                         .ifBlank { s.optString("copyrightId") }
                         .ifBlank { s.optString("id", "s_$i") }
-                    val name = s.optString("name").ifBlank { s.optString("title", "") }
+                    val name = SongMatchingResolver.unescapeMusicText(
+                        s.optString("name").ifBlank { s.optString("title", "") }
+                    )
                     if (name.isBlank()) continue
-                    val singer = s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
-                    val albumName = s.optString("albumName").ifBlank { s.optString("album", "") }
+                    val singer = SongMatchingResolver.unescapeMusicText(
+                        s.optString("singer").ifBlank { s.optString("artist", "未知歌手") }
+                    )
+                    val albumName = SongMatchingResolver.unescapeMusicText(
+                        s.optString("albumName").ifBlank { s.optString("album", "") }
+                    )
                     val durationMs = parseDurationMs(s)
                     var cover = s.optString("cover")
                         .ifBlank { s.optString("img") }
@@ -1965,9 +1984,13 @@ class LemonMusicProtocol(
                             val id = item.optString("id")
                                 .ifBlank { item.optString("albumMid") }
                                 .ifBlank { item.optString("albumId", "album_$i") }
-                            val name = item.optString("name").ifBlank { item.optString("title", "") }
+                            val name = SongMatchingResolver.unescapeMusicText(
+                                item.optString("name").ifBlank { item.optString("title", "") }
+                            )
                             if (name.isBlank()) continue
-                            val artist = item.optString("artist").ifBlank { item.optString("singer", "未知歌手") }
+                            val artist = SongMatchingResolver.unescapeMusicText(
+                                item.optString("artist").ifBlank { item.optString("singer", "未知歌手") }
+                            )
                             var cover = item.optString("img")
                                 .ifBlank { item.optString("cover") }
                                 .ifBlank { item.optString("pic") }
@@ -2028,7 +2051,9 @@ class LemonMusicProtocol(
                 for (i in 0 until list.length()) {
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("play_id") }
-                    val name = item.optString("name").ifBlank { item.optString("title", "") }
+                    val name = SongMatchingResolver.unescapeMusicText(
+                        item.optString("name").ifBlank { item.optString("title", "") }
+                    )
                     if (id.isBlank() || name.isBlank()) continue
                     var cover = item.optString("img")
                         .ifBlank { item.optString("cover") }
@@ -2071,7 +2096,8 @@ class LemonMusicProtocol(
         metaJson: String? = null,
         fallbackTitle: String? = null,
         fallbackArtist: String? = null,
-        refresh: Boolean = false
+        refresh: Boolean = false,
+        allowSearchFallback: Boolean = true
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
@@ -2230,27 +2256,33 @@ class LemonMusicProtocol(
                 parsePlayUrlFromBody(firstBody)?.let { return@withContext Result.success(it) }
             }
 
-            // 若首次请求由于本地数据库旧记录缺失完整 rawMetaJson (例如酷狗缺少高音质 hash) 失败，通过柠檬服务端搜索补全元数据后重试
-            val keyword = listOfNotNull(
-                fallbackTitle?.takeIf { it.isNotBlank() },
-                fallbackArtist?.takeIf { it.isNotBlank() && it != "未知歌手" && !it.equals("Unknown Artist", ignoreCase = true) }
-            ).joinToString(" ").trim()
+            // 仅在允许搜索回退且该歌曲自身的所有音质尝试均失败时，才通过搜索补全同版本曲目元数据重试（严格校验版本一致性，绝不回退到非匹配的首个搜索结果）
+            if (allowSearchFallback) {
+                val keyword = listOfNotNull(
+                    fallbackTitle?.takeIf { it.isNotBlank() },
+                    fallbackArtist?.takeIf { it.isNotBlank() && it != "未知歌手" && !it.equals("Unknown Artist", ignoreCase = true) }
+                ).joinToString(" ").trim()
 
-            if (keyword.isNotBlank()) {
-                val candidateSources = listOf(actualSource, "kw", "tx", "wy", "kg", "mg").distinct()
-                for (candSource in candidateSources) {
-                    val searchRes = searchOnline(keyword = keyword, source = candSource, page = 1, limit = 8).getOrNull().orEmpty()
-                    val bestMatch = searchRes.firstOrNull {
-                        it.id == songId || (fallbackTitle != null && it.title.equals(fallbackTitle, ignoreCase = true))
-                    } ?: searchRes.firstOrNull()
+                if (keyword.isNotBlank()) {
+                    val candidateSources = listOf(actualSource, "kw", "tx", "wy", "kg", "mg").distinct()
+                    for (candSource in candidateSources) {
+                        val searchRes = searchOnline(keyword = keyword, source = candSource, page = 1, limit = 10).getOrNull().orEmpty()
+                        val bestMatch = searchRes.firstOrNull { it.id == songId }
+                            ?: searchRes.firstOrNull {
+                                fallbackTitle != null && SongMatchingResolver.isSongMatch(
+                                    it.title, it.artist, 0L,
+                                    fallbackTitle, fallbackArtist ?: "", 0L
+                                )
+                            }
 
-                    if (bestMatch != null && !bestMatch.rawMetaJson.isNullOrBlank()) {
-                        val candCleanId = bestMatch.id.removePrefix("lemon_online_")
-                        val candSrc = if (candCleanId.contains("_")) candCleanId.substringBefore("_") else candSource
-                        val candRawId = if (candCleanId.contains("_")) candCleanId.substringAfter("_") else candCleanId
-                        val (retryCode, retryBody) = requestPlayUrlWithSourceFallback(candSrc, candRawId, bestMatch.rawMetaJson)
-                        if (retryCode in 200..299) {
-                            parsePlayUrlFromBody(retryBody)?.let { return@withContext Result.success(it) }
+                        if (bestMatch != null && !bestMatch.rawMetaJson.isNullOrBlank()) {
+                            val candCleanId = bestMatch.id.removePrefix("lemon_online_")
+                            val candSrc = if (candCleanId.contains("_")) candCleanId.substringBefore("_") else candSource
+                            val candRawId = if (candCleanId.contains("_")) candCleanId.substringAfter("_") else candCleanId
+                            val (retryCode, retryBody) = requestPlayUrlWithSourceFallback(candSrc, candRawId, bestMatch.rawMetaJson)
+                            if (retryCode in 200..299) {
+                                parsePlayUrlFromBody(retryBody)?.let { return@withContext Result.success(it) }
+                            }
                         }
                     }
                 }
@@ -2269,6 +2301,8 @@ class LemonMusicProtocol(
     /**
      * 按用户设置的试听音质及逐级回退策略 (flac24bit -> flac -> 320k -> 128k) 解析在线播放地址，
      * 并返回实际生效的音质、格式与比特率，以便播放器界面实时展示准确音质标签。
+     * 优先在当前歌曲自身的 ID/metaJson 上完成全音质阶梯回退（避免因高音质不可用而过早跨源搜索串歌至录音室版），
+     * 仅当自身所有音质均失败时才启用版本严格匹配的搜索回退。
      */
     suspend fun resolveOnlineStreamWithQuality(
         songId: String,
@@ -2281,6 +2315,39 @@ class LemonMusicProtocol(
     ): Result<ResolvedOnlineStream> = withContext(Dispatchers.IO) {
         val candidateQualities = getFallbackQualities(preferredQuality)
         var lastError: Throwable? = null
+
+        fun buildResolvedStream(url: String, qKey: String): ResolvedOnlineStream {
+            val decodedUpstream = runCatching {
+                if (url.contains("url=")) {
+                    java.net.URLDecoder.decode(url.substringAfter("url=").substringBefore("&"), "UTF-8")
+                } else url
+            }.getOrDefault(url).lowercase()
+            val cleanPath = decodedUpstream.substringBefore("?")
+            val qEnum = AudioQuality.fromKey(qKey)
+            val detectedFormat = when {
+                cleanPath.endsWith(".flac") -> "flac"
+                cleanPath.endsWith(".wav") -> "wav"
+                cleanPath.endsWith(".m4a") || cleanPath.endsWith(".aac") -> "m4a"
+                cleanPath.endsWith(".ogg") || cleanPath.endsWith(".opus") -> "ogg"
+                cleanPath.endsWith(".mp3") -> "mp3"
+                else -> qEnum.format.lowercase()
+            }
+            val detectedBitRate = when {
+                detectedFormat == "flac" && qEnum == AudioQuality.Q_HIRES -> 1411
+                detectedFormat == "flac" -> 960
+                detectedFormat == "mp3" && (cleanPath.contains("128") && !cleanPath.contains("320") && qEnum != AudioQuality.Q_320K) -> 128
+                else -> qEnum.bitrate
+            }
+            Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey ($detectedFormat ${detectedBitRate}kbps)")
+            return ResolvedOnlineStream(
+                url = url,
+                qualityKey = qKey,
+                format = detectedFormat,
+                bitRate = detectedBitRate
+            )
+        }
+
+        // 第一轮：仅针对当前歌曲自身的 songId 与 metaJson 逐级尝试音质，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
         for ((index, qKey) in candidateQualities.withIndex()) {
             val res = resolveOnlineStreamUrl(
                 songId = songId,
@@ -2289,44 +2356,36 @@ class LemonMusicProtocol(
                 metaJson = metaJson,
                 fallbackTitle = fallbackTitle,
                 fallbackArtist = fallbackArtist,
-                refresh = refresh || index > 0
+                refresh = refresh || index > 0,
+                allowSearchFallback = false
             )
             val url = res.getOrNull()
             if (!url.isNullOrBlank()) {
-                val decodedUpstream = runCatching {
-                    if (url.contains("url=")) {
-                        java.net.URLDecoder.decode(url.substringAfter("url=").substringBefore("&"), "UTF-8")
-                    } else url
-                }.getOrDefault(url).lowercase()
-                val cleanPath = decodedUpstream.substringBefore("?")
-                val qEnum = AudioQuality.fromKey(qKey)
-                val detectedFormat = when {
-                    cleanPath.endsWith(".flac") -> "flac"
-                    cleanPath.endsWith(".wav") -> "wav"
-                    cleanPath.endsWith(".m4a") || cleanPath.endsWith(".aac") -> "m4a"
-                    cleanPath.endsWith(".ogg") || cleanPath.endsWith(".opus") -> "ogg"
-                    cleanPath.endsWith(".mp3") -> "mp3"
-                    else -> qEnum.format.lowercase()
-                }
-                val detectedBitRate = when {
-                    detectedFormat == "flac" && qEnum == AudioQuality.Q_HIRES -> 1411
-                    detectedFormat == "flac" -> 960
-                    detectedFormat == "mp3" && (cleanPath.contains("128") && !cleanPath.contains("320") && qEnum != AudioQuality.Q_320K) -> 128
-                    else -> qEnum.bitrate
-                }
-                Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey ($detectedFormat ${detectedBitRate}kbps)")
-                return@withContext Result.success(
-                    ResolvedOnlineStream(
-                        url = url,
-                        qualityKey = qKey,
-                        format = detectedFormat,
-                        bitRate = detectedBitRate
-                    )
-                )
+                return@withContext Result.success(buildResolvedStream(url, qKey))
             } else {
                 lastError = res.exceptionOrNull()
             }
         }
+
+        // 第二轮：若当前歌曲自身 ID 在所有音质下均无法取链，启用严格版本匹配的搜索回退
+        val fallbackQuality = candidateQualities.firstOrNull { it == AudioQuality.Q_320K.key } ?: candidateQualities.last()
+        val fallbackRes = resolveOnlineStreamUrl(
+            songId = songId,
+            source = source,
+            quality = fallbackQuality,
+            metaJson = metaJson,
+            fallbackTitle = fallbackTitle,
+            fallbackArtist = fallbackArtist,
+            refresh = true,
+            allowSearchFallback = true
+        )
+        val fallbackUrl = fallbackRes.getOrNull()
+        if (!fallbackUrl.isNullOrBlank()) {
+            return@withContext Result.success(buildResolvedStream(fallbackUrl, fallbackQuality))
+        } else {
+            lastError = fallbackRes.exceptionOrNull() ?: lastError
+        }
+
         Result.failure(lastError ?: Exception("未能获取可用的在线播放流地址"))
     }
 

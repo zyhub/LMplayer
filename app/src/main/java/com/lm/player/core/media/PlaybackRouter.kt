@@ -57,18 +57,17 @@ class PlaybackRouter(
             else -> null
         }
 
-        // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频
+        // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（严格校验版本、专辑与时长）
         val resolvedLocalPath: String? = directLocalPath ?: run {
             try {
                 val db = ZdsDatabase.getInstance(context)
                 val allSongs = db.songDao().getAllSongsList()
-                val normTitle = SongMatchingResolver.normalizeTrackTitle(song.title)
-                val normArtist = SongMatchingResolver.normalizeArtist(song.artist)
                 val matched = allSongs.firstOrNull { s ->
                     val hasFile = !s.localFilePath.isNullOrBlank() && File(s.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                    hasFile && (s.id == song.id || (
-                        normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(s.title) == normTitle &&
-                        (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(s.artist) == normArtist)
+                    hasFile && (s.id == song.id || SongMatchingResolver.isSongMatch(
+                        s.title, s.artist, s.durationMs,
+                        song.title, song.artist, song.durationMs,
+                        s.album, song.album
                     ))
                 }
                 matched?.localFilePath
@@ -124,15 +123,13 @@ class PlaybackRouter(
                                 }
                             }
                             if (serverPath.isNullOrBlank()) {
-                                // 从本地数据库中查找同 ID 或同名服务端曲目的有效路径/流地址
+                                // 从本地数据库中查找同 ID 或完全同版本服务端曲目的有效路径/流地址
                                 val allSongs = db.songDao().getAllSongsList()
-                                val normTitle = SongMatchingResolver.normalizeTrackTitle(song.title)
-                                val normArtist = SongMatchingResolver.normalizeArtist(song.artist)
                                 val matchedServerSong = allSongs.firstOrNull { s ->
-                                    (s.id == song.id || (
-                                        normTitle.isNotBlank() &&
-                                        SongMatchingResolver.normalizeTrackTitle(s.title) == normTitle &&
-                                        (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(s.artist) == normArtist)
+                                    (s.id == song.id || SongMatchingResolver.isSongMatch(
+                                        s.title, s.artist, s.durationMs,
+                                        song.title, song.artist, song.durationMs,
+                                        s.album, song.album
                                     )) && (s.streamUrl.contains("/api/play/local") || s.coverUrl.contains("path="))
                                 }
                                 if (matchedServerSong != null) {
@@ -174,15 +171,15 @@ class PlaybackRouter(
                                 resolvedFormat = resolvedStream.format
                                 resolvedBitRate = resolvedStream.bitRate
                             } else {
-                                // 兜底：若第三方音源暂时不可用，回退匹配资料库内同名已就绪的服务端曲目流地址
+                                // 兜底：若第三方音源暂时不可用，回退匹配资料库内完全同版本已就绪的服务端曲目流地址
                                 val allSongs = db.songDao().getAllSongsList()
-                                val normTitle = SongMatchingResolver.normalizeTrackTitle(song.title)
-                                val normArtist = SongMatchingResolver.normalizeArtist(song.artist)
                                 val fallbackLibSong = allSongs.firstOrNull { s ->
-                                    normTitle.isNotBlank() &&
-                                    SongMatchingResolver.normalizeTrackTitle(s.title) == normTitle &&
-                                    (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(s.artist) == normArtist) &&
-                                    (s.streamUrl.startsWith("http://") || s.streamUrl.startsWith("https://"))
+                                    (s.streamUrl.startsWith("http://") || s.streamUrl.startsWith("https://")) &&
+                                    SongMatchingResolver.isSongMatch(
+                                        s.title, s.artist, s.durationMs,
+                                        song.title, song.artist, song.durationMs,
+                                        s.album, song.album
+                                    )
                                 }
                                 if (fallbackLibSong != null) {
                                     val fbPath = LemonMusicProtocol.getServerFilePath(

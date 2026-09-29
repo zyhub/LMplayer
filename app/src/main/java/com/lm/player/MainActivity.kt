@@ -806,21 +806,17 @@ class MainActivity : ComponentActivity() {
                 } else null
 
                 val matchedByMeta = if (matchedById == null && lastPlayedTitle.isNotEmpty()) {
-                    val normTitle = SongMatchingResolver.normalizeTrackTitle(lastPlayedTitle)
-                    val normArtist = SongMatchingResolver.normalizeArtist(lastPlayedArtist)
-                    if (normTitle.isNotEmpty()) {
-                        val allMatches = candidates.filter { s ->
-                            SongMatchingResolver.normalizeTrackTitle(s.title) == normTitle &&
-                            (normArtist.isEmpty() ||
-                             SongMatchingResolver.normalizeArtist(s.artist).let { a ->
-                                 a.isEmpty() || a == normArtist || a.contains(normArtist) || normArtist.contains(a)
-                             })
-                        }
-                        allMatches.firstOrNull { s ->
-                            !s.localFilePath.isNullOrBlank() &&
-                            (s.localFilePath.startsWith("content://") || File(s.localFilePath).exists())
-                        } ?: allMatches.firstOrNull()
-                    } else null
+                    val allMatches = candidates.filter { s ->
+                        SongMatchingResolver.isSongMatch(
+                            s.title, s.artist, s.durationMs,
+                            lastPlayedTitle, lastPlayedArtist, savedSong?.durationMs ?: 0L,
+                            s.album, savedSong?.album ?: ""
+                        )
+                    }
+                    allMatches.firstOrNull { s ->
+                        !s.localFilePath.isNullOrBlank() &&
+                        (s.localFilePath.startsWith("content://") || File(s.localFilePath).exists())
+                    } ?: allMatches.firstOrNull()
                 } else null
 
                 val matchedCandidate = matchedById ?: matchedByMeta
@@ -903,16 +899,15 @@ class MainActivity : ComponentActivity() {
                     targetSong.localFilePath
                 } else null
 
-                // 若未直接携带本地路径，快速从当前已收录歌曲库与已下载列表匹配（如从在线搜索或云端列表点击）
+                // 若未直接携带本地路径，快速从当前已收录歌曲库与已下载列表匹配（严格校验 Live/伴奏/黑胶等版本与时长）
                 val resolvedLocalPath = validDirectPath ?: run {
-                    val normTitle = SongMatchingResolver.normalizeTrackTitle(targetSong.title)
-                    val normArtist = SongMatchingResolver.normalizeArtist(targetSong.artist)
                     val allLocalCandidates = songList + completedDownloadedSongs
                     val matchedLocal = allLocalCandidates.firstOrNull {
                         val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                        hasFile && (it.id == targetSong.id || (
-                            normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
-                            (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(it.artist) == normArtist)
+                        hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                            it.title, it.artist, it.durationMs,
+                            targetSong.title, targetSong.artist, targetSong.durationMs,
+                            it.album, targetSong.album
                         ))
                     }
                     matchedLocal?.localFilePath
@@ -989,14 +984,14 @@ class MainActivity : ComponentActivity() {
                             var realUrl = resolvedStream?.url
 
                             if (realUrl.isNullOrBlank()) {
-                                // 若第三方在线源暂时无法返回直链，自动回退匹配资料库中同名服务端歌曲的有效流地址
-                                val normTitle = SongMatchingResolver.normalizeTrackTitle(targetSong.title)
-                                val normArtist = SongMatchingResolver.normalizeArtist(targetSong.artist)
+                                // 若第三方在线源暂时无法返回直链，自动回退匹配资料库中完全同版本的服务端歌曲有效流地址
                                 val matchedServerSong = songList.firstOrNull {
-                                    normTitle.isNotBlank() &&
-                                    SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
-                                    (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(it.artist) == normArtist) &&
-                                    (it.streamUrl.startsWith("http://") || it.streamUrl.startsWith("https://"))
+                                    (it.streamUrl.startsWith("http://") || it.streamUrl.startsWith("https://")) &&
+                                    SongMatchingResolver.isSongMatch(
+                                        it.title, it.artist, it.durationMs,
+                                        targetSong.title, targetSong.artist, targetSong.durationMs,
+                                        it.album, targetSong.album
+                                    )
                                 }
                                 if (matchedServerSong != null) {
                                     val srvPath = LemonMusicProtocol.getServerFilePath(
@@ -1576,16 +1571,14 @@ class MainActivity : ComponentActivity() {
                         val targetSong = currentSong
                         val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
                         if (targetSong != null) {
-                            val normTitle = SongMatchingResolver.normalizeTrackTitle(targetSong.title)
-                            val normArtist = SongMatchingResolver.normalizeArtist(targetSong.artist)
-
                             if (autoFallbackToLocal) {
-                                // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度
+                                // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
                                 val matchedLocalSong = (songList + completedDownloadedSongs).firstOrNull {
                                     val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                                    hasFile && (it.id == targetSong.id || (
-                                        normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
-                                        (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(it.artist) == normArtist)
+                                    hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                                        it.title, it.artist, it.durationMs,
+                                        targetSong.title, targetSong.artist, targetSong.durationMs,
+                                        it.album, targetSong.album
                                     ))
                                 }
                                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
@@ -1621,13 +1614,16 @@ class MainActivity : ComponentActivity() {
                             }
 
                             if (autoFallbackToLocal) {
-                                // 3. 若重新刷新仍失败，尝试回退至服务器资料库内同名已归档曲目并保留播放进度
+                                // 3. 若重新刷新仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
                                 val matchedServerSong = songList.firstOrNull {
                                     it.id != targetSong.id &&
                                     it.streamUrl != targetSong.streamUrl &&
                                     (it.streamUrl.contains("/api/play/local") || it.streamUrl.startsWith("http")) &&
-                                    normTitle.isNotBlank() && SongMatchingResolver.normalizeTrackTitle(it.title) == normTitle &&
-                                    (normArtist.isBlank() || SongMatchingResolver.normalizeArtist(it.artist) == normArtist)
+                                    SongMatchingResolver.isSongMatch(
+                                        it.title, it.artist, it.durationMs,
+                                        targetSong.title, targetSong.artist, targetSong.durationMs,
+                                        it.album, targetSong.album
+                                    )
                                 }
                                 if (matchedServerSong != null) {
                                     Toast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()

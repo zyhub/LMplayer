@@ -606,53 +606,45 @@ object LocalMediaScanner {
 
                 val normLocalTitle = normalizeTrackTitle(local.title)
                 val normLocalArtist = normalizeArtist(local.artist)
-                val localFileName = localFile.nameWithoutExtension.lowercase()
 
-                // 优先 O(1) 精确哈希匹配
+                // 优先 O(1) 精确哈希匹配（含版本与专辑版本冲突校验）
                 var matchedServerSong: SongEntity? = null
                 if (normLocalTitle.isNotBlank() && normLocalArtist.isNotBlank()) {
-                    matchedServerSong = serverExactMap["$normLocalTitle|||$normLocalArtist"]
+                    matchedServerSong = serverExactMap["$normLocalTitle|||$normLocalArtist"]?.takeIf { server ->
+                        SongMatchingResolver.isSongMatch(
+                            local.title, local.artist, local.durationMs,
+                            server.title, server.artist, server.durationMs,
+                            local.album, server.album
+                        )
+                    }
                 }
 
-                // 次优 O(1) 标题命中 + 艺术家兼容性校验
+                // 次优 O(1) 标题命中 + 艺术家与版本兼容性校验
                 if (matchedServerSong == null && normLocalTitle.isNotBlank()) {
                     val candidates = serverTitleMap[normLocalTitle]
                     if (!candidates.isNullOrEmpty()) {
                         matchedServerSong = candidates.firstOrNull { server ->
-                            val normServerArtist = normalizeArtist(server.artist)
-                            normServerArtist.isBlank() || normLocalArtist.isBlank() ||
-                                    normServerArtist == normLocalArtist ||
-                                    normServerArtist.contains(normLocalArtist) ||
-                                    normLocalArtist.contains(normServerArtist)
+                            SongMatchingResolver.isSongMatch(
+                                local.title, local.artist, local.durationMs,
+                                server.title, server.artist, server.durationMs,
+                                local.album, server.album
+                            )
                         }
                     }
                 }
 
-                // 文件名包含匹配与模糊时长降级兜底
+                // 文件名结构化精确匹配兜底（绝不用包含子串避免把原版识别成 Live 版）
                 if (matchedServerSong == null) {
                     matchedServerSong = serverSongs.firstOrNull { server ->
                         if (server.id == local.id) return@firstOrNull false
-                        val normServerTitle = normalizeTrackTitle(server.title)
-                        val normServerArtist = normalizeArtist(server.artist)
-                        if (normServerTitle.isBlank()) return@firstOrNull false
-
-                        // 本地文件名包含服务器标题与艺术家
-                        val fileNameMatch = localFileName.contains(normServerTitle) && normServerTitle.length >= 2 &&
-                                (normServerArtist.isBlank() || localFileName.contains(normServerArtist))
-                        if (fileNameMatch) return@firstOrNull true
-
-                        // 标题模糊包含且时长在 3.5 秒误差范围内
-                        val durationMatch = server.durationMs > 0 && local.durationMs > 0 &&
-                                kotlin.math.abs(server.durationMs - local.durationMs) < 3500
-                        val titleFuzzyMatch = (normServerTitle.contains(normLocalTitle) || normLocalTitle.contains(normServerTitle)) &&
-                                normServerTitle.length >= 2 && normLocalTitle.length >= 2
-
-                        val artistMatch = normServerArtist.isBlank() || normLocalArtist.isBlank() ||
-                                normServerArtist == normLocalArtist ||
-                                normServerArtist.contains(normLocalArtist) ||
-                                normLocalArtist.contains(normServerArtist)
-
-                        titleFuzzyMatch && durationMatch && artistMatch
+                        val durationCompatible = !(server.durationMs > 0L && local.durationMs > 0L &&
+                                kotlin.math.abs(server.durationMs - local.durationMs) > 5000L)
+                        durationCompatible && SongMatchingResolver.matchFileNameToTrack(
+                            fileNameWithoutExt = localFile.nameWithoutExtension,
+                            targetTitle = server.title,
+                            targetArtist = server.artist,
+                            targetAlbum = server.album
+                        )
                     }
                 }
 
@@ -811,22 +803,26 @@ object LocalMediaScanner {
                     continue
                 }
 
-                // 若之前记录的路径已失效或尚未关联，尝试在本地文件与离线目录中精确搜索匹配
+                // 若之前记录的路径已失效或尚未关联，尝试在本地文件与离线目录中精确搜索匹配（严格区分 Live/不同版本）
                 val normServerTitle = normalizeTrackTitle(server.title)
                 val normServerArtist = normalizeArtist(server.artist)
                 val normServerAlbum = normalizeArtist(server.album)
 
-                // 1. 优先在离线下载目录中按路径层级与文件名匹配
+                // 1. 优先在离线下载目录中按路径层级与文件名精确匹配
                 val matchedPhysicalFile = localFiles.firstOrNull { f ->
+                    if (SongMatchingResolver.matchFileNameToTrack(f.nameWithoutExtension, server.title, server.artist, server.album)) {
+                        return@firstOrNull true
+                    }
                     val fName = normalizeTrackTitle(f.nameWithoutExtension)
                     val pDir = f.parentFile?.name.orEmpty().lowercase()
                     val pParentDir = f.parentFile?.parentFile?.name.orEmpty().lowercase()
 
-                    val titleMatches = fName == normServerTitle || fName.contains(normServerTitle) || normServerTitle.contains(fName)
-                    val dirMatches = pDir.contains(normServerArtist) || pDir.contains(normServerAlbum) ||
-                            pParentDir.contains(normServerArtist) || pParentDir.contains(normServerAlbum)
+                    val titleExactMatch = normServerTitle.isNotBlank() && fName == normServerTitle &&
+                            !SongMatchingResolver.hasEditionConflict(f.nameWithoutExtension, pDir, server.title, server.album)
+                    val dirMatches = (normServerArtist.isNotBlank() && (pDir.contains(normServerArtist) || pParentDir.contains(normServerArtist))) ||
+                            (normServerAlbum.isNotBlank() && (pDir.contains(normServerAlbum) || pParentDir.contains(normServerAlbum)))
 
-                    (titleMatches && (normServerArtist.isBlank() || dirMatches || fName.contains(normServerArtist)))
+                    titleExactMatch && (normServerArtist.isBlank() || dirMatches)
                 }
 
                 if (matchedPhysicalFile != null) {
@@ -856,17 +852,11 @@ object LocalMediaScanner {
                 val matchedLocalSong = localSongs.firstOrNull { local ->
                     val lPath = local.localFilePath ?: return@firstOrNull false
                     if (!File(lPath).exists()) return@firstOrNull false
-
-                    val normLocalTitle = normalizeTrackTitle(local.title)
-                    val normLocalArtist = normalizeArtist(local.artist)
-
-                    val titleStrictMatch = normServerTitle.isNotBlank() && normLocalTitle.isNotBlank() && normServerTitle == normLocalTitle
-                    val artistMatch = normServerArtist.isBlank() || normLocalArtist.isBlank() ||
-                            normServerArtist == normLocalArtist ||
-                            normServerArtist.contains(normLocalArtist) ||
-                            normLocalArtist.contains(normServerArtist)
-
-                    titleStrictMatch && artistMatch
+                    SongMatchingResolver.isSongMatch(
+                        local.title, local.artist, local.durationMs,
+                        server.title, server.artist, server.durationMs,
+                        local.album, server.album
+                    )
                 }
 
                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != null) {
