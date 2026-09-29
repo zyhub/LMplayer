@@ -485,6 +485,7 @@ fun LocalMusicHomeScreen(
     onGoToSettings: () -> Unit = {},
     onPlaylistClick: ((UnifiedPlaylist) -> Unit)? = null,
     onScanLocalMedia: (() -> Unit)? = null,
+    onSubViewActiveChange: (Boolean) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val dimensions = LocalAppDimensions.current
@@ -500,6 +501,19 @@ fun LocalMusicHomeScreen(
     val selectedSongIds = remember { mutableStateListOf<String>() }
     var showBatchDownloadDialog by remember { mutableStateOf(false) }
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    LaunchedEffect(isMultiSelectMode) {
+        onSubViewActiveChange(isMultiSelectMode)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSubViewActiveChange(false) }
+    }
+    if (isMultiSelectMode) {
+        androidx.activity.compose.BackHandler(enabled = true) {
+            isMultiSelectMode = false
+            selectedSongIds.clear()
+        }
+    }
 
     LaunchedEffect(listState.isScrollInProgress) {
         onListScrollingChange(listState.isScrollInProgress)

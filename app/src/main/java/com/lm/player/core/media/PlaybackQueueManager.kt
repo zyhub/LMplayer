@@ -40,6 +40,16 @@ object PlaybackQueueManager {
     val isRepeatFlow: StateFlow<Boolean> = _isRepeatFlow.asStateFlow()
 
     private var isListenerAttached = false
+    private var appContext: Context? = null
+
+    fun initFromPrefs(context: Context) {
+        appContext = context.applicationContext
+        try {
+            val prefs = context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+            _isShuffleFlow.value = prefs.getBoolean("playback_is_shuffle", false)
+            _isRepeatFlow.value = prefs.getBoolean("playback_is_repeat", false)
+        } catch (_: Exception) {}
+    }
 
     fun setQueue(songs: List<UnifiedSong>) {
         _playlistFlow.value = songs
@@ -88,13 +98,24 @@ object PlaybackQueueManager {
 
     fun setShuffle(shuffle: Boolean) {
         _isShuffleFlow.value = shuffle
+        try {
+            appContext?.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                ?.edit()?.putBoolean("playback_is_shuffle", shuffle)?.apply()
+        } catch (_: Exception) {}
     }
 
     fun setRepeat(repeat: Boolean) {
         _isRepeatFlow.value = repeat
+        try {
+            appContext?.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                ?.edit()?.putBoolean("playback_is_repeat", repeat)?.apply()
+        } catch (_: Exception) {}
     }
 
     fun ensurePlayerListener(context: Context) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+        }
         if (isListenerAttached) return
         val player = Media3Factory.getSharedExoPlayer(context)
         player.addListener(object : Player.Listener {

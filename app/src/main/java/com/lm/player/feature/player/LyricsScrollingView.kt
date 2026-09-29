@@ -20,7 +20,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -51,7 +56,7 @@ fun LyricsScrollingView(
     }
 
     var showAdjustDialog by remember { mutableStateOf(false) }
-    val isDark = isSystemInDarkTheme()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     val activeColor = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
     val inactiveColor = if (isDark) lyricTheme.inactiveColorDark else lyricTheme.inactiveColorLight
@@ -226,14 +231,16 @@ fun LyricsAdjustDropdownMenu(
     onOffsetChange: (Long) -> Unit,
     onThemeChange: (LyricTheme) -> Unit
 ) {
-    val isDark = isSystemInDarkTheme()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val primaryText = if (isDark) Color.White else Color.Black
     val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
 
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = Modifier.widthIn(min = 270.dp, max = 320.dp)
+        modifier = Modifier
+            .background(if (isDark) Color(0xFF24242C) else Color.White)
+            .widthIn(min = 270.dp, max = 320.dp)
     ) {
         Column(
             modifier = Modifier
@@ -421,7 +428,7 @@ fun LyricsAdjustDialog(
     onThemeChange: (LyricTheme) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val isDark = isSystemInDarkTheme()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val primaryText = if (isDark) Color.White else Color.Black
     val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
 
@@ -612,3 +619,174 @@ fun LyricsAdjustDialog(
         }
     }
 }
+
+/**
+ * 封面下方 5 行滚动渐变歌词组件
+ * 默认展示 5 行：上上句(顶部淡出)、上一句、当前歌词(高亮放大)、下一句、下下句(底部淡出)
+ */
+@Composable
+fun CoverFiveLineGradientLyrics(
+    lyrics: List<LyricLine>,
+    currentPositionMs: Long,
+    lyricsOffsetMs: Long = 0L,
+    lyricTheme: LyricTheme = LyricTheme.APPLE_MUSIC,
+    onClickLyricsArea: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val activeColor = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
+    val baseInactiveColor = if (isDark) {
+        Color.White.copy(alpha = 0.78f)
+    } else {
+        Color(0xFF1C1C1E).copy(alpha = 0.75f)
+    }
+
+    val cleanLyrics = remember(lyrics) {
+        lyrics.filter { it.text.isNotBlank() && !it.text.trim().equals("null", ignoreCase = true) }
+    }
+
+    val effectivePositionMs = (currentPositionMs + lyricsOffsetMs).coerceAtLeast(0L)
+    val activeIndex = remember(cleanLyrics, effectivePositionMs) {
+        if (cleanLyrics.isEmpty()) 0
+        else {
+            var low = 0
+            var high = cleanLyrics.lastIndex
+            var best = 0
+            while (low <= high) {
+                val mid = (low + high) ushr 1
+                if (cleanLyrics[mid].timestampMs <= effectivePositionMs) {
+                    best = mid
+                    low = mid + 1
+                } else {
+                    high = mid - 1
+                }
+            }
+            best
+        }
+    }
+
+    val animatedCenterIndex by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = activeIndex.toFloat(),
+        animationSpec = tween(
+            durationMillis = 360,
+            easing = androidx.compose.animation.core.FastOutSlowInEasing
+        ),
+        label = "five_line_lyric_scroll"
+    )
+
+    val dimensions = com.lm.player.core.designsystem.theme.LocalAppDimensions.current
+    val rowHeightDp = 28.dp
+    val totalHeightDp = 140.dp // 5 * 28.dp
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val rowHeightPx = with(density) { rowHeightDp.toPx() }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(totalHeightDp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClickLyricsArea)
+            .graphicsLayer {
+                compositingStrategy = CompositingStrategy.Offscreen
+            }
+            .drawWithContent {
+                drawContent()
+                // 上下边缘平滑滚动渐变遮罩 (前后各一条做滚动淡化)
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        0.00f to Color.Transparent,
+                        0.18f to Color.Black.copy(alpha = 0.55f),
+                        0.32f to Color.Black,
+                        0.68f to Color.Black,
+                        0.82f to Color.Black.copy(alpha = 0.55f),
+                        1.00f to Color.Transparent
+                    ),
+                    blendMode = BlendMode.DstIn
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (cleanLyrics.isEmpty()) {
+            val placeholderLines = listOf(
+                "",
+                "· · ·",
+                "♪ 纯音乐 / 暂无歌词 ♪",
+                "点击切换至完整歌词视图",
+                ""
+            )
+            placeholderLines.forEachIndexed { idx, text ->
+                val rel = idx - 2 // -2, -1, 0, +1, +2
+                val absRel = kotlin.math.abs(rel)
+                val lineAlpha = when (absRel) {
+                    0 -> 0.92f
+                    1 -> 0.48f
+                    else -> 0.20f
+                }
+                Text(
+                    text = text,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    style = TextStyle(
+                        fontSize = (if (absRel == 0) 16.5.sp else 14.5.sp) * dimensions.fontScale,
+                        fontWeight = if (absRel == 0) FontWeight.Bold else FontWeight.Normal,
+                        color = (if (absRel == 0) activeColor else baseInactiveColor).copy(alpha = lineAlpha)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .graphicsLayer {
+                            translationY = rel * rowHeightPx
+                        }
+                )
+            }
+        } else {
+            val minIdx = (kotlin.math.floor(animatedCenterIndex).toInt() - 3).coerceAtLeast(-2)
+            val maxIdx = (kotlin.math.ceil(animatedCenterIndex).toInt() + 3).coerceAtMost(cleanLyrics.lastIndex + 2)
+
+            for (idx in minIdx..maxIdx) {
+                val delta = idx - animatedCenterIndex
+                val absDelta = kotlin.math.abs(delta)
+                if (absDelta > 2.65f) continue
+
+                val lineText = when {
+                    idx in cleanLyrics.indices -> cleanLyrics[idx].text
+                    else -> ""
+                }
+                if (lineText.isEmpty()) continue
+
+                // 根据距离中心行的偏移量平滑计算透明度、缩放与色彩权重
+                val lineAlpha = when {
+                    absDelta <= 0.5f -> 1.0f - (absDelta * 0.42f)
+                    absDelta <= 1.5f -> 0.79f - ((absDelta - 0.5f) * 0.45f)
+                    else -> (0.34f - ((absDelta - 1.5f) * 0.26f)).coerceIn(0f, 0.34f)
+                }.coerceIn(0f, 1f)
+
+                val lineScale = (1.08f - (absDelta * 0.065f)).coerceIn(0.90f, 1.08f)
+                val isCurrentCenter = absDelta < 0.45f
+
+                Text(
+                    text = lineText,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    style = TextStyle(
+                        fontSize = (if (isCurrentCenter) 17.5.sp else 15.sp) * dimensions.fontScale,
+                        fontWeight = if (isCurrentCenter) FontWeight.Bold else FontWeight.Medium,
+                        color = if (isCurrentCenter) activeColor else baseInactiveColor
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp)
+                        .graphicsLayer {
+                            translationY = delta * rowHeightPx
+                            alpha = lineAlpha
+                            scaleX = lineScale
+                            scaleY = lineScale
+                        }
+                )
+            }
+        }
+    }
+}
+

@@ -47,13 +47,20 @@ fun DownloadQualityDropdownMenu(
     onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val savedDefaultTarget = remember(context, expanded) {
+        val raw = context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE)
+            .getString("default_download_target", DownloadTarget.LOCAL.name) ?: DownloadTarget.LOCAL.name
+        runCatching { DownloadTarget.valueOf(raw) }.getOrDefault(DownloadTarget.LOCAL)
+    }
     val isOnlyOneDownloaded = hasLocal xor hasServer
-    var selectedTarget by remember(expanded, hasLocal, hasServer, isServerConnected) {
+    var selectedTarget by remember(expanded, hasLocal, hasServer, isServerConnected, savedDefaultTarget) {
         mutableStateOf(
             when {
                 hasServer && !hasLocal -> DownloadTarget.LOCAL
                 hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
-                else -> initialTarget
+                !isServerConnected -> DownloadTarget.LOCAL
+                else -> savedDefaultTarget
             }
         )
     }
@@ -284,16 +291,27 @@ fun DownloadQualityChoiceDialog(
     val surfaceBg = if (isDark) Color(0xFF222228) else Color.White
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
-    var selectedTarget by remember(hasLocal, hasServer, isServerConnected) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val (savedDefaultTarget, savedDefaultQuality) = remember(context) {
+        val prefs = context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE)
+        val rawTarget = prefs.getString("default_download_target", initialTarget.name) ?: initialTarget.name
+        val rawQuality = prefs.getString("default_download_quality", initialQuality.key) ?: initialQuality.key
+        val t = runCatching { DownloadTarget.valueOf(rawTarget) }.getOrDefault(initialTarget)
+        val q = AudioQuality.fromKey(rawQuality)
+        t to q
+    }
+
+    var selectedTarget by remember(hasLocal, hasServer, isServerConnected, savedDefaultTarget) {
         mutableStateOf(
             when {
                 hasServer && !hasLocal -> DownloadTarget.LOCAL
                 hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
-                else -> initialTarget
+                !isServerConnected -> DownloadTarget.LOCAL
+                else -> savedDefaultTarget
             }
         )
     }
-    var selectedQuality by remember { mutableStateOf(initialQuality) }
+    var selectedQuality by remember(savedDefaultQuality) { mutableStateOf(savedDefaultQuality) }
 
     val visibleTargets = remember(hasLocal, hasServer) {
         when {

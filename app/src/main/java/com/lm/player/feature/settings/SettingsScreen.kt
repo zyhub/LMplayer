@@ -185,7 +185,7 @@ fun SettingsScreen(
     // 本地音乐路径管理状态
     val defaultLocalPaths = remember { setOf("/storage/emulated/0/Music", "/storage/emulated/0/Download") }
     var localMusicPaths by remember {
-        mutableStateOf(prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths)
+        mutableStateOf((prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths).toSet())
     }
     var isScanningLocalAndServer by remember { mutableStateOf(false) }
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
@@ -195,6 +195,9 @@ fun SettingsScreen(
 
     // 当切换到音源脚本、下载偏好或存储路径 Tab 时，若连接了柠檬音乐则自动拉取同步
     LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
+        if (selectedTab == SettingsTab.LIBRARY_PATHS) {
+            localMusicPaths = (prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths).toSet()
+        }
         if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
             isLoadingScripts = true
             val client = NetworkClientFactory.createOkHttpClient(context)
@@ -420,6 +423,7 @@ fun SettingsScreen(
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
                                         color = if (isCurrent) AppleRed.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
                                         border = BorderStroke(1.dp, if (isCurrent) AppleRed else borderColor.copy(alpha = 0.4f)),
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -434,7 +438,7 @@ fun SettingsScreen(
                                         ) {
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                                    Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                                                     if (isCurrent) {
                                                         Spacer(modifier = Modifier.width(6.dp))
                                                         Surface(shape = RoundedCornerShape(4.dp), color = AppleRed) {
@@ -447,7 +451,7 @@ fun SettingsScreen(
 
                                             Row {
                                                 IconButton(onClick = { editingServer = s; showAddServerDialog = true }, modifier = Modifier.size(28.dp)) {
-                                                    Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
+                                                    Icon(Icons.Default.Edit, contentDescription = "编辑", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
                                                 }
                                                 IconButton(onClick = { onDeleteServer(s.id) }, modifier = Modifier.size(28.dp)) {
                                                     Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
@@ -530,10 +534,10 @@ fun SettingsScreen(
                                             latestVersion = curVerName,
                                             latestVersionCode = curVerCode.toInt(),
                                             releaseNotes = "【v${curVerName} 更新日志】\n\n" +
-                                                "1. 下载弹窗重构：界面精简美化，更名「双端下载」并支持单端已下载时智能置灰，直观显示文件大小\n" +
-                                                "2. 音质与大小精准显示：在线歌曲动态展示试听音质，本地下载精准识别真实格式 (FLAC/MP3) 与大小\n" +
-                                                "3. 定位按钮优化：改为小圆形纯图标悬浮按钮，修复滑动出现时的阴影重叠问题\n" +
-                                                "4. 后台灵动岛与稳定性：完善后台手机顶部灵动岛、无损 FLAC 标签头保护及全曲库防串歌匹配",
+                                                "1. 设置项全面持久化：修复重启后主题、字体规格、毛玻璃、底栏收缩、自定义目录等设置重置的问题\n" +
+                                                "2. 深色模式视觉优化：全面修复深色模式下播放界面歌词与设置项文字看不清的问题\n" +
+                                                "3. 播放界面体验升级：封面下方新增 5 行滚动渐变歌词，歌曲名称下方新增音质、码率、大小三色徽章\n" +
+                                                "4. 系统级返回键适配：完善全页面、子视图、多选状态与弹窗的层级返回逻辑，直至双击退出软件",
                                             downloadUrl = ""
                                         )
                                         showVersionNotesDialog = true
@@ -587,7 +591,8 @@ fun SettingsScreen(
                                 Text(
                                     text = "服务端音源扩展 (${sourceScripts.size})",
                                     fontSize = 14.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Row {
                                     IconButton(
@@ -610,7 +615,7 @@ fun SettingsScreen(
                                         },
                                         modifier = Modifier.size(28.dp)
                                     ) {
-                                        Icon(Icons.Default.Refresh, contentDescription = "刷新", modifier = Modifier.size(16.dp))
+                                        Icon(Icons.Default.Refresh, contentDescription = "刷新", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
                                     }
                                     IconButton(
                                         onClick = {
@@ -644,6 +649,7 @@ fun SettingsScreen(
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
                                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                        contentColor = MaterialTheme.colorScheme.onSurface,
                                         border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
                                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                                     ) {
@@ -654,7 +660,7 @@ fun SettingsScreen(
                                         ) {
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                                    Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                                                     if (script.version.isNotBlank()) {
                                                         Spacer(modifier = Modifier.width(6.dp))
                                                         Text("v${script.version}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -712,6 +718,7 @@ fun SettingsScreen(
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
@@ -726,6 +733,7 @@ fun SettingsScreen(
                                         },
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onSurface,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
@@ -764,6 +772,7 @@ fun SettingsScreen(
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
@@ -773,6 +782,7 @@ fun SettingsScreen(
                                         text = downloadSettings.customDownloadPath.ifBlank { "默认应用私有目录 (/Music)" },
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onSurface,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
@@ -808,6 +818,7 @@ fun SettingsScreen(
                                 Surface(
                                     shape = RoundedCornerShape(10.dp),
                                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    contentColor = MaterialTheme.colorScheme.onSurface,
                                     border = BorderStroke(1.dp, borderColor),
                                     modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
                                 ) {
@@ -821,6 +832,7 @@ fun SettingsScreen(
                                             text = p,
                                             fontSize = 12.sp,
                                             fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.onSurface,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.weight(1f)
@@ -829,8 +841,10 @@ fun SettingsScreen(
                                             onClick = {
                                                 val updated = localMusicPaths.toMutableSet()
                                                 updated.remove(p)
-                                                localMusicPaths = updated
-                                                prefs.edit().putStringSet("local_music_scan_folders", updated).apply()
+                                                val newSet = updated.toSet()
+                                                localMusicPaths = newSet
+                                                prefs.edit().remove("local_music_scan_folders").apply()
+                                                prefs.edit().putStringSet("local_music_scan_folders", newSet).apply()
                                             },
                                             modifier = Modifier.size(24.dp)
                                         ) {
@@ -1213,7 +1227,7 @@ fun SettingsScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column {
-                                    Text("当前试听缓存占用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                    Text("当前试听缓存占用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                                     Text(formattedCacheSize, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 OutlinedButton(
@@ -1325,7 +1339,7 @@ fun SettingsScreen(
                                 onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
                             )
 
-                            if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY) {
+                            if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY || DynamicIslandManager.isHuaweiOrHarmonyOS()) {
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
@@ -1462,7 +1476,7 @@ fun SettingsScreen(
                             )
 
                             Spacer(modifier = Modifier.height(16.dp))
-                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
+                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                             Slider(
                                 value = blurAlpha,
                                 onValueChange = onBlurAlphaChange,
@@ -1543,6 +1557,7 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = cardBg,
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier.fillMaxWidth(0.95f).padding(16.dp)
             ) {
@@ -1578,6 +1593,7 @@ fun SettingsScreen(
                                 Surface(
                                     shape = RoundedCornerShape(10.dp),
                                     color = if (isSelected) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    contentColor = MaterialTheme.colorScheme.onSurface,
                                     border = BorderStroke(1.dp, if (isSelected) AppleRed else Color.Transparent),
                                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
                                         selectedServerPathChoice = pathItem
@@ -1677,6 +1693,7 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = cardBg,
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier.fillMaxWidth(0.95f).padding(16.dp)
             ) {
@@ -1718,6 +1735,7 @@ fun SettingsScreen(
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable {
                                     newLocalPathInput = preset
                                 }
@@ -1725,7 +1743,7 @@ fun SettingsScreen(
                                 Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.Folder, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(text = preset, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(text = preset, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                             }
                         }
@@ -1772,8 +1790,10 @@ fun SettingsScreen(
                                 if (path.isNotBlank()) {
                                     val updated = localMusicPaths.toMutableSet()
                                     updated.add(path)
-                                    localMusicPaths = updated
-                                    prefs.edit().putStringSet("local_music_scan_folders", updated).apply()
+                                    val newSet = updated.toSet()
+                                    localMusicPaths = newSet
+                                    prefs.edit().remove("local_music_scan_folders").apply()
+                                    prefs.edit().putStringSet("local_music_scan_folders", newSet).apply()
                                     showAddLocalPathDialog = false
                                     newLocalPathInput = ""
                                     Toast.makeText(context, "已添加扫描目录: $path", Toast.LENGTH_SHORT).show()
@@ -1796,11 +1816,12 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = cardBg,
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier.fillMaxWidth(0.94f).padding(16.dp)
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
-                    Text("导入落雪音源脚本", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text("导入落雪音源脚本", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Row(modifier = Modifier.fillMaxWidth()) {
@@ -1941,11 +1962,12 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = cardBg,
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier.fillMaxWidth(0.96f).padding(12.dp)
             ) {
                 Column(modifier = Modifier.padding(18.dp)) {
-                    Text(if (editingServer != null) "编辑服务器" else "添加新服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text(if (editingServer != null) "编辑服务器" else "添加新服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(modifier = Modifier.height(14.dp))
 
                     OutlinedTextField(
@@ -2178,6 +2200,7 @@ fun SettingsScreen(
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        contentColor = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
@@ -2225,6 +2248,7 @@ private fun SettingsCard(
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = cardColor,
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, borderCol),
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -2262,7 +2286,7 @@ private fun SettingInfoRow(label: String, value: String) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(label, fontSize = dimensions.bodySize, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontSize = dimensions.bodySize, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(value, fontSize = dimensions.bodySize, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -2420,6 +2444,7 @@ private fun <T> SettingDropdownRow(
             Surface(
                 shape = RoundedCornerShape(10.dp),
                 color = if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7),
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier
                     .widthIn(min = 84.dp, max = 142.dp)
@@ -2453,7 +2478,9 @@ private fun <T> SettingDropdownRow(
             DropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
-                modifier = Modifier.widthIn(min = 200.dp, max = 280.dp)
+                modifier = Modifier
+                    .background(if (isDark) Color(0xFF24242C) else Color.White)
+                    .widthIn(min = 200.dp, max = 280.dp)
             ) {
                 options.forEach { option ->
                     val isSelected = option == selectedValue

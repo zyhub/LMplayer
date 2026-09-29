@@ -86,6 +86,7 @@ fun LemonDiscoverHomeScreen(
     onFetchDiscoverNewAlbums: (suspend (OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     onFetchCollectionSongs: suspend (id: String, source: OnlineMusicSource) -> List<UnifiedSong>,
+    onSubViewActiveChange: (Boolean) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val dimensions = LocalAppDimensions.current
@@ -125,6 +126,34 @@ fun LemonDiscoverHomeScreen(
     var activeCollectionCover by remember { mutableStateOf("") }
     var activeCollectionSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingCollection by remember { mutableStateOf(false) }
+
+    // 安卓系统返回键逐级回退：多选状态 -> 歌单/榜单详情抽屉 -> 首页
+    val hasActiveSubView = isCollectionMultiSelect || activeCollectionTitle != null || isNewSongsMultiSelect
+    LaunchedEffect(hasActiveSubView) {
+        onSubViewActiveChange(hasActiveSubView)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSubViewActiveChange(false) }
+    }
+    if (hasActiveSubView) {
+        androidx.activity.compose.BackHandler(enabled = true) {
+            when {
+                isCollectionMultiSelect -> {
+                    isCollectionMultiSelect = false
+                    selectedCollectionSongIds = emptySet()
+                }
+                activeCollectionTitle != null -> {
+                    activeCollectionTitle = null
+                    isCollectionMultiSelect = false
+                    selectedCollectionSongIds = emptySet()
+                }
+                isNewSongsMultiSelect -> {
+                    isNewSongsMultiSelect = false
+                    selectedNewSongIds = emptySet()
+                }
+            }
+        }
+    }
 
     val discoverListState = rememberLazyListState()
     val collectionListState = rememberLazyListState()
@@ -663,11 +692,15 @@ fun LemonDiscoverHomeScreen(
                                 }
                                 OutlinedButton(
                                     onClick = onGoToSettings,
-                                    shape = RoundedCornerShape(12.dp)
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, borderColor),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = MaterialTheme.colorScheme.onSurface
+                                    )
                                 ) {
-                                    Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("音源设置", fontSize = 13.sp)
+                                    Text("音源设置", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface)
                                 }
                             }
                         }
@@ -701,7 +734,11 @@ fun LemonDiscoverHomeScreen(
                     isCollectionMultiSelect = false
                     selectedCollectionSongIds = emptySet()
                 }) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "返回",
+                        tint = MaterialTheme.colorScheme.onBackground
+                    )
                 }
                 Spacer(modifier = Modifier.width(6.dp))
                 Column(modifier = Modifier.weight(1f)) {
@@ -709,6 +746,7 @@ fun LemonDiscoverHomeScreen(
                         text = activeCollectionTitle ?: "",
                         fontSize = dimensions.sectionTitleSize,
                         fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -1049,10 +1087,14 @@ fun OnlineSourceDropdownMenu(
     onSourceSelect: (OnlineMusicSource) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val menuBg = if (isDark) Color(0xFF1F1F26) else Color.White
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = modifier.widthIn(min = 250.dp, max = 310.dp)
+        modifier = modifier
+            .widthIn(min = 250.dp, max = 310.dp)
+            .background(menuBg)
     ) {
         Text(
             text = "在线音源平台",

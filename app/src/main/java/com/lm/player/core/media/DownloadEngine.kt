@@ -44,7 +44,7 @@ class DownloadEngine(
     var downloadSettings = MutableStateFlow(
         DownloadSettings(
             maxConcurrent = prefs.getInt("max_concurrent", 3),
-            customDownloadPath = prefs.getString("custom_download_path", "") ?: "",
+            customDownloadPath = resolveFilesystemPath(prefs.getString("custom_download_path", "") ?: ""),
             wifiOnly = prefs.getBoolean("wifi_only", false),
             autoTagging = prefs.getBoolean("auto_tagging", true)
         )
@@ -55,20 +55,67 @@ class DownloadEngine(
         prefs.getInt("max_concurrent", 3).coerceIn(1, 10)
     )
 
+    companion object {
+        /**
+         * 将 SAF Tree URI (如 content://com.android.externalstorage.documents/tree/primary%3AMusic)
+         * 解析为真实文件系统绝对路径 (如 /storage/emulated/0/Music)
+         */
+        fun resolveFilesystemPath(rawPathOrUri: String): String {
+            val trimmed = rawPathOrUri.trim()
+            if (trimmed.isBlank()) return ""
+            if (!trimmed.startsWith("content://") && !trimmed.startsWith("file://")) {
+                return trimmed
+            }
+            return try {
+                val decoded = java.net.URLDecoder.decode(trimmed, "UTF-8")
+                when {
+                    decoded.contains("primary:") -> {
+                        val rel = decoded.substringAfterLast("primary:").trimStart('/')
+                        if (rel.isBlank()) "/storage/emulated/0" else "/storage/emulated/0/$rel"
+                    }
+                    decoded.contains("/tree/") -> {
+                        val treePart = decoded.substringAfterLast("/tree/")
+                        if (treePart.contains(":")) {
+                            val vol = treePart.substringBefore(":")
+                            val rel = treePart.substringAfter(":").trimStart('/')
+                            if (vol.equals("primary", ignoreCase = true) || vol.equals("home", ignoreCase = true)) {
+                                if (rel.isBlank()) "/storage/emulated/0" else "/storage/emulated/0/$rel"
+                            } else {
+                                "/storage/$vol/$rel".trimEnd('/')
+                            }
+                        } else {
+                            trimmed
+                        }
+                    }
+                    decoded.startsWith("file://") -> decoded.removePrefix("file://")
+                    else -> trimmed
+                }
+            } catch (_: Exception) {
+                trimmed
+            }
+        }
+    }
+
     fun updateSettings(newSettings: DownloadSettings) {
+        val normalizedPath = resolveCustomPathIfNeeded(newSettings.customDownloadPath)
+        val normalizedSettings = newSettings.copy(customDownloadPath = normalizedPath)
         val oldMax = downloadSettings.value.maxConcurrent
-        downloadSettings.value = newSettings
+        downloadSettings.value = normalizedSettings
         prefs.edit()
-            .putInt("max_concurrent", newSettings.maxConcurrent)
-            .putString("custom_download_path", newSettings.customDownloadPath)
-            .putBoolean("wifi_only", newSettings.wifiOnly)
-            .putBoolean("auto_tagging", newSettings.autoTagging)
+            .putInt("max_concurrent", normalizedSettings.maxConcurrent)
+            .putString("custom_download_path", normalizedSettings.customDownloadPath)
+            .putBoolean("wifi_only", normalizedSettings.wifiOnly)
+            .putBoolean("auto_tagging", normalizedSettings.autoTagging)
             .apply()
 
-        if (oldMax != newSettings.maxConcurrent) {
-            downloadSemaphore = kotlinx.coroutines.sync.Semaphore(newSettings.maxConcurrent.coerceIn(1, 10))
-            Log.i(TAG, "Download concurrency limit updated to ${newSettings.maxConcurrent}")
+        if (oldMax != normalizedSettings.maxConcurrent) {
+            downloadSemaphore = kotlinx.coroutines.sync.Semaphore(normalizedSettings.maxConcurrent.coerceIn(1, 10))
+            Log.i(TAG, "Download concurrency limit updated to ${normalizedSettings.maxConcurrent}")
         }
+    }
+
+    private fun resolveCustomPathIfNeeded(raw: String): String {
+        return resolveFilesystemPath(raw)
     }
 
     // 活跃下载任务映射 Map<SongId, DownloadTask> - 线程安全反应式 StateFlow

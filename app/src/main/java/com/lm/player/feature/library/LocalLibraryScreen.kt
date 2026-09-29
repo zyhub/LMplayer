@@ -107,6 +107,7 @@ fun LocalLibraryScreen(
     onSelectServer: (ServerConfig) -> Unit = {},
     onSyncNow: () -> Unit = {},
     onGoToSettings: () -> Unit = {},
+    onSubViewActiveChange: (Boolean) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val context = LocalContext.current
@@ -290,8 +291,22 @@ fun LocalLibraryScreen(
     }
 
     // 触屏滑动返回或物理按键退出下钻视图与多选模式
-    BackHandler(enabled = activeSubViewTitle != null) {
-        handleSubViewBack()
+    val hasActiveSubView = activeSubViewTitle != null || isMainSongsMultiSelect || isDownloadManagementMode || isSubViewMultiSelect
+    LaunchedEffect(hasActiveSubView) {
+        onSubViewActiveChange(hasActiveSubView)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSubViewActiveChange(false) }
+    }
+    if (hasActiveSubView) {
+        BackHandler(enabled = true) {
+            if (activeSubViewTitle != null) {
+                handleSubViewBack()
+            } else if (isMainSongsMultiSelect) {
+                isMainSongsMultiSelect = false
+                selectedMainSongIds = emptySet()
+            }
+        }
     }
 
     // 下载选择弹窗
@@ -474,28 +489,6 @@ fun LocalLibraryScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(buttonGap)
                             ) {
-                                // 新建歌单胶囊按键
-                                Surface(
-                                    shape = RoundedCornerShape(20.dp),
-                                    color = AppleRed.copy(alpha = 0.12f),
-                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f)),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(20.dp))
-                                        .clickable { isCreatePlaylistDialogOpen = true }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Add,
-                                            contentDescription = "新建歌单",
-                                            tint = AppleRed,
-                                            modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
-                                        )
-                                    }
-                                }
-
                                 // 下载管理胶囊按键 (与首页风格统一)
                                 Surface(
                                     shape = RoundedCornerShape(20.dp),
@@ -694,6 +687,7 @@ fun LocalLibraryScreen(
                                     icon = Icons.Default.Favorite,
                                     gradient = listOf(Color(0xFFFA233B), Color(0xFFFF5E3A)),
                                     onClick = {
+                                        isFromAllPlaylists = false
                                         activeSubViewTitle = "我喜欢的音乐"
                                         activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
                                         activeSubViewSongs = favSongs
@@ -710,6 +704,7 @@ fun LocalLibraryScreen(
                                     icon = Icons.Default.History,
                                     gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
                                     onClick = {
+                                        isFromAllPlaylists = false
                                         activeSubViewTitle = "最近播放"
                                         activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentSongs.size} 首"
                                         activeSubViewSongs = recentSongs
@@ -727,6 +722,7 @@ fun LocalLibraryScreen(
                                     icon = Icons.Default.Folder,
                                     gradient = listOf(Color(0xFF007AFF), Color(0xFF5AC8FA)),
                                     onClick = {
+                                        isFromAllPlaylists = false
                                         activeSubViewTitle = "本地下载"
                                         activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
                                         activeSubViewSongs = finalDownloadedSongs
@@ -741,6 +737,7 @@ fun LocalLibraryScreen(
                                 PlaylistCardItem(
                                     playlist = pl,
                                     onClick = {
+                                        isFromAllPlaylists = false
                                         activeSubViewTitle = pl.name
                                         activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
                                         if (onFetchPlaylistSongs != null) {
@@ -780,6 +777,7 @@ fun LocalLibraryScreen(
                                     fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
+                                        isFromAllPlaylists = false
                                         activeSubViewTitle = "最近添加"
                                         activeSubViewSubtitle = "共 ${recentAddedSongs.size} 首曲目"
                                         activeSubViewSongs = recentAddedSongs
@@ -892,6 +890,10 @@ fun LocalLibraryScreen(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(16.dp))
                                         .clickable {
+                                            isFromAllPlaylists = false
+                                            isFromAllFolders = false
+                                            isFromAllArtists = false
+                                            isFromAllAlbums = false
                                             activeSubViewTitle = "风格 · $genreName"
                                             activeSubViewSubtitle = if (count > 0) "共 $count 首歌曲" else "精选曲目流"
                                             activeSubViewSongs = allSongs.filter {
@@ -947,6 +949,7 @@ fun LocalLibraryScreen(
                                     fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
+                                        isFromAllArtists = false
                                         activeSubViewTitle = "全部歌手"
                                         activeSubViewSubtitle = "共 ${artists.size} 位歌手"
                                         activeSubViewSongs = allSongs
@@ -969,6 +972,7 @@ fun LocalLibraryScreen(
                                             .clip(RoundedCornerShape(18.dp))
                                             .clickable {
                                                 val artistSongs = allSongs.filter { it.artist == artist.name }
+                                                isFromAllArtists = false
                                                 activeSubViewTitle = artist.name
                                                 activeSubViewSubtitle = "歌手专栏 · 共 ${artistSongs.size} 首歌曲"
                                                 activeSubViewSongs = artistSongs
@@ -1029,6 +1033,7 @@ fun LocalLibraryScreen(
                                     fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
+                                        isFromAllAlbums = false
                                         activeSubViewTitle = "全部专辑"
                                         activeSubViewSubtitle = "共 ${albums.size} 张专辑"
                                         activeSubViewSongs = allSongs
@@ -1048,6 +1053,7 @@ fun LocalLibraryScreen(
                                             .width(128.dp)
                                             .clickable {
                                                 val albumSongs = allSongs.filter { it.album == album.title }
+                                                isFromAllAlbums = false
                                                 activeSubViewTitle = album.title
                                                 activeSubViewSubtitle = "${album.artist} · 共 ${albumSongs.size} 首"
                                                 activeSubViewSongs = albumSongs
@@ -2171,21 +2177,21 @@ private fun PlaylistCardItem(
 }
 
 /**
- * 歌单栏首位新建歌单快捷卡片
+ * 歌单栏首位新建歌单快捷卡片（与旁边 148x148 歌单卡片保持完全一致尺寸）
  */
 @Composable
 private fun CreatePlaylistActionCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
-        .width(136.dp)
-        .height(180.dp)
+        .width(148.dp)
+        .height(148.dp)
 ) {
     Surface(
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
         border = BorderStroke(1.5.dp, AppleRed.copy(alpha = 0.45f)),
         modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
     ) {
         Column(
@@ -2197,7 +2203,7 @@ private fun CreatePlaylistActionCard(
         ) {
             Box(
                 modifier = Modifier
-                    .size(48.dp)
+                    .size(46.dp)
                     .clip(CircleShape)
                     .background(AppleRed.copy(alpha = 0.12f)),
                 contentAlignment = Alignment.Center
@@ -2209,7 +2215,7 @@ private fun CreatePlaylistActionCard(
                     modifier = Modifier.size(26.dp)
                 )
             }
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
             Text(
                 text = "新建歌单",
                 fontSize = 14.sp,

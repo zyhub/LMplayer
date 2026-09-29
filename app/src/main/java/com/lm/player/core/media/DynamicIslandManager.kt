@@ -150,6 +150,38 @@ object DynamicIslandManager {
     private var lastNotifiedPlaying: Boolean? = null
     private var lastNotifiedHasCustomArtwork: Boolean = false
 
+    /**
+     * 检测当前设备是否为华为鸿蒙系统 (HarmonyOS 2.0 / 3.0 / 4.0 / 4.2 等)
+     * 备注：小米澎湃 OS 超级岛、vivo OriginOS 原子岛等支持将标准 MediaSession 直接提升为状态栏胶囊；
+     * 而华为鸿蒙 4.2 系统级「实况窗」对普通第三方 MediaStyle 通知仅放入下拉播控中心，不会自动在状态栏生成胶囊，
+     * 因此华为鸿蒙设备自动启用「鸿蒙实况通知扩展 + 顶部流体悬浮灵动胶囊」双通道确保正常上岛。
+     */
+    fun isHuaweiOrHarmonyOS(): Boolean {
+        val manufacturer = (Build.MANUFACTURER ?: "").lowercase(Locale.US)
+        val brand = (Build.BRAND ?: "").lowercase(Locale.US)
+        if (manufacturer.contains("huawei") || brand.contains("huawei")) {
+            return true
+        }
+        return try {
+            val clz = Class.forName("com.huawei.system.BuildEx")
+            val method = clz.getMethod("getOsBrand")
+            val osBrand = (method.invoke(null) as? String)?.lowercase(Locale.US).orEmpty()
+            osBrand.contains("harmony")
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 判断当前是否应启用后台顶部流体悬浮灵动岛胶囊
+     * - 小米、vivo 等原生上岛机型在默认 SYSTEM_ONLY 下仅使用系统原生岛；
+     * - 华为鸿蒙系统（如 HarmonyOS 4.2）开启灵动岛功能时自动启用顶部流体灵动胶囊以解决无法上岛问题。
+     */
+    fun shouldUseOverlayIsland(): Boolean {
+        if (!_systemIslandEnabledFlow.value) return false
+        return _islandDisplayModeFlow.value != IslandDisplayMode.SYSTEM_ONLY || isHuaweiOrHarmonyOS()
+    }
+
     fun bindMediaSession(session: MediaSession?) {
         activeMediaSession = session
     }
@@ -159,9 +191,13 @@ object DynamicIslandManager {
         if (isInitialized) return
         val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _systemIslandEnabledFlow.value = prefs.getBoolean(KEY_SYSTEM_ISLAND_ENABLED, true)
-        _islandDisplayModeFlow.value = IslandDisplayMode.fromKey(
-            prefs.getString(KEY_ISLAND_DISPLAY_MODE, IslandDisplayMode.SYSTEM_ONLY.key)
-        )
+        val defaultMode = if (isHuaweiOrHarmonyOS()) IslandDisplayMode.SMART else IslandDisplayMode.SYSTEM_ONLY
+        val savedModeKey = prefs.getString(KEY_ISLAND_DISPLAY_MODE, null)
+        _islandDisplayModeFlow.value = if (savedModeKey != null) {
+            IslandDisplayMode.fromKey(savedModeKey)
+        } else {
+            defaultMode
+        }
         _showLyricsInPillFlow.value = prefs.getBoolean(KEY_SHOW_LYRICS_IN_PILL, true)
         isInitialized = true
         startBackgroundLyricsEngine(appCtx)
@@ -239,7 +275,7 @@ object DynamicIslandManager {
                 val song = PlaybackQueueManager.currentSongFlow.value
                 val player = runCatching { Media3Factory.getSharedExoPlayer(appContext) }.getOrNull()
                 val playing = player?.isPlaying == true
-                val needOverlayLyrics = _islandDisplayModeFlow.value != IslandDisplayMode.SYSTEM_ONLY &&
+                val needOverlayLyrics = shouldUseOverlayIsland() &&
                         (_isAppInBackgroundFlow.value || playing)
                 if (song != null && player != null && needOverlayLyrics) {
                     val pos = player.currentPosition.coerceAtLeast(0L)
@@ -362,7 +398,7 @@ object DynamicIslandManager {
         _nextLyricLineFlow.value = cleanNext
         _currentLineProgressFlow.value = lineProgress.coerceIn(0f, 1f)
 
-        if (changed && _islandDisplayModeFlow.value != IslandDisplayMode.SYSTEM_ONLY) {
+        if (changed && shouldUseOverlayIsland()) {
             BackgroundIslandOverlayController.refreshVisibilityAndState(context)
         }
     }
@@ -389,8 +425,8 @@ object DynamicIslandManager {
                 "vivo OriginOS · 系统原生原子岛 (MediaSession 原生直连)"
             manufacturer.contains("honor") || brand.contains("honor") ->
                 "荣耀 MagicOS · 系统原生灵动胶囊 (MediaSession 原生直连)"
-            manufacturer.contains("huawei") || brand.contains("huawei") ->
-                "华为 HarmonyOS · 系统原生实况窗 (MediaSession 原生直连)"
+            isHuaweiOrHarmonyOS() ->
+                "华为 HarmonyOS · 鸿蒙实况窗 + 顶部流体灵动胶囊双擎适配"
             manufacturer.contains("meizu") || brand.contains("meizu") || display.contains("flyme") ->
                 "魅族 Flyme · 系统原生媒体胶囊 (MediaSession 原生直连)"
             manufacturer.contains("samsung") || brand.contains("samsung") ->
@@ -735,6 +771,21 @@ object DynamicIslandManager {
                 MediaStyleNotificationHelper.MediaStyle(resolvedSession)
                     .setShowActionsInCompactView(0, 1, 2)
             )
+        }
+
+        // 仅在华为鸿蒙系统设备上注入鸿蒙实况窗/状态栏胶囊扩展参数，绝不影响小米澎湃与 vivo 原子岛的纯净 MediaStyle
+        if (isHuaweiOrHarmonyOS()) {
+            try {
+                val hwExtras = Bundle().apply {
+                    putBoolean("hw_enable_live_notification", true)
+                    putBoolean("hw_live_view", true)
+                    putInt("hw_live_notification_type", 2)
+                    putString("hw_capsule_title", displayTitle)
+                    putString("hw_capsule_content", rawArtist)
+                    putInt("hw_capsule_status", if (isPlaying) 1 else 0)
+                }
+                builder.addExtras(hwExtras)
+            } catch (_: Throwable) {}
         }
 
         val notification = builder.build()

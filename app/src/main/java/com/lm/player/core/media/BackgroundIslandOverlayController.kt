@@ -148,9 +148,9 @@ object BackgroundIslandOverlayController {
 
             // 核心规则：
             // 1. 应用在前台时绝不显示灵动岛（除非处于设置页手动测试预览）
-            // 2. 应用在后台且有当前曲目时，根据系统与播放会话状态全程置顶显示
+            // 2. 应用在后台且有当前曲目时，根据系统与播放会话状态全程置顶显示（华为鸿蒙系统开启灵动岛时自动激活顶部流体胶囊）
             val shouldShow = hasOverlayPermission(appCtx) &&
-                    displayMode != IslandDisplayMode.SYSTEM_ONLY &&
+                    (DynamicIslandManager.shouldUseOverlayIsland() || isPreviewActive) &&
                     currentSong != null &&
                     (isInBackground || isPreviewActive) &&
                     (isPlaying || isBufferingOrReady || displayMode == IslandDisplayMode.ALWAYS_ON || isPreviewActive || isWindowAttached)
@@ -260,6 +260,26 @@ object BackgroundIslandOverlayController {
             }
         }
 
+        // 华为鸿蒙 HarmonyOS 4.2 挖孔/药丸屏专属识别兜底：后台 Application Context 下 displayCutout 常返回 null，调用 HwNotchSizeUtil 获取精确尺寸
+        if (topCutoutRect == null && DynamicIslandManager.isHuaweiOrHarmonyOS()) {
+            try {
+                val clz = appContext.classLoader.loadClass("com.huawei.android.util.HwNotchSizeUtil")
+                val hasNotch = clz.getMethod("hasNotchInScreen", Context::class.java)
+                    .invoke(clz, appContext) as? Boolean ?: false
+                if (hasNotch) {
+                    val size = clz.getMethod("getNotchSize", Context::class.java)
+                        .invoke(clz, appContext) as? IntArray
+                    if (size != null && size.size >= 2 && size[1] > 0) {
+                        val notchW = size[0].coerceAtLeast(dp(24f).roundToInt())
+                        val notchH = size[1]
+                        insetStatusBarPx = max(insetStatusBarPx, notchH)
+                        val left = (dm.widthPixels - notchW) / 2
+                        topCutoutRect = Rect(left, 0, left + notchW, notchH)
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
         val effectiveSystemBarHeightPx = max(insetStatusBarPx, dp(26f).roundToInt())
 
         // 3. 根据系统挖孔/状态栏高度自适应计算紧凑胶囊高度与顶部置顶 Y 坐标
@@ -346,15 +366,15 @@ object BackgroundIslandOverlayController {
                 WindowManager.LayoutParams.TYPE_PHONE
             }
 
-            // 注意：绝不能包含 FLAG_LAYOUT_INSET_DECOR，否则系统会强制把悬浮窗推到状态栏下方
-            @Suppress("DEPRECATION")
+            // 注意：
+            // 1. 绝不能包含 FLAG_LAYOUT_INSET_DECOR，否则系统会强制把悬浮窗推到状态栏下方；
+            // 2. 移除 FLAG_LAYOUT_NO_LIMITS，因为华为鸿蒙 HarmonyOS 4.2 的 HwPhoneWindowManager 遇到 NO_LIMITS 会将
+            //    父容器参考系扩展为 [-10000, 10000]，导致 Gravity.TOP 坐标偏移至屏幕外而无法显示上岛！
             val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
-                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
 
             windowParams = WindowManager.LayoutParams(
                 metrics.compactWidthPx.roundToInt(),
@@ -374,8 +394,32 @@ object BackgroundIslandOverlayController {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     fitInsetsTypes = 0
                 }
+                // 华为鸿蒙 HarmonyOS 4.2 专属刘海/状态栏挖孔区穿透标志 (FLAG_NOTCH_SUPPORT = 0x00010000)
+                applyHuaweiNotchSupportFlags(this)
             }
         }
+    }
+
+    /**
+     * 为华为鸿蒙 HarmonyOS / EMUI 窗口注入官方刘海/状态栏区渲染标志 (FLAG_NOTCH_SUPPORT = 0x00010000)，
+     * 防止鸿蒙 4.2 HwPhoneWindowManager 将顶部灵动岛窗口裁剪或强制下推到状态栏下方。
+     */
+    private fun applyHuaweiNotchSupportFlags(lp: WindowManager.LayoutParams) {
+        if (!DynamicIslandManager.isHuaweiOrHarmonyOS()) return
+        val flagNotchSupport = 0x00010000
+        try {
+            val layoutParamsExCls = Class.forName("com.huawei.android.view.LayoutParamsEx")
+            val con = layoutParamsExCls.getConstructor(WindowManager.LayoutParams::class.java)
+            val layoutParamsExObj = con.newInstance(lp)
+            val method = layoutParamsExCls.getMethod("addHwFlags", Int::class.javaPrimitiveType)
+            method.invoke(layoutParamsExObj, flagNotchSupport)
+        } catch (_: Throwable) {}
+        try {
+            val hwFlagsField = lp.javaClass.getDeclaredField("hwFlags")
+            hwFlagsField.isAccessible = true
+            val current = hwFlagsField.getInt(lp)
+            hwFlagsField.setInt(lp, current or flagNotchSupport)
+        } catch (_: Throwable) {}
     }
 
     private fun attachWindowIfNeeded(appContext: Context) {

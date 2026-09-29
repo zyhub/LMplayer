@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -71,6 +72,21 @@ fun DownloadManagerScreen(
 
     var isMultiSelectActiveMode by remember { mutableStateOf(false) }
     val selectedActiveTaskIds = remember { mutableStateListOf<String>() }
+
+    // 安卓系统返回键逐层回退：先退出多选状态，否则返回上一级页面
+    BackHandler {
+        when {
+            isMultiSelectMode -> {
+                isMultiSelectMode = false
+                selectedSongIds.clear()
+            }
+            isMultiSelectActiveMode -> {
+                isMultiSelectActiveMode = false
+                selectedActiveTaskIds.clear()
+            }
+            else -> onBack()
+        }
+    }
 
     // 弹窗状态
     var showBatchDeleteConfirmDialog by remember { mutableStateOf(false) }

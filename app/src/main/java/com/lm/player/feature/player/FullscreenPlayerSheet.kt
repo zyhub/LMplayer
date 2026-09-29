@@ -198,6 +198,68 @@ fun FullscreenPlayerSheet(
         lyricsPrefs.edit().putString("player_theme_style", newStyle.id).apply()
     }
 
+    // 系统返回键适配：优先关闭播放页内嵌浮层面板，否则收起全屏播放页
+    androidx.activity.compose.BackHandler(enabled = true) {
+        when {
+            showQueueSheet -> showQueueSheet = false
+            showSleepTimerPanel -> showSleepTimerPanel = false
+            showAudioSpecsPanel -> showAudioSpecsPanel = false
+            showAudioOutputPanel -> showAudioOutputPanel = false
+            else -> onDismiss()
+        }
+    }
+
+    // 计算当前歌曲的音质、码率、文件大小三色徽章数据
+    val streamQualityVer by com.lm.player.core.network.LemonMusicProtocol.streamQualityConfigVersion.collectAsState()
+    val (displayQualityBadge, displayBitrateBadge, displaySizeBadge) = remember(
+        song.id,
+        song.localFilePath,
+        song.format,
+        song.bitRate,
+        song.durationMs,
+        song.downloadStatus,
+        totalDurationMs,
+        streamQualityVer
+    ) {
+        val hasLocalFile = !song.localFilePath.isNullOrBlank() &&
+            (song.localFilePath.startsWith("content://") || runCatching {
+                java.io.File(song.localFilePath).let { it.exists() && it.length() > 0L }
+            }.getOrDefault(false))
+        if (hasLocalFile || song.downloadStatus == DownloadStatus.DOWNLOADED) {
+            val (realExt, realKbps, realSizeStr) = com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
+            val isLossless = realExt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realKbps >= 800
+            val qLabel = when {
+                isLossless && realKbps >= 1200 -> "Hi-Res $realExt"
+                isLossless -> "$realExt 无损"
+                realKbps >= 320 -> "$realExt 极高"
+                else -> "$realExt 标准"
+            }
+            Triple(qLabel, "$realKbps kbps", realSizeStr)
+        } else {
+            val preferredQuality = AudioQuality.fromKey(
+                com.lm.player.core.network.LemonMusicProtocol.getPreferredStreamQuality(context)
+            )
+            val qLabel = when (preferredQuality) {
+                AudioQuality.Q_HIRES -> "Hi-Res FLAC"
+                AudioQuality.Q_FLAC -> "FLAC 无损"
+                AudioQuality.Q_320K -> "MP3 极高"
+                AudioQuality.Q_128K -> "MP3 标准"
+            }
+            val kbps = when (preferredQuality) {
+                AudioQuality.Q_HIRES -> if (song.bitRate > 1200) song.bitRate else 1640
+                AudioQuality.Q_FLAC -> if (song.bitRate in 700..1200) song.bitRate else 960
+                AudioQuality.Q_320K -> 320
+                AudioQuality.Q_128K -> 128
+            }
+            val durSec = ((if (totalDurationMs > 0) totalDurationMs else song.durationMs) / 1000L).coerceAtLeast(180L)
+            val estMb = (durSec * kbps * 1000L / 8L) / (1024.0 * 1024.0)
+            val sizeStr = String.format(Locale.US, "%.1f MB", estMb)
+            Triple(qLabel, "$kbps kbps", sizeStr)
+        }
+    }
+    val bitrateBadgeColor = if (isDark) Color(0xFF38BDF8) else Color(0xFF0284C7)
+    val sizeBadgeColor = if (isDark) Color(0xFF34D399) else Color(0xFF059669)
+
     // 动态主题渐变背景 (深色沉浸黑曜石，浅色纯净白)
     val playerBackdrop = if (isDark) {
         Brush.verticalGradient(
@@ -398,25 +460,6 @@ fun FullscreenPlayerSheet(
                                         }
                                     )
                                 }
-
-                                Box(
-                                    modifier = Modifier
-                                        .size(headerBtnSize)
-                                        .clip(CircleShape)
-                                        .background(circleButtonBg)
-                                        .clickable {
-                                            localIsFavorite = !localIsFavorite
-                                            onToggleFavorite()
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                        contentDescription = "喜欢",
-                                        tint = if (localIsFavorite) AppleRed else primaryTextColor,
-                                        modifier = Modifier.size(headerIconSize)
-                                    )
-                                }
                             }
                         }
 
@@ -482,18 +525,55 @@ fun FullscreenPlayerSheet(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Spacer(modifier = Modifier.height(if (isCompactLandscape) 4.dp else 6.dp))
-                                    Surface(
-                                        shape = RoundedCornerShape(6.dp),
-                                        color = AppleRed.copy(alpha = 0.15f),
-                                        modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                                     ) {
-                                        Text(
-                                            text = "${song.format.uppercase()} ${song.bitRate} kbps",
-                                            fontSize = if (isCompactLandscape) 10.sp else 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = AppleRed,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = AppleRed.copy(alpha = 0.16f),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { showAudioSpecsPanel = true }
+                                        ) {
+                                            Text(
+                                                text = displayQualityBadge,
+                                                fontSize = if (isCompactLandscape) 9.5.sp else 10.5.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleRed,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = bitrateBadgeColor.copy(alpha = 0.16f),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { showAudioSpecsPanel = true }
+                                        ) {
+                                            Text(
+                                                text = displayBitrateBadge,
+                                                fontSize = if (isCompactLandscape) 9.5.sp else 10.5.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = bitrateBadgeColor,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = sizeBadgeColor.copy(alpha = 0.16f),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { showAudioSpecsPanel = true }
+                                        ) {
+                                            Text(
+                                                text = displaySizeBadge,
+                                                fontSize = if (isCompactLandscape) 9.5.sp else 10.5.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = sizeBadgeColor,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -602,23 +682,15 @@ fun FullscreenPlayerSheet(
                                         .size(toolbarBtnSize)
                                         .clip(CircleShape)
                                         .clickable {
-                                            if (!isLyricsVisible) {
-                                                landscapeLyricsRatio = 0.333f
-                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
-                                                landscapeRightPaneMode = 0
-                                            } else if (landscapeRightPaneMode != 0) {
-                                                landscapeRightPaneMode = 0
-                                            } else {
-                                                landscapeLyricsRatio = 0.0f
-                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.0f).apply()
-                                            }
+                                            localIsFavorite = !localIsFavorite
+                                            onToggleFavorite()
                                         },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.Lyrics,
-                                        contentDescription = "歌词/歌曲切换",
-                                        tint = if (isLyricsVisible && landscapeRightPaneMode == 0) AppleRed else secondaryTextColor,
+                                        imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                        contentDescription = "红心喜欢",
+                                        tint = if (localIsFavorite) AppleRed else secondaryTextColor,
                                         modifier = Modifier.size(toolbarIconSize)
                                     )
                                 }
@@ -1025,51 +1097,54 @@ fun FullscreenPlayerSheet(
                         }
                     }
 
-                    // 顶部右侧：收藏按键
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(circleButtonBg)
-                            .clickable {
-                                localIsFavorite = !localIsFavorite
-                                onToggleFavorite()
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                            contentDescription = "红心喜欢",
-                            tint = if (localIsFavorite) AppleRed else primaryTextColor,
-                            modifier = Modifier.size(19.dp)
-                        )
-                    }
+                    // 顶部右侧：对称占位以保证中央 [ 歌曲 | 歌词 ] 胶囊严格居中
+                    Spacer(modifier = Modifier.size(36.dp))
                 }
 
-                // 2. 中间 Pager (支持左右手势直接切换 [ 歌曲封面大图 ⇄ 实时全屏歌词 ])
+                // 2. 中间 Pager (支持左右手势直接切换 [ 歌曲封面大图 + 5行滚动渐变歌词 ⇄ 实时全屏歌词 ])
                 HorizontalPager(
                     state = pagerState,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .padding(vertical = 14.dp)
+                        .padding(vertical = 4.dp)
                 ) { page ->
                     if (page == 0) {
-                        // 页面 0: 居中大封面展示
+                        // 页面 0: 居中大封面展示 + 下方 5 行滚动渐变歌词 (上一句、当前歌词、下一句、前后各一条滚动淡化)
                         BoxWithConstraints(
                             modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.Center
                         ) {
-                            val artworkSize = minOf(maxWidth - 12.dp, maxHeight - 8.dp).coerceIn(180.dp, 360.dp)
-                            AlbumArtworkImage(
-                                model = song.coverUrl,
-                                seedId = song.id,
-                                targetSize = 512,
-                                modifier = Modifier
-                                    .size(artworkSize)
-                                    .shadow(20.dp, RoundedCornerShape(24.dp)),
-                                cornerRadius = 24.dp
-                            )
+                            val lyricsAreaHeight = 140.dp
+                            val gapHeight = 10.dp
+                            val availableForCover = (maxHeight - lyricsAreaHeight - gapHeight).coerceAtLeast(180.dp)
+                            val artworkSize = minOf(maxWidth - 4.dp, availableForCover).coerceIn(180.dp, 360.dp)
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                AlbumArtworkImage(
+                                    model = song.coverUrl,
+                                    seedId = song.id,
+                                    targetSize = 512,
+                                    modifier = Modifier
+                                        .size(artworkSize)
+                                        .shadow(20.dp, RoundedCornerShape(24.dp)),
+                                    cornerRadius = 24.dp
+                                )
+                                Spacer(modifier = Modifier.height(gapHeight))
+                                CoverFiveLineGradientLyrics(
+                                    lyrics = lyrics.lines,
+                                    currentPositionMs = progressMs,
+                                    lyricsOffsetMs = lyricsOffsetMs,
+                                    lyricTheme = currentLyricTheme,
+                                    onClickLyricsArea = {
+                                        coroutineScope.launch { pagerState.animateScrollToPage(1) }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
                         }
                     } else {
                         // 页面 1: 实时滚动全屏歌词
@@ -1089,7 +1164,7 @@ fun FullscreenPlayerSheet(
                     }
                 }
 
-                // 3. 歌曲元数据：标题、歌手与专辑 + 加入歌单与下载按钮
+                // 3. 歌曲元数据：标题、音质/码率/大小三色徽章、歌手与专辑 + 加入歌单与下载按钮
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -1102,7 +1177,7 @@ fun FullscreenPlayerSheet(
                         Text(
                             text = song.title,
                             style = TextStyle(
-                                fontSize = 22.sp * dimensions.fontScale,
+                                fontSize = 21.sp * dimensions.fontScale,
                                 fontWeight = FontWeight.Bold,
                                 color = primaryTextColor
                             ),
@@ -1110,8 +1185,9 @@ fun FullscreenPlayerSheet(
                             overflow = TextOverflow.Ellipsis
                         )
 
-                        Spacer(modifier = Modifier.height(4.dp))
+                        Spacer(modifier = Modifier.height(5.dp))
 
+                        // 音质、码率、文件大小三色区分徽章
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1123,32 +1199,58 @@ fun FullscreenPlayerSheet(
                                     .clip(RoundedCornerShape(5.dp))
                                     .clickable { showAudioSpecsPanel = true }
                             ) {
-                                val badgeLabel = when {
-                                    song.format.equals("flac", ignoreCase = true) && song.bitRate > 1000 -> "Hi-Res FLAC"
-                                    song.format.equals("flac", ignoreCase = true) -> "FLAC 无损"
-                                    song.bitRate >= 320 -> "${song.format.uppercase()} 320K"
-                                    else -> "${song.format.uppercase()} ${song.bitRate}K"
-                                }
                                 Text(
-                                    text = badgeLabel,
+                                    text = displayQualityBadge,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = AppleRed,
-                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                 )
                             }
-                            Text(
-                                text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
-                                style = TextStyle(
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = secondaryTextColor
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = bitrateBadgeColor.copy(alpha = 0.16f),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(5.dp))
+                                    .clickable { showAudioSpecsPanel = true }
+                            ) {
+                                Text(
+                                    text = displayBitrateBadge,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = bitrateBadgeColor,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = sizeBadgeColor.copy(alpha = 0.16f),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(5.dp))
+                                    .clickable { showAudioSpecsPanel = true }
+                            ) {
+                                Text(
+                                    text = displaySizeBadge,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = sizeBadgeColor,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
                         }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        Text(
+                            text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = secondaryTextColor
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
 
                     Spacer(modifier = Modifier.width(10.dp))
@@ -1243,7 +1345,7 @@ fun FullscreenPlayerSheet(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 4. 进度条与播放时间
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -1276,7 +1378,7 @@ fun FullscreenPlayerSheet(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 5. 核心 5 大播放控制按键
                 Row(
@@ -1340,9 +1442,9 @@ fun FullscreenPlayerSheet(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(18.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
-                // 6. 底部功能工具栏: [ 歌词切换 ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
+                // 6. 底部功能工具栏: [ ♥ 喜欢收藏 ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1351,13 +1453,13 @@ fun FullscreenPlayerSheet(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = {
-                        val nextPage = if (pagerState.currentPage == 1) 0 else 1
-                        coroutineScope.launch { pagerState.animateScrollToPage(nextPage) }
+                        localIsFavorite = !localIsFavorite
+                        onToggleFavorite()
                     }) {
                         Icon(
-                            imageVector = Icons.Default.Lyrics,
-                            contentDescription = "歌词/歌曲切换",
-                            tint = if (pagerState.currentPage == 1) AppleRed else secondaryTextColor,
+                            imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                            contentDescription = "红心喜欢",
+                            tint = if (localIsFavorite) AppleRed else secondaryTextColor,
                             modifier = Modifier.size(24.dp)
                         )
                     }

@@ -1,7 +1,9 @@
 package com.lm.player.core.network
 
 import android.util.Log
+import com.lm.player.core.media.EmbeddedLyricsExtractor
 import com.lm.player.core.media.LrcParser
+import com.lm.player.core.media.SmartCharsetDecoder
 import com.lm.player.core.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -1686,7 +1688,92 @@ class LemonMusicProtocol(
     }
 
     /**
-     * 获取歌词 (/api/play/lyric)
+     * 读取服务器曲库音频文件的内嵌歌词与伴随 .lrc 歌词（双通道保障 + 编码自动修复）：
+     * 1. 优先调用柠檬音乐服务端 POST /api/tag/read (读取音频内嵌标签与服务端磁盘同名 .lrc) 并自动修复 latin1/GBK/UTF-16 乱码；
+     * 2. 若服务端 /api/tag/read 未返回或存在编码替换损坏 (\uFFFD)，通过 HTTP Range 拉取音频文件前 384KB 头部字节，
+     *    使用本地 EmbeddedLyricsExtractor + SmartCharsetDecoder 直接从原始字节流提取内嵌歌词（支持 ID3v2 USLT/TXXX、FLAC Vorbis、M4A ©lyr、APEv2）。
+     */
+    suspend fun getEmbeddedLyricsFromServer(
+        songId: String,
+        songOverride: UnifiedSong? = null
+    ): String? = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val cachedSong = songIdToSongMap[songId]
+            val song = songOverride ?: cachedSong
+            val rawPath = getServerFilePath(
+                songId = songId,
+                streamUrl = song?.streamUrl ?: cachedSong?.streamUrl,
+                coverUrl = song?.coverUrl ?: cachedSong?.coverUrl
+            )?.removePrefix("local:")?.trim().orEmpty()
+            if (rawPath.isBlank()) return@withContext null
+
+            // 通道 A：请求服务端 /api/tag/read 接口读取内嵌标签与服务端同名 .lrc
+            var tagApiLyric: String? = null
+            try {
+                val tagPayload = JSONObject().apply {
+                    put("filePath", rawPath)
+                    put("path", rawPath)
+                }
+                val tagReq = newAuthRequest("$cleanBase/api/tag/read")
+                    .post(tagPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                client.newCall(tagReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        if (body.startsWith("{")) {
+                            val json = JSONObject(body)
+                            val dataObj = json.optJSONObject("data")
+                            val rawLyric = dataObj?.optString("lyric", "")
+                                ?.ifBlank { json.optString("lyric", "") }
+                                .orEmpty()
+                            val repaired = SmartCharsetDecoder.repairMojibakeIfNeeded(rawLyric)
+                            if (repaired.isNotBlank() && !repaired.equals("null", ignoreCase = true)) {
+                                tagApiLyric = repaired
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "Server /api/tag/read lyric query skipped: ${e.message}")
+            }
+
+            if (!tagApiLyric.isNullOrBlank() && !SmartCharsetDecoder.looksSuspiciousOrGarbled(tagApiLyric)) {
+                return@withContext tagApiLyric
+            }
+
+            // 通道 B：HTTP Range 直接读取服务器音频文件头部字节进行多编码无损内嵌歌词提取
+            try {
+                val streamUrl = getStreamUrlForPath(rawPath)
+                if (streamUrl.isNotBlank()) {
+                    val rangeReq = newAuthRequest(streamUrl)
+                        .header("Range", "bytes=0-393215")
+                        .get()
+                        .build()
+                    client.newCall(rangeReq).execute().use { resp ->
+                        if (resp.isSuccessful || resp.code == 206) {
+                            val bytes = resp.body?.bytes()
+                            if (bytes != null && bytes.size > 32) {
+                                val extracted = EmbeddedLyricsExtractor.extractFromBytes(bytes, rawPath)
+                                if (!extracted.isNullOrBlank() && !extracted.equals("null", ignoreCase = true)) {
+                                    return@withContext extracted
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "Server HTTP Range embedded lyric extraction skipped: ${e.message}")
+            }
+
+            return@withContext tagApiLyric
+        } catch (_: Exception) {
+            return@withContext null
+        }
+    }
+
+    /**
+     * 获取歌词 (优先读取资料库服务器音频内嵌歌词，无内嵌歌词时请求 /api/play/lyric)
      */
     override suspend fun getLyrics(songId: String): Result<LyricResult> = getLyricsForSong(songId, null)
 
@@ -1695,6 +1782,16 @@ class LemonMusicProtocol(
     suspend fun getLyricsForSong(songId: String, songOverride: UnifiedSong? = null): Result<LyricResult> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
+            // 1. 若为服务器资料库本地曲目，优先读取服务器音频内嵌歌词与同名 .lrc
+            val embeddedLyric = getEmbeddedLyricsFromServer(songId, songOverride)
+            if (!embeddedLyric.isNullOrBlank()) {
+                val parsedEmbedded = LrcParser.parse(embeddedLyric)
+                if (parsedEmbedded.lines.isNotEmpty()) {
+                    return@withContext Result.success(parsedEmbedded)
+                }
+            }
+
+            // 2. 在线歌词接口 (/api/play/lyric)
             val payload = buildLyricPayload(songId, songOverride)
             val req = newAuthRequest("$cleanBase/api/play/lyric")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
@@ -1707,9 +1804,12 @@ class LemonMusicProtocol(
                 val lyricStr = json.optString("lxlyric")
                     .ifBlank { json.optString("lyric") }
                     .ifBlank { json.optString("ylyric") }
-                if (lyricStr.isNotBlank()) {
-                    val parsed = LrcParser.parse(lyricStr)
-                    return@withContext Result.success(parsed)
+                val repaired = SmartCharsetDecoder.repairMojibakeIfNeeded(lyricStr)
+                if (repaired.isNotBlank()) {
+                    val parsed = LrcParser.parse(repaired)
+                    if (parsed.lines.isNotEmpty()) {
+                        return@withContext Result.success(parsed)
+                    }
                 }
                 Result.failure(Exception("歌词为空"))
             }
@@ -1719,7 +1819,7 @@ class LemonMusicProtocol(
     }
 
     /**
-     * 获取原始歌词文本 (/api/play/lyric)
+     * 获取原始歌词文本 (优先读取资料库服务器音频内嵌歌词，无内嵌歌词时请求 /api/play/lyric)
      */
     suspend fun getRawLyrics(songId: String): Result<String> = getRawLyricsForSong(songId, null)
 
@@ -1728,6 +1828,13 @@ class LemonMusicProtocol(
     suspend fun getRawLyricsForSong(songId: String, songOverride: UnifiedSong? = null): Result<String> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
+            // 1. 优先读取服务器曲库音频内嵌歌词与伴随 .lrc
+            val embeddedLyric = getEmbeddedLyricsFromServer(songId, songOverride)
+            if (!embeddedLyric.isNullOrBlank()) {
+                return@withContext Result.success(embeddedLyric)
+            }
+
+            // 2. 在线歌词接口 (/api/play/lyric)
             val payload = buildLyricPayload(songId, songOverride)
             val req = newAuthRequest("$cleanBase/api/play/lyric")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
@@ -1740,8 +1847,9 @@ class LemonMusicProtocol(
                 val lyricStr = json.optString("lxlyric")
                     .ifBlank { json.optString("lyric") }
                     .ifBlank { json.optString("ylyric") }
-                if (lyricStr.isNotBlank()) {
-                    return@withContext Result.success(lyricStr)
+                val repaired = SmartCharsetDecoder.repairMojibakeIfNeeded(lyricStr)
+                if (repaired.isNotBlank()) {
+                    return@withContext Result.success(repaired)
                 }
                 Result.failure(Exception("歌词为空"))
             }

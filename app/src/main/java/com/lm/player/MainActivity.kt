@@ -162,7 +162,12 @@ class MainActivity : ComponentActivity() {
         // 2. 获取全局唯一共享 ExoPlayer 实例并启动前台播放服务（默认关闭在线边听边存）
         val initSettingsPrefs = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
         Media3Factory.setCacheEnabled(initSettingsPrefs.getBoolean("stream_cache_enabled_v2", false))
+        PlaybackQueueManager.initFromPrefs(this)
         exoPlayer = Media3Factory.getSharedExoPlayer(this)
+        val initialSpeed = initSettingsPrefs.getFloat("playback_speed", 1.0f).coerceIn(0.5f, 2.0f)
+        if (initialSpeed != 1.0f) {
+            exoPlayer?.playbackParameters = androidx.media3.common.PlaybackParameters(initialSpeed)
+        }
         startPlaybackService()
 
         // 3. 注册方向盘按键与车载控制广播监听器
@@ -186,10 +191,21 @@ class MainActivity : ComponentActivity() {
             // 启动过渡状态 (默认 false 确保 0ms 瞬间秒开呈现主屏)
             var isSplashVisible by remember { mutableStateOf(false) }
 
-            // 外观主题、毛玻璃与动效状态
-            var currentThemeMode by remember { mutableStateOf(AppThemeMode.FOLLOW_SYSTEM) }
-            var blurAlpha by remember { mutableStateOf(0.85f) }
-            var enableBottomBarAnimation by remember { mutableStateOf(true) }
+            // 外观主题、毛玻璃与动效状态（从 SharedPreferences 持久化恢复）
+            val savedThemeName = remember {
+                uiPrefs.getString("app_theme_mode", AppThemeMode.FOLLOW_SYSTEM.name) ?: AppThemeMode.FOLLOW_SYSTEM.name
+            }
+            var currentThemeMode by remember {
+                mutableStateOf(
+                    try { AppThemeMode.valueOf(savedThemeName) } catch (_: Exception) { AppThemeMode.FOLLOW_SYSTEM }
+                )
+            }
+            var blurAlpha by remember {
+                mutableStateOf(uiPrefs.getFloat("ui_blur_alpha", 0.85f).coerceIn(0.2f, 1.0f))
+            }
+            var enableBottomBarAnimation by remember {
+                mutableStateOf(uiPrefs.getBoolean("enable_bottom_bar_anim", true))
+            }
 
             // 启动自动播放与在线容灾配置
             val autoPlayPrefs = remember { getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE) }
@@ -200,10 +216,9 @@ class MainActivity : ComponentActivity() {
             var showBgIslandOverlayPrompt by remember {
                 DynamicIslandManager.ensureInitialized(this@MainActivity)
                 mutableStateOf(
-                    DynamicIslandManager.systemIslandEnabledFlow.value &&
-                        DynamicIslandManager.islandDisplayModeFlow.value != com.lm.player.core.media.IslandDisplayMode.SYSTEM_ONLY &&
+                    DynamicIslandManager.shouldUseOverlayIsland() &&
                         !DynamicIslandManager.hasOverlayPermission(this@MainActivity) &&
-                        !uiPrefs.getBoolean("bg_island_overlay_prompted_v157", false)
+                        !uiPrefs.getBoolean("bg_island_overlay_prompted_v167", false)
                 )
             }
 
@@ -238,15 +253,44 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // UI 状态机 (启动时默认优先显示本地已下载界面)
+            // UI 状态机与页面历史回退栈 (支持安卓系统返回键逐层回退直至首页双击退出)
             var currentScreen by remember { mutableStateOf(Screen.HOME) }
+            val screenBackStack = remember { mutableStateListOf<Screen>() }
+            val navigateToScreen: (Screen) -> Unit = { target ->
+                if (target != currentScreen) {
+                    if (target == Screen.HOME) {
+                        screenBackStack.clear()
+                    } else {
+                        screenBackStack.remove(target)
+                        screenBackStack.add(currentScreen)
+                    }
+                    currentScreen = target
+                }
+            }
+            val popScreenOrHome: () -> Unit = {
+                currentScreen = if (screenBackStack.isNotEmpty()) {
+                    screenBackStack.removeAt(screenBackStack.lastIndex)
+                } else {
+                    Screen.HOME
+                }
+            }
             var activeServerName by remember { mutableStateOf("本地 · 已下载") }
             var activeServerId by remember { mutableStateOf("") }
             var serversList by remember { mutableStateOf<List<ServerConfig>>(emptyList()) }
             var isSearchDialogOpen by remember { mutableStateOf(false) }
             
-            // 首页展示自定义配置 (默认显示最近播放和最近添加)
-            var homeDisplayConfig by remember { mutableStateOf(HomeScreenDisplayConfig()) }
+            // 首页展示自定义配置 (从 SharedPreferences 持久化恢复)
+            var homeDisplayConfig by remember {
+                mutableStateOf(
+                    HomeScreenDisplayConfig(
+                        showRecentlyPlayed = uiPrefs.getBoolean("home_show_recently_played", true),
+                        showRecentlyAdded = uiPrefs.getBoolean("home_show_recently_added", true),
+                        showAlbums = uiPrefs.getBoolean("home_show_albums", false),
+                        showArtists = uiPrefs.getBoolean("home_show_artists", false),
+                        showFavorites = uiPrefs.getBoolean("home_show_favorites", false)
+                    )
+                )
+            }
 
             // 在线模式操作音源偏好 (酷我/网易云/QQ音乐/酷狗/咪咕)
             val onlinePrefs = remember { getSharedPreferences("zds_online_prefs", Context.MODE_PRIVATE) }
@@ -295,20 +339,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 双击返回退出程序并彻底停止播放
+            // 安卓系统返回键逐层回退与首页双击退出软件逻辑
             var lastBackPressTime by remember { mutableStateOf(0L) }
+            var isChildSubViewActive by remember { mutableStateOf(false) }
+            LaunchedEffect(currentScreen) {
+                isChildSubViewActive = false
+            }
 
-            BackHandler(enabled = isFullPlayerVisible || currentScreen != Screen.HOME || isSearchDialogOpen) {
-                if (isFullPlayerVisible) {
-                    isFullPlayerVisible = false
-                } else if (isSearchDialogOpen) {
-                    isSearchDialogOpen = false
-                } else if (currentScreen != Screen.HOME) {
-                    currentScreen = Screen.HOME
+            BackHandler(
+                enabled = isFullPlayerVisible || isSearchDialogOpen || (!isChildSubViewActive && currentScreen != Screen.HOME)
+            ) {
+                when {
+                    isFullPlayerVisible -> isFullPlayerVisible = false
+                    isSearchDialogOpen -> isSearchDialogOpen = false
+                    currentScreen != Screen.HOME -> popScreenOrHome()
                 }
             }
 
-            BackHandler(enabled = !isFullPlayerVisible && !isSearchDialogOpen && currentScreen == Screen.HOME) {
+            BackHandler(
+                enabled = !isFullPlayerVisible && !isSearchDialogOpen && !isChildSubViewActive && currentScreen == Screen.HOME
+            ) {
                 val now = System.currentTimeMillis()
                 if (now - lastBackPressTime < 2000) {
                     exitAppCompletely()
@@ -1117,7 +1167,11 @@ class MainActivity : ComponentActivity() {
             }
 
             val handleDownloadSong: (UnifiedSong) -> Unit = { songToDownload ->
-                handleDownloadWithOptions(songToDownload, DownloadTarget.LOCAL, AudioQuality.Q_320K)
+                val savedTargetName = uiPrefs.getString("default_download_target", DownloadTarget.LOCAL.name) ?: DownloadTarget.LOCAL.name
+                val defaultTarget = try { DownloadTarget.valueOf(savedTargetName) } catch (_: Exception) { DownloadTarget.LOCAL }
+                val savedQualityKey = uiPrefs.getString("default_download_quality", AudioQuality.Q_320K.key) ?: AudioQuality.Q_320K.key
+                val defaultQuality = AudioQuality.entries.firstOrNull { it.key == savedQualityKey } ?: AudioQuality.Q_320K
+                handleDownloadWithOptions(songToDownload, defaultTarget, defaultQuality)
             }
 
             val handleAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { targetPlaylist, songToAdd ->
@@ -1488,7 +1542,7 @@ class MainActivity : ComponentActivity() {
                         enableBottomBarAnimation = enableBottomBarAnimation,
                         useLinearAnimation = true,
                         onNavigate = { targetNavScreen ->
-                            currentScreen = targetNavScreen
+                            navigateToScreen(targetNavScreen)
                             isSearchDialogOpen = false
                             globalSearchQuery = ""
                             if (targetNavScreen == Screen.LIBRARY) {
@@ -1565,7 +1619,7 @@ class MainActivity : ComponentActivity() {
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
                                                 activeServerName = "本地 · 已下载"
-                                                currentScreen = Screen.HOME
+                                                navigateToScreen(Screen.HOME)
                                             },
                                             onSelectServer = { selectedServer ->
                                                 activeServerName = selectedServer.name
@@ -1580,8 +1634,8 @@ class MainActivity : ComponentActivity() {
                                                 Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
                                                 syncServerSongs(activeServer)
                                             },
-                                            onOpenDownloads = { currentScreen = Screen.DOWNLOADS },
-                                            onGoToSettings = { currentScreen = Screen.SETTINGS },
+                                            onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
+                                            onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
                                             onSearchClick = { isSearchDialogOpen = true },
                                             onFetchDiscoverPlaylists = { src ->
                                                 val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
@@ -1618,6 +1672,7 @@ class MainActivity : ComponentActivity() {
                                                     proto.getPlaylistSongs(collectionId).getOrNull() ?: emptyList()
                                                 }
                                             },
+                                            onSubViewActiveChange = { isChildSubViewActive = it },
                                             contentPadding = innerPadding
                                         )
                                     } else {
@@ -1642,7 +1697,7 @@ class MainActivity : ComponentActivity() {
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
                                                 activeServerName = "本地模式"
-                                                currentScreen = Screen.HOME
+                                                navigateToScreen(Screen.HOME)
                                             },
                                             onSelectServer = { selectedServer ->
                                                 activeServerName = selectedServer.name
@@ -1662,17 +1717,18 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             },
                                             onOpenDownloads = {
-                                                currentScreen = Screen.DOWNLOADS
+                                                navigateToScreen(Screen.DOWNLOADS)
                                             },
                                             onGoToSettings = {
-                                                currentScreen = Screen.SETTINGS
+                                                navigateToScreen(Screen.SETTINGS)
                                             },
                                             onPlaylistClick = {
-                                                currentScreen = Screen.LIBRARY
+                                                navigateToScreen(Screen.LIBRARY)
                                             },
                                             onScanLocalMedia = {
-                                                currentScreen = Screen.SETTINGS
+                                                navigateToScreen(Screen.SETTINGS)
                                             },
+                                            onSubViewActiveChange = { isChildSubViewActive = it },
                                             contentPadding = innerPadding
                                         )
                                     }
@@ -1740,7 +1796,7 @@ class MainActivity : ComponentActivity() {
                                                 Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                                             }
                                         },
-                                        onGoToSettings = { currentScreen = Screen.SETTINGS },
+                                        onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
                                         onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                         onDownloadSong = handleDownloadSong,
                                         onDownloadSongWithOptions = handleDownloadWithOptions,
@@ -1770,7 +1826,7 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             }
                                         },
-                                        onOpenDownloads = { currentScreen = Screen.DOWNLOADS },
+                                        onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
                                         onRefreshPlaylists = {
                                             if (activeConfig != null) {
                                                 Toast.makeText(this@MainActivity, "正在同步在线播放列表...", Toast.LENGTH_SHORT).show()
@@ -1939,6 +1995,7 @@ class MainActivity : ComponentActivity() {
                                                 syncServerSongs(activeConfig)
                                             }
                                         },
+                                        onSubViewActiveChange = { isChildSubViewActive = it },
                                         contentPadding = innerPadding
                                     )
                                 }
@@ -1982,7 +2039,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         downloadPath = downloadSettings.customDownloadPath.ifBlank { getExternalFilesDir(null)?.absolutePath ?: "" },
-                                        onBack = { currentScreen = Screen.LIBRARY },
+                                        onBack = { popScreenOrHome() },
                                         contentPadding = innerPadding
                                     )
                                 }
@@ -2013,18 +2070,36 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         homeDisplayConfig = homeDisplayConfig,
-                                        onHomeDisplayConfigChange = { homeDisplayConfig = it },
+                                        onHomeDisplayConfigChange = { newConfig ->
+                                            homeDisplayConfig = newConfig
+                                            uiPrefs.edit()
+                                                .putBoolean("home_show_recently_played", newConfig.showRecentlyPlayed)
+                                                .putBoolean("home_show_recently_added", newConfig.showRecentlyAdded)
+                                                .putBoolean("home_show_albums", newConfig.showAlbums)
+                                                .putBoolean("home_show_artists", newConfig.showArtists)
+                                                .putBoolean("home_show_favorites", newConfig.showFavorites)
+                                                .apply()
+                                        },
                                         currentScaleMode = currentScaleMode,
                                         onScaleModeChange = { newMode ->
                                             currentScaleMode = newMode
                                             uiPrefs.edit().putString("ui_scale_mode", newMode.name).apply()
                                         },
                                         themeMode = currentThemeMode,
-                                        onThemeModeChange = { currentThemeMode = it },
+                                        onThemeModeChange = { newThemeMode ->
+                                            currentThemeMode = newThemeMode
+                                            uiPrefs.edit().putString("app_theme_mode", newThemeMode.name).apply()
+                                        },
                                         blurAlpha = blurAlpha,
-                                        onBlurAlphaChange = { blurAlpha = it },
+                                        onBlurAlphaChange = { newAlpha ->
+                                            blurAlpha = newAlpha
+                                            uiPrefs.edit().putFloat("ui_blur_alpha", newAlpha).apply()
+                                        },
                                         enableBottomBarAnimation = enableBottomBarAnimation,
-                                        onEnableBottomBarAnimationChange = { enableBottomBarAnimation = it },
+                                        onEnableBottomBarAnimationChange = { isEnabled ->
+                                            enableBottomBarAnimation = isEnabled
+                                            uiPrefs.edit().putBoolean("enable_bottom_bar_anim", isEnabled).apply()
+                                        },
                                         autoPlayOnStartup = autoPlayOnStartup,
                                         onAutoPlayOnStartupChange = { isAuto ->
                                             autoPlayOnStartup = isAuto
@@ -2088,21 +2163,29 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onOpenDownloads = {
-                                            currentScreen = Screen.DOWNLOADS
+                                            navigateToScreen(Screen.DOWNLOADS)
                                         },
                                         onLocalScanCompleted = {
                                             // 触发歌曲刷新
                                         },
                                         onChooseDownloadDirectory = {
                                             onChooseDownloadFolderResult = { uri ->
-                                                val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = uri.toString())
-                                                downloadEngine.downloadSettings.value = updated
-                                                Toast.makeText(this@MainActivity, "已成功设定下载存储目录", Toast.LENGTH_SHORT).show()
+                                                val resolvedPath = DownloadEngine.resolveFilesystemPath(uri.toString())
+                                                val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = resolvedPath)
+                                                downloadEngine.updateSettings(updated)
+                                                Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
                                             }
                                             chooseDownloadDirectoryLauncher.launch(null)
                                         },
                                         onImportCustomFolder = {
                                             onImportFolderResult = { uri ->
+                                                val resolvedFolder = DownloadEngine.resolveFilesystemPath(uri.toString())
+                                                if (resolvedFolder.isNotBlank()) {
+                                                    val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", emptySet())?.toSet() ?: emptySet()
+                                                    val updatedFolders = existingFolders + resolvedFolder
+                                                    uiPrefs.edit().remove("local_music_scan_folders").apply()
+                                                    uiPrefs.edit().putStringSet("local_music_scan_folders", updatedFolders).apply()
+                                                }
                                                 lifecycleScope.launch(Dispatchers.IO) {
                                                     val count = LocalMediaScanner.scanDocumentTree(this@MainActivity, uri, database)
                                                     val dlDir = downloadEngine.getDownloadDir()
@@ -2370,12 +2453,12 @@ class MainActivity : ComponentActivity() {
                         BackgroundIslandPermissionDialog(
                             onGrantClick = {
                                 showBgIslandOverlayPrompt = false
-                                uiPrefs.edit().putBoolean("bg_island_overlay_prompted_v157", true).apply()
+                                uiPrefs.edit().putBoolean("bg_island_overlay_prompted_v167", true).apply()
                                 DynamicIslandManager.requestOverlayPermission(this@MainActivity)
                             },
                             onDismiss = {
                                 showBgIslandOverlayPrompt = false
-                                uiPrefs.edit().putBoolean("bg_island_overlay_prompted_v157", true).apply()
+                                uiPrefs.edit().putBoolean("bg_island_overlay_prompted_v167", true).apply()
                             }
                         )
                     }
@@ -2418,7 +2501,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
 
-                            var playbackSpeed by remember { mutableStateOf(1.0f) }
+                            var playbackSpeed by remember {
+                                mutableStateOf(uiPrefs.getFloat("playback_speed", 1.0f).coerceIn(0.5f, 2.0f))
+                            }
 
                             FullscreenPlayerSheet(
                                 song = song,
@@ -2470,6 +2555,7 @@ class MainActivity : ComponentActivity() {
                                 onToggleRepeat = { PlaybackQueueManager.setRepeat(!isRepeat) },
                                 onChangePlaybackSpeed = { speed ->
                                     playbackSpeed = speed
+                                    uiPrefs.edit().putFloat("playback_speed", speed).apply()
                                     exoPlayer?.playbackParameters = androidx.media3.common.PlaybackParameters(speed)
                                 },
                                 onDownloadSong = handleDownloadSong,
@@ -2577,8 +2663,40 @@ class MainActivity : ComponentActivity() {
 
     private var lastActivityKeyTimestamp = 0L
 
-    // 针对车载中控硬件方向盘按键与蓝牙多功能键的硬件按键分发 (支持全量车机键值与防抖)
+    // 针对车载中控硬件方向盘按键与蓝牙多功能键的硬件按键分发 (支持全量车机键值与防抖，严禁拦截系统返回键 KEYCODE_BACK)
+    private fun isMediaOrVolumeKey(keyCode: Int): Boolean {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_MEDIA_NEXT,
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+            KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,
+            KeyEvent.KEYCODE_MEDIA_STEP_FORWARD,
+            KeyEvent.KEYCODE_BUTTON_R1,
+            KeyEvent.KEYCODE_CHANNEL_UP,
+            KeyEvent.KEYCODE_NAVIGATE_NEXT,
+            KeyEvent.KEYCODE_PAGE_DOWN,
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+            KeyEvent.KEYCODE_MEDIA_REWIND,
+            KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD,
+            KeyEvent.KEYCODE_MEDIA_STEP_BACKWARD,
+            KeyEvent.KEYCODE_BUTTON_L1,
+            KeyEvent.KEYCODE_CHANNEL_DOWN,
+            KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
+            KeyEvent.KEYCODE_PAGE_UP,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_HEADSETHOOK,
+            KeyEvent.KEYCODE_BUTTON_START,
+            KeyEvent.KEYCODE_MEDIA_PLAY,
+            KeyEvent.KEYCODE_MEDIA_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_STOP,
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_VOLUME_MUTE -> true
+            else -> false
+        }
+    }
+
     private fun handleMediaKeyEvent(keyCode: Int): Boolean {
+        if (!isMediaOrVolumeKey(keyCode)) return false
         val now = System.currentTimeMillis()
         if (now - lastActivityKeyTimestamp < 250) return true
         lastActivityKeyTimestamp = now
