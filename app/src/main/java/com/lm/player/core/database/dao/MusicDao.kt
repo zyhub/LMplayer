@@ -41,6 +41,9 @@ interface SongDao {
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath, addedTimestamp = :timestamp WHERE id = :songId")
     suspend fun updateDownloadStatusAndTimestamp(songId: String, status: DownloadStatus, localPath: String?, timestamp: Long)
 
+    @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath, format = :format, bitRate = :bitRate, addedTimestamp = :timestamp WHERE id = :songId")
+    suspend fun updateDownloadStatusSpecsAndTimestamp(songId: String, status: DownloadStatus, localPath: String?, format: String, bitRate: Int, timestamp: Long)
+
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath, coverUrl = CASE WHEN coverUrl = '' OR coverUrl IS NULL THEN :coverUrl ELSE coverUrl END WHERE id = :songId")
     suspend fun matchAndLinkLocalFile(songId: String, status: DownloadStatus, localPath: String?, coverUrl: String)
 

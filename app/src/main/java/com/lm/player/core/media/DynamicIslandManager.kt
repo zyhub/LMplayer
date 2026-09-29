@@ -14,14 +14,15 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.drawable.BitmapDrawable
 import android.media.MediaMetadataRetriever
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.util.LruCache
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.CommandButton
@@ -34,57 +35,63 @@ import coil.request.SuccessResult
 import com.google.common.collect.ImmutableList
 import com.lm.player.MainActivity
 import com.lm.player.R
+import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.model.LyricResult
+import com.lm.player.core.model.ServerConfig
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 
 /**
- * 灵动岛展示模式枚举
+ * 挂后台手机灵动岛展示模式枚举
+ * 默认使用厂商系统原生上岛 (SYSTEM_ONLY)
  */
 enum class IslandDisplayMode(val key: String, val label: String, val subtitle: String) {
+    SYSTEM_ONLY(
+        key = "SYSTEM_ONLY",
+        label = "仅使用厂商系统原生上岛 (默认)",
+        subtitle = "使用小米澎湃超级岛/OPPO流体云/vivo原子岛/荣耀灵动胶囊/华为实况窗系统原生媒体上岛"
+    ),
     SMART(
         key = "SMART",
-        label = "智能灵动上岛 (推荐)",
-        subtitle = "切歌、状态切换及实时歌词更新时灵动呈现，点击可展开完整操控面板"
+        label = "概念版智能悬浮胶囊",
+        subtitle = "挂入后台播放时在顶部呈现流体灵动胶囊，回到应用内自动隐身（需悬浮窗权限）"
     ),
     ALWAYS_ON(
         key = "ALWAYS_ON",
-        label = "常驻顶部灵动胶囊",
-        subtitle = "播放音乐且未打开全屏播放器时，始终悬浮于屏幕顶部居中区域"
-    ),
-    SYSTEM_ONLY(
-        key = "SYSTEM_ONLY",
-        label = "仅使用系统原生上岛",
-        subtitle = "关闭应用内顶部胶囊，仅向小米超级岛/OPPO流体云/vivo原子岛/荣耀灵动胶囊推送"
+        label = "挂后台常驻顶部概念胶囊",
+        subtitle = "只要应用在后台且有待播曲目（含暂停态），始终在手机顶部保留概念版灵动胶囊"
     );
 
     companion object {
         fun fromKey(key: String?): IslandDisplayMode {
-            return entries.firstOrNull { it.key == key } ?: SMART
+            return entries.firstOrNull { it.key == key } ?: SYSTEM_ONLY
         }
     }
 }
 
 /**
- * 全品牌安卓灵动岛 (Dynamic Island) 与系统级实时歌词上岛核心引擎
+ * 挂后台全品牌安卓手机灵动岛 (Dynamic Island) 核心引擎
  *
- * 全面适配：
- * 1. 小米澎湃 OS (HyperOS 1/2/3) 超级岛 / 焦点通知 + MediaStyle 媒体上岛
- * 2. OPPO / 一加 / 真我 (ColorOS) 流体云 (Fluid Cloud) 胶囊与进度同步
- * 3. vivo / iQOO (OriginOS 4/5) 原子岛 (Atomic Island) 音频播控胶囊
- * 4. 荣耀 (MagicOS) 灵动胶囊 (Magic Capsule) 与华为实况窗
- * 5. 魅族 (Flyme) 状态栏歌词协议 (FLAG_ALWAYS_SHOW_TICKER / FLAG_ONLY_UPDATE_TICKER)
- * 6. Android 16+ Promoted Ongoing 实时活动通知及第三方超级岛/状态栏歌词广播协议
- * 7. 应用内高帧率灵动岛交互胶囊 (支持封面旋转呼吸、音频频谱律动、实时双行歌词与展开式播控)
+ * 核心机制：
+ * 1. 默认使用各大厂商系统原生媒体上岛（小米澎湃 OS 超级岛、OPPO ColorOS 流体云、vivo OriginOS 原子岛、荣耀 MagicOS 灵动胶囊、华为实况窗）：
+ *    全程保持纯净、持久的 Media3 MediaSession + MediaStyle 通知绑定，杜绝非法焦点参数覆写或高频重发导致系统断连下岛。
+ * 2. 可选挂后台概念版流体悬浮胶囊通道：
+ *    当用户切换为概念版胶囊模式时，在后台通过悬浮窗呈现黑胶唱片与逐行歌词胶囊。
  */
 @OptIn(UnstableApi::class)
 object DynamicIslandManager {
@@ -93,28 +100,32 @@ object DynamicIslandManager {
     private const val PREFS_NAME = "lemon_settings_prefs"
 
     private const val KEY_SYSTEM_ISLAND_ENABLED = "island_system_enabled"
-    private const val KEY_LIVE_LYRICS_ON_ISLAND = "island_live_lyrics_enabled"
-    private const val KEY_ISLAND_DISPLAY_MODE = "island_display_mode"
+    private const val KEY_ISLAND_DISPLAY_MODE = "island_display_mode_v2"
     private const val KEY_SHOW_LYRICS_IN_PILL = "island_show_lyrics_in_pill"
 
-    // 魅族 Flyme / 类原生 / 状态栏歌词通用 Ticker Flag
-    private const val FLAG_ALWAYS_SHOW_TICKER = 0x01000000
-    private const val FLAG_ONLY_UPDATE_TICKER = 0x02000000
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    // 内存封面 Bitmap 与压缩字节缓存 (保证通知栏与灵动岛 0ms 命中有图封面)
-    private val bitmapCache = LruCache<String, Bitmap>(20)
-    private val artworkBytesCache = LruCache<String, ByteArray>(20)
+    // 内存封面 Bitmap、主题强调色与压缩字节缓存 (保证通知栏与系统原生灵动岛 0ms 命中有图封面)
+    private val bitmapCache = LruCache<String, Bitmap>(24)
+    private val accentColorCache = LruCache<String, Int>(36)
+    private val artworkBytesCache = LruCache<String, ByteArray>(24)
     private var fallbackCoverBitmap: Bitmap? = null
+
+    // 持久持有当前活跃的 MediaSession 与 MediaNotification.Provider.Callback，严防无 Session 覆盖导致下岛
+    @Volatile
+    private var activeMediaSession: MediaSession? = null
+
+    @Volatile
+    private var activeNotificationCallback: MediaNotification.Provider.Callback? = null
+
+    private val _isAppInBackgroundFlow = MutableStateFlow(false)
+    val isAppInBackgroundFlow: StateFlow<Boolean> = _isAppInBackgroundFlow.asStateFlow()
 
     private val _systemIslandEnabledFlow = MutableStateFlow(true)
     val systemIslandEnabledFlow: StateFlow<Boolean> = _systemIslandEnabledFlow.asStateFlow()
 
-    private val _liveLyricsOnIslandFlow = MutableStateFlow(true)
-    val liveLyricsOnIslandFlow: StateFlow<Boolean> = _liveLyricsOnIslandFlow.asStateFlow()
-
-    private val _islandDisplayModeFlow = MutableStateFlow(IslandDisplayMode.SMART)
+    private val _islandDisplayModeFlow = MutableStateFlow(IslandDisplayMode.SYSTEM_ONLY)
     val islandDisplayModeFlow: StateFlow<IslandDisplayMode> = _islandDisplayModeFlow.asStateFlow()
 
     private val _showLyricsInPillFlow = MutableStateFlow(true)
@@ -126,22 +137,173 @@ object DynamicIslandManager {
     private val _nextLyricLineFlow = MutableStateFlow("")
     val nextLyricLineFlow: StateFlow<String> = _nextLyricLineFlow.asStateFlow()
 
-    private val _manualExpandTriggerFlow = MutableStateFlow(0L)
-    val manualExpandTriggerFlow: StateFlow<Long> = _manualExpandTriggerFlow.asStateFlow()
+    // 当前歌词行卡拉OK染色进度 (0f..1f)，用于概念版胶囊的逐行流光染色
+    private val _currentLineProgressFlow = MutableStateFlow(1f)
+    val currentLineProgressFlow: StateFlow<Float> = _currentLineProgressFlow.asStateFlow()
 
     private var isInitialized = false
+    private var backgroundLyricsJob: Job? = null
+    private var activeLyricsSongId: String = ""
+    private var activeLyricResult: LyricResult = LyricResult()
+
     private var lastNotifiedSongId: String = ""
     private var lastNotifiedPlaying: Boolean? = null
-    private var lastNotifiedLyric: String = ""
+    private var lastNotifiedHasCustomArtwork: Boolean = false
+
+    fun bindMediaSession(session: MediaSession?) {
+        activeMediaSession = session
+    }
 
     fun ensureInitialized(context: Context) {
+        val appCtx = context.applicationContext
         if (isInitialized) return
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _systemIslandEnabledFlow.value = prefs.getBoolean(KEY_SYSTEM_ISLAND_ENABLED, true)
-        _liveLyricsOnIslandFlow.value = prefs.getBoolean(KEY_LIVE_LYRICS_ON_ISLAND, true)
-        _islandDisplayModeFlow.value = IslandDisplayMode.fromKey(prefs.getString(KEY_ISLAND_DISPLAY_MODE, IslandDisplayMode.SMART.key))
+        _islandDisplayModeFlow.value = IslandDisplayMode.fromKey(
+            prefs.getString(KEY_ISLAND_DISPLAY_MODE, IslandDisplayMode.SYSTEM_ONLY.key)
+        )
         _showLyricsInPillFlow.value = prefs.getBoolean(KEY_SHOW_LYRICS_IN_PILL, true)
         isInitialized = true
+        startBackgroundLyricsEngine(appCtx)
+    }
+
+    /**
+     * 独立于 Activity 的后台封面预热与歌词同步守护协程
+     */
+    private fun startBackgroundLyricsEngine(appContext: Context) {
+        if (backgroundLyricsJob?.isActive == true) return
+        backgroundLyricsJob = mainScope.launch {
+            // 1. 监听当前歌曲切换，自动预加载封面、提取专辑流体主题色并解析歌词
+            launch {
+                PlaybackQueueManager.currentSongFlow.collectLatest { song ->
+                    if (song == null) {
+                        activeLyricsSongId = ""
+                        activeLyricResult = LyricResult()
+                        clearLyrics()
+                        BackgroundIslandOverlayController.refreshVisibilityAndState(appContext)
+                        return@collectLatest
+                    }
+                    if (song.id != activeLyricsSongId) {
+                        activeLyricsSongId = song.id
+                        clearLyrics()
+                    }
+                    // 异步加载封面与主题色，完成后仅在拥有有效 MediaSession 时平滑刷新系统媒体通知封面
+                    scope.launch {
+                        val bmp = loadSongArtworkBitmap(appContext, song)
+                        getOrExtractAccentColor(song.id, bmp)
+                        withContext(Dispatchers.Main) {
+                            BackgroundIslandOverlayController.refreshVisibilityAndState(appContext)
+                            val session = activeMediaSession
+                            val player = runCatching { Media3Factory.getSharedExoPlayer(appContext) }.getOrNull()
+                            if (session != null && player != null && PlaybackQueueManager.currentSongFlow.value?.id == song.id) {
+                                notifySystemIsland(
+                                    context = appContext,
+                                    mediaSession = session,
+                                    exoPlayer = player,
+                                    force = true
+                                )
+                            }
+                        }
+                    }
+                    // 异步加载歌词
+                    val loaded = withContext(Dispatchers.IO) {
+                        LyricsManager.getCachedLyrics(song.id)?.takeIf { it.lines.isNotEmpty() } ?: run {
+                            val activeServer = try {
+                                val db = ZdsDatabase.getInstance(appContext)
+                                db.serverDao().getAllServers().firstOrNull { it.isCurrentActive }?.let { entity ->
+                                    ServerConfig(
+                                        id = entity.id,
+                                        name = entity.name,
+                                        type = entity.type,
+                                        serverUrl = entity.serverUrl,
+                                        username = entity.username,
+                                        tokenOrApiKey = entity.tokenOrApiKey,
+                                        saltOrSecret = entity.saltOrSecret,
+                                        syncMode = entity.syncMode,
+                                        isCurrentActive = entity.isCurrentActive
+                                    )
+                                }
+                            } catch (_: Exception) { null }
+                            LyricsManager.loadLyrics(song, appContext, activeServer)
+                        }
+                    }
+                    if (PlaybackQueueManager.currentSongFlow.value?.id == song.id) {
+                        activeLyricResult = loaded
+                        BackgroundIslandOverlayController.refreshVisibilityAndState(appContext)
+                    }
+                }
+            }
+
+            // 2. 实时歌词匹配驱动器（仅驱动概念版悬浮胶囊视图，绝不高频刷写系统通知以免破坏原生上岛稳定性）
+            while (isActive) {
+                val song = PlaybackQueueManager.currentSongFlow.value
+                val player = runCatching { Media3Factory.getSharedExoPlayer(appContext) }.getOrNull()
+                val playing = player?.isPlaying == true
+                val needOverlayLyrics = _islandDisplayModeFlow.value != IslandDisplayMode.SYSTEM_ONLY &&
+                        (_isAppInBackgroundFlow.value || playing)
+                if (song != null && player != null && needOverlayLyrics) {
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    val lines = activeLyricResult.lines.ifEmpty {
+                        LyricsManager.getCachedLyrics(song.id)?.lines.orEmpty()
+                    }
+                    if (lines.isNotEmpty()) {
+                        val idx = lines.indexOfLast { it.timestampMs <= pos }.coerceAtLeast(0)
+                        val curObj = lines.getOrNull(idx)
+                        val nxtObj = lines.getOrNull(idx + 1)
+                        val curText = curObj?.text.orEmpty()
+                        val nxtText = nxtObj?.text.orEmpty()
+
+                        val startMs = curObj?.timestampMs ?: 0L
+                        val endMs = nxtObj?.timestampMs ?: (startMs + 4000L)
+                        val spanMs = (endMs - startMs).coerceIn(600L, 12000L)
+                        val lineProg = ((pos - startMs).toFloat() / spanMs.toFloat()).coerceIn(0f, 1f)
+                        _currentLineProgressFlow.value = lineProg
+
+                        updateRealtimeLyrics(
+                            context = appContext,
+                            song = song,
+                            currentLine = curText,
+                            nextLine = nxtText,
+                            lineProgress = lineProg,
+                            isPlaying = playing
+                        )
+                    } else {
+                        _currentLineProgressFlow.value = 1f
+                    }
+                }
+                delay(if (playing && needOverlayLyrics) 200L else 600L)
+            }
+        }
+    }
+
+    /**
+     * 当应用前后台状态切换时调用：
+     * - 仅刷新概念版悬浮胶囊可见性，绝不用无 Session 的通知覆盖系统原生媒体通知（防止切后台几秒后掉岛）
+     */
+    fun onAppBackgroundStateChanged(context: Context, inBackground: Boolean) {
+        ensureInitialized(context)
+        _isAppInBackgroundFlow.value = inBackground
+        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
+    }
+
+    fun hasOverlayPermission(context: Context): Boolean {
+        return BackgroundIslandOverlayController.hasOverlayPermission(context)
+    }
+
+    fun requestOverlayPermission(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to open overlay permission settings", e)
+            }
+        }
     }
 
     fun setSystemIslandEnabled(context: Context, enabled: Boolean) {
@@ -149,13 +311,12 @@ object DynamicIslandManager {
         _systemIslandEnabledFlow.value = enabled
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_SYSTEM_ISLAND_ENABLED, enabled).apply()
-    }
-
-    fun setLiveLyricsOnIsland(context: Context, enabled: Boolean) {
-        ensureInitialized(context)
-        _liveLyricsOnIslandFlow.value = enabled
-        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_LIVE_LYRICS_ON_ISLAND, enabled).apply()
+        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
+        val session = activeMediaSession
+        val player = runCatching { Media3Factory.getSharedExoPlayer(context) }.getOrNull()
+        if (session != null && player != null) {
+            notifySystemIsland(context, mediaSession = session, exoPlayer = player, force = true)
+        }
     }
 
     fun setIslandDisplayMode(context: Context, mode: IslandDisplayMode) {
@@ -163,6 +324,7 @@ object DynamicIslandManager {
         _islandDisplayModeFlow.value = mode
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putString(KEY_ISLAND_DISPLAY_MODE, mode.key).apply()
+        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
     }
 
     fun setShowLyricsInPill(context: Context, show: Boolean) {
@@ -170,24 +332,26 @@ object DynamicIslandManager {
         _showLyricsInPillFlow.value = show
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_SHOW_LYRICS_IN_PILL, show).apply()
+        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
     }
 
     /**
-     * 触发应用内灵动岛展开动效并同步刷新系统灵动岛通知
+     * 在设置页中手动测试预览后台灵动岛效果（临时展示 5 秒）
      */
     fun triggerIslandPreview(context: Context) {
         ensureInitialized(context)
-        _manualExpandTriggerFlow.value = System.currentTimeMillis()
+        BackgroundIslandOverlayController.triggerTemporaryPreview(context)
     }
 
     /**
-     * 更新当前播放的实时同步歌词行，并按需推送至系统灵动岛与状态栏
+     * 更新当前播放的实时同步歌词行（仅用于应用内/悬浮胶囊展示，不干扰系统原生 MediaStyle 媒体岛通知）
      */
     fun updateRealtimeLyrics(
         context: Context,
         song: UnifiedSong?,
         currentLine: String,
         nextLine: String = "",
+        lineProgress: Float = _currentLineProgressFlow.value,
         isPlaying: Boolean = true
     ) {
         ensureInitialized(context)
@@ -196,19 +360,21 @@ object DynamicIslandManager {
         val changed = (_currentLyricLineFlow.value != cleanCurrent) || (_nextLyricLineFlow.value != cleanNext)
         _currentLyricLineFlow.value = cleanCurrent
         _nextLyricLineFlow.value = cleanNext
+        _currentLineProgressFlow.value = lineProgress.coerceIn(0f, 1f)
 
-        if (changed && song != null && _systemIslandEnabledFlow.value && _liveLyricsOnIslandFlow.value) {
-            dispatchThirdPartyLyricBroadcast(context, song, cleanCurrent, isPlaying)
+        if (changed && _islandDisplayModeFlow.value != IslandDisplayMode.SYSTEM_ONLY) {
+            BackgroundIslandOverlayController.refreshVisibilityAndState(context)
         }
     }
 
     fun clearLyrics() {
         _currentLyricLineFlow.value = ""
         _nextLyricLineFlow.value = ""
+        _currentLineProgressFlow.value = 1f
     }
 
     /**
-     * 识别当前设备所属厂商与系统灵动岛协议类型
+     * 识别当前设备所属厂商与系统原生灵动岛协议类型
      */
     fun getDeviceIslandProfile(): String {
         val manufacturer = (Build.MANUFACTURER ?: "").lowercase(Locale.US)
@@ -216,21 +382,21 @@ object DynamicIslandManager {
         val display = (Build.DISPLAY ?: "").lowercase(Locale.US)
         return when {
             manufacturer.contains("xiaomi") || brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco") ->
-                "小米澎湃 OS · 超级岛 / 焦点媒体通知"
+                "小米澎湃 OS · 系统原生超级岛 (MediaSession 原生直连)"
             manufacturer.contains("oppo") || brand.contains("oppo") || brand.contains("oneplus") || brand.contains("realme") ->
-                "OPPO ColorOS · 流体云 (Fluid Cloud)"
+                "OPPO ColorOS · 系统原生流体云 (MediaSession 原生直连)"
             manufacturer.contains("vivo") || brand.contains("vivo") || brand.contains("iqoo") ->
-                "vivo OriginOS · 原子岛 (Atomic Island)"
+                "vivo OriginOS · 系统原生原子岛 (MediaSession 原生直连)"
             manufacturer.contains("honor") || brand.contains("honor") ->
-                "荣耀 MagicOS · 灵动胶囊 (Magic Capsule)"
+                "荣耀 MagicOS · 系统原生灵动胶囊 (MediaSession 原生直连)"
             manufacturer.contains("huawei") || brand.contains("huawei") ->
-                "华为 HarmonyOS · 实况窗 (Live View)"
+                "华为 HarmonyOS · 系统原生实况窗 (MediaSession 原生直连)"
             manufacturer.contains("meizu") || brand.contains("meizu") || display.contains("flyme") ->
-                "魅族 Flyme · 灵动岛与状态栏实时歌词"
+                "魅族 Flyme · 系统原生媒体胶囊 (MediaSession 原生直连)"
             manufacturer.contains("samsung") || brand.contains("samsung") ->
-                "三星 One UI · 实时媒体胶囊 (Now Bar)"
+                "三星 One UI · 系统原生实时媒体胶囊 (MediaSession 原生直连)"
             else ->
-                "Android MediaSession 原生上岛 + 内置灵动岛双引擎"
+                "Android 系统原生媒体上岛 (MediaSession 原生直连)"
         }
     }
 
@@ -238,9 +404,63 @@ object DynamicIslandManager {
 
     fun getCachedArtworkBytes(songId: String): ByteArray? = artworkBytesCache.get(songId)
 
+    fun getCachedAccentColor(songId: String): Int {
+        return accentColorCache.get(songId) ?: 0xFF00E5FF.toInt()
+    }
+
+    /**
+     * 从专辑封面提取高饱和度概念荧光主色调（参考酷狗音乐概念版流体光晕算法）
+     */
+    fun getOrExtractAccentColor(songId: String, bitmap: Bitmap): Int {
+        accentColorCache.get(songId)?.let { return it }
+        return try {
+            val w = bitmap.width
+            val h = bitmap.height
+            var rSum = 0L
+            var gSum = 0L
+            var bSum = 0L
+            var count = 0
+            val stepX = (w / 8).coerceAtLeast(1)
+            val stepY = (h / 8).coerceAtLeast(1)
+            val hsv = FloatArray(3)
+            for (x in stepX until w - stepX step stepX) {
+                for (y in stepY until h - stepY step stepY) {
+                    val pixel = bitmap.getPixel(x, y)
+                    android.graphics.Color.colorToHSV(pixel, hsv)
+                    // 优先采样具备一定饱和度与亮度的彩色像素
+                    if (hsv[1] > 0.22f && hsv[2] in 0.20f..0.95f) {
+                        rSum += android.graphics.Color.red(pixel)
+                        gSum += android.graphics.Color.green(pixel)
+                        bSum += android.graphics.Color.blue(pixel)
+                        count++
+                    }
+                }
+            }
+            val finalColor = if (count >= 3) {
+                val avgColor = android.graphics.Color.rgb(
+                    (rSum / count).toInt(),
+                    (gSum / count).toInt(),
+                    (bSum / count).toInt()
+                )
+                android.graphics.Color.colorToHSV(avgColor, hsv)
+                // 提升饱和度与明度以匹配酷狗概念版清透霓虹流光质感
+                hsv[1] = hsv[1].coerceIn(0.68f, 0.92f)
+                hsv[2] = hsv[2].coerceIn(0.88f, 1.0f)
+                android.graphics.Color.HSVToColor(hsv)
+            } else {
+                // 默认酷狗概念版荧光青色
+                0xFF00E5FF.toInt()
+            }
+            accentColorCache.put(songId, finalColor)
+            finalColor
+        } catch (_: Exception) {
+            0xFF00E5FF.toInt()
+        }
+    }
+
     /**
      * 同步或异步加载曲目高清封面 Bitmap (带内存缓存 + 本地内嵌封面提取 + Coil 网络拉取 + 渐变兜底图)
-     * 确保各大厂商系统灵动岛 (HyperOS/OriginOS/ColorOS/MagicOS) 100% 获取到有效封面位图
+     * 确保各大厂商系统灵动岛与后台顶部悬浮灵动岛 100% 获取到有效封面位图
      */
     suspend fun loadSongArtworkBitmap(context: Context, song: UnifiedSong): Bitmap {
         bitmapCache.get(song.id)?.let { return it }
@@ -278,7 +498,7 @@ object DynamicIslandManager {
                 val request = ImageRequest.Builder(context.applicationContext)
                     .data(cleanUrl)
                     .size(256, 256)
-                    .allowHardware(false) // Notification RemoteViews / MediaSession 要求非 Hardware Bitmap
+                    .allowHardware(false) // Notification / MediaSession / Canvas Shader 要求非 Hardware Bitmap
                     .build()
                 val result = Coil.imageLoader(context.applicationContext).execute(request)
                 if (result is SuccessResult) {
@@ -306,6 +526,7 @@ object DynamicIslandManager {
                 loadedBitmap
             }
             bitmapCache.put(song.id, scaled)
+            getOrExtractAccentColor(song.id, scaled)
             try {
                 val bos = ByteArrayOutputStream()
                 scaled.compress(Bitmap.CompressFormat.JPEG, 85, bos)
@@ -318,7 +539,7 @@ object DynamicIslandManager {
     }
 
     /**
-     * 生成高颜值 Apple Red 渐变兜底封面 Bitmap，防止无封面歌曲在系统灵动岛上呈现空白
+     * 生成高颜值 Apple Red 渐变兜底封面 Bitmap，防止无封面歌曲在灵动岛上呈现空白
      */
     fun getOrCreateFallbackBitmap(): Bitmap {
         fallbackCoverBitmap?.let { return it }
@@ -334,7 +555,6 @@ object DynamicIslandManager {
         )
         canvas.drawRoundRect(RectF(0f, 0f, size.toFloat(), size.toFloat()), 36f, 36f, paint)
 
-        // 绘制中心音符圆形修饰
         val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = 0x33FFFFFF
             style = Paint.Style.FILL
@@ -355,7 +575,7 @@ object DynamicIslandManager {
     }
 
     /**
-     * 构建 Media3 自定义 MediaNotification.Provider，接管前台服务媒体通知并与各大系统灵动岛深度互通
+     * 构建 Media3 自定义 MediaNotification.Provider，接管前台服务媒体通知并与各大系统原生灵动岛深度互通
      */
     fun createMediaNotificationProvider(service: PlaybackService): MediaNotification.Provider {
         return object : MediaNotification.Provider {
@@ -365,38 +585,34 @@ object DynamicIslandManager {
                 actionFactory: MediaNotification.ActionFactory,
                 onNotificationChangedCallback: MediaNotification.Provider.Callback
             ): MediaNotification {
+                activeMediaSession = mediaSession
+                activeNotificationCallback = onNotificationChangedCallback
+
                 val player = Media3Factory.getSharedExoPlayer(service)
                 val currentSong = PlaybackQueueManager.currentSongFlow.value
-                val isPlaying = player.isPlaying
-                val lyricLine = _currentLyricLineFlow.value
+                val cachedBmp = currentSong?.let { bitmapCache.get(it.id) }
 
-                // 若当前曲目封面尚未缓存，后台异步加载完成后主动回调刷新系统灵动岛封面与 MediaMetadata
-                if (currentSong != null && bitmapCache.get(currentSong.id) == null) {
+                if (currentSong != null && cachedBmp == null) {
+                    val targetSongId = currentSong.id
                     scope.launch {
                         val bmp = loadSongArtworkBitmap(service, currentSong)
-                        val bytes = artworkBytesCache.get(currentSong.id)
-                        kotlinx.coroutines.withContext(Dispatchers.Main) {
+                        withContext(Dispatchers.Main) {
                             try {
-                                // 同步将封面字节注入当前 MediaItem 的 MediaMetadata，使澎湃OS/OriginOS/ColorOS灵动岛立即显示专辑图
-                                val curItem = player.currentMediaItem
-                                if (curItem != null && curItem.mediaId == currentSong.id && bytes != null) {
-                                    val newMeta = curItem.mediaMetadata.buildUpon()
-                                        .setArtworkData(bytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-                                        .build()
-                                    val newItem = curItem.buildUpon().setMediaMetadata(newMeta).build()
-                                    player.replaceMediaItem(player.currentMediaItemIndex, newItem)
+                                if (PlaybackQueueManager.currentSongFlow.value?.id == targetSongId) {
+                                    BackgroundIslandOverlayController.refreshVisibilityAndState(service)
+                                    val updatedNotif = buildIslandNotification(
+                                        context = service,
+                                        mediaSession = mediaSession,
+                                        exoPlayer = player,
+                                        overrideBitmap = bmp
+                                    )
+                                    lastNotifiedSongId = targetSongId
+                                    lastNotifiedPlaying = player.isPlaying
+                                    lastNotifiedHasCustomArtwork = true
+                                    onNotificationChangedCallback.onNotificationChanged(
+                                        MediaNotification(PlaybackService.NOTIFICATION_ID, updatedNotif)
+                                    )
                                 }
-                                val updatedNotif = buildIslandNotification(
-                                    context = service,
-                                    mediaSession = mediaSession,
-                                    exoPlayer = player,
-                                    currentLyric = _currentLyricLineFlow.value,
-                                    overrideBitmap = bmp,
-                                    isTickerOnlyUpdate = false
-                                )
-                                onNotificationChangedCallback.onNotificationChanged(
-                                    MediaNotification(PlaybackService.NOTIFICATION_ID, updatedNotif)
-                                )
                             } catch (e: Exception) {
                                 Log.d(TAG, "Callback notification update skipped: ${e.message}")
                             }
@@ -408,10 +624,11 @@ object DynamicIslandManager {
                     context = service,
                     mediaSession = mediaSession,
                     exoPlayer = player,
-                    currentLyric = lyricLine,
-                    overrideBitmap = currentSong?.let { bitmapCache.get(it.id) },
-                    isTickerOnlyUpdate = false
+                    overrideBitmap = cachedBmp
                 )
+                lastNotifiedSongId = currentSong?.id.orEmpty()
+                lastNotifiedPlaying = player.isPlaying
+                lastNotifiedHasCustomArtwork = (cachedBmp != null)
                 return MediaNotification(PlaybackService.NOTIFICATION_ID, notification)
             }
 
@@ -424,18 +641,19 @@ object DynamicIslandManager {
     }
 
     /**
-     * 构建符合 Android MediaStyle + 小米澎湃超级岛/焦点通知 + OPPO流体云 + vivo原子岛 + 荣耀灵动胶囊 + Flyme状态栏歌词的综合媒体通知
+     * 构建符合各大厂商系统原生媒体上岛（小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊、华为实况窗）的纯净标准 MediaStyle 媒体通知：
+     * - 始终绑定有效 MediaSession Token，严防无 Session 通知覆盖导致几秒后掉岛
+     * - 移除非白名单签名会触发系统校验踢下岛的自定义焦点模板参数与高频 Ticker 标志
      */
     fun buildIslandNotification(
         context: Context,
         mediaSession: MediaSession?,
         exoPlayer: ExoPlayer?,
-        currentLyric: String = _currentLyricLineFlow.value,
-        overrideBitmap: Bitmap? = null,
-        isTickerOnlyUpdate: Boolean = false
+        overrideBitmap: Bitmap? = null
     ): Notification {
         ensureInitialized(context)
 
+        val resolvedSession = mediaSession ?: activeMediaSession
         val currentSong = PlaybackQueueManager.currentSongFlow.value
         val currentMediaItem = exoPlayer?.currentMediaItem
         val rawTitle = currentSong?.title?.ifBlank { null }
@@ -448,17 +666,14 @@ object DynamicIslandManager {
             ?: currentMediaItem?.mediaMetadata?.albumTitle?.toString().orEmpty()
 
         val isPlaying = exoPlayer?.isPlaying == true
-        val useLiveLyric = _systemIslandEnabledFlow.value && _liveLyricsOnIslandFlow.value && currentLyric.isNotBlank()
+        val isActiveSession = isPlaying || exoPlayer?.playWhenReady == true || currentSong != null
 
         val displayTitle = rawTitle
-        val displayContent = if (useLiveLyric) {
-            "♪ $currentLyric"
-        } else if (rawAlbum.isNotBlank()) {
+        val displayContent = if (rawAlbum.isNotBlank() && rawAlbum != rawArtist) {
             "$rawArtist · $rawAlbum"
         } else {
             rawArtist
         }
-        val tickerText = if (useLiveLyric) currentLyric else "$rawTitle - $rawArtist"
 
         val coverBitmap = overrideBitmap
             ?: currentSong?.let { bitmapCache.get(it.id) }
@@ -478,64 +693,21 @@ object DynamicIslandManager {
         val togglePendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_TOGGLE, 102)
         val nextPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_NEXT, 103)
 
-        val extras = Bundle().apply {
-            putString("android.substName", context.getString(R.string.app_name))
-            if (_systemIslandEnabledFlow.value) {
-                // 1. 小米澎湃 OS (HyperOS) 焦点通知与超级岛扩展参数
-                putBoolean("miui.focus.enable", true)
-                putString("miui.focus.ticker", tickerText)
-                try {
-                    val miuiParam = JSONObject().apply {
-                        put("protocol", 1)
-                        put("scene", "music")
-                        put("ticker", tickerText)
-                        put("title", displayTitle)
-                        put("content", displayContent)
-                        put("enableFloat", false)
-                        put("updatable", true)
-                    }
-                    putString("miui.focus.param", miuiParam.toString())
-                } catch (_: Exception) {}
-
-                // 2. OPPO / OnePlus / Realme ColorOS 流体云 (Fluid Cloud) 扩展参数
-                putBoolean("oplus.fluids.enable", true)
-                putBoolean("coloros.fluid.cloud", true)
-                putInt("android.ongoingActivityNoti.style", 1)
-
-                // 3. vivo / iQOO OriginOS 原子岛 (Atomic Island) 扩展参数
-                putBoolean("vivo.originos.atomic.island", true)
-                putBoolean("android.media.extra.ATOMIC_ISLAND_ENABLED", true)
-
-                // 4. 荣耀 MagicOS 灵动胶囊 & 华为 HarmonyOS 实况窗扩展参数
-                putBoolean("honor.magic.capsule.enable", true)
-                putBoolean("hw_live_view_enabled", true)
-
-                // 5. Android 16+ 实时活动胶囊 (Promoted Ongoing)
-                putBoolean("android.app.extra.PROMOTED_ONGOING", true)
-
-                // 6. 实时状态栏/灵动岛歌词扩展字段
-                if (useLiveLyric) {
-                    putString("lyric_line", currentLyric)
-                    putInt("ticker_icon_switch", 0)
-                }
-            }
-        }
-
         val builder = NotificationCompat.Builder(context, PlaybackService.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setLargeIcon(coverBitmap)
             .setContentTitle(displayTitle)
             .setContentText(displayContent)
-            .setSubText(if (useLiveLyric) rawArtist else null)
-            .setTicker(tickerText)
+            .setSubText(rawAlbum.takeIf { it.isNotBlank() })
             .setContentIntent(contentPendingIntent)
-            .setOngoing(isPlaying)
+            .setOngoing(isActiveSession)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
+            .setColorized(true)
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .addExtras(extras)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_media_previous,
@@ -558,20 +730,16 @@ object DynamicIslandManager {
                 ).build()
             )
 
-        // 关键：挂载 Media3 标准 MediaStyle 并绑定 MediaSession，使澎湃OS/ColorOS/OriginOS/MagicOS 系统识别为原生媒体灵动岛
-        if (mediaSession != null) {
+        if (resolvedSession != null) {
             builder.setStyle(
-                MediaStyleNotificationHelper.MediaStyle(mediaSession)
+                MediaStyleNotificationHelper.MediaStyle(resolvedSession)
                     .setShowActionsInCompactView(0, 1, 2)
             )
         }
 
         val notification = builder.build()
-        if (useLiveLyric) {
-            notification.flags = notification.flags or FLAG_ALWAYS_SHOW_TICKER
-            if (isTickerOnlyUpdate) {
-                notification.flags = notification.flags or FLAG_ONLY_UPDATE_TICKER
-            }
+        if (isActiveSession) {
+            notification.flags = notification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
         }
         return notification
     }
@@ -594,7 +762,8 @@ object DynamicIslandManager {
     }
 
     /**
-     * 刷新系统前台通知与各大厂商灵动岛胶囊状态 (带去重节流)
+     * 刷新系统前台通知、各大厂商原生灵动岛与后台顶部悬浮灵动岛状态
+     * 仅在曲目切换、播放/暂停状态改变或封面加载完成时更新，且必须持有有效 MediaSession
      */
     fun notifySystemIsland(
         context: Context,
@@ -603,66 +772,45 @@ object DynamicIslandManager {
         force: Boolean = false
     ) {
         ensureInitialized(context)
-        if (!_systemIslandEnabledFlow.value && !force) return
+        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
+
+        val resolvedSession = mediaSession ?: activeMediaSession ?: return
+        val player = exoPlayer ?: runCatching { Media3Factory.getSharedExoPlayer(context) }.getOrNull() ?: return
 
         val songId = PlaybackQueueManager.currentSongFlow.value?.id.orEmpty()
-        val isPlaying = exoPlayer?.isPlaying == true
-        val lyric = _currentLyricLineFlow.value
+        val isPlaying = player.isPlaying
+        val hasCustomArtwork = songId.isNotEmpty() && bitmapCache.get(songId) != null
 
-        if (!force && songId == lastNotifiedSongId && isPlaying == lastNotifiedPlaying && lyric == lastNotifiedLyric) {
+        if (!force &&
+            songId == lastNotifiedSongId &&
+            isPlaying == lastNotifiedPlaying &&
+            hasCustomArtwork == lastNotifiedHasCustomArtwork
+        ) {
             return
         }
-        val isTickerOnly = !force && songId == lastNotifiedSongId && isPlaying == lastNotifiedPlaying && lyric != lastNotifiedLyric
 
         lastNotifiedSongId = songId
         lastNotifiedPlaying = isPlaying
-        lastNotifiedLyric = lyric
+        lastNotifiedHasCustomArtwork = hasCustomArtwork
 
         try {
             val notification = buildIslandNotification(
                 context = context,
-                mediaSession = mediaSession,
-                exoPlayer = exoPlayer,
-                currentLyric = lyric,
-                isTickerOnlyUpdate = isTickerOnly
+                mediaSession = resolvedSession,
+                exoPlayer = player,
+                overrideBitmap = songId.takeIf { it.isNotEmpty() }?.let { bitmapCache.get(it) }
             )
-            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.notify(PlaybackService.NOTIFICATION_ID, notification)
+            val callback = activeNotificationCallback
+            if (callback != null) {
+                callback.onNotificationChanged(
+                    MediaNotification(PlaybackService.NOTIFICATION_ID, notification)
+                )
+            } else {
+                val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                manager.notify(PlaybackService.NOTIFICATION_ID, notification)
+            }
         } catch (e: Throwable) {
             Log.e(TAG, "Error pushing island notification", e)
         }
-    }
-
-    /**
-     * 发送标准音乐元数据与实时歌词广播，兼容安卓第三方超级岛/灵动鸟/状态栏歌词插件及车载蓝牙仪表盘
-     */
-    fun dispatchThirdPartyLyricBroadcast(
-        context: Context,
-        song: UnifiedSong,
-        lyricLine: String,
-        isPlaying: Boolean
-    ) {
-        try {
-            // 1. 标准 Android 音乐状态与元数据广播
-            val metaIntent = Intent("com.android.music.metachanged").apply {
-                putExtra("id", song.id)
-                putExtra("track", if (lyricLine.isNotBlank()) lyricLine else song.title)
-                putExtra("artist", song.artist)
-                putExtra("album", song.album)
-                putExtra("playing", isPlaying)
-                putExtra("lyric", lyricLine)
-            }
-            context.sendBroadcast(metaIntent)
-
-            // 2. 通用状态栏歌词与第三方安卓灵动岛插件广播
-            val lyricIntent = Intent("com.lm.player.ACTION_LYRIC_UPDATED").apply {
-                putExtra("song_id", song.id)
-                putExtra("title", song.title)
-                putExtra("artist", song.artist)
-                putExtra("lyric", lyricLine)
-                putExtra("is_playing", isPlaying)
-            }
-            context.sendBroadcast(lyricIntent)
-        } catch (_: Exception) {}
     }
 }

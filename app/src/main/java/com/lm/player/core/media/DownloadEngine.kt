@@ -78,6 +78,80 @@ class DownloadEngine(
         .stateIn(coroutineScope, SharingStarted.Eagerly, emptyList())
 
     private val jobMap = ConcurrentHashMap<String, Job>()
+    private val urlResolverMap = ConcurrentHashMap<String, suspend () -> String?>()
+
+    /**
+     * 从文件魔数头 (Magic Bytes)、Content-Type 或 URL 参数精准识别音频真实封装扩展名
+     */
+    fun detectAudioExtension(file: File?, streamUrl: String = "", contentType: String = ""): String? {
+        if (file != null && file.exists() && file.length() >= 12L) {
+            try {
+                val header = ByteArray(12)
+                java.io.FileInputStream(file).use { it.read(header) }
+                // 1. FLAC: "fLaC" (0x66 0x4C 0x61 0x43)
+                if (header[0] == 0x66.toByte() && header[1] == 0x4C.toByte() &&
+                    header[2] == 0x61.toByte() && header[3] == 0x43.toByte()
+                ) {
+                    return "flac"
+                }
+                // 2. WAV: "RIFF" ... "WAVE"
+                if (header[0] == 'R'.code.toByte() && header[1] == 'I'.code.toByte() &&
+                    header[2] == 'F'.code.toByte() && header[3] == 'F'.code.toByte() &&
+                    header[8] == 'W'.code.toByte() && header[9] == 'A'.code.toByte() &&
+                    header[10] == 'V'.code.toByte() && header[11] == 'E'.code.toByte()
+                ) {
+                    return "wav"
+                }
+                // 3. OGG: "OggS"
+                if (header[0] == 'O'.code.toByte() && header[1] == 'g'.code.toByte() &&
+                    header[2] == 'g'.code.toByte() && header[3] == 'S'.code.toByte()
+                ) {
+                    return "ogg"
+                }
+                // 4. MP4/M4A: "ftyp" at offset 4
+                if (header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
+                    header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte()
+                ) {
+                    return "m4a"
+                }
+                // 5. MP3: "ID3" or MPEG frame sync (0xFF 0xE0)
+                if ((header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() && header[2] == '3'.code.toByte()) ||
+                    (header[0] == 0xFF.toByte() && (header[1].toInt() and 0xE0) == 0xE0)
+                ) {
+                    return "mp3"
+                }
+            } catch (_: Exception) {}
+        }
+
+        val ct = contentType.lowercase()
+        when {
+            ct.contains("flac") -> return "flac"
+            ct.contains("wav") || ct.contains("wave") -> return "wav"
+            ct.contains("ogg") -> return "ogg"
+            ct.contains("mp4") || ct.contains("m4a") -> return "m4a"
+            ct.contains("aac") -> return "aac"
+            ct.contains("mpeg") || ct.contains("mp3") -> return "mp3"
+        }
+
+        val decodedCandidate = try {
+            if (streamUrl.contains("url=")) {
+                java.net.URLDecoder.decode(streamUrl.substringAfter("url=").substringBefore("&"), "UTF-8")
+            } else if (streamUrl.contains("path=")) {
+                java.net.URLDecoder.decode(streamUrl.substringAfter("path=").substringBefore("&"), "UTF-8")
+            } else streamUrl
+        } catch (_: Exception) { streamUrl }
+
+        val cleanUrlPath = decodedCandidate.substringBefore("?").lowercase()
+        return when {
+            cleanUrlPath.endsWith(".flac") -> "flac"
+            cleanUrlPath.endsWith(".mp3") -> "mp3"
+            cleanUrlPath.endsWith(".m4a") -> "m4a"
+            cleanUrlPath.endsWith(".wav") -> "wav"
+            cleanUrlPath.endsWith(".ogg") -> "ogg"
+            cleanUrlPath.endsWith(".aac") -> "aac"
+            else -> null
+        }
+    }
 
     fun getDownloadDir(): File {
         val customPath = downloadSettings.value.customDownloadPath
@@ -155,9 +229,30 @@ class DownloadEngine(
     }
 
     private suspend fun saveOrUpdateSongEntity(song: UnifiedSong, localFilePath: String) {
+        val localFile = File(localFilePath)
+        val detectedExt = detectAudioExtension(localFile) ?: localFile.extension.lowercase().ifBlank { song.format.lowercase().ifBlank { "mp3" } }
+        val isLosslessExt = detectedExt in listOf("flac", "wav", "ape", "alac")
+        val computedBitRate = run {
+            val durSec = (song.durationMs / 1000L)
+            if (localFile.exists() && localFile.length() > 0 && durSec in 15..3600) {
+                ((localFile.length() * 8L) / (durSec * 1000L)).toInt().coerceIn(64, 4608)
+            } else if (isLosslessExt) {
+                song.bitRate.coerceAtLeast(960)
+            } else {
+                if (song.bitRate > 0) song.bitRate else 320
+            }
+        }
+
         val existing = songDao.getSongById(song.id)
         if (existing != null) {
-            songDao.updateDownloadStatusAndTimestamp(song.id, DownloadStatus.DOWNLOADED, localFilePath, System.currentTimeMillis())
+            songDao.updateDownloadStatusSpecsAndTimestamp(
+                songId = song.id,
+                status = DownloadStatus.DOWNLOADED,
+                localPath = localFilePath,
+                format = detectedExt,
+                bitRate = computedBitRate,
+                timestamp = System.currentTimeMillis()
+            )
         } else {
             val safeRelativePath = song.relativeFolderPath?.takeIf {
                 !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100
@@ -175,8 +270,8 @@ class DownloadEngine(
                 serverId = if (song.serverId == "lemon_online" || song.serverId.isBlank()) "local_storage" else song.serverId,
                 localFilePath = localFilePath,
                 downloadStatus = DownloadStatus.DOWNLOADED,
-                bitRate = if (song.bitRate > 0) song.bitRate else 320,
-                format = song.format.ifBlank { "mp3" },
+                bitRate = computedBitRate,
+                format = detectedExt,
                 isFavorite = song.isFavorite,
                 relativeFolderPath = safeRelativePath,
                 addedTimestamp = System.currentTimeMillis()
@@ -200,9 +295,14 @@ class DownloadEngine(
             return
         }
 
+        if (urlResolver != null) {
+            urlResolverMap[song.id] = urlResolver
+        }
+
         // 立即向活跃任务映射中加入，确保 UI 在点击瞬间立即可见 (避免直链解析网络延迟导致下载中空白)
         updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
 
+        var currentJob: Job? = null
         val job = coroutineScope.launch(Dispatchers.IO) {
             val dbRelativePath = if (song.relativeFolderPath.isNullOrBlank()) {
                 try {
@@ -225,17 +325,25 @@ class DownloadEngine(
             val destFile = getTargetDownloadFile(songToDownload, effectiveFolderHierarchy)
             val tempFile = File("${destFile.absolutePath}.download")
 
-            // 1. 防重复下载检测与核对：检查 Room 数据库与本地文件真实性
+            // 1. 防重复下载检测与核对：仅当目标同名同音质格式物理文件已存在且非空时才跳过下载
             val record = downloadDao.getDownloadRecord(song.id)
-            val isRecordDownloaded = record?.status == DownloadStatus.DOWNLOADED &&
-                    !record.localFilePath.isNullOrBlank() &&
-                    File(record.localFilePath).let { it.exists() && it.length() > 0 }
+            val requestedLossless = song.format.equals("flac", ignoreCase = true) || song.bitRate >= 800
+            fun isExistingFileCompatible(path: String?): Boolean {
+                if (path.isNullOrBlank()) return false
+                val f = File(path)
+                if (!f.exists() || f.length() <= 0L || f.name.endsWith(".download")) return false
+                if (requestedLossless) {
+                    val realExt = detectAudioExtension(f) ?: f.extension.lowercase()
+                    return realExt in listOf("flac", "wav", "ape", "alac")
+                }
+                return true
+            }
 
-            val isDestFileValid = destFile.exists() && destFile.length() > 0 && !tempFile.exists()
-            val isLocalPathValid = !song.localFilePath.isNullOrBlank() &&
-                    File(song.localFilePath).let { it.exists() && it.length() > 0 && it.name != tempFile.name }
+            val isDestFileValid = destFile.exists() && destFile.length() > 0 && !tempFile.exists() && isExistingFileCompatible(destFile.absolutePath)
+            val isRecordDownloaded = record?.status == DownloadStatus.DOWNLOADED && isExistingFileCompatible(record.localFilePath)
+            val isLocalPathValid = isExistingFileCompatible(song.localFilePath)
 
-            if (isRecordDownloaded || isDestFileValid || isLocalPathValid) {
+            if (isDestFileValid || isRecordDownloaded || isLocalPathValid) {
                 val validPath = when {
                     isDestFileValid -> destFile.absolutePath
                     isRecordDownloaded -> record!!.localFilePath!!
@@ -257,6 +365,7 @@ class DownloadEngine(
                     )
                 )
                 removeTask(song.id)
+                urlResolverMap.remove(song.id)
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "「${song.title}」已在本地下载完成", Toast.LENGTH_SHORT).show()
                 }
@@ -285,12 +394,16 @@ class DownloadEngine(
                 try {
                     // 动态解析真实直链（若有传入 urlResolver 且 streamUrl 为空或占位协议）
                     var effectiveStreamUrl = song.streamUrl
+                    val activeResolver = urlResolver ?: urlResolverMap[song.id]
                     if (effectiveStreamUrl.isBlank() || effectiveStreamUrl.startsWith("lemon_online://")) {
-                        if (urlResolver != null) {
-                            val resolved = runCatching { urlResolver() }.getOrNull()
+                        if (activeResolver != null) {
+                            val resolved = runCatching { activeResolver() }.getOrNull()
                             if (!resolved.isNullOrBlank()) {
                                 effectiveStreamUrl = resolved
                             }
+                        }
+                        if (effectiveStreamUrl.isBlank() && !record?.remoteUrl.isNullOrBlank() && record?.remoteUrl?.startsWith("http") == true) {
+                            effectiveStreamUrl = record.remoteUrl
                         }
                     }
 
@@ -298,86 +411,93 @@ class DownloadEngine(
                         throw Exception("未能解析或获取有效的音频直链")
                     }
 
-                    // 动态校准真实文件后缀扩展名
-                    val cleanUrlPath = effectiveStreamUrl.substringBefore("?").lowercase()
-                    val detectedExt = when {
-                        cleanUrlPath.endsWith(".flac") -> "flac"
-                        cleanUrlPath.endsWith(".mp3") -> "mp3"
-                        cleanUrlPath.endsWith(".m4a") -> "m4a"
-                        cleanUrlPath.endsWith(".wav") -> "wav"
-                        cleanUrlPath.endsWith(".ogg") -> "ogg"
-                        cleanUrlPath.endsWith(".aac") -> "aac"
-                        else -> null
-                    }
-                    if (detectedExt != null && !destFile.name.endsWith(".$detectedExt", ignoreCase = true)) {
-                        actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$detectedExt")
+                    // 初步根据 URL 校准后缀扩展名
+                    val preDetectedExt = detectAudioExtension(null, effectiveStreamUrl, "")
+                    if (preDetectedExt != null && !destFile.name.endsWith(".$preDetectedExt", ignoreCase = true)) {
+                        actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$preDetectedExt")
                     }
 
                     val tempDestFile = File("${actualDestFile.absolutePath}.download")
-                    val existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
+                    var existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
 
-                    val requestBuilder = Request.Builder()
-                        .url(effectiveStreamUrl)
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                        .header("Accept", "*/*")
-
-                    if (existingBytes > 0L) {
-                        requestBuilder.header("Range", "bytes=$existingBytes-")
+                    fun buildDownloadRequest(rangeStart: Long): Request {
+                        val rb = Request.Builder()
+                            .url(effectiveStreamUrl)
+                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                            .header("Accept", "*/*")
+                        if (rangeStart > 0L) {
+                            rb.header("Range", "bytes=$rangeStart-")
+                        }
+                        return rb.build()
                     }
 
-                    val request = requestBuilder.build()
-                    val response = okHttpClient.newCall(request).execute()
-
-                    if (!response.isSuccessful && response.code != 416) {
-                        throw Exception("HTTP 下载失败: ${response.code}")
+                    var response = okHttpClient.newCall(buildDownloadRequest(existingBytes)).execute()
+                    if (response.code == 416 && existingBytes > 0L) {
+                        response.close()
+                        tempDestFile.delete()
+                        existingBytes = 0L
+                        response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
                     }
 
-                    val isRangeOk = response.code == 206
-                    val append = isRangeOk && existingBytes > 0L
-                    val body = response.body ?: throw Exception("响应体为空")
-                    val totalLength = if (isRangeOk) {
-                        existingBytes + body.contentLength()
-                    } else {
-                        if (!append && tempDestFile.exists()) tempDestFile.delete()
-                        body.contentLength()
-                    }
+                    response.use { resp ->
+                        if (!resp.isSuccessful) {
+                            throw Exception("HTTP 下载失败: ${resp.code}")
+                        }
 
-                    var lastTime = System.currentTimeMillis()
-                    var lastBytes = if (append) existingBytes else 0L
-                    var totalRead = if (append) existingBytes else 0L
+                        val isRangeOk = resp.code == 206
+                        val append = isRangeOk && existingBytes > 0L
+                        val body = resp.body ?: throw Exception("响应体为空")
+                        val contentTypeHeader = resp.header("Content-Type").orEmpty()
+                        val totalLength = if (isRangeOk) {
+                            existingBytes + body.contentLength()
+                        } else {
+                            if (!append && tempDestFile.exists()) tempDestFile.delete()
+                            body.contentLength()
+                        }
 
-                    body.byteStream().use { input ->
-                        FileOutputStream(tempDestFile, append).use { output ->
-                            val buffer = ByteArray(8 * 1024)
-                            var bytesRead: Int
+                        var lastTime = System.currentTimeMillis()
+                        var lastBytes = if (append) existingBytes else 0L
+                        var totalRead = if (append) existingBytes else 0L
 
-                            while (input.read(buffer).also { bytesRead = it } != -1) {
-                                output.write(buffer, 0, bytesRead)
-                                totalRead += bytesRead
+                        body.byteStream().use { input ->
+                            FileOutputStream(tempDestFile, append).use { output ->
+                                val buffer = ByteArray(8 * 1024)
+                                var bytesRead: Int
 
-                                val now = System.currentTimeMillis()
-                                if (now - lastTime >= 300 || totalRead == totalLength) {
-                                    val speed = if (now > lastTime) ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L else 0L
-                                    lastTime = now
-                                    lastBytes = totalRead
-                                    val progress = if (totalLength > 0) (totalRead.toFloat() / totalLength).coerceIn(0f, 1f) else 0f
-                                    updateTask(
-                                        DownloadTask(
-                                            song = song.copy(streamUrl = effectiveStreamUrl),
-                                            progress = progress,
-                                            bytesDownloaded = totalRead,
-                                            totalBytes = totalLength,
-                                            speedKbps = speed,
-                                            status = DownloadStatus.DOWNLOADING
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                    totalRead += bytesRead
+
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastTime >= 300 || totalRead == totalLength) {
+                                        val speed = if (now > lastTime) ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L else 0L
+                                        lastTime = now
+                                        lastBytes = totalRead
+                                        val progress = if (totalLength > 0) (totalRead.toFloat() / totalLength).coerceIn(0f, 1f) else 0f
+                                        updateTask(
+                                            DownloadTask(
+                                                song = song.copy(streamUrl = effectiveStreamUrl),
+                                                progress = progress,
+                                                bytesDownloaded = totalRead,
+                                                totalBytes = totalLength,
+                                                speedKbps = speed,
+                                                status = DownloadStatus.DOWNLOADING
+                                            )
                                         )
-                                    )
+                                    }
                                 }
+                                output.flush()
                             }
-                            output.flush()
+                        }
+
+                        // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
+                        val realAudioExt = detectAudioExtension(tempDestFile, effectiveStreamUrl, contentTypeHeader)
+                        if (realAudioExt != null && !actualDestFile.name.endsWith(".$realAudioExt", ignoreCase = true)) {
+                            actualDestFile = File(actualDestFile.parentFile, "${actualDestFile.nameWithoutExtension}.$realAudioExt")
                         }
                     }
 
-                    // 下载完成，原子化重命名临时文件为正式音频文件
+                    // 原子化重命名临时文件为正式音频文件
                     if (actualDestFile.exists()) {
                         actualDestFile.delete()
                     }
@@ -386,9 +506,16 @@ class DownloadEngine(
                         tempDestFile.delete()
                     }
 
+                    val finalExt = actualDestFile.extension.lowercase().ifBlank { song.format.lowercase() }
+                    val finalSong = song.copy(
+                        streamUrl = effectiveStreamUrl,
+                        format = finalExt,
+                        bitRate = if (finalExt in listOf("flac", "wav")) song.bitRate.coerceAtLeast(960) else song.bitRate
+                    )
+
                     // 4. 后置元数据处理：拉取高清封面、原始同步歌词、生成伴随 .lrc 以及音频内嵌 ID3/FLAC/M4A 标签
-                    val localCoverPath = postProcessDownloadedFile(actualDestFile, song)
-                    val effectiveCover = if (!localCoverPath.isNullOrBlank() && song.coverUrl.isBlank()) localCoverPath else song.coverUrl
+                    val localCoverPath = postProcessDownloadedFile(actualDestFile, finalSong)
+                    val effectiveCover = if (!localCoverPath.isNullOrBlank() && finalSong.coverUrl.isBlank()) localCoverPath else finalSong.coverUrl
 
                     // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表
                     val completedEntity = initialEntity.copy(
@@ -401,8 +528,9 @@ class DownloadEngine(
                         completedTimestamp = System.currentTimeMillis()
                     )
                     downloadDao.insertOrUpdate(completedEntity)
-                    saveOrUpdateSongEntity(song.copy(streamUrl = effectiveStreamUrl, coverUrl = effectiveCover), actualDestFile.absolutePath)
+                    saveOrUpdateSongEntity(finalSong.copy(coverUrl = effectiveCover), actualDestFile.absolutePath)
                     removeTask(song.id)
+                    urlResolverMap.remove(song.id)
                     Log.i(TAG, "Song ${song.title} downloaded and tagged successfully to ${actualDestFile.absolutePath}")
 
                     withContext(Dispatchers.Main) {
@@ -428,15 +556,21 @@ class DownloadEngine(
                         downloadDao.insertOrUpdate(failedEntity)
                         songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null)
                         removeTask(song.id)
+                        urlResolverMap.remove(song.id)
                         withContext(Dispatchers.Main) {
                             Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
                         }
                     }
                 } finally {
-                    jobMap.remove(song.id)
+                    if (currentJob != null) {
+                        jobMap.remove(song.id, currentJob)
+                    } else {
+                        jobMap.remove(song.id)
+                    }
                 }
             }
         }
+        currentJob = job
         jobMap[song.id] = job
     }
 
@@ -445,8 +579,7 @@ class DownloadEngine(
      */
     fun pauseTask(songId: String) {
         val task = _activeTasksMap.value[songId] ?: return
-        jobMap[songId]?.cancel()
-        jobMap.remove(songId)
+        jobMap.remove(songId)?.cancel()
         updateTask(task.copy(status = DownloadStatus.PAUSED, speedKbps = 0L))
         coroutineScope.launch(Dispatchers.IO) {
             downloadDao.getDownloadRecord(songId)?.let {
@@ -456,12 +589,12 @@ class DownloadEngine(
     }
 
     /**
-     * 恢复/继续已暂停的下载任务 (基于 HTTP Range 断点续传)
+     * 恢复/继续已暂停的下载任务 (基于 HTTP Range 断点续传，自动复用缓存的直链解析器)
      */
     fun resumeTask(songId: String) {
         val task = _activeTasksMap.value[songId] ?: return
         if (task.status == DownloadStatus.PAUSED || !jobMap.containsKey(songId)) {
-            startDownload(task.song)
+            startDownload(task.song, urlResolver = urlResolverMap[songId])
         }
     }
 
@@ -470,8 +603,8 @@ class DownloadEngine(
      */
     fun cancelTask(songId: String) {
         val task = _activeTasksMap.value[songId]
-        jobMap[songId]?.cancel()
-        jobMap.remove(songId)
+        jobMap.remove(songId)?.cancel()
+        urlResolverMap.remove(songId)
         removeTask(songId)
         coroutineScope.launch(Dispatchers.IO) {
             val record = downloadDao.getDownloadRecord(songId)
@@ -563,7 +696,7 @@ class DownloadEngine(
         val lemonPrefs = context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
         val embedCover = lemonPrefs.getBoolean("download_embed_cover", true)
         val embedLyric = lemonPrefs.getBoolean("download_embed_lyric", true)
-        val downloadLrc = lemonPrefs.getBoolean("download_lrc_file", true)
+        val downloadLrc = lemonPrefs.getBoolean("download_lrc_file_v2", false)
 
         var localCoverPath: String? = null
         var coverBytes: ByteArray? = null
@@ -719,7 +852,7 @@ class DownloadEngine(
      * 删除已完成下载的本地歌曲文件与数据库记录
      */
     fun deleteDownloadedSong(song: UnifiedSong) {
-        cancelDownload(song.id)
+        cancelTask(song.id)
         coroutineScope.launch(Dispatchers.IO) {
             val record = downloadDao.getDownloadRecord(song.id)
             if (record?.localFilePath != null) {
@@ -755,7 +888,7 @@ class DownloadEngine(
      */
     fun deleteDownloadedSongs(songs: List<UnifiedSong>) {
         if (songs.isEmpty()) return
-        songs.forEach { cancelDownload(it.id) }
+        songs.forEach { cancelTask(it.id) }
         coroutineScope.launch(Dispatchers.IO) {
             var freedBytes = 0L
             val downloadDir = getDownloadDir()

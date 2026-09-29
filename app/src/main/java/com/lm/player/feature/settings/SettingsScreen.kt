@@ -90,6 +90,7 @@ fun SettingsScreen(
     onChooseDownloadDirectory: () -> Unit = {},
     onImportCustomFolder: () -> Unit = {},
     onLocalScanCompleted: () -> Unit = {},
+    onStreamQualityChanged: () -> Unit = {},
     onOpenDownloads: () -> Unit,
     onExitAppCompletely: () -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
@@ -123,10 +124,13 @@ fun SettingsScreen(
         mutableStateOf(prefs.getBoolean("download_embed_lyric", true))
     }
     var downloadLrcFile by remember {
-        mutableStateOf(prefs.getBoolean("download_lrc_file", true))
+        mutableStateOf(prefs.getBoolean("download_lrc_file_v2", false))
+    }
+    var maxConcurrentDownloads by remember(downloadSettings.maxConcurrent) {
+        mutableIntStateOf(downloadSettings.maxConcurrent.coerceIn(1, 6))
     }
 
-    // 在线试听音质与试听缓存偏好设置
+    // 在线试听音质与试听缓存偏好设置 (默认关闭边听边存)
     var wifiStreamQuality by remember {
         mutableStateOf(AudioQuality.fromKey(prefs.getString("wifi_stream_quality", "320k") ?: "320k"))
     }
@@ -134,7 +138,7 @@ fun SettingsScreen(
         mutableStateOf(AudioQuality.fromKey(prefs.getString("cellular_stream_quality", "128k") ?: "128k"))
     }
     var streamCacheEnabled by remember {
-        mutableStateOf(prefs.getBoolean("stream_cache_enabled", true))
+        mutableStateOf(prefs.getBoolean("stream_cache_enabled_v2", false))
     }
 
     // 弹窗状态
@@ -189,7 +193,7 @@ fun SettingsScreen(
 
     val activeServer = servers.firstOrNull { it.id == activeServerId } ?: servers.firstOrNull { it.isCurrentActive }
 
-    // 当切换到音源脚本或存储路径 Tab 时，若连接了柠檬音乐则自动拉取
+    // 当切换到音源脚本、下载偏好或存储路径 Tab 时，若连接了柠檬音乐则自动拉取同步
     LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
         if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
             isLoadingScripts = true
@@ -198,6 +202,19 @@ fun SettingsScreen(
             val result = proto.fetchSourceList()
             sourceScripts = result.getOrDefault(emptyList())
             isLoadingScripts = false
+        }
+        if (selectedTab == SettingsTab.DOWNLOAD && activeServer?.type == ServerType.LEMON_MUSIC) {
+            val client = NetworkClientFactory.createOkHttpClient(context)
+            val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+            val settingsObj = proto.getServerSettings().getOrNull()
+            if (settingsObj != null) {
+                val serverMax = settingsObj.optString("download.maxDownloadNum").toIntOrNull()
+                if (serverMax != null && serverMax in 1..10 && !prefs.contains("user_set_max_concurrent")) {
+                    val clamped = serverMax.coerceIn(1, 6)
+                    maxConcurrentDownloads = clamped
+                    onDownloadSettingsChange(downloadSettings.copy(maxConcurrent = clamped))
+                }
+            }
         }
         if (selectedTab == SettingsTab.LIBRARY_PATHS && activeServer?.type == ServerType.LEMON_MUSIC) {
             isLoadingServerPaths = true
@@ -260,16 +277,16 @@ fun SettingsScreen(
             Text(
                 text = "设置",
                 style = TextStyle(
-                    fontSize = 32.sp * dimensions.fontScale,
+                    fontSize = dimensions.pageTitleSize,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground
                 )
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "个性化您的音乐播放与同步体验 · 对标柠檬音乐",
+                text = "个性化您的音乐播放与同步体验 · 统一视觉规格",
                 style = TextStyle(
-                    fontSize = 12.sp,
+                    fontSize = dimensions.captionSize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             )
@@ -307,7 +324,7 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = tab.label,
-                                fontSize = 13.sp,
+                                fontSize = dimensions.bodySize,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                                 color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface
                             )
@@ -512,12 +529,11 @@ fun SettingsScreen(
                                             hasUpdate = false,
                                             latestVersion = curVerName,
                                             latestVersionCode = curVerCode.toInt(),
-                                            releaseNotes = "【v${curVerName} 最新更新日志】\n\n" +
-                                                "1. 全品牌安卓灵动岛上岛适配：深度适配小米澎湃OS超级岛/焦点通知、OPPO流体云、vivo原子岛、荣耀灵动胶囊与魅族状态栏歌词\n" +
-                                                "2. 系统级媒体会话封面与进度直推：自动提取内嵌/云端高清封面注入 MediaSession 与 MediaStyle 通知，解决系统灵动岛无封面或不识别问题\n" +
-                                                "3. 内置交互式灵动岛胶囊与展开播控面板：支持旋转黑胶封面、四柱音频律动波纹、实时双行歌词翻滚及左右滑动切歌\n" +
-                                                "4. 灵动岛与状态栏实时歌词推送：后台播放服务毫秒级驱动同步歌词上岛与蓝牙车载仪表盘广播\n" +
-                                                "5. 设置中心新增「安卓灵动岛与实时歌词上岛」配置专区：支持智能上岛/常驻胶囊/仅系统上岛多模式切换与动效预览",
+                                            releaseNotes = "【v${curVerName} 更新日志】\n\n" +
+                                                "1. 下载弹窗重构：界面精简美化，更名「双端下载」并支持单端已下载时智能置灰，直观显示文件大小\n" +
+                                                "2. 音质与大小精准显示：在线歌曲动态展示试听音质，本地下载精准识别真实格式 (FLAC/MP3) 与大小\n" +
+                                                "3. 定位按钮优化：改为小圆形纯图标悬浮按钮，修复滑动出现时的阴影重叠问题\n" +
+                                                "4. 后台灵动岛与稳定性：完善后台手机顶部灵动岛、无损 FLAC 标签头保护及全曲库防串歌匹配",
                                             downloadUrl = ""
                                         )
                                         showVersionNotesDialog = true
@@ -528,7 +544,7 @@ fun SettingsScreen(
                                 ) {
                                     Icon(Icons.Default.Notes, contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("更新日志", fontSize = 13.sp)
+                                    Text("更新日志", fontSize = dimensions.bodySize)
                                 }
                             }
                         }
@@ -1028,6 +1044,39 @@ fun SettingsScreen(
                                 }
                             )
 
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingDropdownRow(
+                                title = "同时下载缓存数设置",
+                                subtitle = "同步控制本机与柠檬音乐服务端并发下载任务数上限 (download.maxDownloadNum)",
+                                selectedValue = maxConcurrentDownloads,
+                                options = listOf(1, 2, 3, 4, 5, 6),
+                                getLabel = { count ->
+                                    when (count) {
+                                        1 -> "1 个任务 (单线程顺序下载)"
+                                        3 -> "3 个任务 (推荐默认)"
+                                        else -> "$count 个任务并行"
+                                    }
+                                },
+                                getSubtitle = { count -> "最多同时下载 $count 首歌曲，超出任务自动进入等待队列" },
+                                onSelect = { count ->
+                                    maxConcurrentDownloads = count
+                                    prefs.edit().putBoolean("user_set_max_concurrent", true).apply()
+                                    onDownloadSettingsChange(downloadSettings.copy(maxConcurrent = count))
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.maxDownloadNum" to count.toString()))
+                                        }
+                                    }
+                                }
+                            )
+
                             Spacer(modifier = Modifier.height(14.dp))
                             SettingSwitchRow(
                                 title = "内嵌高清专辑封面",
@@ -1036,6 +1085,17 @@ fun SettingsScreen(
                                 onCheckedChange = {
                                     embedCoverMeta = it
                                     prefs.edit().putBoolean("download_embed_cover", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isEmbedPic" to it.toString()))
+                                        }
+                                    }
                                 }
                             )
 
@@ -1047,17 +1107,39 @@ fun SettingsScreen(
                                 onCheckedChange = {
                                     embedLyricMeta = it
                                     prefs.edit().putBoolean("download_embed_lyric", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isEmbedLyric" to it.toString()))
+                                        }
+                                    }
                                 }
                             )
 
                             Spacer(modifier = Modifier.height(8.dp))
                             SettingSwitchRow(
                                 title = "同时保存 .lrc 独立歌词文件",
-                                subtitle = "在歌曲同级目录下保存独立同名 .lrc 歌词文件 (isDownloadLrc)",
+                                subtitle = "在歌曲同级目录下保存独立同名 .lrc 歌词文件 (默认关闭 · isDownloadLrc)",
                                 checked = downloadLrcFile,
                                 onCheckedChange = {
                                     downloadLrcFile = it
-                                    prefs.edit().putBoolean("download_lrc_file", it).apply()
+                                    prefs.edit().putBoolean("download_lrc_file_v2", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isDownloadLrc" to it.toString()))
+                                        }
+                                    }
                                 }
                             )
                         }
@@ -1072,14 +1154,15 @@ fun SettingsScreen(
                             SettingDropdownRow(
                                 icon = Icons.Default.Wifi,
                                 title = "Wi-Fi 状态试听音质",
-                                subtitle = "连接无线局域网时流式播放音质",
+                                subtitle = "连接无线局域网时流式播放音质 (立即生效)",
                                 selectedValue = wifiStreamQuality,
                                 options = AudioQuality.entries,
                                 getLabel = { "${it.label} [${it.badge}]" },
                                 getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
                                 onSelect = { q ->
                                     wifiStreamQuality = q
-                                    prefs.edit().putString("wifi_stream_quality", q.key).apply()
+                                    prefs.edit().putString("wifi_stream_quality", q.key).commit()
+                                    onStreamQualityChanged()
                                 }
                             )
 
@@ -1089,14 +1172,15 @@ fun SettingsScreen(
                             SettingDropdownRow(
                                 icon = Icons.Default.SignalCellularAlt,
                                 title = "移动流量状态试听音质",
-                                subtitle = "使用蜂窝网络时播放音质 (建议标准/极高)",
+                                subtitle = "使用蜂窝网络时播放音质 (立即生效)",
                                 selectedValue = cellularStreamQuality,
                                 options = AudioQuality.entries,
                                 getLabel = { "${it.label} [${it.badge}]" },
                                 getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
                                 onSelect = { q ->
                                     cellularStreamQuality = q
-                                    prefs.edit().putString("cellular_stream_quality", q.key).apply()
+                                    prefs.edit().putString("cellular_stream_quality", q.key).commit()
+                                    onStreamQualityChanged()
                                 }
                             )
 
@@ -1107,11 +1191,11 @@ fun SettingsScreen(
                             // 3. 试听本地缓存开关
                             SettingSwitchRow(
                                 title = "在线试听边听边存",
-                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已彻底关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
+                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已默认关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
                                 checked = streamCacheEnabled,
                                 onCheckedChange = { isEnabled ->
                                     streamCacheEnabled = isEnabled
-                                    prefs.edit().putBoolean("stream_cache_enabled", isEnabled).apply()
+                                    prefs.edit().putBoolean("stream_cache_enabled_v2", isEnabled).apply()
                                     Media3Factory.setCacheEnabled(isEnabled)
                                 }
                             )
@@ -1171,12 +1255,22 @@ fun SettingsScreen(
 
                     item {
                         val systemIslandEnabled by DynamicIslandManager.systemIslandEnabledFlow.collectAsState()
-                        val liveLyricsOnIsland by DynamicIslandManager.liveLyricsOnIslandFlow.collectAsState()
                         val islandDisplayMode by DynamicIslandManager.islandDisplayModeFlow.collectAsState()
                         val showLyricsInPill by DynamicIslandManager.showLyricsInPillFlow.collectAsState()
                         val deviceIslandProfile = remember { DynamicIslandManager.getDeviceIslandProfile() }
+                        var hasOverlayPerm by remember { mutableStateOf(DynamicIslandManager.hasOverlayPermission(context)) }
+                        val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                        DisposableEffect(lifecycleOwner) {
+                            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                                    hasOverlayPerm = DynamicIslandManager.hasOverlayPermission(context)
+                                }
+                            }
+                            lifecycleOwner.lifecycle.addObserver(observer)
+                            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                        }
 
-                        SettingsCard(title = "安卓灵动岛与实时歌词上岛", icon = Icons.Default.AutoAwesome) {
+                        SettingsCard(title = "挂后台手机灵动岛设置", icon = Icons.Default.AutoAwesome) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
                                 color = AppleRed.copy(alpha = 0.10f),
@@ -1196,13 +1290,13 @@ fun SettingsScreen(
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Column {
                                         Text(
-                                            text = "当前设备灵动岛协议识别",
-                                            fontSize = 11.sp,
+                                            text = "当前设备后台上岛协议识别（默认使用厂商系统原生上岛）",
+                                            fontSize = dimensions.captionSize,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                         Text(
                                             text = deviceIslandProfile,
-                                            fontSize = 13.sp,
+                                            fontSize = dimensions.bodySize,
                                             fontWeight = FontWeight.Bold,
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
@@ -1213,26 +1307,17 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.height(14.dp))
 
                             SettingSwitchRow(
-                                title = "系统级原生上岛引擎",
-                                subtitle = "适配小米澎湃OS超级岛/焦点通知、OPPO流体云、vivo原子岛、荣耀灵动胶囊及系统媒体中心高清封面同步",
+                                title = "启用挂后台手机灵动岛",
+                                subtitle = "退到后台播放音乐时自动激活小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊等系统原生媒体岛",
                                 checked = systemIslandEnabled,
                                 onCheckedChange = { DynamicIslandManager.setSystemIslandEnabled(context, it) }
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))
 
-                            SettingSwitchRow(
-                                title = "灵动岛与状态栏实时歌词推送",
-                                subtitle = "将当前同步歌词实时推送至系统灵动岛、状态栏 Ticker (Flyme/OriginOS/ColorOS) 及车载蓝牙仪表盘",
-                                checked = liveLyricsOnIsland,
-                                onCheckedChange = { DynamicIslandManager.setLiveLyricsOnIsland(context, it) }
-                            )
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
                             SettingDropdownRow(
-                                title = "灵动岛展示模式",
-                                subtitle = "控制应用内顶部灵动胶囊与系统原生灵动岛的协同方式",
+                                title = "挂后台灵动岛通道模式",
+                                subtitle = "默认使用厂商系统原生媒体上岛，保持持久稳定在线不掉岛",
                                 selectedValue = islandDisplayMode,
                                 options = IslandDisplayMode.entries,
                                 getLabel = { it.label },
@@ -1240,38 +1325,130 @@ fun SettingsScreen(
                                 onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
                             )
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                            if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY) {
+                                Spacer(modifier = Modifier.height(12.dp))
 
-                            SettingSwitchRow(
-                                title = "紧凑胶囊优先滚动同步歌词",
-                                subtitle = "在顶部灵动胶囊中优先翻滚显示当前同步歌词，无歌词时展示歌名与歌手",
-                                checked = showLyricsInPill,
-                                onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
-                            )
+                                // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.10f) else Color(0xFFFF9500).copy(alpha = 0.12f),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.35f) else Color(0xFFFF9500).copy(alpha = 0.45f)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable {
+                                            if (!hasOverlayPerm) {
+                                                DynamicIslandManager.requestOverlayPermission(context)
+                                            }
+                                        }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (hasOverlayPerm) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                                                contentDescription = null,
+                                                tint = if (hasOverlayPerm) Color(0xFF34C759) else Color(0xFFFF9500),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Column {
+                                                Text(
+                                                    text = if (hasOverlayPerm) "概念版顶部悬浮胶囊权限：已授权" else "概念版顶部悬浮胶囊权限：未开启",
+                                                    fontSize = dimensions.bodySize,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = if (hasOverlayPerm) {
+                                                        "当按 Home 键退到手机桌面或切换应用时，手机顶部将自动浮现黑胶灵动岛胶囊"
+                                                    } else {
+                                                        "当前选择了概念版悬浮胶囊模式，请点击授予悬浮窗权限以在后台顶部展示胶囊"
+                                                    },
+                                                    fontSize = dimensions.captionSize,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                        if (!hasOverlayPerm) {
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = AppleRed
+                                            ) {
+                                                Text(
+                                                    text = "去开启",
+                                                    fontSize = dimensions.captionSize,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
 
-                            Spacer(modifier = Modifier.height(12.dp))
+                                Spacer(modifier = Modifier.height(10.dp))
 
-                            OutlinedButton(
-                                onClick = {
-                                    DynamicIslandManager.triggerIslandPreview(context)
-                                    Toast.makeText(context, "已触发灵动岛展开动效（播放歌曲时将在屏幕顶部居中展开）", Toast.LENGTH_SHORT).show()
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("立即测试并展开顶部灵动岛面板", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                SettingSwitchRow(
+                                    title = "后台紧凑胶囊优先滚动同步歌词",
+                                    subtitle = "在后台顶部紧凑胶囊中优先翻滚显示实时歌词，无歌词时显示歌名与歌手（长按胶囊可上下微调避开前摄挖孔）",
+                                    checked = showLyricsInPill,
+                                    onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
+                                )
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                OutlinedButton(
+                                    onClick = {
+                                        if (!DynamicIslandManager.hasOverlayPermission(context)) {
+                                            Toast.makeText(context, "请先授予悬浮窗权限以启用手机后台顶部灵动岛", Toast.LENGTH_SHORT).show()
+                                            DynamicIslandManager.requestOverlayPermission(context)
+                                        } else {
+                                            DynamicIslandManager.triggerIslandPreview(context)
+                                            Toast.makeText(context, "已在屏幕顶部启动 4.5 秒后台灵动岛真机预览（点击可展开/收起）", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
+                                }
                             }
                         }
                     }
 
                     item {
-                        SettingsCard(title = "界面外观与特效", icon = Icons.Default.Palette) {
+                        SettingsCard(title = "界面外观与字体规格", icon = Icons.Default.Palette) {
+                            SettingDropdownRow(
+                                title = "全局字体与排版规格",
+                                subtitle = "统一控制全应用 7 级标题、列表、正文与角标的字号层级缩放",
+                                icon = Icons.Default.FormatSize,
+                                selectedValue = currentScaleMode,
+                                options = UiScaleMode.entries,
+                                getLabel = { it.label },
+                                getSubtitle = { it.subtitle },
+                                onSelect = { onScaleModeChange(it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
                             SettingDropdownRow(
                                 title = "主题外观",
-                                subtitle = "选择系统全局视觉风格",
+                                subtitle = "选择系统全局视觉色彩风格",
+                                icon = Icons.Default.Brightness6,
                                 selectedValue = themeMode,
                                 options = listOf(AppThemeMode.FOLLOW_SYSTEM, AppThemeMode.DARK, AppThemeMode.LIGHT),
                                 getLabel = { mode ->
@@ -1285,7 +1462,7 @@ fun SettingsScreen(
                             )
 
                             Spacer(modifier = Modifier.height(16.dp))
-                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
                             Slider(
                                 value = blurAlpha,
                                 onValueChange = onBlurAlphaChange,
@@ -1313,7 +1490,7 @@ fun SettingsScreen(
                         ) {
                             Icon(Icons.Default.PowerSettingsNew, contentDescription = null, tint = MaterialTheme.colorScheme.error)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("彻底退出应用并停止后台服务", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                            Text("彻底退出应用并停止后台服务", color = MaterialTheme.colorScheme.error, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -2040,6 +2217,7 @@ private fun SettingsCard(
     icon: ImageVector,
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val dimensions = LocalAppDimensions.current
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val cardColor = if (isDark) Color(0xFF24242C) else Color.White
     val borderCol = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.06f)
@@ -2061,8 +2239,8 @@ private fun SettingsCard(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = title,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
+                    fontSize = dimensions.cardHeaderSize,
+                    fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
@@ -2077,13 +2255,14 @@ private fun SettingsCard(
  */
 @Composable
 private fun SettingInfoRow(label: String, value: String) {
+    val dimensions = LocalAppDimensions.current
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(label, fontSize = dimensions.bodySize, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, fontSize = dimensions.bodySize, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -2097,14 +2276,21 @@ private fun SettingSwitchRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
+    val dimensions = LocalAppDimensions.current
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 14.sp)
+            Text(title, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                subtitle,
+                fontSize = dimensions.captionSize,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                lineHeight = (dimensions.captionSize.value * 1.35f).sp
+            )
         }
         Switch(
             checked = checked,
@@ -2123,27 +2309,48 @@ private fun SettingActionRow(
     actionText: String,
     onAction: () -> Unit
 ) {
+    val dimensions = LocalAppDimensions.current
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 14.sp)
+            Text(
+                text = title,
+                fontSize = dimensions.itemTitleSize,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = subtitle,
+                fontSize = dimensions.captionSize,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                lineHeight = (dimensions.captionSize.value * 1.35f).sp
+            )
         }
         OutlinedButton(
             onClick = onAction,
             shape = RoundedCornerShape(10.dp),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            modifier = Modifier.widthIn(max = 124.dp)
         ) {
-            Text(actionText, fontSize = 12.sp)
+            Text(
+                text = actionText,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
 
 /**
- * 现代轻奢原生下拉选择行
+ * 现代轻奢原生下拉选择行（自适应宽度防挤压）
  */
 @Composable
 private fun <T> SettingDropdownRow(
@@ -2156,34 +2363,58 @@ private fun <T> SettingDropdownRow(
     getSubtitle: ((T) -> String)? = null,
     onSelect: (T) -> Unit
 ) {
+    val dimensions = LocalAppDimensions.current
     var expanded by remember { mutableStateOf(false) }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
+    // 针对右侧胶囊精简冗长括号后缀，保留核心名称，防止右侧胶囊过宽挤压左侧标题成竖列
+    val rawSelectedLabel = getLabel(selectedValue)
+    val compactPillLabel = remember(rawSelectedLabel) {
+        if (rawSelectedLabel.length > 10 && (rawSelectedLabel.contains(" (") || rawSelectedLabel.contains("（"))) {
+            rawSelectedLabel.substringBefore(" (").substringBefore("（").trim()
+        } else {
+            rawSelectedLabel
+        }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 5.dp),
+            .padding(vertical = 6.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Row(
-            modifier = Modifier.weight(1f),
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (icon != null) {
                 Icon(icon, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
             }
-            Column {
-                Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    fontSize = dimensions.itemTitleSize,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
                 if (!subtitle.isNullOrBlank()) {
-                    Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 13.sp)
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = subtitle,
+                        fontSize = dimensions.captionSize,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        lineHeight = (dimensions.captionSize.value * 1.35f).sp
+                    )
                 }
             }
         }
-
-        Spacer(modifier = Modifier.width(10.dp))
 
         Box {
             Surface(
@@ -2191,25 +2422,30 @@ private fun <T> SettingDropdownRow(
                 color = if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7),
                 border = BorderStroke(1.dp, borderColor),
                 modifier = Modifier
+                    .widthIn(min = 84.dp, max = 142.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { expanded = true }
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
                 ) {
                     Text(
-                        text = getLabel(selectedValue),
-                        fontSize = 12.sp,
+                        text = compactPillLabel,
+                        fontSize = dimensions.bodySize,
                         fontWeight = FontWeight.Bold,
-                        color = AppleRed
+                        color = AppleRed,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(2.dp))
                     Icon(
                         imageVector = Icons.Default.ArrowDropDown,
                         contentDescription = "展开下拉选择",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
@@ -2217,7 +2453,7 @@ private fun <T> SettingDropdownRow(
             DropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
-                modifier = Modifier.widthIn(min = 180.dp, max = 280.dp)
+                modifier = Modifier.widthIn(min = 200.dp, max = 280.dp)
             ) {
                 options.forEach { option ->
                     val isSelected = option == selectedValue
@@ -2228,16 +2464,16 @@ private fun <T> SettingDropdownRow(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                                     Text(
                                         text = getLabel(option),
-                                        fontSize = 13.sp,
+                                        fontSize = dimensions.bodySize,
                                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                         color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
                                     )
                                     getSubtitle?.invoke(option)?.let { sub ->
                                         if (sub.isNotBlank()) {
-                                            Text(sub, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(sub, fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                     }
                                 }

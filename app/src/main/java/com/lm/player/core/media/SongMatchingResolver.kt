@@ -24,6 +24,15 @@ object SongMatchingResolver {
     private const val TAG = "SongMatchingResolver"
     private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd", "dsf")
 
+    // 预编译正则表达式，彻底消除高频调用时成千上万次 Regex 实例分配与编译开销
+    private val TRACK_NUM_REGEX = Regex("""^\d{1,3}[\.\-\s_]+""")
+    private val BRACKET_SUFFIX_REGEX = Regex("""[\(\[\{（【][^\)\]\}）】]*[\)\]\}）】]""")
+    private val AUDIO_EXT_REGEX = Regex("""\.(mp3|flac|wav|m4a|aac|ogg|opus|ape|dsd|dsf)$""")
+
+    // 高并发内存记忆化缓存，避免同一曲库重复执行字符串正则替换
+    private val normalizedTitleCache = java.util.concurrent.ConcurrentHashMap<String, String>(2048)
+    private val normalizedArtistCache = java.util.concurrent.ConcurrentHashMap<String, String>(1024)
+
     /**
      * 规范化曲目标题
      * - 去除开头的音轨编号（如 "01. ", "01 - ", "1. ", "1 - ", "01_"）
@@ -31,13 +40,14 @@ object SongMatchingResolver {
      * - 去除音频文件扩展名
      */
     fun normalizeTrackTitle(title: String): String {
+        if (title.isBlank()) return ""
+        normalizedTitleCache[title]?.let { return it }
         var t = title.trim().lowercase()
-        // 去除开头的音轨号（如 "01. ", "01 - ", "1. ", "1 - ", "01 "）
-        t = t.replace(Regex("""^\d{1,3}[\.\-\s_]+"""), "").trim()
-        // 去除后缀括号（如 "(live)", "[flac]", "(feat. xxx)", "（官方版）", "【hires】" 等）
-        t = t.replace(Regex("""[\(\[\{（【][^\)\]\}）】]*[\)\]\}）】]"""), "").trim()
-        // 去除常见文件后缀
-        t = t.replace(Regex("""\.(mp3|flac|wav|m4a|aac|ogg|opus|ape|dsd|dsf)$"""), "").trim()
+        t = t.replace(TRACK_NUM_REGEX, "").trim()
+        t = t.replace(BRACKET_SUFFIX_REGEX, "").trim()
+        t = t.replace(AUDIO_EXT_REGEX, "").trim()
+        if (normalizedTitleCache.size > 8192) normalizedTitleCache.clear()
+        normalizedTitleCache[title] = t
         return t
     }
 
@@ -45,9 +55,13 @@ object SongMatchingResolver {
      * 规范化艺术家名称
      */
     fun normalizeArtist(artist: String): String {
+        if (artist.isBlank()) return ""
+        normalizedArtistCache[artist]?.let { return it }
         val a = artist.trim().lowercase()
-        if (a.contains("<unknown>") || a.contains("未知") || a == "local_storage" || a == "local_folder" || a == "local_saf") return ""
-        return a
+        val result = if (a.contains("<unknown>") || a.contains("未知") || a == "local_storage" || a == "local_folder" || a == "local_saf") "" else a
+        if (normalizedArtistCache.size > 4096) normalizedArtistCache.clear()
+        normalizedArtistCache[artist] = result
+        return result
     }
 
     /**
@@ -100,6 +114,17 @@ object SongMatchingResolver {
     ): List<UnifiedSong> {
         if (incomingSongs.isEmpty()) return emptyList()
 
+        val validPathMemo = HashMap<String, Boolean>(128)
+        fun isLocalPathValidFast(path: String?, status: DownloadStatus): Boolean {
+            if (path.isNullOrBlank()) return false
+            if (path.startsWith("content://")) return true
+            // 当处于纯内存列表解析 (downloadDir == null) 且状态已明确标记为 DOWNLOADED 时，避免在主线程重复触发磁盘 stat()
+            if (downloadDir == null && status == DownloadStatus.DOWNLOADED) return true
+            return validPathMemo.getOrPut(path) {
+                File(path).let { it.exists() && it.length() > 0 }
+            }
+        }
+
         // 1. 预构建内存快速哈希索引表
         val cachedById = HashMap<String, UnifiedSong>(allCachedSongs.size)
         val cachedByNormalizedKey = HashMap<String, UnifiedSong>(allCachedSongs.size)
@@ -107,9 +132,19 @@ object SongMatchingResolver {
 
         for (song in allCachedSongs) {
             cachedById[song.id] = song
-            val normKey = "${normalizeTrackTitle(song.title)}|||${normalizeArtist(song.artist)}"
-            if (!cachedByNormalizedKey.containsKey(normKey)) {
-                cachedByNormalizedKey[normKey] = song
+            val normTitle = normalizeTrackTitle(song.title)
+            val normArtist = normalizeArtist(song.artist)
+            if (normTitle.isNotBlank()) {
+                val normKey = "$normTitle|||$normArtist"
+                val existing = cachedByNormalizedKey[normKey]
+                val songHasValidLocal = isLocalPathValidFast(song.localFilePath, song.downloadStatus)
+                val existingHasValidLocal = existing != null && isLocalPathValidFast(existing.localFilePath, existing.downloadStatus)
+                if (existing == null ||
+                    (songHasValidLocal && !existingHasValidLocal) ||
+                    (song.streamUrl.isNotBlank() && existing.streamUrl.isBlank())
+                ) {
+                    cachedByNormalizedKey[normKey] = song
+                }
             }
             val path = song.localFilePath
             if (!path.isNullOrBlank()) {
@@ -117,7 +152,7 @@ object SongMatchingResolver {
             }
         }
 
-        val activeTaskBySongId = activeTasks.associateBy { it.song.id }
+        val activeTaskBySongId = if (activeTasks.isEmpty()) emptyMap() else activeTasks.associateBy { it.song.id }
 
         // 2. 收集离线存储目录中的物理文件（如果可用）
         val physicalFiles = if (downloadDir != null && downloadDir.exists() && downloadDir.isDirectory) {
@@ -144,19 +179,15 @@ object SongMatchingResolver {
             val normKey = "${normalizeTrackTitle(rawSong.title)}|||${normalizeArtist(rawSong.artist)}"
             val match = cachedById[rawSong.id] ?: cachedByNormalizedKey[normKey]
 
-            // 检查本地离线文件有效性
-            val matchHasLocal = match != null && (
-                match.downloadStatus == DownloadStatus.DOWNLOADED ||
-                !match.localFilePath.isNullOrBlank() ||
-                match.serverId in listOf("local_storage", "local_folder", "local_saf")
-            )
-            val selfPathValid = !rawSong.localFilePath.isNullOrBlank()
+            // 检查本地离线物理文件真实有效性（防止指向已删除或空路径导致播放失败）
+            val selfPathValid = isLocalPathValidFast(rawSong.localFilePath, rawSong.downloadStatus)
+            val matchHasLocal = match != null && isLocalPathValidFast(match.localFilePath, match.downloadStatus)
 
-            // 检查服务端存储状态
+            // 检查服务端存储状态（仅当匹配的服务器曲目本身具有有效流地址或非未就绪的在线占位符时视为服务端已存）
             val matchHasServer = match != null && (
                 match.serverId == "lemon_music" ||
                 (match.serverId.isNotBlank() && match.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online"))
-            )
+            ) && (!match.id.startsWith("lemon_online_") || match.streamUrl.isNotBlank())
 
             // 物理磁盘匹配（兜底）
             var matchedPhysicalPath: String? = null
@@ -165,7 +196,7 @@ object SongMatchingResolver {
                 val normArtist = normalizeArtist(rawSong.artist)
                 val matchedFile = physicalFiles.firstOrNull { f ->
                     val fName = normalizeTrackTitle(f.nameWithoutExtension)
-                    val titleMatch = fName == normTitle || fName.contains(normTitle) || normTitle.contains(fName)
+                    val titleMatch = normTitle.isNotBlank() && (fName == normTitle || fName.contains(normTitle) || normTitle.contains(fName))
                     val artistMatch = normArtist.isBlank() || f.absolutePath.lowercase().contains(normArtist) || fName.contains(normArtist)
                     titleMatch && artistMatch
                 }
@@ -182,6 +213,14 @@ object SongMatchingResolver {
                 rawSong.serverId.isNotBlank() && rawSong.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online") -> rawSong.serverId
                 hasLocal && (rawSong.serverId == "lemon_online" || rawSong.serverId.isBlank()) -> "local_storage"
                 else -> rawSong.serverId
+            }
+
+            // 优先使用本地已下载文件或柠檬音乐服务器已入库曲目流地址 (/api/play/local)，避免复用旧音质的临时代理流 (/api/play/proxy)
+            val effectiveStreamUrl = when {
+                rawSong.streamUrl.isNotBlank() && !rawSong.streamUrl.startsWith("lemon_online://") && !rawSong.streamUrl.contains("/api/play/proxy") -> rawSong.streamUrl
+                hasLocal && !effectiveLocalPath.isNullOrBlank() -> effectiveLocalPath
+                match != null && match.streamUrl.isNotBlank() && !match.streamUrl.startsWith("lemon_online://") && !match.streamUrl.contains("/api/play/proxy") -> match.streamUrl
+                else -> rawSong.streamUrl
             }
 
             val effectiveDownloadStatus = when {
@@ -209,12 +248,42 @@ object SongMatchingResolver {
                 else -> 0L
             }
 
+            val localExt = effectiveLocalPath?.takeIf { !it.startsWith("content://") }
+                ?.substringAfterLast('.', "")
+                ?.lowercase()
+                ?.takeIf { it in listOf("flac", "wav", "mp3", "m4a", "aac", "ogg", "ape", "alac") }
+
+            val effectiveFormat = when {
+                !localExt.isNullOrBlank() -> localExt
+                match != null && match.format.isNotBlank() && (hasLocal || rawSong.format.equals("mp3", ignoreCase = true)) -> match.format
+                else -> rawSong.format
+            }
+
+            val effectiveBitRate = when {
+                !effectiveLocalPath.isNullOrBlank() && !effectiveLocalPath.startsWith("content://") -> {
+                    val f = File(effectiveLocalPath)
+                    val durSec = ((if (rawSong.durationMs > 0) rawSong.durationMs else (match?.durationMs ?: 0L)) / 1000L)
+                    if (f.exists() && f.length() > 0 && durSec in 15..3600) {
+                        ((f.length() * 8L) / (durSec * 1000L)).toInt().coerceIn(64, 4608)
+                    } else if (effectiveFormat in listOf("flac", "wav", "ape", "alac")) {
+                        (match?.bitRate ?: rawSong.bitRate).coerceAtLeast(960)
+                    } else {
+                        match?.bitRate ?: rawSong.bitRate
+                    }
+                }
+                effectiveFormat in listOf("flac", "wav", "ape", "alac") -> (match?.bitRate ?: rawSong.bitRate).coerceAtLeast(960)
+                else -> rawSong.bitRate
+            }
+
             rawSong.copy(
                 serverId = effectiveServerId,
+                streamUrl = effectiveStreamUrl,
                 localFilePath = effectiveLocalPath,
                 downloadStatus = effectiveDownloadStatus,
                 downloadProgress = effectiveProgress,
                 coverUrl = effectiveCover,
+                format = effectiveFormat,
+                bitRate = effectiveBitRate,
                 addedTimestamp = effectiveAddedTimestamp
             )
         }
@@ -254,22 +323,40 @@ object SongMatchingResolver {
         val existingById = existingSongs.associateBy { it.id }
         val existingDownloads = database.downloadDao().getAllDownloadsList().associateBy { it.songId }
 
-        // 2. 收集已有独立扫描的本地歌曲 (local_storage / local_folder / local_saf)
-        val localScannedSongs = existingSongs.filter {
-            it.serverId in listOf("local_storage", "local_folder", "local_saf")
+        // 预构建规范化标题分桶索引，将 O(N^2) 全表扫描优化为 O(1) 哈希桶查找
+        val existingByNormTitle = HashMap<String, MutableList<SongEntity>>(existingSongs.size)
+        val localScannedByNormTitle = HashMap<String, MutableList<SongEntity>>(256)
+        for (song in existingSongs) {
+            val normT = normalizeTrackTitle(song.title)
+            if (normT.isNotBlank()) {
+                existingByNormTitle.getOrPut(normT) { ArrayList(2) }.add(song)
+                if (song.serverId in listOf("local_storage", "local_folder", "local_saf")) {
+                    localScannedByNormTitle.getOrPut(normT) { ArrayList(2) }.add(song)
+                }
+            }
+        }
+
+        val validFileMemo = HashMap<String, Boolean>(256)
+        fun checkFileExists(path: String?): Boolean {
+            if (path.isNullOrBlank()) return false
+            if (path.startsWith("content://")) return true
+            return validFileMemo.getOrPut(path) {
+                File(path).let { it.exists() && it.length() > 0 }
+            }
         }
 
         // 3. 构建保护性实体集合
         val preservedEntities = incomingServerSongs.map { incoming ->
             val existing = existingById[incoming.id]
             val download = existingDownloads[incoming.id]
+            val normIncomingTitle = normalizeTrackTitle(incoming.title)
 
             // 检查已记录的本地路径有效性
             val existingPath = existing?.localFilePath
-            val isExistingFileValid = !existingPath.isNullOrBlank() && File(existingPath).let { it.exists() && it.length() > 0 }
+            val isExistingFileValid = checkFileExists(existingPath)
 
             val downloadPath = download?.localFilePath
-            val isDownloadFileValid = !downloadPath.isNullOrBlank() && File(downloadPath).let { it.exists() && it.length() > 0 }
+            val isDownloadFileValid = checkFileExists(downloadPath)
 
             var validLocalPath = when {
                 isExistingFileValid -> existingPath
@@ -277,9 +364,9 @@ object SongMatchingResolver {
                 else -> null
             }
 
-            // 若依然未找到本地文件，尝试在本地扫描独立歌曲中进行一次规范化标题与歌手匹配
-            if (validLocalPath == null && localScannedSongs.isNotEmpty()) {
-                val matchedLocal = localScannedSongs.firstOrNull { local ->
+            // 若依然未找到本地文件，尝试在本地扫描独立歌曲的同标题哈希桶中进行 O(1) 匹配
+            if (validLocalPath == null && normIncomingTitle.isNotBlank()) {
+                val matchedLocal = localScannedByNormTitle[normIncomingTitle]?.firstOrNull { local ->
                     isSongMatch(
                         title1 = incoming.title,
                         artist1 = incoming.artist,
@@ -289,21 +376,23 @@ object SongMatchingResolver {
                         durationMs2 = local.durationMs
                     )
                 }
-                if (matchedLocal?.localFilePath != null && File(matchedLocal.localFilePath).exists()) {
+                if (matchedLocal?.localFilePath != null && checkFileExists(matchedLocal.localFilePath)) {
                     validLocalPath = matchedLocal.localFilePath
                 }
             }
 
-            val existingMatch = existing ?: existingSongs.firstOrNull {
-                isSongMatch(
-                    title1 = incoming.title,
-                    artist1 = incoming.artist,
-                    durationMs1 = incoming.durationMs,
-                    title2 = it.title,
-                    artist2 = it.artist,
-                    durationMs2 = it.durationMs
-                )
-            }
+            val existingMatch = existing ?: if (normIncomingTitle.isNotBlank()) {
+                existingByNormTitle[normIncomingTitle]?.firstOrNull {
+                    isSongMatch(
+                        title1 = incoming.title,
+                        artist1 = incoming.artist,
+                        durationMs1 = incoming.durationMs,
+                        title2 = it.title,
+                        artist2 = it.artist,
+                        durationMs2 = it.durationMs
+                    )
+                }
+            } else null
             val finalTimestamp = when {
                 existing != null && existing.addedTimestamp > 0 -> existing.addedTimestamp
                 existingMatch != null && existingMatch.addedTimestamp > 0 -> existingMatch.addedTimestamp
@@ -319,9 +408,22 @@ object SongMatchingResolver {
             val finalRelPath = candidateRelPath?.takeIf { !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100 }
             val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existing?.coverUrl ?: existingMatch?.coverUrl ?: "")
 
+            val localExt = validLocalPath?.takeIf { !it.startsWith("content://") }
+                ?.substringAfterLast('.', "")
+                ?.lowercase()
+                ?.takeIf { it in listOf("flac", "wav", "mp3", "m4a", "aac", "ogg", "ape", "alac") }
+            val finalFormat = localExt ?: incoming.format
+            val finalBitRate = if (!localExt.isNullOrBlank() && localExt in listOf("flac", "wav", "ape", "alac")) {
+                incoming.bitRate.coerceAtLeast(960)
+            } else {
+                incoming.bitRate
+            }
+
             incoming.copy(
                 localFilePath = validLocalPath,
                 downloadStatus = finalDownloadStatus,
+                format = finalFormat,
+                bitRate = finalBitRate,
                 isFavorite = finalIsFavorite,
                 relativeFolderPath = finalRelPath,
                 coverUrl = finalCover,

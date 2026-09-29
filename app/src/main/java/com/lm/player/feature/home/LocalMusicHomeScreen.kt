@@ -21,6 +21,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -47,24 +48,184 @@ import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
 
 /**
- * 格式化已下载音频的技术参数与文件大小
+ * 精准解析本地已下载文件的真实封装格式 (支持魔数头 fLaC 校验)、真实码率与真实物理文件大小
+ */
+fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String> {
+    val localPath = song.localFilePath
+    val localFile = if (!localPath.isNullOrBlank() && !localPath.startsWith("content://")) {
+        try {
+            java.io.File(localPath).takeIf { it.exists() && it.length() > 0L }
+        } catch (_: Exception) { null }
+    } else null
+
+    val detectedExt = if (localFile != null) {
+        val magicExt = try {
+            if (localFile.length() >= 12L) {
+                val h = ByteArray(12)
+                java.io.FileInputStream(localFile).use { it.read(h) }
+                when {
+                    h[0] == 0x66.toByte() && h[1] == 0x4C.toByte() && h[2] == 0x61.toByte() && h[3] == 0x43.toByte() -> "FLAC"
+                    h[0] == 'R'.code.toByte() && h[1] == 'I'.code.toByte() && h[2] == 'F'.code.toByte() && h[3] == 'F'.code.toByte() -> "WAV"
+                    h[0] == 'O'.code.toByte() && h[1] == 'g'.code.toByte() && h[2] == 'g'.code.toByte() && h[3] == 'S'.code.toByte() -> "OGG"
+                    h[4] == 'f'.code.toByte() && h[5] == 't'.code.toByte() && h[6] == 'y'.code.toByte() && h[7] == 'p'.code.toByte() -> "M4A"
+                    else -> null
+                }
+            } else null
+        } catch (_: Exception) { null }
+        magicExt ?: localFile.extension.uppercase().ifBlank { song.format.uppercase().ifBlank { "MP3" } }
+    } else {
+        song.format.uppercase().ifBlank { "MP3" }
+    }
+
+    val isLossless = detectedExt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF")
+    val realBitRate = if (localFile != null && song.durationMs >= 15_000L) {
+        ((localFile.length() * 8L) / song.durationMs).toInt().coerceIn(64, 4608)
+    } else if (isLossless) {
+        song.bitRate.coerceAtLeast(960)
+    } else {
+        if (song.bitRate > 0) song.bitRate else 320
+    }
+
+    val sizeStr = if (localFile != null) {
+        "%.1f MB".format(java.util.Locale.US, localFile.length() / (1024.0 * 1024.0))
+    } else {
+        val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
+        val rate = if (isLossless) 900 else realBitRate.coerceAtLeast(128)
+        val estMb = (durationSec * rate * 1000L / 8L) / (1024.0 * 1024.0)
+        "%.1f MB".format(java.util.Locale.US, estMb)
+    }
+
+    return Triple(detectedExt, realBitRate, sizeStr)
+}
+
+/**
+ * 格式化已下载音频的技术参数与真实物理文件大小
  */
 fun formatDownloadedSongSpecs(song: UnifiedSong): String {
-    val formatStr = song.format.uppercase()
-    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || song.bitRate >= 800
-    val qualityTag = if (isLossless) "Hi-Res 无损" else if (song.bitRate >= 320) "极高音质" else "标准音质"
-    val bitrateStr = if (song.bitRate > 0) "${song.bitRate} kbps" else if (isLossless) "920 kbps (无损)" else "320 kbps"
-
-    val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
-    val rate = if (isLossless) 900 else song.bitRate.coerceAtLeast(320)
-    val estMb = (durationSec * rate * 1024L / 8L) / (1024.0 * 1024.0)
-    val sizeStr = "%.1f MB".format(java.util.Locale.US, estMb)
-
+    val (formatStr, realBitRate, sizeStr) = resolveRealLocalFormatAndSize(song)
+    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
+    val qualityTag = when {
+        isLossless && realBitRate >= 1200 -> "Hi-Res 无损"
+        isLossless -> "无损音质"
+        realBitRate >= 320 -> "极高音质"
+        else -> "标准音质"
+    }
+    val bitrateStr = "$realBitRate kbps"
     return "$qualityTag • $formatStr • $bitrateStr • $sizeStr"
 }
 
 /**
- * 歌曲列表单行（已下载展示音质/码率/大小，末尾直显下载按键/进度）
+ * 歌曲列表顶部的「播放全部 + 多选/全选下载」通用操作栏
+ * 按钮放置在「播放全部」按钮旁边，支持一键进入多选、全选/取消全选、批量选择缓存位置与音质下载
+ */
+@Composable
+fun SongListPlayAndBatchDownloadBar(
+    totalCount: Int,
+    isMultiSelectMode: Boolean,
+    selectedCount: Int,
+    isAllSelected: Boolean,
+    onPlayAll: () -> Unit,
+    onEnterMultiSelect: () -> Unit,
+    onToggleSelectAll: () -> Unit,
+    onBatchDownloadClick: () -> Unit,
+    onExitMultiSelect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.10f)
+
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (!isMultiSelectMode) {
+            Button(
+                onClick = onPlayAll,
+                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("播放全部 ($totalCount)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+
+            OutlinedButton(
+                onClick = onEnterMultiSelect,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, borderColor),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Checklist,
+                    contentDescription = "多选下载",
+                    tint = AppleRed,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "多选下载",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        } else {
+            OutlinedButton(
+                onClick = onToggleSelectAll,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, if (isAllSelected) AppleRed else borderColor),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Icon(
+                    imageVector = if (isAllSelected) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
+                    contentDescription = "全选",
+                    tint = AppleRed,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = if (isAllSelected) "取消全选" else "全选 ($totalCount)",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (isAllSelected) AppleRed else MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            Button(
+                onClick = onBatchDownloadClick,
+                enabled = selectedCount > 0,
+                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "下载 ($selectedCount)",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            TextButton(
+                onClick = onExitMultiSelect,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Text("完成", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+/**
+ * 歌曲列表单行（已下载展示音质/码率/大小，后方展示正在播放动态音波标志与下载按键/进度，支持多选下载）
  * 全局通用行组件，用于首页、资料库、搜索与歌单
  */
 @Composable
@@ -73,25 +234,66 @@ fun SongListItemRow(
     isLocalOfflineMode: Boolean = false,
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     isServerConnected: Boolean = true,
+    currentPlayingSong: UnifiedSong? = null,
+    isPlaying: Boolean = false,
+    isMultiSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onToggleSelect: (() -> Unit)? = null,
     onClick: () -> Unit,
     onDownloadClick: () -> Unit = {},
     onDownloadWithOptions: ((UnifiedSong, DownloadTarget, AudioQuality) -> Unit)? = null,
     onOpenDownloads: () -> Unit = {}
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
     val activeTask = activeDownloadTasks.firstOrNull { it.song.id == song.id }
-    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED
+    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED ||
+            (!song.localFilePath.isNullOrBlank() && (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists()))
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
+    val isCurrentPlaying = com.lm.player.core.designsystem.component.isSamePlayingSong(song, currentPlayingSong)
+    val streamQualityVer by com.lm.player.core.network.LemonMusicProtocol.streamQualityConfigVersion.collectAsState()
+    val onlineStreamQualityTag = remember(context, streamQualityVer) {
+        val preferredKey = com.lm.player.core.network.LemonMusicProtocol.getPreferredStreamQuality(context)
+        AudioQuality.fromKey(preferredKey).onlineStreamTag()
+    }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
-            .padding(vertical = 5.dp),
+            .background(
+                when {
+                    isMultiSelectMode && isSelected -> AppleRed.copy(alpha = 0.08f)
+                    isCurrentPlaying -> AppleRed.copy(alpha = 0.06f)
+                    else -> Color.Transparent
+                }
+            )
+            .clickable(
+                onClick = {
+                    if (isMultiSelectMode && onToggleSelect != null) {
+                        onToggleSelect()
+                    } else {
+                        onClick()
+                    }
+                }
+            )
+            .padding(horizontal = if (isMultiSelectMode || isCurrentPlaying) 6.dp else 0.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (isMultiSelectMode) {
+            Checkbox(
+                checked = isSelected,
+                onCheckedChange = { onToggleSelect?.invoke() },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = AppleRed,
+                    uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant
+                ),
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+        }
+
         AlbumArtworkImage(
             model = song.coverUrl,
             seedId = song.id,
@@ -107,24 +309,28 @@ fun SongListItemRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 style = TextStyle(
-                    fontSize = 15.sp * dimensions.fontScale,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
+                    fontSize = dimensions.itemTitleSize,
+                    fontWeight = if (isCurrentPlaying) FontWeight.Bold else FontWeight.Medium,
+                    color = if (isCurrentPlaying) AppleRed else MaterialTheme.colorScheme.onSurface
                 )
             )
 
             Spacer(modifier = Modifier.height(2.dp))
 
             if (isDownloaded) {
-                // 已下载歌曲：展示丰富音质、码率、大小参数
+                val (realFormatStr, realBitRate, realSizeStr) = remember(song.id, song.localFilePath, song.format, song.bitRate) {
+                    resolveRealLocalFormatAndSize(song)
+                }
+                val isLosslessLocal = realFormatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
+                // 已下载到本地的歌曲：括号内显示真实文件具体音质与大小，下方显示完整技术参数
                 Text(
-                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"}",
+                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($realFormatStr · $realSizeStr)",
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     style = TextStyle(
-                        fontSize = 12.sp,
+                        fontSize = dimensions.captionSize,
                         fontWeight = FontWeight.Normal,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 )
                 Spacer(modifier = Modifier.height(2.dp))
@@ -134,9 +340,9 @@ fun SongListItemRow(
                         color = Color(0xFF34C759).copy(alpha = 0.14f)
                     ) {
                         Text(
-                            text = if (song.format.uppercase() in listOf("FLAC", "WAV", "ALAC", "APE")) "Hi-Res" else "已离线",
+                            text = if (isLosslessLocal && realBitRate >= 1200) "Hi-Res" else if (isLosslessLocal) "无损" else "已离线",
                             color = Color(0xFF34C759),
-                            fontSize = 10.sp,
+                            fontSize = dimensions.badgeSize,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                         )
@@ -144,24 +350,33 @@ fun SongListItemRow(
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
                         text = formatDownloadedSongSpecs(song),
-                        fontSize = 11.sp,
+                        fontSize = dimensions.badgeSize,
                         color = Color(0xFF34C759),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
             } else {
+                // 在线模式歌曲：括号内显示当前试听模式设置的对应音质
                 Text(
-                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} (${song.format.uppercase()})",
+                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($onlineStreamQualityTag)",
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     style = TextStyle(
-                        fontSize = 12.sp,
+                        fontSize = dimensions.captionSize,
                         fontWeight = FontWeight.Normal,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 )
             }
+        }
+
+        // 歌曲后方正在播放的动态音波标志
+        if (isCurrentPlaying) {
+            Spacer(modifier = Modifier.width(6.dp))
+            com.lm.player.core.designsystem.component.NowPlayingWaveIndicator(
+                isPlaying = isPlaying
+            )
         }
 
         Spacer(modifier = Modifier.width(6.dp))
@@ -253,9 +468,16 @@ fun LocalMusicHomeScreen(
     homeDisplayConfig: HomeScreenDisplayConfig = HomeScreenDisplayConfig(),
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     activeDownloadCount: Int = 0,
+    currentPlayingSong: UnifiedSong? = null,
+    isPlaying: Boolean = false,
+    locateSongTrigger: Int = 0,
+    onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
+    onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { songs, target, quality ->
+        songs.forEach { onDownloadSongWithOptions(it, target, quality) }
+    },
     onSelectLocalServer: () -> Unit = {},
     onSelectServer: (ServerConfig) -> Unit = {},
     onSyncNow: () -> Unit = {},
@@ -266,11 +488,22 @@ fun LocalMusicHomeScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val dimensions = LocalAppDimensions.current
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val isCompactHeader = screenWidthDp < 390
+    val isUltraCompactHeader = screenWidthDp < 350
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = blurAlpha)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.10f)
 
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
+    var isMultiSelectMode by remember { mutableStateOf(false) }
+    val selectedSongIds = remember { mutableStateListOf<String>() }
+    var showBatchDownloadDialog by remember { mutableStateOf(false) }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    LaunchedEffect(listState.isScrollInProgress) {
+        onListScrollingChange(listState.isScrollInProgress)
+    }
 
     // 本地模式仅筛选真正已下载到本地或扫描导入且物理文件存在的离线音频
     val localDownloadedSongs = remember(recentSongs) {
@@ -319,8 +552,26 @@ fun LocalMusicHomeScreen(
             }
     }
 
+    val isServerOk = configuredServers.any { it.type == ServerType.LEMON_MUSIC }
+
+    LaunchedEffect(locateSongTrigger) {
+        if (locateSongTrigger > 0 && currentPlayingSong != null && activeSongSource.isNotEmpty()) {
+            val songIdx = activeSongSource.indexOfFirst {
+                com.lm.player.core.designsystem.component.isSamePlayingSong(it, currentPlayingSong)
+            }
+            if (songIdx >= 0) {
+                var headerOffset = 2 // 顶部 Header + 所有曲目 Header
+                if (homeDisplayConfig.showRecentlyAdded && effectiveRecentlyAdded.isNotEmpty()) headerOffset++
+                if (homeDisplayConfig.showAlbums && albums.isNotEmpty()) headerOffset++
+                if (homeDisplayConfig.showArtists && artists.isNotEmpty()) headerOffset++
+                listState.animateScrollToItem((headerOffset + songIdx).coerceAtLeast(0))
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 16.dp),
@@ -330,8 +581,12 @@ fun LocalMusicHomeScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
-        // 1. 顶部 Header (大标题 + 下载管理胶囊 + 音源下拉切换)
+        // 1. 顶部 Header (大标题 + 下载管理胶囊 + 音源下拉切换，自适应不同分辨率)
         item {
+            val pillHorizontalPad = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp
+            val pillVerticalPad = if (isCompactHeader) 5.dp else 6.dp
+            val buttonGap = if (isUltraCompactHeader) 4.dp else 6.dp
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -340,23 +595,34 @@ fun LocalMusicHomeScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .padding(end = 6.dp)
+                ) {
                     Text(
                         text = "本地音乐",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = TextStyle(
-                            fontSize = 32.sp * dimensions.fontScale,
+                            fontSize = dimensions.pageTitleSize,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onBackground
                         )
                     )
                     Text(
                         text = if (activeSongSource.isEmpty()) "暂无已下载歌曲" else "已收录 ${activeSongSource.size} 首已下载歌曲 · ${albums.size} 张专辑",
-                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontSize = dimensions.captionSize,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(buttonGap)
+                ) {
                     // 顶部下载管理胶囊按键 (毛玻璃效果)
                     Surface(
                         shape = RoundedCornerShape(20.dp),
@@ -368,28 +634,28 @@ fun LocalMusicHomeScreen(
                             .clickable(onClick = onOpenDownloads)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
                                 imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
                                 contentDescription = "下载管理",
                                 tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
                             )
                             if (activeDownloadCount > 0) {
-                                Spacer(modifier = Modifier.width(4.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
                                     color = AppleRed,
-                                    fontSize = 12.sp * dimensions.fontScale,
-                                    fontWeight = FontWeight.Bold
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    softWrap = false
                                 )
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.width(6.dp))
 
                     ServerSwitchDropdownButton(
                         currentServer = serverName,
@@ -503,12 +769,46 @@ fun LocalMusicHomeScreen(
                 }
             }
 
-            // D. 所有曲目
+            // D. 所有曲目 (含播放全部 + 多选/全选下载操作栏)
             item {
-                SectionHeader(
-                    title = "所有曲目",
-                    subtitle = "共 ${activeSongSource.size} 首本地音频"
-                )
+                val isAllSelected = activeSongSource.isNotEmpty() && selectedSongIds.size == activeSongSource.size
+                Column {
+                    SectionHeader(
+                        title = "所有曲目",
+                        subtitle = "共 ${activeSongSource.size} 首本地音频"
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    SongListPlayAndBatchDownloadBar(
+                        totalCount = activeSongSource.size,
+                        isMultiSelectMode = isMultiSelectMode,
+                        selectedCount = selectedSongIds.size,
+                        isAllSelected = isAllSelected,
+                        onPlayAll = {
+                            activeSongSource.firstOrNull()?.let { onSongClick(it, activeSongSource) }
+                        },
+                        onEnterMultiSelect = {
+                            selectedSongIds.clear()
+                            isMultiSelectMode = true
+                        },
+                        onToggleSelectAll = {
+                            if (isAllSelected) {
+                                selectedSongIds.clear()
+                            } else {
+                                selectedSongIds.clear()
+                                selectedSongIds.addAll(activeSongSource.map { it.id })
+                            }
+                        },
+                        onBatchDownloadClick = {
+                            if (selectedSongIds.isNotEmpty()) {
+                                showBatchDownloadDialog = true
+                            }
+                        },
+                        onExitMultiSelect = {
+                            isMultiSelectMode = false
+                            selectedSongIds.clear()
+                        }
+                    )
+                }
             }
 
             items(
@@ -516,12 +816,19 @@ fun LocalMusicHomeScreen(
                 key = { it.id },
                 contentType = { "song_row" }
             ) { song ->
-                val isServerOk = configuredServers.any { it.type == ServerType.LEMON_MUSIC }
+                val isSelected = song.id in selectedSongIds
                 SongListItemRow(
                     song = song,
                     isLocalOfflineMode = true,
                     activeDownloadTasks = activeDownloadTasks,
                     isServerConnected = isServerOk,
+                    currentPlayingSong = currentPlayingSong,
+                    isPlaying = isPlaying,
+                    isMultiSelectMode = isMultiSelectMode,
+                    isSelected = isSelected,
+                    onToggleSelect = {
+                        if (isSelected) selectedSongIds.remove(song.id) else selectedSongIds.add(song.id)
+                    },
                     onClick = { onSongClick(song, activeSongSource) },
                     onDownloadClick = { songForDownloadChoice = song },
                     onDownloadWithOptions = { s, target, quality ->
@@ -531,6 +838,21 @@ fun LocalMusicHomeScreen(
                 )
             }
         }
+    }
+
+    if (showBatchDownloadDialog) {
+        val selectedSongs = activeSongSource.filter { it.id in selectedSongIds }
+        com.lm.player.core.designsystem.component.BatchDownloadQualityChoiceDialog(
+            selectedCount = selectedSongs.size,
+            isServerConnected = isServerOk,
+            onConfirm = { target, quality ->
+                showBatchDownloadDialog = false
+                isMultiSelectMode = false
+                selectedSongIds.clear()
+                onBatchDownloadSongsWithOptions(selectedSongs, target, quality)
+            },
+            onDismiss = { showBatchDownloadDialog = false }
+        )
     }
 
     if (songForDownloadChoice != null) {
@@ -556,7 +878,7 @@ private fun SectionHeader(
         Text(
             text = title,
             style = TextStyle(
-                fontSize = 20.sp * dimensions.fontScale,
+                fontSize = dimensions.sectionTitleSize,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground
             )
@@ -566,7 +888,7 @@ private fun SectionHeader(
             Text(
                 text = subtitle,
                 style = TextStyle(
-                    fontSize = 12.sp,
+                    fontSize = dimensions.captionSize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             )
@@ -608,7 +930,7 @@ private fun RecentlyAddedSongCard(
                 Text(
                     text = if (isDownloaded) "本地已存" else song.format.uppercase(),
                     color = if (isDownloaded) AppleRed else Color.White,
-                    fontSize = 9.sp,
+                    fontSize = dimensions.badgeSize,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                 )
@@ -622,8 +944,8 @@ private fun RecentlyAddedSongCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 14.sp * dimensions.fontScale,
-                fontWeight = FontWeight.Bold,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface
             )
         )
@@ -635,7 +957,7 @@ private fun RecentlyAddedSongCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 12.sp,
+                fontSize = dimensions.captionSize,
                 fontWeight = FontWeight.Normal,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -668,8 +990,8 @@ private fun AlbumCardItem(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 13.sp * dimensions.fontScale,
-                fontWeight = FontWeight.Bold,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface
             )
         )
@@ -679,7 +1001,7 @@ private fun AlbumCardItem(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 11.sp,
+                fontSize = dimensions.captionSize,
                 fontWeight = FontWeight.Normal,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -712,8 +1034,8 @@ private fun ArtistCircleItem(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 12.sp * dimensions.fontScale,
-                fontWeight = FontWeight.SemiBold,
+                fontSize = dimensions.captionSize,
+                fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center
             )
@@ -726,6 +1048,7 @@ private fun EmptyStateWelcomeCard(
     onGoToSettings: () -> Unit,
     onScanLocalMedia: (() -> Unit)? = null
 ) {
+    val dimensions = LocalAppDimensions.current
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surface,
@@ -753,14 +1076,14 @@ private fun EmptyStateWelcomeCard(
 
             Text(
                 text = "欢迎使用 柠檬音乐 (LMPlayer)",
-                style = TextStyle(fontSize = 19.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                style = TextStyle(fontSize = dimensions.sectionTitleSize, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
             )
 
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
                 text = "当前处于本地模式。您可以扫描本机存储中的音乐文件，或前往设置登录柠檬音乐服务器获取海量在线乐库与推荐歌单。",
-                style = TextStyle(fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center),
+                style = TextStyle(fontSize = dimensions.bodySize, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center),
                 modifier = Modifier.padding(horizontal = 12.dp)
             )
 
@@ -775,7 +1098,7 @@ private fun EmptyStateWelcomeCard(
                 ) {
                     Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("一键扫描本地音乐", fontWeight = FontWeight.SemiBold)
+                    Text("一键扫描本地音乐", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
                 }
                 Spacer(modifier = Modifier.height(10.dp))
             }
@@ -787,7 +1110,7 @@ private fun EmptyStateWelcomeCard(
             ) {
                 Icon(Icons.Default.Cloud, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("前往设置登录柠檬音乐", fontWeight = FontWeight.SemiBold)
+                Text("前往设置登录柠檬音乐", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
             }
         }
     }

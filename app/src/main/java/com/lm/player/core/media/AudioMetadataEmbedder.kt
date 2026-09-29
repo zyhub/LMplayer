@@ -39,17 +39,14 @@ object AudioMetadataEmbedder {
 
         val ext = file.extension.lowercase(Locale.US)
         return try {
-            when (ext) {
-                "mp3" -> embedMp3(file, title, artist, album, coverBytes, lyrics)
-                "flac" -> embedFlac(file, title, artist, album, coverBytes, lyrics)
-                "m4a", "mp4", "aac", "alac" -> embedM4a(file, title, artist, album, coverBytes, lyrics)
-                else -> {
-                    // 其它格式优先尝试 MP3 ID3v2，若失败尝试 FLAC
-                    if (isFlacFile(file)) {
-                        embedFlac(file, title, artist, album, coverBytes, lyrics)
-                    } else {
-                        embedMp3(file, title, artist, album, coverBytes, lyrics)
-                    }
+            if (isFlacFile(file)) {
+                embedFlac(file, title, artist, album, coverBytes, lyrics)
+            } else {
+                when (ext) {
+                    "mp3" -> embedMp3(file, title, artist, album, coverBytes, lyrics)
+                    "flac" -> embedFlac(file, title, artist, album, coverBytes, lyrics)
+                    "m4a", "mp4", "aac", "alac" -> embedM4a(file, title, artist, album, coverBytes, lyrics)
+                    else -> embedMp3(file, title, artist, album, coverBytes, lyrics)
                 }
             }
         } catch (e: Exception) {

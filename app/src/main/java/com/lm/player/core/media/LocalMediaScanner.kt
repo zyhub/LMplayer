@@ -667,16 +667,25 @@ object LocalMediaScanner {
                         else -> System.currentTimeMillis()
                     }
 
+                    val localExt = localFile.extension.lowercase().ifBlank { local.format.ifBlank { matchedServerSong.format } }
+                    val localBitRate = if (localExt in listOf("flac", "wav", "ape", "alac")) {
+                        local.bitRate.coerceAtLeast(matchedServerSong.bitRate).coerceAtLeast(960)
+                    } else {
+                        if (local.bitRate > 0) local.bitRate else matchedServerSong.bitRate
+                    }
+
                     database.songDao().matchAndLinkLocalFile(
                         songId = matchedServerSong.id,
                         status = DownloadStatus.DOWNLOADED,
                         localPath = localPath,
                         coverUrl = cover
                     )
-                    database.songDao().updateDownloadStatusAndTimestamp(
+                    database.songDao().updateDownloadStatusSpecsAndTimestamp(
                         songId = matchedServerSong.id,
                         status = DownloadStatus.DOWNLOADED,
                         localPath = localPath,
+                        format = localExt,
+                        bitRate = localBitRate,
                         timestamp = effectiveTimestamp
                     )
                     if (isFav && !matchedServerSong.isFavorite) {
@@ -761,15 +770,30 @@ object LocalMediaScanner {
 
             val downloadRecords = database.downloadDao().getAllDownloadsList().associateBy { it.songId }
 
+            fun resolveLocalSpecs(path: String, fallbackFormat: String, fallbackBitRate: Int, durationMs: Long): Pair<String, Int> {
+                val f = File(path)
+                val ext = f.extension.lowercase().ifBlank { fallbackFormat.ifBlank { "mp3" } }
+                val durSec = durationMs / 1000L
+                val br = if (f.exists() && f.length() > 0 && durSec in 15..3600) {
+                    ((f.length() * 8L) / (durSec * 1000L)).toInt().coerceIn(64, 4608)
+                } else if (ext in listOf("flac", "wav", "ape", "alac")) {
+                    fallbackBitRate.coerceAtLeast(960)
+                } else {
+                    if (fallbackBitRate > 0) fallbackBitRate else 320
+                }
+                return ext to br
+            }
+
             for (server in serverSongs) {
                 val downloadRec = downloadRecords[server.id]
                 val currentPath = server.localFilePath
                 val isCurrentFileValid = !currentPath.isNullOrBlank() && File(currentPath).let { it.exists() && it.length() > 0 }
 
-                if (isCurrentFileValid) {
+                if (isCurrentFileValid && !currentPath.isNullOrBlank()) {
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
-                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, currentPath, finalTs)
-                    if (server.downloadStatus != DownloadStatus.DOWNLOADED) {
+                    val (realFmt, realBr) = resolveLocalSpecs(currentPath, server.format, server.bitRate, server.durationMs)
+                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, currentPath, realFmt, realBr, finalTs)
+                    if (server.downloadStatus != DownloadStatus.DOWNLOADED || server.format != realFmt) {
                         updatedCount++
                     }
                     continue
@@ -779,8 +803,9 @@ object LocalMediaScanner {
                 val isDownloadRecValid = !recPath.isNullOrBlank() && File(recPath).let { it.exists() && it.length() > 0 }
                 if (isDownloadRecValid && !recPath.isNullOrBlank()) {
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
-                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, finalTs)
-                    if (server.downloadStatus != DownloadStatus.DOWNLOADED) {
+                    val (realFmt, realBr) = resolveLocalSpecs(recPath, server.format, server.bitRate, server.durationMs)
+                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, realFmt, realBr, finalTs)
+                    if (server.downloadStatus != DownloadStatus.DOWNLOADED || server.format != realFmt) {
                         updatedCount++
                     }
                     continue
@@ -807,7 +832,8 @@ object LocalMediaScanner {
                 if (matchedPhysicalFile != null) {
                     val filePath = matchedPhysicalFile.absolutePath
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else System.currentTimeMillis()
-                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, filePath, finalTs)
+                    val (realFmt, realBr) = resolveLocalSpecs(filePath, server.format, server.bitRate, server.durationMs)
+                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, filePath, realFmt, realBr, finalTs)
                     database.downloadDao().insertOrUpdate(
                         DownloadEntity(
                             songId = server.id,
@@ -846,7 +872,8 @@ object LocalMediaScanner {
                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != null) {
                     val lFile = File(matchedLocalSong.localFilePath)
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else if (matchedLocalSong.addedTimestamp > 0) matchedLocalSong.addedTimestamp else System.currentTimeMillis()
-                    database.songDao().updateDownloadStatusAndTimestamp(server.id, DownloadStatus.DOWNLOADED, matchedLocalSong.localFilePath, finalTs)
+                    val (realFmt, realBr) = resolveLocalSpecs(matchedLocalSong.localFilePath, matchedLocalSong.format, matchedLocalSong.bitRate, server.durationMs)
+                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, matchedLocalSong.localFilePath, realFmt, realBr, finalTs)
                     database.downloadDao().insertOrUpdate(
                         DownloadEntity(
                             songId = server.id,

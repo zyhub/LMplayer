@@ -195,16 +195,28 @@ data class LemonToplist(
     val source: String = "kw"
 )
 
-enum class OnlineMusicSource(val key: String, val displayName: String) {
-    KUWO("kw", "酷我音乐"),
-    NETEASE("wy", "网易云音乐"),
-    QQ("tx", "QQ音乐"),
-    KUGOU("kg", "酷狗音乐"),
-    MIGU("mg", "咪咕音乐");
+enum class OnlineMusicSource(val key: String, val displayName: String, val shortName: String) {
+    KUWO("kw", "酷我音乐", "酷我"),
+    NETEASE("wy", "网易云音乐", "网易"),
+    QQ("tx", "QQ音乐", "QQ"),
+    KUGOU("kg", "酷狗音乐", "酷狗"),
+    MIGU("mg", "咪咕音乐", "咪咕");
 
     companion object {
         fun fromKey(key: String): OnlineMusicSource {
             return entries.firstOrNull { it.key == key } ?: KUWO
+        }
+    }
+}
+
+enum class SearchContentType(val key: String, val displayName: String) {
+    SONG("song", "歌曲"),
+    ALBUM("album", "专辑"),
+    PLAYLIST("playlist", "歌单");
+
+    companion object {
+        fun fromKey(key: String): SearchContentType {
+            return entries.firstOrNull { it.key.equals(key, ignoreCase = true) } ?: SONG
         }
     }
 }
@@ -226,17 +238,68 @@ data class LemonSourceScriptInfo(
 )
 
 enum class DownloadTarget(val displayName: String, val desc: String) {
-    LOCAL("缓存至本地", "保存到本设备内部存储，离线随时聆听"),
-    SERVER("缓存至服务器", "保存到飞牛/NAS曲库，全终端同步共享"),
-    BOTH("双方同步缓存", "同时推送到服务器曲库并下载到本地离线存储")
+    LOCAL("本地下载", "保存到本设备内部存储，离线随时聆听"),
+    SERVER("服务器下载", "保存到飞牛/NAS曲库，全终端同步共享"),
+    BOTH("双端下载", "同时推送到服务器曲库并下载到本地离线存储")
 }
 
 
 enum class AudioQuality(val key: String, val label: String, val format: String, val badge: String, val bitrate: Int) {
-    Q_128K("128k", "标准音质 128K (MP3)", "MP3", "128K", 128),
-    Q_320K("320k", "极高音质 320K (MP3)", "MP3", "320K", 320),
-    Q_FLAC("flac", "无损音质 (FLAC)", "FLAC", "FLAC", 960),
-    Q_HIRES("flac24bit", "Hi-Res 高解析母带 (24bit)", "FLAC", "Hi-Res", 1411);
+    Q_128K("128k", "标准音质", "MP3", "128K", 128),
+    Q_320K("320k", "极高音质", "MP3", "320K", 320),
+    Q_FLAC("flac", "无损音质", "FLAC", "FLAC", 960),
+    Q_HIRES("flac24bit", "Hi-Res 高解析母带", "FLAC", "Hi-Res", 1411);
+
+    fun onlineStreamTag(): String = when (this) {
+        Q_128K -> "标准 128K"
+        Q_320K -> "极高 320K"
+        Q_FLAC -> "无损 FLAC"
+        Q_HIRES -> "Hi-Res 无损"
+    }
+
+    fun estimateSizeText(song: UnifiedSong): String {
+        val rawJson = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
+            ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
+        if (!rawJson.isNullOrBlank()) {
+            try {
+                val obj = org.json.JSONObject(rawJson)
+                val typesObj = obj.optJSONObject("_types")
+                if (typesObj != null) {
+                    val qObj = typesObj.optJSONObject(key)
+                    val s = qObj?.optString("size")?.trim().orEmpty()
+                    if (s.isNotBlank() && !s.equals("null", true) && !s.startsWith("0")) {
+                        return s.replace(Regex("(?i)(\\d)(mb|kb|gb)"), "$1 $2").uppercase(java.util.Locale.US)
+                    }
+                }
+                val typesArr = obj.optJSONArray("types")
+                if (typesArr != null) {
+                    for (i in 0 until typesArr.length()) {
+                        val item = typesArr.optJSONObject(i) ?: continue
+                        if (item.optString("type").equals(key, ignoreCase = true)) {
+                            val s = item.optString("size").trim()
+                            if (s.isNotBlank() && !s.equals("null", true) && !s.startsWith("0")) {
+                                return s.replace(Regex("(?i)(\\d)(mb|kb|gb)"), "$1 $2").uppercase(java.util.Locale.US)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        val batchMultiplier = if (song.id.startsWith("batch_download_")) {
+            song.id.removePrefix("batch_download_").toIntOrNull()?.coerceAtLeast(1) ?: 1
+        } else 1
+        val durationSec = if (song.durationMs > 1000L) (song.durationMs / 1000.0).coerceIn(30.0, 1800.0) else 215.0
+        val singleMb = (durationSec * bitrate * 1000.0 / 8.0) / (1024.0 * 1024.0)
+        val totalMb = singleMb * batchMultiplier
+        return if (totalMb >= 1024.0) {
+            "约 %.2f GB".format(java.util.Locale.US, totalMb / 1024.0)
+        } else {
+            "约 %.1f MB".format(java.util.Locale.US, totalMb)
+        }
+    }
+
+    fun labelWithSize(song: UnifiedSong): String = "$label (${estimateSizeText(song)})"
 
     companion object {
         fun fromKey(key: String): AudioQuality {
@@ -272,9 +335,17 @@ data class LemonDownloadPreferences(
     val maxConcurrent: Int = 3,
     val embedCover: Boolean = true,
     val embedLyric: Boolean = true,
-    val downloadLrcFile: Boolean = true,
+    val downloadLrcFile: Boolean = false,
     val existFileMode: String = "skip", // skip | overwrite
     val groupByFolder: Boolean = false
+)
+
+@Immutable
+data class ResolvedOnlineStream(
+    val url: String,
+    val qualityKey: String,
+    val format: String,
+    val bitRate: Int
 )
 
 @Immutable

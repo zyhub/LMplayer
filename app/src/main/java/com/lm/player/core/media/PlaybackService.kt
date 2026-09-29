@@ -12,8 +12,8 @@ import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
 import androidx.annotation.OptIn
-import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -55,10 +55,11 @@ class PlaybackService : MediaSessionService() {
         const val CMD_PREV = "CMD_PREV"
 
         /**
-         * 彻底关闭播放服务并停止音乐播放
+         * 彻底关闭播放服务并停止音乐播放与后台灵动岛
          */
         fun stopServiceAndPlayback(context: Context) {
             try {
+                BackgroundIslandOverlayController.destroy()
                 val player = Media3Factory.getSharedExoPlayer(context)
                 player.stop()
                 player.clearMediaItems()
@@ -79,9 +80,63 @@ class PlaybackService : MediaSessionService() {
             createNotificationChannel()
 
             // 1. 获取全局单例 ExoPlayer
-            exoPlayer = Media3Factory.getSharedExoPlayer(this)
+            val rawPlayer = Media3Factory.getSharedExoPlayer(this)
+            exoPlayer = rawPlayer
 
-            // 2. 建立 MediaSession 并挂载车载按键回调 (响应方向盘上一首/下一首/播放暂停/耳机线控)
+            // 2. 使用 ForwardingPlayer 包装 ExoPlayer，向系统 MediaSession 声明始终支持上一首/下一首/拖拽与元数据指令
+            //    确保小米澎湃超级岛、vivo原子岛、OPPO流体云、荣耀灵动胶囊及锁屏媒体卡持续稳定识别完整播控与曲目信息
+            val forwardingPlayer = object : ForwardingPlayer(rawPlayer) {
+                override fun getAvailableCommands(): Player.Commands {
+                    return super.getAvailableCommands().buildUpon()
+                        .add(Player.COMMAND_SEEK_TO_NEXT)
+                        .add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                        .add(Player.COMMAND_SEEK_TO_PREVIOUS)
+                        .add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                        .add(Player.COMMAND_PLAY_PAUSE)
+                        .add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)
+                        .add(Player.COMMAND_GET_CURRENT_MEDIA_ITEM)
+                        .add(Player.COMMAND_GET_METADATA)
+                        .add(Player.COMMAND_GET_TIMELINE)
+                        .build()
+                }
+
+                override fun isCommandAvailable(command: Int): Boolean {
+                    return when (command) {
+                        Player.COMMAND_SEEK_TO_NEXT,
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                        Player.COMMAND_SEEK_TO_PREVIOUS,
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                        Player.COMMAND_PLAY_PAUSE,
+                        Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
+                        Player.COMMAND_GET_CURRENT_MEDIA_ITEM,
+                        Player.COMMAND_GET_METADATA,
+                        Player.COMMAND_GET_TIMELINE -> true
+                        else -> super.isCommandAvailable(command)
+                    }
+                }
+
+                override fun seekToNext() {
+                    PlaybackQueueManager.playNext(this@PlaybackService)
+                    dispatchBroadcast(CMD_NEXT)
+                }
+
+                override fun seekToNextMediaItem() {
+                    PlaybackQueueManager.playNext(this@PlaybackService)
+                    dispatchBroadcast(CMD_NEXT)
+                }
+
+                override fun seekToPrevious() {
+                    PlaybackQueueManager.playPrevious(this@PlaybackService)
+                    dispatchBroadcast(CMD_PREV)
+                }
+
+                override fun seekToPreviousMediaItem() {
+                    PlaybackQueueManager.playPrevious(this@PlaybackService)
+                    dispatchBroadcast(CMD_PREV)
+                }
+            }
+
+            // 3. 建立 MediaSession 并挂载车载按键回调
             val sessionActivityIntent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
             }
@@ -115,6 +170,9 @@ class PlaybackService : MediaSessionService() {
                         .add(Player.COMMAND_PREPARE)
                         .add(Player.COMMAND_STOP)
                         .add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)
+                        .add(Player.COMMAND_GET_CURRENT_MEDIA_ITEM)
+                        .add(Player.COMMAND_GET_METADATA)
+                        .add(Player.COMMAND_GET_TIMELINE)
                         .build()
                     return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
                         .setAvailableSessionCommands(sessionCommands)
@@ -170,7 +228,7 @@ class PlaybackService : MediaSessionService() {
                     if (keyEvent != null) {
                         val now = System.currentTimeMillis()
                         if (now - lastKeyTimestamp < 250) {
-                            return true // 防抖：250ms 内忽略重复事件
+                            return true
                         }
                         if (keyEvent.action == KeyEvent.ACTION_DOWN || (keyEvent.action == KeyEvent.ACTION_UP && keyEvent.repeatCount == 0)) {
                             lastKeyTimestamp = now
@@ -255,94 +313,38 @@ class PlaybackService : MediaSessionService() {
                 }
             }
 
-            mediaSession = MediaSession.Builder(this, exoPlayer!!)
+            val session = MediaSession.Builder(this, forwardingPlayer)
                 .setSessionActivity(sessionActivityPendingIntent)
                 .setCallback(sessionCallback)
                 .build()
+            mediaSession = session
+            DynamicIslandManager.bindMediaSession(session)
 
-            // 3. 挂载全品牌安卓灵动岛 MediaNotification.Provider (澎湃OS超级岛/ColorOS流体云/OriginOS原子岛/MagicOS灵动胶囊)
+            // 关键：将 MediaSession 注册至 MediaSessionService，确保系统级媒体控制中心与厂商灵动岛识别
+            addSession(session)
+
+            // 4. 挂载全品牌安卓灵动岛 MediaNotification.Provider
             DynamicIslandManager.ensureInitialized(this)
             setMediaNotificationProvider(DynamicIslandManager.createMediaNotificationProvider(this))
 
-            // 4. 立即发布初始前台通知（彻底杜绝 Android 8.0+ 5秒启动超时闪退）
+            // 5. 立即发布初始前台通知（彻底杜绝 Android 8.0+ 5秒启动超时闪退）
             startImmediateForeground()
 
-            // 5. 监听播放状态与曲目切换动态刷新灵动岛
-            exoPlayer?.addListener(object : Player.Listener {
+            // 6. 监听播放状态与曲目切换，平滑同步系统原生媒体通知与悬浮胶囊
+            rawPlayer.addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     updateForegroundNotification(isPlaying)
+                    BackgroundIslandOverlayController.refreshVisibilityAndState(this@PlaybackService)
                 }
 
                 override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                     DynamicIslandManager.clearLyrics()
-                    updateForegroundNotification(exoPlayer?.isPlaying == true)
+                    updateForegroundNotification(rawPlayer.isPlaying)
+                    BackgroundIslandOverlayController.refreshVisibilityAndState(this@PlaybackService)
                 }
             })
-
-            // 6. 启动后台灵动岛实时歌词与高清封面同步引擎
-            startIslandLyricSyncLoop()
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to initialize PlaybackService", e)
-        }
-    }
-
-    private fun startIslandLyricSyncLoop() {
-        var loadedSongIdForIsland = ""
-        serviceScope.launch {
-            while (isActive) {
-                try {
-                    val song = PlaybackQueueManager.currentSongFlow.value
-                    val player = exoPlayer
-                    if (song != null && player != null) {
-                        // 切换新歌时后台预热高清封面 Bitmap 与同步歌词
-                        if (loadedSongIdForIsland != song.id) {
-                            loadedSongIdForIsland = song.id
-                            launch(Dispatchers.IO) {
-                                try {
-                                    DynamicIslandManager.loadSongArtworkBitmap(this@PlaybackService, song)
-                                    LyricsManager.loadLyrics(song, this@PlaybackService, null)
-                                    kotlinx.coroutines.withContext(Dispatchers.Main) {
-                                        DynamicIslandManager.notifySystemIsland(
-                                            context = this@PlaybackService,
-                                            mediaSession = mediaSession,
-                                            exoPlayer = exoPlayer,
-                                            force = true
-                                        )
-                                    }
-                                } catch (_: Exception) {}
-                            }
-                        }
-
-                        if (player.isPlaying) {
-                            val posMs = player.currentPosition.coerceAtLeast(0L)
-                            val cachedLyrics = LyricsManager.getCachedLyrics(song.id)
-                            if (cachedLyrics != null && cachedLyrics.lines.isNotEmpty()) {
-                                val lines = cachedLyrics.lines
-                                val idx = lines.indexOfLast { it.timestampMs <= posMs }.coerceAtLeast(0)
-                                val currentText = lines.getOrNull(idx)?.text.orEmpty()
-                                val nextText = lines.getOrNull(idx + 1)?.text.orEmpty()
-                                val prevLyric = DynamicIslandManager.currentLyricLineFlow.value
-                                DynamicIslandManager.updateRealtimeLyrics(
-                                    context = this@PlaybackService,
-                                    song = song,
-                                    currentLine = currentText,
-                                    nextLine = nextText,
-                                    isPlaying = true
-                                )
-                                if (currentText != prevLyric && currentText.isNotBlank()) {
-                                    DynamicIslandManager.notifySystemIsland(
-                                        context = this@PlaybackService,
-                                        mediaSession = mediaSession,
-                                        exoPlayer = player,
-                                        force = false
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-                delay(450L)
-            }
         }
     }
 
@@ -361,6 +363,7 @@ class PlaybackService : MediaSessionService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_SERVICE) {
             try {
+                BackgroundIslandOverlayController.destroy()
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -409,6 +412,7 @@ class PlaybackService : MediaSessionService() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         try {
+            BackgroundIslandOverlayController.destroy()
             exoPlayer?.stop()
             exoPlayer?.clearMediaItems()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -477,6 +481,8 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         try {
+            BackgroundIslandOverlayController.destroy()
+            DynamicIslandManager.bindMediaSession(null)
             serviceScope.cancel()
             mediaSession?.run {
                 release()

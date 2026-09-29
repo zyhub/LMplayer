@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -34,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -43,12 +45,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
+import com.lm.player.core.designsystem.component.BatchDownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
+import com.lm.player.core.designsystem.component.isSamePlayingSong
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.model.*
 import com.lm.player.feature.home.SongListItemRow
+import com.lm.player.feature.home.SongListPlayAndBatchDownloadBar
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -60,7 +65,7 @@ import kotlinx.coroutines.launch
  * 3. 音乐风格流派 (流派气泡筛选)
  * 4. 歌手胶囊流 (歌手头像、曲目数、即点即播)
  * 5. 专辑矩阵 (最新专辑卡片流)
- * 6. 全部歌曲高保真流 (带格式/音质标签、收藏、下载弹窗、多维排序)
+ * 6. 全部歌曲高保真流 (带格式/音质标签、收藏、下载弹窗、多维排序、多选/全选下载)
  * 7. 页面内无缝下钻视图 (歌单/歌手/专辑/流派详情，不遮挡底部悬浮播放栏)
  */
 @Composable
@@ -71,9 +76,16 @@ fun LocalLibraryScreen(
     activeServerConfig: ServerConfig? = null,
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     activeDownloadCount: Int = 0,
+    currentPlayingSong: UnifiedSong? = null,
+    isPlaying: Boolean = false,
+    locateSongTrigger: Int = 0,
+    onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
+    onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { songs, target, quality ->
+        songs.forEach { onDownloadSongWithOptions(it, target, quality) }
+    },
     onOpenDownloads: () -> Unit = {},
     onRefreshPlaylists: () -> Unit = {},
     onCreatePlaylist: (name: String, isOnline: Boolean) -> Unit = { _, _ -> },
@@ -100,6 +112,9 @@ fun LocalLibraryScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val dimensions = LocalAppDimensions.current
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val isCompactHeader = screenWidthDp < 390
+    val isUltraCompactHeader = screenWidthDp < 350
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
@@ -110,12 +125,37 @@ fun LocalLibraryScreen(
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
     var activeSubViewSubtitle by remember { mutableStateOf<String>("") }
+    var lastSubViewTitle by remember { mutableStateOf<String?>(null) }
+    var lastSubViewSubtitle by remember { mutableStateOf<String>("") }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingSubView by remember { mutableStateOf(false) }
     var isFromAllPlaylists by remember { mutableStateOf(false) }
     var isFromAllFolders by remember { mutableStateOf(false) }
     var isFromAllArtists by remember { mutableStateOf(false) }
     var isFromAllAlbums by remember { mutableStateOf(false) }
+
+    // 资料库主列表与二级子列表多选下载状态
+    var isMainSongsMultiSelect by remember { mutableStateOf(false) }
+    var selectedMainSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var isSubViewMultiSelect by remember { mutableStateOf(false) }
+    var selectedSubViewSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var songsForBatchDownloadChoice by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+
+    val libraryListState = rememberLazyListState()
+    val subViewListState = rememberLazyListState()
+    val isAnyScrolling = libraryListState.isScrollInProgress || subViewListState.isScrollInProgress
+    LaunchedEffect(isAnyScrolling) {
+        onListScrollingChange(isAnyScrolling)
+    }
+
+    LaunchedEffect(activeSubViewTitle) {
+        isSubViewMultiSelect = false
+        selectedSubViewSongIds = emptySet()
+        if (activeSubViewTitle != null && activeSubViewTitle !in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")) {
+            lastSubViewTitle = activeSubViewTitle
+            lastSubViewSubtitle = activeSubViewSubtitle
+        }
+    }
 
     // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名，过滤服务端 JSON 元数据)
     val localFolders = remember(allSongs) {
@@ -221,6 +261,9 @@ fun LocalLibraryScreen(
         if (isDownloadManagementMode) {
             isDownloadManagementMode = false
             selectedDownloadSongIds.clear()
+        } else if (isSubViewMultiSelect) {
+            isSubViewMultiSelect = false
+            selectedSubViewSongIds = emptySet()
         } else if (activeSubViewTitle != "全部歌单" && isFromAllPlaylists) {
             activeSubViewTitle = "全部歌单"
             activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
@@ -342,10 +385,39 @@ fun LocalLibraryScreen(
         }
     }
 
+    // 定位正在播放的歌曲（自动切回所属子列表或全部歌曲主列表并滚动定位）
+    LaunchedEffect(locateSongTrigger) {
+        if (locateSongTrigger > 0 && currentPlayingSong != null) {
+            val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")
+            val subIdx = activeSubViewSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
+            val mainIdx = filteredSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
+            if (activeSubViewTitle != null && !isGridSubView && subIdx >= 0) {
+                runCatching { subViewListState.animateScrollToItem(subIdx) }
+            } else if (mainIdx >= 0) {
+                if (activeSubViewTitle != null) {
+                    activeSubViewTitle = null
+                    delay(80)
+                }
+                var headerCount = 4 // Header + 歌单 + 音乐风格 + 全部歌曲标题栏
+                if (recentAddedSongs.isNotEmpty()) headerCount++
+                if (localFolders.isNotEmpty()) headerCount++
+                if (artists.isNotEmpty()) headerCount++
+                if (albums.isNotEmpty()) headerCount++
+                runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
+            } else if (subIdx >= 0 && lastSubViewTitle != null) {
+                activeSubViewTitle = lastSubViewTitle
+                activeSubViewSubtitle = lastSubViewSubtitle
+                delay(80)
+                runCatching { subViewListState.animateScrollToItem(subIdx) }
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         // 主视图：浏览资料库各大板块 (当没有进入二级下钻时展示)
         if (activeSubViewTitle == null) {
             LazyColumn(
+                state = libraryListState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
@@ -355,8 +427,12 @@ fun LocalLibraryScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
-                // 1. 顶部 Header (大标题 + 刷新/新建歌单/离线下载按键)
+                // 1. 顶部 Header (大标题 + 新建歌单/离线下载/服务器切换按键，自适应不同分辨率)
                 item {
+                    val pillHorizontalPad = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp
+                    val pillVerticalPad = if (isCompactHeader) 5.dp else 6.dp
+                    val buttonGap = if (isUltraCompactHeader) 4.dp else 6.dp
+
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -368,19 +444,27 @@ fun LocalLibraryScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f, fill = false)
+                                    .padding(end = 6.dp)
+                            ) {
                                 Text(
                                     text = "资料库",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                     style = TextStyle(
-                                        fontSize = 32.sp * dimensions.fontScale,
+                                        fontSize = dimensions.pageTitleSize,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onBackground
                                     )
                                 )
                                 Text(
                                     text = if (currentServerName.contains("本地") || currentServerName.contains("已下载")) "本地离线曲库" else "已连接 · $currentServerName",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                     style = TextStyle(
-                                        fontSize = 12.sp,
+                                        fontSize = dimensions.captionSize,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 )
@@ -388,36 +472,61 @@ fun LocalLibraryScreen(
 
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(buttonGap)
                             ) {
-                                IconButton(
-                                    onClick = { isCreatePlaylistDialogOpen = true },
-                                    modifier = Modifier.size(36.dp)
+                                // 新建歌单胶囊按键
+                                Surface(
+                                    shape = RoundedCornerShape(20.dp),
+                                    color = AppleRed.copy(alpha = 0.12f),
+                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f)),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(20.dp))
+                                        .clickable { isCreatePlaylistDialogOpen = true }
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Add,
-                                        contentDescription = "新建歌单",
-                                        tint = AppleRed,
-                                        modifier = Modifier.size(22.dp)
-                                    )
-                                }
-                                IconButton(
-                                    onClick = onOpenDownloads,
-                                    modifier = Modifier.size(36.dp)
-                                ) {
-                                    BadgedBox(badge = {
-                                        if (activeDownloadCount > 0) {
-                                            Badge(containerColor = AppleRed) {
-                                                Text(activeDownloadCount.toString(), fontSize = 10.sp)
-                                            }
-                                        }
-                                    }) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Icon(
-                                            imageVector = Icons.Default.Download,
-                                            contentDescription = "下载管理",
-                                            tint = MaterialTheme.colorScheme.onSurface,
-                                            modifier = Modifier.size(20.dp)
+                                            imageVector = Icons.Default.Add,
+                                            contentDescription = "新建歌单",
+                                            tint = AppleRed,
+                                            modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
                                         )
+                                    }
+                                }
+
+                                // 下载管理胶囊按键 (与首页风格统一)
+                                Surface(
+                                    shape = RoundedCornerShape(20.dp),
+                                    color = surfaceColor,
+                                    shadowElevation = 2.dp,
+                                    border = BorderStroke(1.dp, borderColor),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(20.dp))
+                                        .clickable(onClick = onOpenDownloads)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
+                                            contentDescription = "下载管理",
+                                            tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
+                                        )
+                                        if (activeDownloadCount > 0) {
+                                            Spacer(modifier = Modifier.width(3.dp))
+                                            Text(
+                                                text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
+                                                color = AppleRed,
+                                                fontSize = dimensions.captionSize,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                softWrap = false
+                                            )
+                                        }
                                     }
                                 }
 
@@ -472,13 +581,13 @@ fun LocalLibraryScreen(
                                             } else {
                                                 "本地离线曲库 · 共 ${allSongs.size} 首歌曲"
                                             },
-                                            fontSize = 12.sp * dimensions.fontScale,
+                                            fontSize = dimensions.bodySize,
                                             fontWeight = FontWeight.Medium,
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
                                         Text(
                                             text = "${playlists.size} 个歌单 · ${artists.size} 位歌手 · ${albums.size} 张专辑",
-                                            fontSize = 10.sp,
+                                            fontSize = dimensions.captionSize,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
@@ -507,7 +616,7 @@ fun LocalLibraryScreen(
                                         Spacer(modifier = Modifier.width(4.dp))
                                         Text(
                                             text = if (isTriggeringScan) "请求中" else "刷新库",
-                                            fontSize = 11.sp,
+                                            fontSize = dimensions.captionSize,
                                             color = AppleRed,
                                             fontWeight = FontWeight.Bold
                                         )
@@ -528,7 +637,7 @@ fun LocalLibraryScreen(
                         ) {
                             Text(
                                 text = "歌单",
-                                fontSize = 19.sp * dimensions.fontScale,
+                                fontSize = dimensions.sectionTitleSize,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
@@ -551,7 +660,8 @@ fun LocalLibraryScreen(
                                 }
                                 Text(
                                     text = "全部 ${playlists.size + 3} 个",
-                                    fontSize = 12.sp,
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "全部歌单"
@@ -660,13 +770,14 @@ fun LocalLibraryScreen(
                             ) {
                                 Text(
                                     text = "最近添加",
-                                    fontSize = 19.sp * dimensions.fontScale,
+                                    fontSize = dimensions.sectionTitleSize,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                                 Text(
                                     text = "全部 ${recentAddedSongs.size} 首",
-                                    fontSize = 12.sp,
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "最近添加"
@@ -704,13 +815,14 @@ fun LocalLibraryScreen(
                             ) {
                                 Text(
                                     text = "本地文件夹",
-                                    fontSize = 19.sp * dimensions.fontScale,
+                                    fontSize = dimensions.sectionTitleSize,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                                 Text(
                                     text = "全部 ${localFolders.size} 个",
-                                    fontSize = 12.sp,
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "全部文件夹"
@@ -752,7 +864,7 @@ fun LocalLibraryScreen(
                         ) {
                             Text(
                                 text = "音乐风格",
-                                fontSize = 19.sp * dimensions.fontScale,
+                                fontSize = dimensions.sectionTitleSize,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
@@ -796,7 +908,7 @@ fun LocalLibraryScreen(
                                     ) {
                                         Text(
                                             text = if (count > 0) "$genreName · $count" else genreName,
-                                            fontSize = 12.sp,
+                                            fontSize = dimensions.captionSize,
                                             fontWeight = FontWeight.Medium,
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
@@ -825,13 +937,14 @@ fun LocalLibraryScreen(
                             ) {
                                 Text(
                                     text = "歌手",
-                                    fontSize = 19.sp * dimensions.fontScale,
+                                    fontSize = dimensions.sectionTitleSize,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                                 Text(
                                     text = "全部 ${artists.size} 位",
-                                    fontSize = 12.sp,
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "全部歌手"
@@ -875,7 +988,7 @@ fun LocalLibraryScreen(
                                             Column {
                                                 Text(
                                                     text = artist.name,
-                                                    fontSize = 13.sp,
+                                                    fontSize = dimensions.bodySize,
                                                     fontWeight = FontWeight.SemiBold,
                                                     color = MaterialTheme.colorScheme.onSurface,
                                                     maxLines = 1,
@@ -883,7 +996,7 @@ fun LocalLibraryScreen(
                                                 )
                                                 Text(
                                                     text = "${artist.songCount} 首",
-                                                    fontSize = 11.sp,
+                                                    fontSize = dimensions.captionSize,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
                                             }
@@ -906,13 +1019,14 @@ fun LocalLibraryScreen(
                             ) {
                                 Text(
                                     text = "最近添加专辑",
-                                    fontSize = 19.sp * dimensions.fontScale,
+                                    fontSize = dimensions.sectionTitleSize,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                                 Text(
                                     text = "全部 ${albums.size} 张",
-                                    fontSize = 12.sp,
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "全部专辑"
@@ -950,15 +1064,15 @@ fun LocalLibraryScreen(
                                         Spacer(modifier = Modifier.height(6.dp))
                                         Text(
                                             text = album.title,
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.Bold,
+                                            fontSize = dimensions.bodySize,
+                                            fontWeight = FontWeight.SemiBold,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
                                         Text(
                                             text = album.artist,
-                                            fontSize = 11.sp,
+                                            fontSize = dimensions.captionSize,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
@@ -972,60 +1086,98 @@ fun LocalLibraryScreen(
 
                 // 6. 【歌曲】板块 (Songs Header & Full List)
                 item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "全部歌曲",
-                                fontSize = 19.sp * dimensions.fontScale,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onBackground
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.padding(vertical = 2.dp)
-                            ) {
+                    Column {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    text = "${filteredSongs.size} 首",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    text = "全部歌曲",
+                                    fontSize = dimensions.sectionTitleSize,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onBackground
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = "${filteredSongs.size} 首",
+                                        fontSize = dimensions.badgeSize,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+
+                            // 排序方式快捷切换
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = when (songSortMode) {
+                                        "name" -> "按歌曲名"
+                                        "artist" -> "按歌手"
+                                        "duration" -> "按时长"
+                                        "source" -> "按加入方式"
+                                        else -> "默认排序"
+                                    },
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Medium,
+                                    color = AppleRed,
+                                    modifier = Modifier.clickable {
+                                        songSortMode = when (songSortMode) {
+                                            "default" -> "name"
+                                            "name" -> "artist"
+                                            "artist" -> "duration"
+                                            "duration" -> "source"
+                                            else -> "default"
+                                        }
+                                    }
+                                )
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.Sort,
+                                    contentDescription = "排序",
+                                    tint = AppleRed,
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                         }
 
-                        // 排序方式快捷切换
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = when (songSortMode) {
-                                    "name" -> "按歌曲名"
-                                    "artist" -> "按歌手"
-                                    "duration" -> "按时长"
-                                    "source" -> "按加入方式"
-                                    else -> "默认排序"
+                        if (filteredSongs.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SongListPlayAndBatchDownloadBar(
+                                totalCount = filteredSongs.size,
+                                isMultiSelectMode = isMainSongsMultiSelect,
+                                selectedCount = selectedMainSongIds.size,
+                                isAllSelected = filteredSongs.isNotEmpty() && selectedMainSongIds.size == filteredSongs.size,
+                                onPlayAll = {
+                                    filteredSongs.firstOrNull()?.let { onSongClick(it, filteredSongs) }
                                 },
-                                fontSize = 12.sp,
-                                color = AppleRed,
-                                modifier = Modifier.clickable {
-                                    songSortMode = when (songSortMode) {
-                                        "default" -> "name"
-                                        "name" -> "artist"
-                                        "artist" -> "duration"
-                                        "duration" -> "source"
-                                        else -> "default"
+                                onEnterMultiSelect = {
+                                    isMainSongsMultiSelect = true
+                                    selectedMainSongIds = emptySet()
+                                },
+                                onExitMultiSelect = {
+                                    isMainSongsMultiSelect = false
+                                    selectedMainSongIds = emptySet()
+                                },
+                                onToggleSelectAll = {
+                                    selectedMainSongIds = if (selectedMainSongIds.size == filteredSongs.size) {
+                                        emptySet()
+                                    } else {
+                                        filteredSongs.map { it.id }.toSet()
+                                    }
+                                },
+                                onBatchDownloadClick = {
+                                    val selectedSongs = filteredSongs.filter { selectedMainSongIds.contains(it.id) }
+                                    if (selectedSongs.isNotEmpty()) {
+                                        songsForBatchDownloadChoice = selectedSongs
                                     }
                                 }
-                            )
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Sort,
-                                contentDescription = "排序",
-                                tint = AppleRed,
-                                modifier = Modifier.size(16.dp)
                             )
                         }
                     }
@@ -1076,6 +1228,7 @@ fun LocalLibraryScreen(
                         key = { it.id },
                         contentType = { "library_song_item" }
                     ) { song ->
+                        val isSelected = selectedMainSongIds.contains(song.id)
                         Column {
                             if (songSortMode == "source") {
                                 val idx = filteredSongs.indexOf(song)
@@ -1101,6 +1254,17 @@ fun LocalLibraryScreen(
                                 song = song,
                                 activeDownloadTasks = activeDownloadTasks,
                                 isServerConnected = isServerOk,
+                                currentPlayingSong = currentPlayingSong,
+                                isPlaying = isPlaying,
+                                isMultiSelectMode = isMainSongsMultiSelect,
+                                isSelected = isSelected,
+                                onToggleSelect = {
+                                    selectedMainSongIds = if (isSelected) {
+                                        selectedMainSongIds - song.id
+                                    } else {
+                                        selectedMainSongIds + song.id
+                                    }
+                                },
                                 onClick = { onSongClick(song, filteredSongs) },
                                 onDownloadClick = { songForDownloadChoice = song },
                                 onDownloadWithOptions = { s, target, quality ->
@@ -1116,6 +1280,7 @@ fun LocalLibraryScreen(
 
         // 二级下钻详情视图 (页面内展示：歌单曲目、歌手曲目、专辑曲目，绝不遮挡底部播放栏)
         if (activeSubViewTitle != null) {
+            val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1127,7 +1292,7 @@ fun LocalLibraryScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 12.dp),
+                        .padding(vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = handleSubViewBack) {
@@ -1156,7 +1321,7 @@ fun LocalLibraryScreen(
                         )
                     }
 
-                    // 播放全部与管理按键
+                    // 特殊页面头部按键（全部歌单新建 / 本地下载管理与播放全部）
                     if (activeSubViewTitle == "全部歌单") {
                         Button(
                             onClick = { isCreatePlaylistDialogOpen = true },
@@ -1205,20 +1370,42 @@ fun LocalLibraryScreen(
                                 }
                             }
                         }
-                    } else if (activeSubViewSongs.isNotEmpty()) {
-                        Button(
-                            onClick = {
-                                activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
-                            },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("播放全部", fontSize = 12.sp)
-                        }
                     }
+                }
+
+                // 普通歌曲子列表：播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
+                if (!isGridSubView && activeSubViewTitle != "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                    SongListPlayAndBatchDownloadBar(
+                        totalCount = activeSubViewSongs.size,
+                        isMultiSelectMode = isSubViewMultiSelect,
+                        selectedCount = selectedSubViewSongIds.size,
+                        isAllSelected = activeSubViewSongs.isNotEmpty() && selectedSubViewSongIds.size == activeSubViewSongs.size,
+                        onPlayAll = {
+                            activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
+                        },
+                        onEnterMultiSelect = {
+                            isSubViewMultiSelect = true
+                            selectedSubViewSongIds = emptySet()
+                        },
+                        onExitMultiSelect = {
+                            isSubViewMultiSelect = false
+                            selectedSubViewSongIds = emptySet()
+                        },
+                        onToggleSelectAll = {
+                            selectedSubViewSongIds = if (selectedSubViewSongIds.size == activeSubViewSongs.size) {
+                                emptySet()
+                            } else {
+                                activeSubViewSongs.map { it.id }.toSet()
+                            }
+                        },
+                        onBatchDownloadClick = {
+                            val selectedSongs = activeSubViewSongs.filter { selectedSubViewSongIds.contains(it.id) }
+                            if (selectedSongs.isNotEmpty()) {
+                                songsForBatchDownloadChoice = selectedSongs
+                            }
+                        },
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
                 }
 
                 if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
@@ -1549,6 +1736,7 @@ fun LocalLibraryScreen(
                     }
                 } else {
                     LazyColumn(
+                        state = subViewListState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
@@ -1587,6 +1775,8 @@ fun LocalLibraryScreen(
                                                 song = song,
                                                 activeDownloadTasks = activeDownloadTasks,
                                                 isServerConnected = isServerOk,
+                                                currentPlayingSong = currentPlayingSong,
+                                                isPlaying = isPlaying,
                                                 onClick = {
                                                     if (isSelected) selectedDownloadSongIds.remove(song.id) else selectedDownloadSongIds.add(song.id)
                                                 },
@@ -1598,10 +1788,22 @@ fun LocalLibraryScreen(
                                     }
                                 }
                             } else {
+                                val isSelected = selectedSubViewSongIds.contains(song.id)
                                 SongListItemRow(
                                     song = song,
                                     activeDownloadTasks = activeDownloadTasks,
                                     isServerConnected = isServerOk,
+                                    currentPlayingSong = currentPlayingSong,
+                                    isPlaying = isPlaying,
+                                    isMultiSelectMode = isSubViewMultiSelect && activeSubViewTitle != "本地下载",
+                                    isSelected = isSelected,
+                                    onToggleSelect = {
+                                        selectedSubViewSongIds = if (isSelected) {
+                                            selectedSubViewSongIds - song.id
+                                        } else {
+                                            selectedSubViewSongIds + song.id
+                                        }
+                                    },
                                     onClick = { onSongClick(song, activeSubViewSongs) },
                                     onDownloadClick = { songForDownloadChoice = song },
                                     onDownloadWithOptions = { s, target, quality ->
@@ -1688,6 +1890,24 @@ fun LocalLibraryScreen(
                 onDownloadSongWithOptions(songForDownloadChoice!!, target, quality)
             },
             onDismiss = { songForDownloadChoice = null }
+        )
+    }
+
+    // 批量多选下载音质与目标选择弹窗
+    if (songsForBatchDownloadChoice.isNotEmpty()) {
+        BatchDownloadQualityChoiceDialog(
+            selectedCount = songsForBatchDownloadChoice.size,
+            isServerConnected = isServerOk,
+            onConfirm = { target, quality ->
+                val batch = songsForBatchDownloadChoice
+                songsForBatchDownloadChoice = emptyList()
+                isMainSongsMultiSelect = false
+                selectedMainSongIds = emptySet()
+                isSubViewMultiSelect = false
+                selectedSubViewSongIds = emptySet()
+                onBatchDownloadSongsWithOptions(batch, target, quality)
+            },
+            onDismiss = { songsForBatchDownloadChoice = emptyList() }
         )
     }
 

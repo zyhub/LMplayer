@@ -371,10 +371,8 @@ object LyricsManager {
 
             if (effectiveServer != null && effectiveServer.serverUrl.isNotBlank()) {
                 val protocol = LemonMusicProtocol(client, effectiveServer.serverUrl, effectiveServer.username, effectiveServer.tokenOrApiKey)
-                if (effectiveServer.tokenOrApiKey.isBlank() || effectiveServer.tokenOrApiKey.length < 20) {
-                    protocol.authenticate(effectiveServer)
-                }
-                val rawResp = protocol.getRawLyrics(song.id).getOrNull()
+                protocol.ensureAuthenticated()
+                val rawResp = protocol.getRawLyricsForSong(song).getOrNull()
                 if (!rawResp.isNullOrBlank() && !rawResp.equals("null", ignoreCase = true)) {
                     return@withContext rawResp.trim()
                 }
@@ -636,10 +634,8 @@ object LyricsManager {
 
             if (effectiveServer != null && effectiveServer.serverUrl.isNotBlank()) {
                 val protocol = LemonMusicProtocol(client, effectiveServer.serverUrl, effectiveServer.username, effectiveServer.tokenOrApiKey)
-                if (effectiveServer.tokenOrApiKey.isBlank() || effectiveServer.tokenOrApiKey.length < 20) {
-                    protocol.authenticate(effectiveServer)
-                }
-                val lyricRes = protocol.getLyrics(song.id)
+                protocol.ensureAuthenticated()
+                val lyricRes = protocol.getLyricsForSong(song)
                 if (lyricRes.isSuccess && lyricRes.getOrNull()?.lines?.isNotEmpty() == true) {
                     return@withContext lyricRes.getOrNull()!!
                 }

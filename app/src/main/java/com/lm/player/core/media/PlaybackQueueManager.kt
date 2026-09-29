@@ -10,6 +10,7 @@ import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +22,7 @@ object PlaybackQueueManager {
 
     private const val TAG = "PlaybackQueueManager"
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var playJob: Job? = null
 
     private val _playlistFlow = MutableStateFlow<List<UnifiedSong>>(emptyList())
     val playlistFlow: StateFlow<List<UnifiedSong>> = _playlistFlow.asStateFlow()
@@ -41,6 +43,15 @@ object PlaybackQueueManager {
 
     fun setQueue(songs: List<UnifiedSong>) {
         _playlistFlow.value = songs
+    }
+
+    fun setInitialSongIfAbsent(song: UnifiedSong, playlist: List<UnifiedSong>) {
+        if (_currentSongFlow.value == null) {
+            _currentSongFlow.value = song
+            if (_playlistFlow.value.isEmpty() && playlist.isNotEmpty()) {
+                _playlistFlow.value = playlist
+            }
+        }
     }
 
     fun updateMetadata(songs: List<UnifiedSong>) {
@@ -104,7 +115,13 @@ object PlaybackQueueManager {
         isListenerAttached = true
     }
 
-    fun playSong(targetSong: UnifiedSong, context: Context, newPlaylist: List<UnifiedSong>? = null) {
+    fun playSong(
+        targetSong: UnifiedSong,
+        context: Context,
+        newPlaylist: List<UnifiedSong>? = null,
+        startPositionMs: Long = 0L,
+        forceRefresh: Boolean = false
+    ) {
         ensurePlayerListener(context)
         _currentSongFlow.value = targetSong
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
@@ -118,16 +135,23 @@ object PlaybackQueueManager {
             prefs.edit().putString("last_played_song_id", targetSong.id).apply()
         } catch (_: Exception) {}
 
-        coroutineScope.launch {
+        playJob?.cancel()
+        playJob = coroutineScope.launch {
             try {
                 val db = ZdsDatabase.getInstance(context)
                 val router = PlaybackRouter(db.downloadDao(), context)
-                val mediaItem: MediaItem = router.resolveMediaItem(targetSong)
+                val mediaItem: MediaItem = router.resolveMediaItem(targetSong, forceRefresh = forceRefresh)
                 val player = Media3Factory.getSharedExoPlayer(context)
-                player.setMediaItem(mediaItem)
+                if (startPositionMs > 0L) {
+                    player.setMediaItem(mediaItem, startPositionMs)
+                } else {
+                    player.setMediaItem(mediaItem)
+                }
                 player.prepare()
                 player.play()
-                Log.i(TAG, "playSong started:  ()")
+                Log.i(TAG, "playSong started: ${targetSong.title} (startPos=${startPositionMs}ms, forceRefresh=$forceRefresh)")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error playing song: ", e)
             }

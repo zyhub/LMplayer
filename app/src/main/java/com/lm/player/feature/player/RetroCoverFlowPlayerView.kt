@@ -1,4 +1,4 @@
-﻿package com.lm.player.feature.player
+package com.lm.player.feature.player
 
 import android.content.Context
 import android.content.res.Configuration
@@ -179,7 +179,6 @@ fun RetroCoverFlowPlayerView(
     var showLyricsAdjustDialog by remember { mutableStateOf(false) }
     var showSleepTimerMenu by remember { mutableStateOf(false) }
     var showAudioSpecsMenu by remember { mutableStateOf(false) }
-    var showAudioOutputMenu by remember { mutableStateOf(false) }
 
     // 经典暗黑黑胶与水晶镜面渐变背景 (remember 缓存画刷，杜绝每秒高频重组重复分配内存)
     val backdropBrush = remember(isDark) {
@@ -243,12 +242,9 @@ fun RetroCoverFlowPlayerView(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // 左侧播放器区 (自适应占比 66.7% ~ 100%)
-                val leftStageWidth = screenWidth * playerWeight
-                val cardSizeDp = ((screenHeight * 0.50f).coerceIn(190f, 250f)).dp
-                val reflectionHeightDp = cardSizeDp * 0.25f
-                val stageHeightDp = cardSizeDp + reflectionHeightDp + 4.dp
-                val horizontalPaddingDp = ((leftStageWidth - cardSizeDp.value) / 2).coerceAtLeast(0f).dp
+                // 左侧播放器区 (自适应占比 66.7% ~ 100%，高度自适应手机/平板横屏)
+                val isCompactLandscape = screenHeight < 420
+                val isUltraCompactLandscape = screenHeight < 365
 
                 Column(
                     modifier = Modifier
@@ -262,22 +258,23 @@ fun RetroCoverFlowPlayerView(
                         modifier = Modifier
                             .fillMaxWidth()
                             .zIndex(150f)
-                            .padding(horizontal = 12.dp, vertical = 2.dp),
+                            .padding(horizontal = 12.dp, vertical = if (isCompactLandscape) 0.dp else 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        IconButton(
-                            onClick = onDismiss,
+                        Box(
                             modifier = Modifier
-                                .size(36.dp)
+                                .size(if (isCompactLandscape) 30.dp else 36.dp)
                                 .clip(CircleShape)
                                 .background(if (isDark) Color(0x44FFFFFF) else Color(0x33000000))
+                                .clickable(onClick = onDismiss),
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 Icons.Default.KeyboardArrowDown,
                                 contentDescription = "最小化",
                                 tint = primaryTextColor,
-                                modifier = Modifier.size(22.dp)
+                                modifier = Modifier.size(if (isCompactLandscape) 20.dp else 22.dp)
                             )
                         }
 
@@ -295,39 +292,13 @@ fun RetroCoverFlowPlayerView(
                                     .clickable { onSwitchPlayerTheme(PlayerThemeStyle.MODERN) }
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = if (isCompactLandscape) 3.dp else 5.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(Icons.Default.DashboardCustomize, contentDescription = "切回现代模式", tint = AppleRed, modifier = Modifier.size(13.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text("切回现代", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = primaryTextColor)
                                 }
-                            }
-
-                            // 融入式音频共享输出
-                            Box {
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = if (isDark) Color(0x28FFFFFF) else Color(0x18000000),
-                                    border = BorderStroke(0.6.dp, if (isDark) Color(0x33FFFFFF) else Color(0x22000000)),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable { showAudioOutputMenu = true }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(Icons.Default.SurroundSound, contentDescription = "共享与输出", tint = primaryTextColor, modifier = Modifier.size(13.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("共享", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = primaryTextColor)
-                                    }
-                                }
-                                AudioOutputDropdownMenu(
-                                    expanded = showAudioOutputMenu,
-                                    onDismissRequest = { showAudioOutputMenu = false },
-                                    song = song
-                                )
                             }
 
                             // 融入式收藏胶囊键
@@ -343,7 +314,7 @@ fun RetroCoverFlowPlayerView(
                                     .clickable(onClick = onToggleFavorite)
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = if (isCompactLandscape) 3.dp else 5.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
@@ -364,13 +335,19 @@ fun RetroCoverFlowPlayerView(
                         }
                     }
 
-                    // 2. 3D Cover Flow 展台
-                    Box(
+                    // 2. 3D Cover Flow 展台 (使用 weight(1f) + BoxWithConstraints 动态测算剩余高度，彻底消除手机横屏底部遮挡)
+                    BoxWithConstraints(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .height(stageHeightDp),
+                            .weight(1f)
+                            .fillMaxWidth(),
                         contentAlignment = Alignment.Center
                     ) {
+                        val reflectionRatio = if (isCompactLandscape) 0.18f else 0.25f
+                        val cardSizeDp = ((maxHeight.value - 4f) / (1f + reflectionRatio))
+                            .coerceIn(88f, 245f)
+                            .dp
+                        val reflectionHeightDp = cardSizeDp * reflectionRatio
+                        val horizontalPaddingDp = ((maxWidth.value - cardSizeDp.value) / 2f).coerceAtLeast(0f).dp
                         val beyondBoundsCount = 4 // 优化为 4 (可视区域 9 首)，降低 57% GPU 渲染开销
                         val cardSizePx = with(density) { cardSizeDp.toPx() }
                         HorizontalPager(
@@ -477,7 +454,7 @@ fun RetroCoverFlowPlayerView(
                                             ) {
                                                 Box(
                                                     modifier = Modifier
-                                                        .size(54.dp)
+                                                        .size(if (isCompactLandscape) 44.dp else 54.dp)
                                                         .clip(CircleShape)
                                                         .background(Color.Black.copy(alpha = 0.45f))
                                                         .border(
@@ -501,7 +478,7 @@ fun RetroCoverFlowPlayerView(
                                                         imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                                                         contentDescription = if (isPlaying) "暂停" else "播放",
                                                         tint = Color.White,
-                                                        modifier = Modifier.size(28.dp)
+                                                        modifier = Modifier.size(if (isCompactLandscape) 24.dp else 28.dp)
                                                     )
                                                 }
                                             }
@@ -548,15 +525,19 @@ fun RetroCoverFlowPlayerView(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
                             text = song.title,
-                            style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Bold, color = primaryTextColor),
+                            style = TextStyle(
+                                fontSize = if (isUltraCompactLandscape) 14.sp else if (isCompactLandscape) 15.sp else 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = primaryTextColor
+                            ),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Spacer(modifier = Modifier.height(2.dp))
+                        Spacer(modifier = Modifier.height(if (isCompactLandscape) 1.dp else 2.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选集"}",
-                                style = TextStyle(fontSize = 12.sp, color = secondaryTextColor),
+                                style = TextStyle(fontSize = if (isCompactLandscape) 11.sp else 12.sp, color = secondaryTextColor),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -897,29 +878,6 @@ fun RetroCoverFlowPlayerView(
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("现代模式", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = primaryTextColor)
                             }
-                        }
-
-                        // 融入式音频共享输出
-                        Box {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isDark) Color(0x28FFFFFF) else Color(0x18000000),
-                                border = BorderStroke(0.6.dp, if (isDark) Color(0x33FFFFFF) else Color(0x22000000)),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { showAudioOutputMenu = true }
-                            ) {
-                                Row(modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.SurroundSound, contentDescription = "共享", tint = primaryTextColor, modifier = Modifier.size(13.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("共享", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = primaryTextColor)
-                                }
-                            }
-                            AudioOutputDropdownMenu(
-                                expanded = showAudioOutputMenu,
-                                onDismissRequest = { showAudioOutputMenu = false },
-                                song = song
-                            )
                         }
 
                         // 融入式收藏键

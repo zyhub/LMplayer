@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.theme.AppleRed
+import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.DownloadTask
 import com.lm.player.core.model.UnifiedSong
@@ -63,6 +64,7 @@ fun DownloadManagerScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val context = LocalContext.current
+    val dimensions = LocalAppDimensions.current
     var selectedTab by remember { mutableIntStateOf(1) } // 0: 正在下载, 1: 已下载完成 (默认)
     var isMultiSelectMode by remember { mutableStateOf(false) }
     val selectedSongIds = remember { mutableStateListOf<String>() }
@@ -140,7 +142,7 @@ fun DownloadManagerScreen(
                     Text(
                         text = if (isAnyMultiSelect) "批量管理 (${currentSelectCount})" else "下载管理",
                         style = TextStyle(
-                            fontSize = 24.sp,
+                            fontSize = dimensions.pageTitleSize,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onBackground
                         )
@@ -871,10 +873,11 @@ fun DownloadManagerScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // 存储信息详情
+                    val (realFmt, realBr, _) = com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
                     val hasLrc = file?.let { File(it.parentFile, "${it.nameWithoutExtension}.lrc").exists() } ?: false
                     SettingDetailRow(label = "物理文件大小", value = fileSizeFormatted)
-                    SettingDetailRow(label = "音频解码格式", value = song.format.uppercase())
-                    SettingDetailRow(label = "音频规格码率", value = "${song.bitRate} kbps")
+                    SettingDetailRow(label = "音频解码格式", value = realFmt)
+                    SettingDetailRow(label = "音频规格码率", value = "$realBr kbps")
                     SettingDetailRow(label = "伴随歌词文件", value = if (hasLrc) "已生成 (.lrc)" else "未生成")
                     SettingDetailRow(label = "专辑封面状态", value = if (song.coverUrl.isNotBlank()) "已关联封面" else "默认底图")
 
@@ -1161,6 +1164,11 @@ private fun CompletedDownloadSongRow(
 
             Spacer(modifier = Modifier.width(12.dp))
 
+            val (realFormatStr, realBitRate, realSizeStr) = remember(song.id, song.localFilePath, song.format, song.bitRate) {
+                com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
+            }
+            val isLossless = realFormatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
+
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = song.title,
@@ -1170,7 +1178,7 @@ private fun CompletedDownloadSongRow(
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"}",
+                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($realFormatStr · $realSizeStr)",
                     style = TextStyle(fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -1182,7 +1190,7 @@ private fun CompletedDownloadSongRow(
                         color = Color(0xFF34C759).copy(alpha = 0.14f)
                     ) {
                         Text(
-                            text = if (song.format.uppercase() in listOf("FLAC", "WAV", "ALAC", "APE")) "Hi-Res" else "已离线",
+                            text = if (isLossless && realBitRate >= 1200) "Hi-Res" else if (isLossless) "无损" else "已离线",
                             color = Color(0xFF34C759),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,

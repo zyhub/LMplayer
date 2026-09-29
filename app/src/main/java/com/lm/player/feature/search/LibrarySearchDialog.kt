@@ -1,7 +1,10 @@
 package com.lm.player.feature.search
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,55 +13,111 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
+import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.DownloadTarget
+import com.lm.player.core.model.DownloadTask
 import com.lm.player.core.model.OnlineMusicSource
+import com.lm.player.core.model.SearchContentType
+import com.lm.player.core.model.UnifiedAlbum
+import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.feature.home.SongListItemRow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
- * 仿 Apple Music 沉浸式全局搜索面板
- * - 内嵌展示在脚手架内容层中，保持底部迷你播放条完整常显
- * - 点击歌曲直接触发播放并留在搜索界面，不自动退出
- * - 点击顶部返回箭头或取消按钮退出搜索
+ * 搜索结果面板 (已移除空状态下的「弹出式全局搜索」提示框)
+ * - 当未输入关键词时，仅保留底栏左滑搜索框，不遮挡主界面
+ * - 当输入关键词后，展示歌曲 / 专辑 / 歌单检索结果，支持点击专辑或歌单直接展开内部曲目播放与下载
  */
 @Composable
 fun LibrarySearchDialog(
     allSongs: List<UnifiedSong>,
+    allAlbums: List<UnifiedAlbum> = emptyList(),
+    allPlaylists: List<UnifiedPlaylist> = emptyList(),
+    activeDownloadTasks: List<DownloadTask> = emptyList(),
+    query: String = "",
+    onQueryChange: (String) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
     initialOnlineSource: OnlineMusicSource = OnlineMusicSource.KUWO,
     onOnlineSourceChanged: ((OnlineMusicSource) -> Unit)? = null,
+    selectedSearchType: SearchContentType = SearchContentType.SONG,
+    onSearchTypeChanged: ((SearchContentType) -> Unit)? = null,
     onOnlineSearch: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
+    onOnlineSearchAlbums: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
+    onOnlineSearchPlaylists: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedPlaylist>)? = null,
+    onFetchCollectionSongs: (suspend (collectionId: String) -> List<UnifiedSong>)? = null,
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     isServerConnected: Boolean = true,
+    hasMiniPlayer: Boolean = true,
+    currentPlayingSong: UnifiedSong? = null,
+    isPlaying: Boolean = false,
     contentPadding: PaddingValues = PaddingValues(0.dp),
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit = {}
 ) {
-    var query by remember { mutableStateOf("") }
-    var selectedSource by remember { mutableStateOf(initialOnlineSource) }
-    var onlineResults by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    // 专辑/歌单二级详情钻取状态
+    var drillDownTitle by remember { mutableStateOf<String?>(null) }
+    var drillDownSubtitle by remember { mutableStateOf<String?>(null) }
+    var drillDownSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    var isLoadingDrillDown by remember { mutableStateOf(false) }
+
+    BackHandler {
+        if (drillDownTitle != null) {
+            drillDownTitle = null
+            drillDownSubtitle = null
+            drillDownSongs = emptyList()
+        } else {
+            onDismiss()
+        }
+    }
+
+    // 切换搜索类型或清空关键词时，自动退出二级详情
+    LaunchedEffect(query, selectedSearchType) {
+        if (query.isBlank()) {
+            drillDownTitle = null
+            drillDownSubtitle = null
+            drillDownSongs = emptyList()
+        }
+    }
+
+    // 未输入关键词且未处于二级详情时，不显示任何「弹出式全局搜索」浮框，仅保留底部左滑搜索框
+    if (query.isBlank() && drillDownTitle == null) {
+        return
+    }
+
+    val dimensions = LocalAppDimensions.current
+    var selectedSource by remember(initialOnlineSource) { mutableStateOf(initialOnlineSource) }
+    var onlineSongResults by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    var onlineAlbumResults by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
+    var onlinePlaylistResults by remember { mutableStateOf<List<UnifiedPlaylist>>(emptyList()) }
     var isSearchingOnline by remember { mutableStateOf(false) }
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
+    val coroutineScope = rememberCoroutineScope()
 
-    LaunchedEffect(query, selectedSource) {
+    LaunchedEffect(query, selectedSource, selectedSearchType) {
         if (query.isBlank()) {
-            onlineResults = emptyList()
+            onlineSongResults = emptyList()
+            onlineAlbumResults = emptyList()
+            onlinePlaylistResults = emptyList()
             isSearchingOnline = false
             return@LaunchedEffect
         }
@@ -66,318 +125,719 @@ fun LibrarySearchDialog(
         if (onParseExternalPlaylist != null && (trimmed.startsWith("http://") || trimmed.startsWith("https://"))) {
             isSearchingOnline = true
             try {
-                onlineResults = onParseExternalPlaylist(trimmed, selectedSource)
+                onlineSongResults = onParseExternalPlaylist(trimmed, selectedSource)
             } catch (_: Exception) {
-                onlineResults = emptyList()
+                onlineSongResults = emptyList()
             } finally {
                 isSearchingOnline = false
             }
             return@LaunchedEffect
         }
-        if (onOnlineSearch == null) {
-            onlineResults = emptyList()
-            isSearchingOnline = false
-            return@LaunchedEffect
-        }
-        kotlinx.coroutines.delay(350)
+        kotlinx.coroutines.delay(280)
         isSearchingOnline = true
         try {
-            onlineResults = onOnlineSearch(trimmed, selectedSource)
-        } catch (e: Exception) {
-            onlineResults = emptyList()
+            when (selectedSearchType) {
+                SearchContentType.SONG -> {
+                    onlineSongResults = onOnlineSearch?.invoke(trimmed, selectedSource).orEmpty()
+                }
+                SearchContentType.ALBUM -> {
+                    onlineAlbumResults = onOnlineSearchAlbums?.invoke(trimmed, selectedSource).orEmpty()
+                }
+                SearchContentType.PLAYLIST -> {
+                    onlinePlaylistResults = onOnlineSearchPlaylists?.invoke(trimmed, selectedSource).orEmpty()
+                }
+            }
+        } catch (_: Exception) {
+            when (selectedSearchType) {
+                SearchContentType.SONG -> onlineSongResults = emptyList()
+                SearchContentType.ALBUM -> onlineAlbumResults = emptyList()
+                SearchContentType.PLAYLIST -> onlinePlaylistResults = emptyList()
+            }
         } finally {
             isSearchingOnline = false
         }
     }
 
-    // 将在线全网搜索结果与本地曲库及已下载歌曲进行智能哈希比对
-    val resolvedOnlineResults = remember(onlineResults, allSongs) {
-        if (allSongs.isEmpty() || onlineResults.isEmpty()) onlineResults
-        else com.lm.player.core.media.SongMatchingResolver.resolveSongList(onlineResults, allSongs)
-    }
-
-    val searchResults = remember(query, allSongs) {
-        if (query.isBlank()) {
-            emptyList()
+    // 后台线程执行在线搜索歌曲与本地/服务器曲库智能比对，消除主线程卡顿
+    val resolvedOnlineSongs by produceState(initialValue = onlineSongResults, onlineSongResults, allSongs, activeDownloadTasks) {
+        value = if (allSongs.isEmpty() || onlineSongResults.isEmpty()) {
+            onlineSongResults
         } else {
-            val q = query.trim().lowercase()
-            allSongs.filter {
-                it.title.lowercase().contains(q) ||
-                it.artist.lowercase().contains(q) ||
-                it.album.lowercase().contains(q)
+            withContext(Dispatchers.Default) {
+                SongMatchingResolver.resolveSongList(onlineSongResults, allSongs, activeDownloadTasks)
             }
         }
     }
 
-    Surface(
+    val resolvedDrillDownSongs by produceState(initialValue = drillDownSongs, drillDownSongs, allSongs, activeDownloadTasks) {
+        value = if (allSongs.isEmpty() || drillDownSongs.isEmpty()) {
+            drillDownSongs
+        } else {
+            withContext(Dispatchers.Default) {
+                SongMatchingResolver.resolveSongList(drillDownSongs, allSongs, activeDownloadTasks)
+            }
+        }
+    }
+
+    // 本地/服务端已同步媒体库过滤结果 (后台计算)
+    val localSongResults by produceState(initialValue = emptyList<UnifiedSong>(), query, allSongs) {
+        val q = query.trim().lowercase()
+        value = if (q.isEmpty()) emptyList() else withContext(Dispatchers.Default) {
+            allSongs.filter {
+                it.title.lowercase().contains(q) ||
+                    it.artist.lowercase().contains(q) ||
+                    it.album.lowercase().contains(q)
+            }
+        }
+    }
+
+    val localAlbumResults by produceState(initialValue = emptyList<UnifiedAlbum>(), query, allAlbums, allSongs) {
+        val q = query.trim().lowercase()
+        value = if (q.isEmpty()) emptyList() else withContext(Dispatchers.Default) {
+            if (allAlbums.isNotEmpty()) {
+                allAlbums.filter {
+                    it.title.lowercase().contains(q) || it.artist.lowercase().contains(q)
+                }
+            } else {
+                allSongs.asSequence()
+                    .filter { it.album.isNotBlank() && (it.album.lowercase().contains(q) || it.artist.lowercase().contains(q)) }
+                    .groupBy { it.album.trim() }
+                    .map { (albumName, tracks) ->
+                        val first = tracks.first()
+                        UnifiedAlbum(
+                            id = first.albumId.ifBlank { "local_album_${albumName.hashCode()}" },
+                            title = albumName,
+                            artist = first.artist,
+                            coverUrl = first.coverUrl,
+                            songCount = tracks.size
+                        )
+                    }
+                    .toList()
+            }
+        }
+    }
+
+    val localPlaylistResults by produceState(initialValue = emptyList<UnifiedPlaylist>(), query, allPlaylists) {
+        val q = query.trim().lowercase()
+        value = if (q.isEmpty()) emptyList() else withContext(Dispatchers.Default) {
+            allPlaylists.filter { it.name.lowercase().contains(q) }
+        }
+    }
+
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val cardBgColor = if (isDark) Color(0xFF1C1C22).copy(alpha = 0.96f) else Color(0xFFFAFAFC).copy(alpha = 0.97f)
+    val cardBorderColor = if (isDark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)
+    val bottomSafeReservation = if (hasMiniPlayer) 142.dp else 78.dp
+
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
-        color = MaterialTheme.colorScheme.background
+            .imePadding()
+            .background(Color.Black.copy(alpha = if (isDark) 0.40f else 0.22f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onDismiss
+            )
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(
+                start = 14.dp,
+                end = 14.dp,
+                top = 12.dp,
+                bottom = bottomSafeReservation
+            ),
+        contentAlignment = Alignment.BottomCenter
     ) {
-        Column(
+        Surface(
             modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .widthIn(max = 580.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(0.86f)
+                .shadow(18.dp, RoundedCornerShape(24.dp))
+                .clip(RoundedCornerShape(24.dp))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {} // 拦截内部点击，防止穿透关闭
+                ),
+            shape = RoundedCornerShape(24.dp),
+            color = cardBgColor,
+            border = BorderStroke(1.dp, cardBorderColor)
         ) {
-            // 1. 顶部搜索栏与返回/取消按键
-            Row(
+            Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .padding(end = 4.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "返回",
-                        tint = MaterialTheme.colorScheme.onSurface
-                    )
-                }
+                if (drillDownTitle != null) {
+                    // =========================================================================
+                    // 二级视图：专辑 / 歌单 内部歌曲列表
+                    // =========================================================================
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    drillDownTitle = null
+                                    drillDownSubtitle = null
+                                    drillDownSongs = emptyList()
+                                }
+                                .padding(vertical = 4.dp, horizontal = 4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "返回搜索结果",
+                                tint = AppleRed,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = drillDownTitle.orEmpty(),
+                                    fontSize = dimensions.itemTitleSize,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (!drillDownSubtitle.isNullOrBlank()) {
+                                    Text(
+                                        text = drillDownSubtitle.orEmpty(),
+                                        fontSize = dimensions.captionSize,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
 
-                TextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    placeholder = {
-                        Text(
-                            text = if (onOnlineSearch != null) "搜索媒体库/全网音乐，或粘贴歌单链接..." else "搜索歌曲、歌手、专辑...",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                            fontSize = 15.sp
-                        )
-                    },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.Search,
-                            contentDescription = "搜索",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    },
-                    trailingIcon = {
-                        if (query.isNotEmpty()) {
-                            IconButton(onClick = { query = "" }) {
-                                Icon(
-                                    imageVector = Icons.Default.Clear,
-                                    contentDescription = "清空",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp)
+                        if (resolvedDrillDownSongs.isNotEmpty()) {
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = AppleRed,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable {
+                                        onSongClick(resolvedDrillDownSongs.first(), resolvedDrillDownSongs)
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = "播放全部",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        text = "播放全部 (${resolvedDrillDownSongs.size})",
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (isLoadingDrillDown) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp, color = AppleRed)
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text(
+                                    text = "正在从柠檬音乐服务器加载曲目...",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = dimensions.bodySize
                                 )
                             }
                         }
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(16.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    textStyle = TextStyle(fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface),
-                    modifier = Modifier.weight(1f)
-                )
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                TextButton(onClick = onDismiss) {
-                    Text(
-                        text = "取消",
-                        color = AppleRed,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-
-            if (onOnlineSearch != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "音源:",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    OnlineMusicSource.entries.forEach { src ->
-                        val isSelected = src == selectedSource
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (isSelected) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                            border = if (isSelected) androidx.compose.foundation.BorderStroke(1.dp, AppleRed) else null,
-                            modifier = Modifier.clickable {
-                                selectedSource = src
-                                onOnlineSourceChanged?.invoke(src)
-                            }
+                    } else if (resolvedDrillDownSongs.isEmpty()) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = src.displayName,
-                                color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 12.sp,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // 2. 搜索结果列表 (底部避让悬浮迷你播放栏)
-            if (query.isBlank()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(top = 80.dp),
-                    contentAlignment = Alignment.TopCenter
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.Search,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                            modifier = Modifier.size(56.dp)
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = if (onOnlineSearch != null)
-                                "输入关键词，搜索 NAS 媒体库 (${allSongs.size} 首) 及在线全网曲库"
-                            else
-                                "输入关键词搜索 NAS 媒体库中的全部 ${allSongs.size} 首歌曲",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 14.sp
-                        )
-                    }
-                }
-            } else if (searchResults.isEmpty() && resolvedOnlineResults.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(top = 80.dp),
-                    contentAlignment = Alignment.TopCenter
-                ) {
-                    if (isSearchingOnline) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp, color = AppleRed)
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = "正在搜索媒体库及在线曲库...",
+                                text = "暂未获取到曲目列表，请尝试切换其他音源",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 14.sp
+                                fontSize = dimensions.bodySize
                             )
                         }
                     } else {
-                        Text(
-                            text = "未找到与「$query」匹配的歌曲或歌手",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 15.sp
-                        )
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(
+                                items = resolvedDrillDownSongs,
+                                key = { "drill_${it.id}" },
+                                contentType = { "drill_song_item" }
+                            ) { song ->
+                                SongListItemRow(
+                                    song = song,
+                                    isServerConnected = isServerConnected,
+                                    currentPlayingSong = currentPlayingSong,
+                                    isPlaying = isPlaying,
+                                    onClick = { onSongClick(song, resolvedDrillDownSongs) },
+                                    onDownloadClick = { songForDownloadChoice = song },
+                                    onDownloadWithOptions = { s, target, quality ->
+                                        onDownloadSongWithOptions(s, target, quality)
+                                    }
+                                )
+                            }
+                        }
                     }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(
-                        top = 4.dp,
-                        bottom = contentPadding.calculateBottomPadding() + 24.dp
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    // 媒体库结果
-                    if (searchResults.isNotEmpty()) {
-                        item {
+                } else {
+                    // =========================================================================
+                    // 一级视图：根据 selectedSearchType 展示 [ 歌曲 / 专辑 / 歌单 ] 搜索结果
+                    // =========================================================================
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = when (selectedSearchType) {
+                                    SearchContentType.SONG -> Icons.Default.MusicNote
+                                    SearchContentType.ALBUM -> Icons.Default.Album
+                                    SearchContentType.PLAYLIST -> Icons.Default.QueueMusic
+                                },
+                                contentDescription = null,
+                                tint = AppleRed,
+                                modifier = Modifier.size(19.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "媒体库歌曲 (${searchResults.size})",
-                                fontSize = 13.sp,
+                                text = "「$query」的${selectedSearchType.displayName}结果",
+                                fontSize = dimensions.itemTitleSize,
                                 fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(vertical = 6.dp)
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        items(
-                            items = searchResults,
-                            key = { "local_${it.id}" },
-                            contentType = { "search_song_item" }
-                        ) { song ->
-                            SongListItemRow(
-                                song = song,
-                                isServerConnected = isServerConnected,
-                                onClick = {
-                                    // 播放歌曲并保持留在搜索页面
-                                    onSongClick(song, searchResults)
-                                },
-                                onDownloadClick = { songForDownloadChoice = song },
-                                onDownloadWithOptions = { s, target, quality ->
-                                    onDownloadSongWithOptions(s, target, quality)
-                                }
+
+                        if (isSearchingOnline) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 1.8.dp,
+                                color = AppleRed
                             )
                         }
                     }
 
-                    // 在线搜索结果 (经过本地曲库智能比对与状态挂载)
-                    if (resolvedOnlineResults.isNotEmpty() || isSearchingOnline) {
-                        item {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 12.dp, bottom = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "全网在线发现 · ${selectedSource.displayName} (${resolvedOnlineResults.size})",
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = AppleRed
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val isUrlQuery = query.trim().startsWith("http://") || query.trim().startsWith("https://")
+                    val effectiveType = if (isUrlQuery) SearchContentType.SONG else selectedSearchType
+
+                    when (effectiveType) {
+                        SearchContentType.SONG -> {
+                            if (localSongResults.isEmpty() && resolvedOnlineSongs.isEmpty()) {
+                                SearchEmptyOrLoadingBox(
+                                    isSearchingOnline = isSearchingOnline,
+                                    emptyText = "未找到与「$query」匹配的歌曲或歌手"
                                 )
-                                if (isSearchingOnline) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 1.8.dp, color = AppleRed)
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    if (localSongResults.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "媒体库歌曲 (${localSongResults.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(vertical = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = localSongResults,
+                                            key = { "local_${it.id}" },
+                                            contentType = { "search_song_item" }
+                                        ) { song ->
+                                            SongListItemRow(
+                                                song = song,
+                                                isServerConnected = isServerConnected,
+                                                currentPlayingSong = currentPlayingSong,
+                                                isPlaying = isPlaying,
+                                                onClick = { onSongClick(song, localSongResults) },
+                                                onDownloadClick = { songForDownloadChoice = song },
+                                                onDownloadWithOptions = { s, target, quality ->
+                                                    onDownloadSongWithOptions(s, target, quality)
+                                                }
+                                            )
+                                        }
+                                    }
+
+                                    if (resolvedOnlineSongs.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "柠檬在线 · ${selectedSource.displayName} (${resolvedOnlineSongs.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleRed,
+                                                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = resolvedOnlineSongs,
+                                            key = { "online_${it.id}" },
+                                            contentType = { "search_online_song_item" }
+                                        ) { song ->
+                                            SongListItemRow(
+                                                song = song,
+                                                isServerConnected = isServerConnected,
+                                                currentPlayingSong = currentPlayingSong,
+                                                isPlaying = isPlaying,
+                                                onClick = { onSongClick(song, resolvedOnlineSongs) },
+                                                onDownloadClick = { songForDownloadChoice = song },
+                                                onDownloadWithOptions = { s, target, quality ->
+                                                    onDownloadSongWithOptions(s, target, quality)
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
-                        items(
-                            items = resolvedOnlineResults,
-                            key = { "online_${it.id}" },
-                            contentType = { "search_online_song_item" }
-                        ) { song ->
-                            SongListItemRow(
-                                song = song,
-                                isServerConnected = isServerConnected,
-                                onClick = {
-                                    // 播放在线歌曲并保持留在搜索页面
-                                    onSongClick(song, resolvedOnlineResults)
-                                },
-                                onDownloadClick = { songForDownloadChoice = song },
-                                onDownloadWithOptions = { s, target, quality ->
-                                    onDownloadSongWithOptions(s, target, quality)
+
+                        SearchContentType.ALBUM -> {
+                            if (localAlbumResults.isEmpty() && onlineAlbumResults.isEmpty()) {
+                                SearchEmptyOrLoadingBox(
+                                    isSearchingOnline = isSearchingOnline,
+                                    emptyText = "未找到与「$query」匹配的专辑"
+                                )
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    if (localAlbumResults.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "媒体库专辑 (${localAlbumResults.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(vertical = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = localAlbumResults,
+                                            key = { "local_album_${it.id}_${it.title}" },
+                                            contentType = { "search_album_item" }
+                                        ) { album ->
+                                            SearchAlbumListItem(
+                                                album = album,
+                                                onClick = {
+                                                    drillDownTitle = album.title
+                                                    drillDownSubtitle = album.artist
+                                                    drillDownSongs = allSongs.filter {
+                                                        it.albumId == album.id || it.album.equals(album.title, ignoreCase = true)
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+
+                                    if (onlineAlbumResults.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "柠檬在线专辑 · ${selectedSource.displayName} (${onlineAlbumResults.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleRed,
+                                                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = onlineAlbumResults,
+                                            key = { "online_album_${it.id}" },
+                                            contentType = { "search_online_album_item" }
+                                        ) { album ->
+                                            SearchAlbumListItem(
+                                                album = album,
+                                                onClick = {
+                                                    drillDownTitle = album.title
+                                                    drillDownSubtitle = album.artist
+                                                    isLoadingDrillDown = true
+                                                    drillDownSongs = emptyList()
+                                                    kotlinx.coroutines.MainScope().let { _ -> }
+                                                    coroutineScope.launch {
+                                                        try {
+                                                            drillDownSongs = onFetchCollectionSongs?.invoke(album.id).orEmpty()
+                                                        } catch (_: Exception) {
+                                                            drillDownSongs = emptyList()
+                                                        } finally {
+                                                            isLoadingDrillDown = false
+                                                        }
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
-                            )
+                            }
+                        }
+
+                        SearchContentType.PLAYLIST -> {
+                            if (localPlaylistResults.isEmpty() && onlinePlaylistResults.isEmpty()) {
+                                SearchEmptyOrLoadingBox(
+                                    isSearchingOnline = isSearchingOnline,
+                                    emptyText = "未找到与「$query」匹配的歌单"
+                                )
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    if (localPlaylistResults.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "媒体库歌单 (${localPlaylistResults.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(vertical = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = localPlaylistResults,
+                                            key = { "local_pl_${it.id}" },
+                                            contentType = { "search_playlist_item" }
+                                        ) { pl ->
+                                            SearchPlaylistListItem(
+                                                playlist = pl,
+                                                onClick = {
+                                                    drillDownTitle = pl.name
+                                                    drillDownSubtitle = "${pl.songCount} 首歌曲"
+                                                    isLoadingDrillDown = true
+                                                    drillDownSongs = emptyList()
+                                                    coroutineScope.launch {
+                                                        try {
+                                                            drillDownSongs = onFetchCollectionSongs?.invoke(pl.id).orEmpty()
+                                                        } catch (_: Exception) {
+                                                            drillDownSongs = emptyList()
+                                                        } finally {
+                                                            isLoadingDrillDown = false
+                                                        }
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+
+                                    if (onlinePlaylistResults.isNotEmpty()) {
+                                        item {
+                                            Text(
+                                                text = "柠檬在线歌单 · ${selectedSource.displayName} (${onlinePlaylistResults.size})",
+                                                fontSize = dimensions.bodySize,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleRed,
+                                                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                            )
+                                        }
+                                        items(
+                                            items = onlinePlaylistResults,
+                                            key = { "online_pl_${it.id}" },
+                                            contentType = { "search_online_playlist_item" }
+                                        ) { pl ->
+                                            SearchPlaylistListItem(
+                                                playlist = pl,
+                                                onClick = {
+                                                    drillDownTitle = pl.name
+                                                    drillDownSubtitle = if (pl.songCount > 0) "${pl.songCount} 首歌曲" else selectedSource.displayName
+                                                    isLoadingDrillDown = true
+                                                    drillDownSongs = emptyList()
+                                                    coroutineScope.launch {
+                                                        try {
+                                                            drillDownSongs = onFetchCollectionSongs?.invoke(pl.id).orEmpty()
+                                                        } catch (_: Exception) {
+                                                            drillDownSongs = emptyList()
+                                                        } finally {
+                                                            isLoadingDrillDown = false
+                                                        }
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            }
 
-            if (songForDownloadChoice != null) {
-                DownloadQualityChoiceDialog(
-                    song = songForDownloadChoice!!,
-                    isServerConnected = isServerConnected,
-                    onDismiss = { songForDownloadChoice = null },
-                    onConfirm = { target, quality ->
-                        onDownloadSongWithOptions(songForDownloadChoice!!, target, quality)
-                        songForDownloadChoice = null
-                    }
-                )
+                if (songForDownloadChoice != null) {
+                    DownloadQualityChoiceDialog(
+                        song = songForDownloadChoice!!,
+                        isServerConnected = isServerConnected,
+                        onDismiss = { songForDownloadChoice = null },
+                        onConfirm = { target, quality ->
+                            onDownloadSongWithOptions(songForDownloadChoice!!, target, quality)
+                            songForDownloadChoice = null
+                        }
+                    )
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun SearchEmptyOrLoadingBox(
+    isSearchingOnline: Boolean,
+    emptyText: String
+) {
+    val dimensions = LocalAppDimensions.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(top = 64.dp),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        if (isSearchingOnline) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp, color = AppleRed)
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "正在从柠檬音乐服务器检索...",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = dimensions.bodySize
+                )
+            }
+        } else {
+            Text(
+                text = emptyText,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = dimensions.itemTitleSize
+            )
+        }
+    }
+}
+
+@Composable
+private fun SearchAlbumListItem(
+    album: UnifiedAlbum,
+    onClick: () -> Unit
+) {
+    val dimensions = LocalAppDimensions.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        AlbumArtworkImage(
+            model = album.coverUrl,
+            seedId = album.id,
+            modifier = Modifier.size(48.dp),
+            cornerRadius = 10.dp
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = album.title,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            val metaParts = buildList {
+                if (album.artist.isNotBlank()) add(album.artist)
+                if (album.songCount > 0) add("${album.songCount} 首")
+                if (album.year != null && album.year > 0) add("${album.year}")
+            }
+            Text(
+                text = metaParts.joinToString(" · "),
+                fontSize = dimensions.captionSize,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Icon(
+            imageVector = Icons.Default.ChevronRight,
+            contentDescription = "查看专辑曲目",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun SearchPlaylistListItem(
+    playlist: UnifiedPlaylist,
+    onClick: () -> Unit
+) {
+    val dimensions = LocalAppDimensions.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        AlbumArtworkImage(
+            model = playlist.coverUrl,
+            seedId = playlist.id,
+            modifier = Modifier.size(48.dp),
+            cornerRadius = 10.dp
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = playlist.name,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = if (playlist.songCount > 0) "${playlist.songCount} 首歌曲" else "精选歌单",
+                fontSize = dimensions.captionSize,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Icon(
+            imageVector = Icons.Default.ChevronRight,
+            contentDescription = "查看歌单曲目",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }

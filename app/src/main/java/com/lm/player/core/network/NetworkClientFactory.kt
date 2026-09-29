@@ -42,6 +42,17 @@ object NetworkClientFactory {
     @Volatile
     private var sharedClient: OkHttpClient? = null
 
+    @Volatile
+    private var activeAuthToken: String = ""
+
+    fun setActiveAuthToken(token: String) {
+        if (token.isNotBlank()) {
+            activeAuthToken = token.trim()
+        }
+    }
+
+    fun getActiveAuthToken(): String = activeAuthToken
+
     fun createOkHttpClient(context: Context): OkHttpClient {
         return getSharedClient(context)
     }
@@ -69,16 +80,16 @@ object NetworkClientFactory {
         val builder = OkHttpClient.Builder()
             .connectionPool(pool)
             .dispatcher(dispatcher)
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .writeTimeout(25, TimeUnit.SECONDS)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
 
         if (cache != null) {
             builder.cache(cache)
         }
 
-        // 统一注入现代主流 User-Agent 与自动补齐 Authorization 头
+        // 统一注入现代主流 User-Agent 与自动补齐柠檬服务端 Authorization 头
         builder.addInterceptor { chain ->
             val request = chain.request()
             val reqBuilder = request.newBuilder()
@@ -88,10 +99,19 @@ object NetworkClientFactory {
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 )
             }
-            // 若 URL 中携带 token 参数且未显式指定 Authorization 请求头，自动补充 Bearer Token
+            val encodedPath = request.url.encodedPath
+            // 音频流式接口绕过 OkHttp 磁盘缓存（交由 Media3 SimpleCache 统一管理），避免 206 Range 截断冲突
+            if (encodedPath.contains("/api/play/")) {
+                reqBuilder.cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+            }
+            // 若 URL 中携带 token 参数或访问柠檬服务端 API 且未显式指定 Authorization 请求头，自动补充 Bearer Token
             val tokenParam = request.url.queryParameter("token")
-            if (!tokenParam.isNullOrBlank() && request.header("Authorization").isNullOrBlank()) {
-                reqBuilder.header("Authorization", "Bearer $tokenParam")
+            if (request.header("Authorization").isNullOrBlank()) {
+                if (!tokenParam.isNullOrBlank()) {
+                    reqBuilder.header("Authorization", "Bearer $tokenParam")
+                } else if (activeAuthToken.isNotBlank() && encodedPath.startsWith("/api/")) {
+                    reqBuilder.header("Authorization", "Bearer $activeAuthToken")
+                }
             }
             chain.proceed(reqBuilder.build())
         }

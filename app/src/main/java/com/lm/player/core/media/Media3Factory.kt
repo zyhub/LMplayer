@@ -55,7 +55,7 @@ object Media3Factory {
     }
 
     @Volatile
-    private var isCacheEnabled = true
+    private var isCacheEnabled = false
 
     fun setCacheEnabled(enabled: Boolean) {
         isCacheEnabled = enabled
@@ -73,15 +73,17 @@ object Media3Factory {
      */
     fun buildDataSourceFactory(context: Context, okHttpClient: OkHttpClient): DataSource.Factory {
         val httpDataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
-            .setUserAgent("LMPlayer/1.0 (Android; Low-Latency-Streaming-Engine)")
 
         val upstreamFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
 
         val cache = getSimpleCache(context)
+        val cacheDataSinkFactory = CacheDataSink.Factory()
+            .setCache(cache)
+            .setFragmentSize(20L * 1024 * 1024) // 20MB 单切片，避免默认 5MB 频繁断开重连触发服务端代理并发限制
         val cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(cache)
             .setUpstreamDataSourceFactory(upstreamFactory)
-            .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(cache))
+            .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
         return DataSource.Factory {
@@ -97,19 +99,22 @@ object Media3Factory {
     fun getSharedExoPlayer(context: Context): ExoPlayer {
         if (sharedExoPlayer == null) {
             val appContext = context.applicationContext
+            isCacheEnabled = appContext.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                .getBoolean("stream_cache_enabled_v2", false)
             val okHttpClient = NetworkClientFactory.createOkHttpClient(appContext)
             val dataSourceFactory = buildDataSourceFactory(appContext, okHttpClient)
 
             val renderersFactory = DefaultRenderersFactory(appContext)
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
 
-            // 极速低延迟播放缓冲控制器 (bufferForPlaybackMs: 500ms 极速起播，避免传统 2500ms 等待)
+            // 针对柠檬音乐服务端 /api/play/proxy (15秒 Socket 空闲超时) 调优缓冲窗口：
+            // minBufferMs=50s 与 maxBufferMs=55s 仅差 5 秒 (< 15秒)，保证流连接每 5 秒持续读取保活，彻底根治播半首断开暂停问题
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    /* minBufferMs = */ 15_000,
-                    /* maxBufferMs = */ 50_000,
-                    /* bufferForPlaybackMs = */ 500,
-                    /* bufferForPlaybackAfterRebufferMs = */ 1_000
+                    /* minBufferMs = */ 50_000,
+                    /* maxBufferMs = */ 55_000,
+                    /* bufferForPlaybackMs = */ 600,
+                    /* bufferForPlaybackAfterRebufferMs = */ 1_500
                 )
                 .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
@@ -125,7 +130,7 @@ object Media3Factory {
                 .setLoadControl(loadControl)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(appContext).setDataSourceFactory(dataSourceFactory))
                 .setAudioAttributes(audioAttributes, true)
-                .setWakeMode(C.WAKE_MODE_LOCAL)
+                .setWakeMode(C.WAKE_MODE_NETWORK) // 同时持有 CPU WakeLock 与 WifiLock，防止息屏或后台流媒体休眠断流
                 .setHandleAudioBecomingNoisy(true) // 拔出耳机或蓝牙断开自动暂停
                 .build()
         }

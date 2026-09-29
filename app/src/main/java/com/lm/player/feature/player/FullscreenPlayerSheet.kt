@@ -16,7 +16,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
@@ -52,6 +54,8 @@ import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
+import com.lm.player.core.media.AudioSharingManager
+import com.lm.player.core.media.ShareProtocolType
 import com.lm.player.core.model.*
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -61,7 +65,7 @@ import kotlin.math.roundToInt
  * 现代全屏音乐播放界面 (全面支持横竖屏自适应与界面内嵌融合面板)
  * - 竖屏模式：顶部 Segmented 切换 [ 歌曲 | 歌词 ]、支持左右滑动无缝切换歌词、下拉手势丝滑最小化
  * - 横屏模式：超大专辑封面展示 + 左侧全功能控制器与工具栏 + 右侧视窗支持 [ 歌词 ⇄ 待播列表 ] 顶部右上角一键无缝切换
- * - 底部工具条：[ ≡ 待播列表 ] [ ⏱ 定时关闭 ] [ ⓘ 音频参数详情 ] (取消倍速展示，界面融为一体)
+ * - 底部工具条：[ ≡ 待播列表 ] [ ⏱ 定时关闭 ] [ 📡 AirPlay/DLNA/输出路由 ] [ ⓘ 音频参数详情 ]
  * - 工具面板：定时器、音频参数、音频输出共享均使用界面内嵌浮层弹出，与播放界面完美融合
  */
 @androidx.compose.foundation.ExperimentalFoundationApi
@@ -101,6 +105,20 @@ fun FullscreenPlayerSheet(
     val dimensions = LocalAppDimensions.current
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+
+    val activeCastDevice by AudioSharingManager.activeCastDevice.collectAsState()
+
+    LaunchedEffect(Unit) {
+        AudioSharingManager.observeLocalAudioRoutes(context)
+    }
+
+    // 若当前处于 DLNA / AirPlay 无线投射状态，切歌时自动将新曲目同步推送至远端接收器
+    LaunchedEffect(song.id) {
+        val targetDevice = activeCastDevice
+        if (targetDevice != null) {
+            AudioSharingManager.castSongToDevice(context, targetDevice, song, 0L)
+        }
+    }
 
     // 竖屏 Pager 状态：0 为歌曲封面大图，1 为实时滚动歌词
     val pagerState = rememberPagerState(initialPage = if (isLyricsMode) 1 else 0, pageCount = { 2 })
@@ -230,7 +248,8 @@ fun FullscreenPlayerSheet(
     ) {
         if (isLandscape) {
             // =========================================================================
-            // 横屏布局：支持左右拖动调节比例 (左侧控制器 66.7%~100% + 中间手柄 + 右侧歌词/待播 0%~33.3%)
+            // 横屏自适应布局：支持左右拖动调节比例 (左侧控制器 66.7%~100% + 中间手柄 + 右侧歌词/待播 0%~33.3%)
+            // 针对手机横屏短垂直高度 (270dp~360dp) 动态分配各区块尺寸，确保底部播控与工具栏 100% 完整显示绝不裁切
             // =========================================================================
             val screenWidthPx = with(LocalDensity.current) { configuration.screenWidthDp.dp.toPx() }
             val effectiveLyricsRatio = landscapeLyricsRatio.coerceIn(0.0f, 0.333f)
@@ -241,322 +260,468 @@ fun FullscreenPlayerSheet(
                 modifier = Modifier
                     .fillMaxSize()
                     .systemBarsPadding()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // 左侧控制器面板 (自适应占比 66.7% ~ 100%)
-                Column(
+                BoxWithConstraints(
                     modifier = Modifier
                         .weight(playerWeight)
-                        .fillMaxHeight(),
-                    verticalArrangement = Arrangement.SpaceBetween
+                        .fillMaxHeight()
                 ) {
-                    // 1. 顶部 Header (确保左右各司其职，绝不重叠)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .zIndex(150f),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    val availH = maxHeight
+                    val isCompactLandscape = availH < 370.dp
+                    val headerBtnSize = (availH * 0.10f).coerceIn(28.dp, 36.dp)
+                    val headerIconSize = (headerBtnSize * 0.54f).coerceIn(15.dp, 20.dp)
+                    val playBtnSize = (availH * 0.145f).coerceIn(38.dp, 52.dp)
+                    val playIconSize = (playBtnSize * 0.54f).coerceIn(20.dp, 28.dp)
+                    val skipBtnSize = (availH * 0.115f).coerceIn(32.dp, 42.dp)
+                    val skipIconSize = (skipBtnSize * 0.72f).coerceIn(22.dp, 30.dp)
+                    val modeBtnSize = (availH * 0.10f).coerceIn(28.dp, 38.dp)
+                    val modeIconSize = (modeBtnSize * 0.58f).coerceIn(16.dp, 20.dp)
+                    val toolbarBtnSize = (availH * 0.10f).coerceIn(28.dp, 38.dp)
+                    val toolbarIconSize = (toolbarBtnSize * 0.58f).coerceIn(16.dp, 20.dp)
+
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(circleButtonBg)
-                                .clickable(onClick = onDismiss),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.KeyboardArrowDown, contentDescription = "最小化", tint = primaryTextColor, modifier = Modifier.size(22.dp))
-                        }
-
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = circleButtonBg
-                        ) {
-                            Text(
-                                text = if (song.localFilePath != null) "本地高保真音频" else "在线高保真流媒体",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = primaryTextColor,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                            )
-                        }
-
+                        // 1. 顶部 Header (确保左右各司其职，绝不重叠)
                         Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .zIndex(150f),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // 加入歌单 (音频共享式展出)
-                            Box {
-                                Box(
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .clip(CircleShape)
-                                        .background(circleButtonBg)
-                                        .clickable(onClick = { showLandscapeAddToPlaylistMenu = true }),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = "加入歌单", tint = primaryTextColor, modifier = Modifier.size(19.dp))
-                                }
-                                AddToPlaylistDropdownMenu(
-                                    expanded = showLandscapeAddToPlaylistMenu,
-                                    onDismissRequest = { showLandscapeAddToPlaylistMenu = false },
-                                    song = song,
-                                    playlists = allPlaylists,
-                                    isServerConnected = isServerConnected,
-                                    onSelectPlaylist = { pl, s ->
-                                        onAddToPlaylist(pl, s)
-                                        Toast.makeText(context, "已添加至歌单: ${pl.name}", Toast.LENGTH_SHORT).show()
-                                    },
-                                    onCreatePlaylistAndAdd = { name, s ->
-                                        onCreatePlaylistAndAddSong(name, s)
-                                        Toast.makeText(context, "已创建歌单 \"$name\" 并添加歌曲", Toast.LENGTH_SHORT).show()
-                                    }
-                                )
-                            }
-
-                            // 缓存与下载
-                            Box {
-                                Box(
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .clip(CircleShape)
-                                        .background(circleButtonBg)
-                                        .clickable(onClick = { showLandscapeDownloadMenu = true }),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
-                                    val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
-                                    if (isDownloaded && isServerCached) {
-                                        Icon(Icons.Default.CheckCircle, contentDescription = "双端已同步", tint = Color(0xFF34C759), modifier = Modifier.size(19.dp))
-                                    } else if (isDownloaded || isServerCached) {
-                                        Icon(Icons.Default.CheckCircleOutline, contentDescription = "单端已缓存", tint = Color(0xFF34C759), modifier = Modifier.size(19.dp))
-                                    } else {
-                                        Icon(Icons.Default.FileDownload, contentDescription = "下载", tint = primaryTextColor, modifier = Modifier.size(19.dp))
-                                    }
-                                }
-                                DownloadQualityDropdownMenu(
-                                    expanded = showLandscapeDownloadMenu,
-                                    onDismissRequest = { showLandscapeDownloadMenu = false },
-                                    song = song,
-                                    isServerConnected = isServerConnected,
-                                    hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
-                                    hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
-                                    onConfirm = { target, quality ->
-                                        showLandscapeDownloadMenu = false
-                                        onDownloadSongWithOptions(song, target, quality)
-                                    }
-                                )
-                            }
-
-                            Box {
-                                Box(
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .clip(CircleShape)
-                                        .background(circleButtonBg)
-                                        .clickable(onClick = { showAudioOutputPanel = true }),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.Default.SurroundSound, contentDescription = "音频输出与共享", tint = primaryTextColor, modifier = Modifier.size(19.dp))
-                                }
-                                AudioOutputDropdownMenu(
-                                    expanded = showAudioOutputPanel,
-                                    onDismissRequest = { showAudioOutputPanel = false },
-                                    song = song
-                                )
-                            }
-
                             Box(
                                 modifier = Modifier
-                                    .size(36.dp)
+                                    .size(headerBtnSize)
                                     .clip(CircleShape)
                                     .background(circleButtonBg)
-                                    .clickable {
-                                        localIsFavorite = !localIsFavorite
-                                        onToggleFavorite()
-                                    },
+                                    .clickable(onClick = onDismiss),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                    contentDescription = "喜欢",
-                                    tint = if (localIsFavorite) AppleRed else primaryTextColor,
-                                    modifier = Modifier.size(19.dp)
+                                    Icons.Default.KeyboardArrowDown,
+                                    contentDescription = "最小化",
+                                    tint = primaryTextColor,
+                                    modifier = Modifier.size(headerIconSize)
                                 )
                             }
-                        }
-                    }
 
-                    // 2. 超大专辑封面展示 + 歌名歌手
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        AlbumArtworkImage(
-                            model = song.coverUrl,
-                            seedId = song.id,
-                            targetSize = 480,
-                            modifier = Modifier
-                                .size(230.dp)
-                                .clip(RoundedCornerShape(18.dp))
-                                .shadow(16.dp, RoundedCornerShape(18.dp)),
-                            cornerRadius = 18.dp
-                        )
-
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Text(
-                                text = song.title,
-                                style = TextStyle(
-                                    fontSize = 20.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = primaryTextColor
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = song.artist,
-                                style = TextStyle(
-                                    fontSize = 14.sp,
-                                    color = secondaryTextColor
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = song.album.ifBlank { "单曲精选" },
-                                style = TextStyle(
-                                    fontSize = 12.sp,
-                                    color = secondaryTextColor.copy(alpha = 0.8f)
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
                             Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = AppleRed.copy(alpha = 0.15f),
-                                modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                                shape = RoundedCornerShape(10.dp),
+                                color = circleButtonBg
                             ) {
                                 Text(
-                                    text = "${song.format.uppercase()} ${song.bitRate} kbps",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = AppleRed,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    text = if (song.localFilePath != null) "本地高保真音频" else "在线高保真流媒体",
+                                    fontSize = if (isCompactLandscape) 10.sp else 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = primaryTextColor,
+                                    modifier = Modifier.padding(
+                                        horizontal = 8.dp,
+                                        vertical = if (isCompactLandscape) 2.dp else 3.dp
+                                    )
                                 )
                             }
-                        }
-                    }
 
-                    // 3. 进度条与时间
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Slider(
-                            value = if (totalDurationMs > 0) (progressMs.toFloat() / totalDurationMs).coerceIn(0f, 1f) else 0f,
-                            onValueChange = { ratio -> onSeekTo((ratio * totalDurationMs).toLong()) },
-                            colors = SliderDefaults.colors(
-                                thumbColor = primaryTextColor,
-                                activeTrackColor = primaryTextColor,
-                                inactiveTrackColor = primaryTextColor.copy(alpha = 0.2f)
-                            ),
-                            modifier = Modifier.fillMaxWidth().height(18.dp)
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(text = formatDuration(progressMs), fontSize = 11.sp, color = secondaryTextColor)
-                            Text(text = formatDuration(totalDurationMs), fontSize = 11.sp, color = secondaryTextColor)
-                        }
-                    }
-
-                    // 4. 5 大主控播放按键
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = onToggleShuffle) {
-                            Icon(Icons.Default.Shuffle, contentDescription = "随机", tint = if (isShuffle) AppleRed else secondaryTextColor, modifier = Modifier.size(20.dp))
-                        }
-                        IconButton(onClick = onPrevious) {
-                            Icon(Icons.Default.SkipPrevious, contentDescription = "上一首", tint = primaryTextColor, modifier = Modifier.size(32.dp))
-                        }
-                        IconButton(onClick = onTogglePlayPause, modifier = Modifier.size(52.dp).clip(CircleShape).background(primaryTextColor)) {
-                            Icon(if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, contentDescription = "播放/暂停", tint = if (isDark) Color.Black else Color.White, modifier = Modifier.size(28.dp))
-                        }
-                        IconButton(onClick = onNext) {
-                            Icon(Icons.Default.SkipNext, contentDescription = "下一首", tint = primaryTextColor, modifier = Modifier.size(32.dp))
-                        }
-                        IconButton(onClick = onToggleRepeat) {
-                            Icon(Icons.Default.Repeat, contentDescription = "循环", tint = if (isRepeat) AppleRed else secondaryTextColor, modifier = Modifier.size(20.dp))
-                        }
-                    }
-
-                    // 5. 底部功能工具栏
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp)),
-                        color = surfaceGlassColor
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceAround,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            IconButton(onClick = {
-                                landscapeRightPaneMode = if (landscapeRightPaneMode == 1) 0 else 1
-                            }) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.QueueMusic,
-                                    contentDescription = "待播列表",
-                                    tint = if (landscapeRightPaneMode == 1) AppleRed else secondaryTextColor,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                            Box {
-                                IconButton(onClick = { showSleepTimerPanel = true }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Timer,
-                                        contentDescription = "定时关闭",
-                                        tint = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor,
-                                        modifier = Modifier.size(20.dp)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(if (isCompactLandscape) 8.dp else 10.dp)
+                            ) {
+                                // 加入歌单 (音频共享式展出)
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(headerBtnSize)
+                                            .clip(CircleShape)
+                                            .background(circleButtonBg)
+                                            .clickable(onClick = { showLandscapeAddToPlaylistMenu = true }),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.PlaylistAdd,
+                                            contentDescription = "加入歌单",
+                                            tint = primaryTextColor,
+                                            modifier = Modifier.size(headerIconSize)
+                                        )
+                                    }
+                                    AddToPlaylistDropdownMenu(
+                                        expanded = showLandscapeAddToPlaylistMenu,
+                                        onDismissRequest = { showLandscapeAddToPlaylistMenu = false },
+                                        song = song,
+                                        playlists = allPlaylists,
+                                        isServerConnected = isServerConnected,
+                                        onSelectPlaylist = { pl, s ->
+                                            onAddToPlaylist(pl, s)
+                                            Toast.makeText(context, "已添加至歌单: ${pl.name}", Toast.LENGTH_SHORT).show()
+                                        },
+                                        onCreatePlaylistAndAdd = { name, s ->
+                                            onCreatePlaylistAndAddSong(name, s)
+                                            Toast.makeText(context, "已创建歌单 \"$name\" 并添加歌曲", Toast.LENGTH_SHORT).show()
+                                        }
                                     )
                                 }
-                                SleepTimerDropdownMenu(
-                                    expanded = showSleepTimerPanel,
-                                    onDismissRequest = { showSleepTimerPanel = false },
-                                    activeTimerMinutes = activeTimerMinutes,
-                                    onSelectTimer = { min ->
-                                        activeTimerMinutes = min
-                                        if (min > 0) {
-                                            Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
+
+                                // 缓存与下载
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(headerBtnSize)
+                                            .clip(CircleShape)
+                                            .background(circleButtonBg)
+                                            .clickable(onClick = { showLandscapeDownloadMenu = true }),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                        val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
+                                        if (isDownloaded && isServerCached) {
+                                            Icon(Icons.Default.CheckCircle, contentDescription = "双端已同步", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
+                                        } else if (isDownloaded || isServerCached) {
+                                            Icon(Icons.Default.CheckCircleOutline, contentDescription = "单端已缓存", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
                                         } else {
-                                            Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
+                                            Icon(Icons.Default.FileDownload, contentDescription = "下载", tint = primaryTextColor, modifier = Modifier.size(headerIconSize))
                                         }
                                     }
+                                    DownloadQualityDropdownMenu(
+                                        expanded = showLandscapeDownloadMenu,
+                                        onDismissRequest = { showLandscapeDownloadMenu = false },
+                                        song = song,
+                                        isServerConnected = isServerConnected,
+                                        hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                        hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
+                                        onConfirm = { target, quality ->
+                                            showLandscapeDownloadMenu = false
+                                            onDownloadSongWithOptions(song, target, quality)
+                                        }
+                                    )
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .size(headerBtnSize)
+                                        .clip(CircleShape)
+                                        .background(circleButtonBg)
+                                        .clickable {
+                                            localIsFavorite = !localIsFavorite
+                                            onToggleFavorite()
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                        contentDescription = "喜欢",
+                                        tint = if (localIsFavorite) AppleRed else primaryTextColor,
+                                        modifier = Modifier.size(headerIconSize)
+                                    )
+                                }
+                            }
+                        }
+
+                        // 2. 自适应专辑封面展示 + 歌名歌手 (使用 weight(1f) 动态吸收剩余高度，绝不挤压底部控件)
+                        BoxWithConstraints(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            val dynamicCoverSize = minOf(maxHeight - 4.dp, maxWidth * 0.44f).coerceIn(76.dp, 220.dp)
+                            val coverCorner = (dynamicCoverSize * 0.08f).coerceIn(10.dp, 18.dp)
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(if (isCompactLandscape) 12.dp else 16.dp)
+                            ) {
+                                AlbumArtworkImage(
+                                    model = song.coverUrl,
+                                    seedId = song.id,
+                                    targetSize = 480,
+                                    modifier = Modifier
+                                        .size(dynamicCoverSize)
+                                        .clip(RoundedCornerShape(coverCorner))
+                                        .shadow(12.dp, RoundedCornerShape(coverCorner)),
+                                    cornerRadius = coverCorner
+                                )
+
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        text = song.title,
+                                        style = TextStyle(
+                                            fontSize = if (isCompactLandscape) 17.sp else 20.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = primaryTextColor
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(if (isCompactLandscape) 2.dp else 4.dp))
+                                    Text(
+                                        text = song.artist,
+                                        style = TextStyle(
+                                            fontSize = if (isCompactLandscape) 13.sp else 14.sp,
+                                            color = secondaryTextColor
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = song.album.ifBlank { "单曲精选" },
+                                        style = TextStyle(
+                                            fontSize = if (isCompactLandscape) 11.sp else 12.sp,
+                                            color = secondaryTextColor.copy(alpha = 0.8f)
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(if (isCompactLandscape) 4.dp else 6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = AppleRed.copy(alpha = 0.15f),
+                                        modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                                    ) {
+                                        Text(
+                                            text = "${song.format.uppercase()} ${song.bitRate} kbps",
+                                            fontSize = if (isCompactLandscape) 10.sp else 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = AppleRed,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. 进度条与时间
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Slider(
+                                value = if (totalDurationMs > 0) (progressMs.toFloat() / totalDurationMs).coerceIn(0f, 1f) else 0f,
+                                onValueChange = { ratio -> onSeekTo((ratio * totalDurationMs).toLong()) },
+                                colors = SliderDefaults.colors(
+                                    thumbColor = primaryTextColor,
+                                    activeTrackColor = primaryTextColor,
+                                    inactiveTrackColor = primaryTextColor.copy(alpha = 0.2f)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(if (isCompactLandscape) 14.dp else 18.dp)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(text = formatDuration(progressMs), fontSize = if (isCompactLandscape) 10.sp else 11.sp, color = secondaryTextColor)
+                                Text(text = formatDuration(totalDurationMs), fontSize = if (isCompactLandscape) 10.sp else 11.sp, color = secondaryTextColor)
+                            }
+                        }
+
+                        // 4. 5 大主控播放按键 (采用自适应紧凑触控盒，避免默认 48dp IconButton 撑破小高度屏幕)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(modeBtnSize)
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onToggleShuffle),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Shuffle, contentDescription = "随机", tint = if (isShuffle) AppleRed else secondaryTextColor, modifier = Modifier.size(modeIconSize))
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(skipBtnSize)
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onPrevious),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.SkipPrevious, contentDescription = "上一首", tint = primaryTextColor, modifier = Modifier.size(skipIconSize))
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(playBtnSize)
+                                    .clip(CircleShape)
+                                    .background(primaryTextColor)
+                                    .clickable(onClick = onTogglePlayPause),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    contentDescription = "播放/暂停",
+                                    tint = if (isDark) Color.Black else Color.White,
+                                    modifier = Modifier.size(playIconSize)
                                 )
                             }
+                            Box(
+                                modifier = Modifier
+                                    .size(skipBtnSize)
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onNext),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.SkipNext, contentDescription = "下一首", tint = primaryTextColor, modifier = Modifier.size(skipIconSize))
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(modeBtnSize)
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onToggleRepeat),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Repeat, contentDescription = "循环", tint = if (isRepeat) AppleRed else secondaryTextColor, modifier = Modifier.size(modeIconSize))
+                            }
+                        }
 
-                            Box {
-                                IconButton(onClick = { showAudioSpecsPanel = true }) {
-                                    Icon(Icons.Outlined.Info, contentDescription = "参数详情", tint = secondaryTextColor, modifier = Modifier.size(20.dp))
+                        // 5. 底部功能工具栏 (自适应紧凑高度，完整露出)
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp)),
+                            color = surfaceGlassColor
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = if (isCompactLandscape) 2.dp else 4.dp),
+                                horizontalArrangement = Arrangement.SpaceAround,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(toolbarBtnSize)
+                                        .clip(CircleShape)
+                                        .clickable {
+                                            if (!isLyricsVisible) {
+                                                landscapeLyricsRatio = 0.333f
+                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
+                                                landscapeRightPaneMode = 0
+                                            } else if (landscapeRightPaneMode != 0) {
+                                                landscapeRightPaneMode = 0
+                                            } else {
+                                                landscapeLyricsRatio = 0.0f
+                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.0f).apply()
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Lyrics,
+                                        contentDescription = "歌词/歌曲切换",
+                                        tint = if (isLyricsVisible && landscapeRightPaneMode == 0) AppleRed else secondaryTextColor,
+                                        modifier = Modifier.size(toolbarIconSize)
+                                    )
                                 }
-                                AudioSpecsDropdownMenu(
-                                    expanded = showAudioSpecsPanel,
-                                    onDismissRequest = { showAudioSpecsPanel = false },
-                                    song = song
-                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(toolbarBtnSize)
+                                        .clip(CircleShape)
+                                        .clickable {
+                                            if (!isLyricsVisible) {
+                                                landscapeLyricsRatio = 0.333f
+                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
+                                                landscapeRightPaneMode = 1
+                                            } else {
+                                                landscapeRightPaneMode = if (landscapeRightPaneMode == 1) 0 else 1
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.QueueMusic,
+                                        contentDescription = "待播列表",
+                                        tint = if (isLyricsVisible && landscapeRightPaneMode == 1) AppleRed else secondaryTextColor,
+                                        modifier = Modifier.size(toolbarIconSize)
+                                    )
+                                }
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(toolbarBtnSize)
+                                            .clip(CircleShape)
+                                            .clickable { showSleepTimerPanel = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Timer,
+                                            contentDescription = "定时关闭",
+                                            tint = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor,
+                                            modifier = Modifier.size(toolbarIconSize)
+                                        )
+                                    }
+                                    SleepTimerDropdownMenu(
+                                        expanded = showSleepTimerPanel,
+                                        onDismissRequest = { showSleepTimerPanel = false },
+                                        activeTimerMinutes = activeTimerMinutes,
+                                        onSelectTimer = { min ->
+                                            activeTimerMinutes = min
+                                            if (min > 0) {
+                                                Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    )
+                                }
+
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(toolbarBtnSize)
+                                            .clip(CircleShape)
+                                            .clickable {
+                                                AudioSharingManager.refreshLocalAudioRoutes(context)
+                                                AudioSharingManager.startLanDiscovery(context)
+                                                showAudioOutputPanel = true
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Cast,
+                                            contentDescription = "AirPlay / DLNA / 音频输出",
+                                            tint = if (activeCastDevice != null || showAudioOutputPanel) AppleRed else secondaryTextColor,
+                                            modifier = Modifier.size(toolbarIconSize)
+                                        )
+                                    }
+                                    AudioOutputDropdownMenu(
+                                        expanded = showAudioOutputPanel,
+                                        onDismissRequest = { showAudioOutputPanel = false },
+                                        song = song,
+                                        progressMs = progressMs
+                                    )
+                                }
+
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(toolbarBtnSize)
+                                            .clip(CircleShape)
+                                            .clickable { showAudioSpecsPanel = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Outlined.Info,
+                                            contentDescription = "参数详情",
+                                            tint = secondaryTextColor,
+                                            modifier = Modifier.size(toolbarIconSize)
+                                        )
+                                    }
+                                    AudioSpecsDropdownMenu(
+                                        expanded = showAudioSpecsPanel,
+                                        onDismissRequest = { showAudioSpecsPanel = false },
+                                        song = song
+                                    )
+                                }
                             }
                         }
                     }
@@ -774,7 +939,7 @@ fun FullscreenPlayerSheet(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // 1. 顶部操作栏
+                // 1. 顶部操作栏 (左侧最小化 + 居中 [ 歌曲 | 歌词 ] 胶囊切换 + 右侧收藏按键)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -798,13 +963,14 @@ fun FullscreenPlayerSheet(
                         )
                     }
 
-                    // 顶部 Segmented Control 胶囊切换: [ 歌曲 | 歌词 ]
+                    // 顶部居中：[ 歌曲 | 歌词 ] 分段切换胶囊
+                    val isOnLyricsPage = pagerState.currentPage == 1
                     Surface(
-                        shape = RoundedCornerShape(20.dp),
+                        shape = RoundedCornerShape(18.dp),
                         color = circleButtonBg,
                         modifier = Modifier
                             .height(34.dp)
-                            .width(116.dp)
+                            .width(136.dp)
                     ) {
                         Row(
                             modifier = Modifier
@@ -817,22 +983,21 @@ fun FullscreenPlayerSheet(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxHeight()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(if (pagerState.currentPage == 0) (if (isDark) Color(0xFF3A3A3C) else Color.White) else Color.Transparent)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(
+                                        if (!isOnLyricsPage) (if (isDark) Color(0xFF3A3A42) else Color.White)
+                                        else Color.Transparent
+                                    )
                                     .clickable {
-                                        coroutineScope.launch {
-                                            pagerState.animateScrollToPage(0)
-                                        }
+                                        coroutineScope.launch { pagerState.animateScrollToPage(0) }
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     text = "歌曲",
-                                    style = TextStyle(
-                                        fontSize = 12.sp,
-                                        fontWeight = if (pagerState.currentPage == 0) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (pagerState.currentPage == 0) primaryTextColor else secondaryTextColor
-                                    )
+                                    fontSize = 13.sp,
+                                    fontWeight = if (!isOnLyricsPage) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (!isOnLyricsPage) primaryTextColor else secondaryTextColor
                                 )
                             }
 
@@ -840,73 +1005,44 @@ fun FullscreenPlayerSheet(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxHeight()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(if (pagerState.currentPage == 1) (if (isDark) Color(0xFF3A3A3C) else Color.White) else Color.Transparent)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(
+                                        if (isOnLyricsPage) (if (isDark) Color(0xFF3A3A42) else Color.White)
+                                        else Color.Transparent
+                                    )
                                     .clickable {
-                                        coroutineScope.launch {
-                                            pagerState.animateScrollToPage(1)
-                                        }
+                                        coroutineScope.launch { pagerState.animateScrollToPage(1) }
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     text = "歌词",
-                                    style = TextStyle(
-                                        fontSize = 12.sp,
-                                        fontWeight = if (pagerState.currentPage == 1) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (pagerState.currentPage == 1) primaryTextColor else secondaryTextColor
-                                    )
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isOnLyricsPage) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isOnLyricsPage) primaryTextColor else secondaryTextColor
                                 )
                             }
                         }
                     }
 
-                    // 顶部右侧：怀旧模式 + 音频共享输出 + 收藏按键
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    // 顶部右侧：收藏按键
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(circleButtonBg)
+                            .clickable {
+                                localIsFavorite = !localIsFavorite
+                                onToggleFavorite()
+                            },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Box {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(circleButtonBg)
-                                    .clickable(onClick = { showAudioOutputPanel = true }),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.SurroundSound,
-                                    contentDescription = "音频共享输出",
-                                    tint = primaryTextColor,
-                                    modifier = Modifier.size(19.dp)
-                                )
-                            }
-                            AudioOutputDropdownMenu(
-                                expanded = showAudioOutputPanel,
-                                onDismissRequest = { showAudioOutputPanel = false },
-                                song = song
-                            )
-                        }
-
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(circleButtonBg)
-                                .clickable {
-                                    localIsFavorite = !localIsFavorite
-                                    onToggleFavorite()
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                contentDescription = "红心喜欢",
-                                tint = if (localIsFavorite) AppleRed else primaryTextColor,
-                                modifier = Modifier.size(19.dp)
-                            )
-                        }
+                        Icon(
+                            imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                            contentDescription = "红心喜欢",
+                            tint = if (localIsFavorite) AppleRed else primaryTextColor,
+                            modifier = Modifier.size(19.dp)
+                        )
                     }
                 }
 
@@ -920,11 +1056,11 @@ fun FullscreenPlayerSheet(
                 ) { page ->
                     if (page == 0) {
                         // 页面 0: 居中大封面展示
-                        Box(
+                        BoxWithConstraints(
                             modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.Center
                         ) {
-                            val artworkSize = (configuration.screenWidthDp - 48).dp.coerceIn(280.dp, 400.dp)
+                            val artworkSize = minOf(maxWidth - 12.dp, maxHeight - 8.dp).coerceIn(180.dp, 360.dp)
                             AlbumArtworkImage(
                                 model = song.coverUrl,
                                 seedId = song.id,
@@ -976,16 +1112,43 @@ fun FullscreenPlayerSheet(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        Text(
-                            text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
-                            style = TextStyle(
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = secondaryTextColor
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = AppleRed.copy(alpha = 0.18f),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(5.dp))
+                                    .clickable { showAudioSpecsPanel = true }
+                            ) {
+                                val badgeLabel = when {
+                                    song.format.equals("flac", ignoreCase = true) && song.bitRate > 1000 -> "Hi-Res FLAC"
+                                    song.format.equals("flac", ignoreCase = true) -> "FLAC 无损"
+                                    song.bitRate >= 320 -> "${song.format.uppercase()} 320K"
+                                    else -> "${song.format.uppercase()} ${song.bitRate}K"
+                                }
+                                Text(
+                                    text = badgeLabel,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = AppleRed,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
+                                )
+                            }
+                            Text(
+                                text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选单曲"}",
+                                style = TextStyle(
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = secondaryTextColor
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(10.dp))
@@ -1179,14 +1342,26 @@ fun FullscreenPlayerSheet(
 
                 Spacer(modifier = Modifier.height(18.dp))
 
-                // 6. 底部 3 大功能工具栏: [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ ⓘ 参数详情 ]
+                // 6. 底部功能工具栏: [ 歌词切换 ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 6.dp),
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceAround,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    IconButton(onClick = {
+                        val nextPage = if (pagerState.currentPage == 1) 0 else 1
+                        coroutineScope.launch { pagerState.animateScrollToPage(nextPage) }
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.Lyrics,
+                            contentDescription = "歌词/歌曲切换",
+                            tint = if (pagerState.currentPage == 1) AppleRed else secondaryTextColor,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+
                     IconButton(onClick = { showQueueSheet = true }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.QueueMusic,
@@ -1217,6 +1392,27 @@ fun FullscreenPlayerSheet(
                                     Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
                                 }
                             }
+                        )
+                    }
+
+                    Box {
+                        IconButton(onClick = {
+                            AudioSharingManager.refreshLocalAudioRoutes(context)
+                            AudioSharingManager.startLanDiscovery(context)
+                            showAudioOutputPanel = true
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.Cast,
+                                contentDescription = "AirPlay / DLNA / 音频输出",
+                                tint = if (activeCastDevice != null || showAudioOutputPanel) AppleRed else secondaryTextColor,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        AudioOutputDropdownMenu(
+                            expanded = showAudioOutputPanel,
+                            onDismissRequest = { showAudioOutputPanel = false },
+                            song = song,
+                            progressMs = progressMs
                         )
                     }
 
@@ -1416,57 +1612,80 @@ fun AudioSpecsDropdownMenu(
     onDismissRequest: () -> Unit,
     song: UnifiedSong
 ) {
-    val formatStr = song.format.uppercase()
-    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || song.bitRate >= 800
-    val qualityTag = if (isLossless) "Hi-Res 无损母带" else if (song.bitRate >= 320) "极高品质音频" else "标准音频"
+    if (!expanded) return
+
     val isLocal = !song.localFilePath.isNullOrBlank()
-
-    val localSize: String? = if (isLocal && !song.localFilePath.orEmpty().startsWith("content://")) {
-        try {
-            val f = java.io.File(song.localFilePath!!)
-            if (f.exists()) "%.1f MB".format(java.util.Locale.US, f.length() / (1024.0 * 1024.0)) else null
-        } catch (_: Exception) {
-            null
-        }
+    val (formatStr, realBitRate, realLocalSizeStr) = if (isLocal) {
+        com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
     } else {
-        null
+        val context = androidx.compose.ui.platform.LocalContext.current
+        val q = AudioQuality.fromKey(com.lm.player.core.network.LemonMusicProtocol.getPreferredStreamQuality(context))
+        Triple(q.format.uppercase(), q.bitrate, q.estimateSizeText(song))
     }
-
-    val sizeText: String = localSize ?: run {
-        val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
-        val rate = if (isLossless) 900 else song.bitRate.coerceAtLeast(320)
-        val estMb = (durationSec * rate * 1024L / 8L) / (1024.0 * 1024.0)
-        "%.1f MB (预估)".format(java.util.Locale.US, estMb)
-    }
+    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
+    val qualityTag = if (isLossless && realBitRate >= 1200) "Hi-Res 无损母带" else if (isLossless) "无损品质音频" else if (realBitRate >= 320) "极高品质音频" else "标准音频"
+    val sizeText: String = realLocalSizeStr
 
     val locationText: String = if (isLocal) (song.localFilePath ?: "本地存储") else (song.streamUrl.takeIf { it.isNotBlank() } ?: "在线 NAS 媒体流")
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
-    DropdownMenu(
-        expanded = expanded,
+    Dialog(
         onDismissRequest = onDismissRequest,
-        modifier = Modifier
-            .widthIn(min = 270.dp, max = 330.dp)
-            .padding(14.dp)
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(shape = RoundedCornerShape(6.dp), color = Color(0xFFD4AF37).copy(alpha = 0.2f)) {
-                Text("Hi-Res", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color(0xFFD4AF37), modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = if (isDark) Color(0xFF1E1E26) else Color(0xFFF9F9FC),
+            border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)),
+            shadowElevation = 18.dp,
+            modifier = Modifier
+                .fillMaxWidth(0.90f)
+                .widthIn(max = 370.dp)
+                .padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(18.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = RoundedCornerShape(6.dp), color = Color(0xFFD4AF37).copy(alpha = 0.2f)) {
+                            Text("Hi-Res", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color(0xFFD4AF37), modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("音频参数详情", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    IconButton(onClick = onDismissRequest, modifier = Modifier.size(26.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "关闭", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
+                Spacer(modifier = Modifier.height(10.dp))
+
+                val activeRouteName by AudioSharingManager.activeLocalRouteName.collectAsState()
+                val activeCast by AudioSharingManager.activeCastDevice.collectAsState()
+                val activeChannelSummary = when {
+                    activeCast != null -> "${activeCast!!.name} (${activeCast!!.protocol.badge})"
+                    isLocal -> "$activeRouteName · 本地硬件直解"
+                    else -> "$activeRouteName · NAS 无损推流"
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SpecRowItem("音质等级", qualityTag, valueColor = if (isLossless) Color(0xFFD4AF37) else AppleRed)
+                    SpecRowItem("编码格式", formatStr, isBold = true)
+                    SpecRowItem("音频码率", "${if (song.bitRate > 0) song.bitRate else (if (isLossless) 920 else 320)} kbps")
+                    SpecRowItem("文件大小", sizeText, isBold = true, valueColor = AppleRed)
+                    SpecRowItem("存储位置", locationText, isPath = true)
+                    SpecRowItem("播放通道", activeChannelSummary, valueColor = AppleRed)
+                }
             }
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("音频参数详情", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            SpecRowItem("音质等级", qualityTag, valueColor = if (isLossless) Color(0xFFD4AF37) else AppleRed)
-            SpecRowItem("编码格式", formatStr, isBold = true)
-            SpecRowItem("音频码率", "${if (song.bitRate > 0) song.bitRate else (if (isLossless) 920 else 320)} kbps")
-            SpecRowItem("文件大小", sizeText, isBold = true, valueColor = AppleRed)
-            SpecRowItem("存储位置", locationText, isPath = true)
-            SpecRowItem("播放通道", if (isLocal) "本地硬件直解" else "NAS 无损推流", valueColor = AppleRed)
         }
     }
 }
@@ -1475,113 +1694,323 @@ fun AudioSpecsDropdownMenu(
 fun AudioOutputDropdownMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
-    song: UnifiedSong
+    song: UnifiedSong,
+    progressMs: Long = 0L
 ) {
+    if (!expanded) return
+
     val context = LocalContext.current
-    DropdownMenu(
-        expanded = expanded,
+    val scope = rememberCoroutineScope()
+    val localRoutes by AudioSharingManager.localRoutes.collectAsState()
+    val lanDevices by AudioSharingManager.lanDevices.collectAsState()
+    val activeCastDevice by AudioSharingManager.activeCastDevice.collectAsState()
+    val isScanning by AudioSharingManager.isScanning.collectAsState()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+
+    LaunchedEffect(expanded) {
+        if (expanded) {
+            AudioSharingManager.refreshLocalAudioRoutes(context)
+            AudioSharingManager.startLanDiscovery(context)
+        }
+    }
+
+    Dialog(
         onDismissRequest = onDismissRequest,
-        modifier = Modifier.widthIn(min = 240.dp, max = 300.dp)
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Text(
-            text = "音频输出与共享",
-            style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-        )
-        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = if (isDark) Color(0xFF1E1E26) else Color(0xFFF9F9FC),
+            border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)),
+            shadowElevation = 20.dp,
+            modifier = Modifier
+                .fillMaxWidth(0.90f)
+                .widthIn(max = 380.dp)
+                .heightIn(max = 520.dp)
+                .padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 12.dp)
+            ) {
+                // 1. 顶部标题与刷新扫描按钮
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "音频输出与 AirPlay / DLNA 共享",
+                        style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface),
+                        modifier = Modifier.weight(1f)
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = if (isScanning) "扫描中..." else "刷新局域网",
+                            style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppleRed),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable(enabled = !isScanning) {
+                                    AudioSharingManager.refreshLocalAudioRoutes(context)
+                                    AudioSharingManager.startLanDiscovery(context)
+                                }
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                        IconButton(onClick = onDismissRequest, modifier = Modifier.size(26.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = "关闭", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
 
-        DropdownMenuItem(
-            text = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
+                // 2. 本机实时音频输出通道列表 (扬声器 / 蓝牙 A2DP / USB DAC / 有线耳机)
+                localRoutes.forEach { route ->
+                    val isCurrentActive = activeCastDevice == null && route.isActivePrimary
+                    val routeIcon = when {
+                        route.typeLabel.contains("蓝牙") -> Icons.Default.Bluetooth
+                        route.typeLabel.contains("USB") -> Icons.Default.Usb
+                        route.typeLabel.contains("耳机") -> Icons.Default.Headphones
+                        else -> Icons.AutoMirrored.Filled.VolumeUp
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable {
+                                scope.launch {
+                                    if (activeCastDevice != null) {
+                                        AudioSharingManager.stopActiveCast(context)
+                                        Toast.makeText(context, "已断开局域网投射，恢复本机输出: ${route.name}", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        AudioSharingManager.launchSystemMediaOutputSwitcher(context)
+                                    }
+                                }
+                                onDismissRequest()
+                            }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = routeIcon,
+                                contentDescription = null,
+                                tint = if (isCurrentActive) AppleRed else Color(0xFF007AFF),
+                                modifier = Modifier.size(19.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = route.name,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = if (isCurrentActive) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isCurrentActive) AppleRed else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val subText = buildString {
+                                    append(if (isCurrentActive) "当前输出通道" else "点击切换系统音频路由")
+                                    if (route.sampleRatesSummary.isNotBlank()) {
+                                        append(" · 最高 ${route.sampleRatesSummary}")
+                                    }
+                                }
+                                Text(subText, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        if (isCurrentActive) {
+                            Icon(Icons.Default.Check, contentDescription = null, tint = AppleRed, modifier = Modifier.size(17.dp))
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp, modifier = Modifier.padding(vertical = 4.dp))
+
+                // 3. 局域网发现的 DLNA / UPnP MediaRenderer 与 AirPlay / RAOP 接收端
+                Text(
+                    text = if (isScanning) "局域网音响与接收器 (正在搜索 AirPlay / DLNA...)" else "局域网音响与接收器 (${lanDevices.size})",
+                    style = TextStyle(fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                )
+
+                if (lanDevices.isEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { AudioSharingManager.startLanDiscovery(context) }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.WifiTethering,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (isScanning) "正在扫描同一 Wi-Fi 下的设备..." else "暂未发现 DLNA / AirPlay 音响",
+                                fontSize = 12.5.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = "请确保音响/电视与手机处于同一局域网，点击重新扫描",
+                                fontSize = 10.5.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)
+                            )
+                        }
+                    }
+                } else {
+                    lanDevices.forEach { device ->
+                        val isCurrentCast = activeCastDevice?.id == device.id
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    scope.launch {
+                                        if (isCurrentCast) {
+                                            AudioSharingManager.stopActiveCast(context)
+                                            Toast.makeText(context, "已停止向 ${device.name} 投射音频", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(context, "正在连接 ${device.name} (${device.protocol.badge})...", Toast.LENGTH_SHORT).show()
+                                            val res = AudioSharingManager.castSongToDevice(context, device, song, progressMs)
+                                            res.onSuccess { msg ->
+                                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                            }.onFailure { err ->
+                                                Toast.makeText(context, err.message ?: "投射失败", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    }
+                                    onDismissRequest()
+                                }
+                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = if (device.protocol == ShareProtocolType.AIRPLAY_RAOP) Icons.Default.Airplay else Icons.Default.SpeakerGroup,
+                                    contentDescription = null,
+                                    tint = if (isCurrentCast) AppleRed else Color(0xFF5856D6),
+                                    modifier = Modifier.size(19.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = device.name,
+                                        fontSize = 13.5.sp,
+                                        fontWeight = if (isCurrentCast) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (isCurrentCast) AppleRed else MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "${device.protocol.badge} · ${device.host}${if (isCurrentCast) " (正在投射，点击断开)" else ""}",
+                                        fontSize = 11.sp,
+                                        color = if (isCurrentCast) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            if (isCurrentCast) {
+                                Icon(Icons.Default.Check, contentDescription = null, tint = AppleRed, modifier = Modifier.size(17.dp))
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp, modifier = Modifier.padding(vertical = 4.dp))
+
+                // 4. 系统媒体输出切换器 (Android 11+ Media Output Panel) 与系统无线投屏
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            AudioSharingManager.launchSystemMediaOutputSwitcher(context)
+                            onDismissRequest()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.SettingsInputComponent, contentDescription = null, tint = Color(0xFF007AFF), modifier = Modifier.size(19.dp))
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text("本机扬声器 (当前通道)", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                        Text("高保真硬件直出", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("系统音频输出切换面板", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                        Text("一键切换车载蓝牙、外置声卡与系统扬声器", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-            },
-            onClick = {
-                Toast.makeText(context, "当前已在使用设备扬声器输出", Toast.LENGTH_SHORT).show()
-                onDismissRequest()
-            },
-            modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp))
-        )
 
-        DropdownMenuItem(
-            text = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Bluetooth, contentDescription = null, tint = Color(0xFF007AFF), modifier = Modifier.size(18.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            AudioSharingManager.launchSystemCastSettings(context)
+                            onDismissRequest()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.CastConnected, contentDescription = null, tint = Color(0xFF5856D6), modifier = Modifier.size(19.dp))
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text("车载蓝牙 / 无线耳机", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                        Text("随系统音频路由自动切换", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("系统无线投屏 (Cast / 镜像)", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                        Text("调用系统级屏幕与音频投射设置", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-            },
-            onClick = {
-                try {
-                    val intent = android.content.Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
-                    context.startActivity(intent)
-                } catch (_: Exception) {
-                    Toast.makeText(context, "请在系统设置中连接车载蓝牙", Toast.LENGTH_SHORT).show()
-                }
-                onDismissRequest()
-            },
-            modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp))
-        )
 
-        DropdownMenuItem(
-            text = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Cast, contentDescription = null, tint = Color(0xFF5856D6), modifier = Modifier.size(18.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp, modifier = Modifier.padding(vertical = 4.dp))
+
+                // 5. 分享当前歌曲
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            try {
+                                val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(android.content.Intent.EXTRA_SUBJECT, "正在播放: ${song.title}")
+                                    putExtra(android.content.Intent.EXTRA_TEXT, "我正在使用 LMPlayer 收听 《${song.title}》 - ${song.artist}")
+                                }
+                                context.startActivity(android.content.Intent.createChooser(shareIntent, "分享歌曲至"))
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "无法启动系统分享", Toast.LENGTH_SHORT).show()
+                            }
+                            onDismissRequest()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null, tint = AppleRed, modifier = Modifier.size(19.dp))
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text("无线投屏 (Cast / AirPlay)", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                        Text("投送至车机大屏或家庭音响", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("分享当前歌曲", fontSize = 13.5.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Text("${song.title} — ${song.artist}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
-            },
-            onClick = {
-                try {
-                    val intent = android.content.Intent(android.provider.Settings.ACTION_CAST_SETTINGS)
-                    context.startActivity(intent)
-                } catch (_: Exception) {
-                    Toast.makeText(context, "请在系统控制中心选择投屏设备", Toast.LENGTH_SHORT).show()
-                }
-                onDismissRequest()
-            },
-            modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp))
-        )
-
-        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
-
-        DropdownMenuItem(
-            text = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Share, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text("分享当前歌曲", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                        Text("${song.title} — ${song.artist}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-            },
-            onClick = {
-                try {
-                    val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(android.content.Intent.EXTRA_SUBJECT, "正在播放: ${song.title}")
-                        putExtra(android.content.Intent.EXTRA_TEXT, "我正在使用 ZDS 车载音乐播放器收听 《${song.title}》 - ${song.artist}")
-                    }
-                    context.startActivity(android.content.Intent.createChooser(shareIntent, "分享歌曲至"))
-                } catch (_: Exception) {
-                    Toast.makeText(context, "无法启动系统分享", Toast.LENGTH_SHORT).show()
-                }
-                onDismissRequest()
-            },
-            modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp))
-        )
+            }
+        }
     }
 }
 

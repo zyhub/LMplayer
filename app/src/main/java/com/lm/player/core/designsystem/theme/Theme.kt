@@ -8,7 +8,10 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 val AppleRed = Color(0xFFFA2D48)
@@ -65,6 +68,83 @@ val AppShapes = Shapes(
 )
 
 @Composable
+fun buildAppTypography(dims: AppDimensions): Typography {
+    return Typography(
+        // Level 1: 一级页面主标题 (26sp Bold)
+        headlineLarge = TextStyle(
+            fontSize = dims.pageTitleSize,
+            fontWeight = FontWeight.Bold,
+            lineHeight = (dims.pageTitleSize.value * 1.24f).sp,
+            letterSpacing = (-0.4).sp
+        ),
+        headlineMedium = TextStyle(
+            fontSize = (22f * dims.fontScale).sp,
+            fontWeight = FontWeight.Bold,
+            lineHeight = (27f * dims.fontScale).sp,
+            letterSpacing = (-0.2).sp
+        ),
+        // Level 2: 二级分区栏目标题 (18sp Bold)
+        headlineSmall = TextStyle(
+            fontSize = dims.sectionTitleSize,
+            fontWeight = FontWeight.Bold,
+            lineHeight = (dims.sectionTitleSize.value * 1.3f).sp,
+            letterSpacing = (-0.1).sp
+        ),
+        // Level 3: 三级卡片组标题 / 弹窗标题 (16sp SemiBold)
+        titleLarge = TextStyle(
+            fontSize = dims.cardHeaderSize,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = (dims.cardHeaderSize.value * 1.35f).sp
+        ),
+        // Level 4: 四级列表主项标题 / 歌曲名 (15sp Medium)
+        titleMedium = TextStyle(
+            fontSize = dims.itemTitleSize,
+            fontWeight = FontWeight.Medium,
+            lineHeight = (dims.itemTitleSize.value * 1.35f).sp
+        ),
+        // Level 5: 五级正文 / 网格卡片标题 / 导航与药丸文案 (13.5sp Medium)
+        titleSmall = TextStyle(
+            fontSize = dims.bodySize,
+            fontWeight = FontWeight.Medium,
+            lineHeight = (dims.bodySize.value * 1.38f).sp
+        ),
+        bodyLarge = TextStyle(
+            fontSize = dims.itemTitleSize,
+            fontWeight = FontWeight.Normal,
+            lineHeight = (dims.itemTitleSize.value * 1.42f).sp
+        ),
+        bodyMedium = TextStyle(
+            fontSize = dims.bodySize,
+            fontWeight = FontWeight.Normal,
+            lineHeight = (dims.bodySize.value * 1.42f).sp
+        ),
+        // Level 6: 六级辅助副标题 / 歌手专辑信息 (12sp Normal)
+        bodySmall = TextStyle(
+            fontSize = dims.captionSize,
+            fontWeight = FontWeight.Normal,
+            lineHeight = (dims.captionSize.value * 1.38f).sp
+        ),
+        labelLarge = TextStyle(
+            fontSize = dims.bodySize,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = (dims.bodySize.value * 1.3f).sp
+        ),
+        labelMedium = TextStyle(
+            fontSize = dims.captionSize,
+            fontWeight = FontWeight.Medium,
+            lineHeight = (dims.captionSize.value * 1.3f).sp
+        ),
+        // Level 7: 七级角标 / 音质徽章 / 时间戳 (10.5sp Bold)
+        labelSmall = TextStyle(
+            fontSize = dims.badgeSize,
+            fontWeight = FontWeight.Bold,
+            lineHeight = (dims.badgeSize.value * 1.25f).sp,
+            letterSpacing = 0.2.sp
+        )
+    )
+}
+
+@Composable
 fun LMPlayerTheme(
     themeMode: AppThemeMode = AppThemeMode.FOLLOW_SYSTEM,
     content: @Composable () -> Unit
@@ -76,6 +156,8 @@ fun LMPlayerTheme(
     }
 
     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
+    val dimensions = LocalAppDimensions.current
+    val appTypography = buildAppTypography(dimensions)
     val view = LocalView.current
 
     if (!view.isInEditMode) {
@@ -94,7 +176,7 @@ fun LMPlayerTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         shapes = AppShapes,
-        typography = Typography(),
+        typography = appTypography,
         content = content
     )
 }

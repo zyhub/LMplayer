@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.5.6"
-    const val CURRENT_VERSION_CODE = 21
+    const val CURRENT_VERSION_NAME = "1.6.6"
+    const val CURRENT_VERSION_CODE = 31
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -200,7 +200,7 @@ object AppUpdateManager {
                     hasUpdate = false,
                     latestVersion = currentVersionName,
                     latestVersionCode = currentVersionCode.toInt(),
-                    releaseNotes = "当前已是最新至臻发布版本 (v$currentVersionName)。\n\n1. 本地下载音频歌词与封面标签内嵌\n2. 伴随LRC生成与历史曲目补全\n3. 关联柠檬音乐服务端仓库\n4. 安装包调起与版本检测优化",
+                    releaseNotes = "当前已是最新版本 (v$currentVersionName)：\n\n1. 下载弹窗精简重构：双端下载智能置灰与文件大小展示\n2. 音质精准显示：在线试听音质与本地 FLAC/MP3 真实规格识别\n3. 定位按钮圆形纯图标化，修复滑动出现时的阴影重叠\n4. 后台手机顶部灵动岛优化与下载引擎稳定性提升",
                     downloadUrl = ""
                 )
             )

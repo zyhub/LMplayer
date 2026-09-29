@@ -84,10 +84,21 @@ fun LyricsScrollingView(
     // 结合用户快慢偏置时间计算有效播放时间戳
     val effectivePositionMs = (currentPositionMs + lyricsOffsetMs).coerceAtLeast(0L)
 
-    // 计算当前处于哪一行歌词 (依据当前时间戳匹配对应行)
+    // 计算当前处于哪一行歌词 (采用 O(log N) 二分查找匹配对应行，降低每 400ms 进度刷新的 CPU 开销)
     val activeIndex = remember(cleanLyrics, effectivePositionMs) {
-        val index = cleanLyrics.indexOfLast { it.timestampMs <= effectivePositionMs }
-        if (index >= 0) index else 0
+        var low = 0
+        var high = cleanLyrics.lastIndex
+        var best = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (cleanLyrics[mid].timestampMs <= effectivePositionMs) {
+                best = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        best
     }
 
     // 伴随播放进度自动丝滑居中滚动至当前歌词 (用户手动拖动歌词时不抢夺手势)
@@ -99,6 +110,11 @@ fun LyricsScrollingView(
             )
         }
     }
+
+    val activeFontSize = remember(fontSizeSp) { fontSizeSp.sp }
+    val inactiveFontSize = remember(fontSizeSp) { (fontSizeSp * 0.74f).sp }
+    val activeLineHeight = remember(fontSizeSp) { (fontSizeSp * 1.38f).sp }
+    val inactiveLineHeight = remember(fontSizeSp) { (fontSizeSp * 0.74f * 1.38f).sp }
 
     Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(
@@ -115,12 +131,19 @@ fun LyricsScrollingView(
                 contentType = { _, _ -> "lyric_item" }
             ) { index, item ->
                 val isActive = index == activeIndex
-                val textColor by animateColorAsState(
-                    targetValue = if (isActive) activeColor else inactiveColor,
-                    animationSpec = tween(durationMillis = 280),
-                    label = "lyric_color"
-                )
-                val currentSize = if (isActive) fontSizeSp.sp else (fontSizeSp * 0.74f).sp
+                val isNearActive = kotlin.math.abs(index - activeIndex) <= 1
+                val textColor = if (isNearActive) {
+                    val animated by animateColorAsState(
+                        targetValue = if (isActive) activeColor else inactiveColor,
+                        animationSpec = tween(durationMillis = 260),
+                        label = "lyric_color"
+                    )
+                    animated
+                } else {
+                    inactiveColor
+                }
+                val currentSize = if (isActive) activeFontSize else inactiveFontSize
+                val currentLineHeight = if (isActive) activeLineHeight else inactiveLineHeight
                 val fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
 
                 Text(
@@ -129,7 +152,7 @@ fun LyricsScrollingView(
                         fontSize = currentSize,
                         fontWeight = fontWeight,
                         color = textColor,
-                        lineHeight = (currentSize.value * 1.38f).sp
+                        lineHeight = currentLineHeight
                     ),
                     modifier = Modifier
                         .fillMaxWidth()

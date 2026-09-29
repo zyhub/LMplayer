@@ -1,11 +1,14 @@
 package com.lm.player.core.designsystem.component
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,8 +32,8 @@ import com.lm.player.core.model.UnifiedSong
 import androidx.compose.ui.text.TextStyle
 
 /**
- * 仿音频输出与共享展出方式的浮动依附式下载菜单 (DropdownMenu)
- * 原位依附于歌曲下载按键，提供存储目标（本地/服务器/双端）与音质选择，一键启动下载
+ * 简洁美观的浮动依附式下载菜单 (DropdownMenu)
+ * 原位依附于歌曲后方下载按键，提供存储目标（本地下载/服务器下载/双端下载）与音质规格一键下载
  */
 @Composable
 fun DownloadQualityDropdownMenu(
@@ -44,221 +47,235 @@ fun DownloadQualityDropdownMenu(
     onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var selectedTarget by remember(expanded, hasLocal, hasServer) {
+    val isOnlyOneDownloaded = hasLocal xor hasServer
+    var selectedTarget by remember(expanded, hasLocal, hasServer, isServerConnected) {
         mutableStateOf(
-            if (hasServer && !hasLocal) DownloadTarget.LOCAL
-            else if (hasLocal && !hasServer && isServerConnected) DownloadTarget.SERVER
-            else DownloadTarget.LOCAL
+            when {
+                hasServer && !hasLocal -> DownloadTarget.LOCAL
+                hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
+                else -> initialTarget
+            }
         )
     }
 
-    DropdownMenu(
-        expanded = expanded,
-        onDismissRequest = onDismissRequest,
-        modifier = modifier.widthIn(min = 290.dp, max = 340.dp)
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val menuBg = if (isDark) Color(0xFF1F1F26) else Color(0xFFFCFCFE)
+    val subtleCardBg = if (isDark) Color.White.copy(alpha = 0.06f) else Color.Black.copy(alpha = 0.04f)
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.07f)
+
+    MaterialTheme(
+        colorScheme = MaterialTheme.colorScheme.copy(
+            surface = menuBg,
+            surfaceVariant = menuBg
+        ),
+        shapes = MaterialTheme.shapes.copy(extraSmall = RoundedCornerShape(18.dp))
     ) {
-        // 1. 顶部标题与歌曲信息
-        Text(
-            text = "下载与缓存设置",
-            style = TextStyle(
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            ),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-        )
-        Text(
-            text = "${song.title} · ${song.artist}",
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp)
-        )
-
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-            thickness = 0.5.dp,
-            modifier = Modifier.padding(vertical = 4.dp)
-        )
-
-        // 2. 存储位置选择器 (已下载的一方置灰不可点，未下载的一方高亮可选)
-        Text(
-            text = "存储位置",
-            style = TextStyle(
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            ),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = onDismissRequest,
+            modifier = modifier
+                .width(276.dp)
+                .background(menuBg, RoundedCornerShape(18.dp))
+                .border(0.8.dp, borderColor, RoundedCornerShape(18.dp))
         ) {
-            val options = listOf(
-                Triple(DownloadTarget.LOCAL, if (hasLocal) "📱 已在本地" else "📱 本地", !hasLocal),
-                Triple(DownloadTarget.SERVER, if (hasServer) "☁️ 已存服务器" else "☁️ 服务器", isServerConnected && !hasServer),
-                Triple(DownloadTarget.BOTH, if (hasLocal && hasServer) "🔄 已双端同步" else "🔄 双端同步", isServerConnected && (!hasLocal || !hasServer))
-            )
-
-            options.forEach { (target, label, enabled) ->
-                val isSelected = selectedTarget == target && enabled
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = when {
-                        !enabled -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f)
-                        isSelected -> AppleRed.copy(alpha = 0.15f)
-                        else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                    },
-                    border = BorderStroke(
-                        1.dp,
-                        if (isSelected) AppleRed else Color.Transparent
-                    ),
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                // 1. 顶部紧凑歌曲信息标题栏
+                Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(enabled = enabled) {
-                            selectedTarget = target
-                        }
+                        .fillMaxWidth()
+                        .padding(horizontal = 2.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Box(
-                        modifier = Modifier.padding(vertical = 6.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = label,
-                            fontSize = 10.5.sp,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                            color = when {
-                                !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
-                                isSelected -> AppleRed
-                                else -> MaterialTheme.colorScheme.onSurface
-                            },
-                            maxLines = 1
+                    Text(
+                        text = song.title,
+                        style = TextStyle(
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = song.artist,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 96.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // 2. 存储目标分段胶囊栏：
+                // 当有一端已经下载时，仅显示未下载的那一端 + 保持灰色的「双端下载」
+                val targetOptions = remember(hasLocal, hasServer, isServerConnected, isOnlyOneDownloaded) {
+                    when {
+                        hasLocal && !hasServer -> listOf(
+                            Triple(DownloadTarget.SERVER, "☁️ 服务器下载", isServerConnected),
+                            Triple(DownloadTarget.BOTH, "🔄 双端下载", false)
+                        )
+                        !hasLocal && hasServer -> listOf(
+                            Triple(DownloadTarget.LOCAL, "📱 本地下载", true),
+                            Triple(DownloadTarget.BOTH, "🔄 双端下载", false)
+                        )
+                        else -> listOf(
+                            Triple(DownloadTarget.LOCAL, "📱 本地下载", true),
+                            Triple(DownloadTarget.SERVER, "☁️ 服务器下载", isServerConnected),
+                            Triple(DownloadTarget.BOTH, "🔄 双端下载", isServerConnected)
                         )
                     }
                 }
-            }
-        }
 
-        if (!isServerConnected) {
-            Text(
-                text = "当前未连接柠檬服务器，仅支持缓存至本机",
-                fontSize = 10.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp)
-            )
-        } else if (hasLocal && !hasServer) {
-            Text(
-                text = "本地已有离线文件，可点击缓存至服务器以双端同步",
-                fontSize = 10.sp,
-                color = Color(0xFF34C759),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp)
-            )
-        } else if (!hasLocal && hasServer) {
-            Text(
-                text = "服务器已有曲库存储，可点击下载至本地以双端同步",
-                fontSize = 10.sp,
-                color = Color(0xFF34C759),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp)
-            )
-        }
-
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-            thickness = 0.5.dp,
-            modifier = Modifier.padding(vertical = 4.dp)
-        )
-
-        // 3. 音质规格选择与一键下载
-        Text(
-            text = "选择音质并开始下载",
-            style = TextStyle(
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            ),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)
-        )
-
-        AudioQuality.entries.forEach { quality ->
-            val isLossless = quality == AudioQuality.Q_FLAC || quality == AudioQuality.Q_HIRES
-            val badgeColor = if (isLossless) AppleRed else Color(0xFF007AFF)
-
-            DropdownMenuItem(
-                text = {
+                Surface(
+                    shape = RoundedCornerShape(11.dp),
+                    color = subtleCardBg,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        targetOptions.forEach { (target, label, enabled) ->
+                            val isSelected = selectedTarget == target && enabled
                             Surface(
-                                shape = RoundedCornerShape(4.dp),
-                                color = badgeColor.copy(alpha = 0.12f),
-                                modifier = Modifier.padding(end = 8.dp)
+                                shape = RoundedCornerShape(8.dp),
+                                color = when {
+                                    !enabled -> Color.Transparent
+                                    isSelected -> AppleRed
+                                    else -> Color.Transparent
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable(enabled = enabled) {
+                                        selectedTarget = target
+                                    }
                             ) {
-                                Text(
-                                    text = quality.badge,
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = badgeColor,
-                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                                )
+                                Box(
+                                    modifier = Modifier.padding(vertical = 6.dp, horizontal = 4.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = label,
+                                        fontSize = 11.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                        color = when {
+                                            !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                                            isSelected -> Color.White
+                                            else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
-                            Column {
-                                Text(
-                                    text = quality.label,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = "${quality.format} · ${quality.bitrate} kbps",
-                                    fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // 3. 简洁音质选择列表（括号内显示预计下载大小，去除下方重复的格式-码率行）
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    AudioQuality.entries.forEach { quality ->
+                        val isLossless = quality == AudioQuality.Q_FLAC || quality == AudioQuality.Q_HIRES
+                        val badgeColor = if (isLossless) AppleRed else Color(0xFF007AFF)
+
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = subtleCardBg,
+                            border = BorderStroke(0.5.dp, borderColor),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable {
+                                    onConfirm(selectedTarget, quality)
+                                    onDismissRequest()
+                                }
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(5.dp),
+                                        color = badgeColor.copy(alpha = 0.14f),
+                                        modifier = Modifier.width(46.dp)
+                                    ) {
+                                        Text(
+                                            text = quality.badge,
+                                            fontSize = 9.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = badgeColor,
+                                            maxLines = 1,
+                                            modifier = Modifier
+                                                .padding(vertical = 2.dp)
+                                                .wrapContentWidth(Alignment.CenterHorizontally)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = quality.labelWithSize(song),
+                                        fontSize = 12.5.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+
+                                Icon(
+                                    imageVector = Icons.Default.Download,
+                                    contentDescription = "下载",
+                                    tint = AppleRed,
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                         }
-
-                        Icon(
-                            imageVector = Icons.Default.Download,
-                            contentDescription = "下载",
-                            tint = AppleRed,
-                            modifier = Modifier.size(16.dp)
-                        )
                     }
-                },
-                onClick = {
-                    onConfirm(selectedTarget, quality)
-                    onDismissRequest()
-                },
-                modifier = Modifier
-                    .padding(horizontal = 4.dp, vertical = 1.dp)
-                    .clip(RoundedCornerShape(8.dp))
-            )
+                }
+            }
         }
     }
 }
 
 /**
- * 仿平台切换方式的折叠展开式全局缓存下载对话框
+ * 全局缓存下载对话框
  * 支持：
- * 1. 三种缓存目标（折叠展开选择）：
- *    - 缓存至本地
- *    - 缓存至服务器
- *    - 双方同步缓存
- * 2. 音质选择（128K / 320K / FLAC / Hi-Res）
+ * 1. 存储目标（本地下载 / 服务器下载 / 双端下载；当有一端已下载时，双端下载保持灰色，仅显示未下载的一端）
+ * 2. 音质选择（括号内显示文件大小，无冗余重复码率行）
  */
 @Composable
 fun DownloadQualityChoiceDialog(
     song: UnifiedSong,
     isServerConnected: Boolean = true,
-    initialTarget: DownloadTarget = DownloadTarget.LOCAL,
+    hasLocal: Boolean = (song.downloadStatus == com.lm.player.core.model.DownloadStatus.DOWNLOADED) ||
+            (!song.localFilePath.isNullOrBlank()) ||
+            (song.serverId in listOf("local_storage", "local_folder", "local_saf")),
+    hasServer: Boolean = (song.serverId == "lemon_music" ||
+            (isServerConnected && song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online"))),
+    initialTarget: DownloadTarget = if (hasServer && !hasLocal) DownloadTarget.LOCAL else if (hasLocal && !hasServer && isServerConnected) DownloadTarget.SERVER else DownloadTarget.LOCAL,
     initialQuality: AudioQuality = AudioQuality.Q_320K,
     onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
     onDismiss: () -> Unit
@@ -267,8 +284,24 @@ fun DownloadQualityChoiceDialog(
     val surfaceBg = if (isDark) Color(0xFF222228) else Color.White
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
-    var selectedTarget by remember { mutableStateOf(initialTarget) }
+    var selectedTarget by remember(hasLocal, hasServer, isServerConnected) {
+        mutableStateOf(
+            when {
+                hasServer && !hasLocal -> DownloadTarget.LOCAL
+                hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
+                else -> initialTarget
+            }
+        )
+    }
     var selectedQuality by remember { mutableStateOf(initialQuality) }
+
+    val visibleTargets = remember(hasLocal, hasServer) {
+        when {
+            hasLocal && !hasServer -> listOf(DownloadTarget.SERVER, DownloadTarget.BOTH)
+            !hasLocal && hasServer -> listOf(DownloadTarget.LOCAL, DownloadTarget.BOTH)
+            else -> DownloadTarget.entries.toList()
+        }
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -293,8 +326,8 @@ fun DownloadQualityChoiceDialog(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "选择缓存方式与音质",
-                            fontSize = 18.sp,
+                            text = "下载与音质选择",
+                            fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -320,25 +353,26 @@ fun DownloadQualityChoiceDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-                // 2. 缓存目标列表 (如同切换平台方式，支持折叠展开)
+                // 2. 存储位置选择
                 Text(
-                    text = "缓存模式",
-                    fontSize = 13.sp,
+                    text = "存储位置",
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(8.dp))
 
-                Column(
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    DownloadTarget.entries.forEach { target ->
-                        val isSelected = selectedTarget == target
+                    visibleTargets.forEach { target ->
                         val isServerRelated = target == DownloadTarget.SERVER || target == DownloadTarget.BOTH
-                        val isEnabled = !isServerRelated || isServerConnected
+                        val isBothDisabledBecauseOneSideDone = (target == DownloadTarget.BOTH) && (hasLocal xor hasServer)
+                        val isEnabled = (!isServerRelated || isServerConnected) && !isBothDisabledBecauseOneSideDone
+                        val isSelected = selectedTarget == target && isEnabled
 
                         val icon = when (target) {
                             DownloadTarget.LOCAL -> Icons.Default.PhoneAndroid
@@ -347,70 +381,63 @@ fun DownloadQualityChoiceDialog(
                         }
 
                         Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = if (isSelected) AppleRed.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(12.dp),
+                            color = when {
+                                !isEnabled -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f)
+                                isSelected -> AppleRed.copy(alpha = 0.12f)
+                                else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                            },
                             border = BorderStroke(
                                 1.dp,
                                 if (isSelected) AppleRed else borderColor.copy(alpha = 0.4f)
                             ),
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
                                 .clickable(enabled = isEnabled) {
                                     selectedTarget = target
                                 }
                         ) {
-                            Column(
+                            Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 14.dp, vertical = 11.dp)
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(
-                                            imageVector = icon,
-                                            contentDescription = null,
-                                            tint = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(10.dp))
-                                        Column {
-                                            Text(
-                                                text = target.displayName,
-                                                fontSize = 14.sp,
-                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                                color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = if (isServerRelated && !isServerConnected) "需连接柠檬音乐服务器" else target.desc,
-                                                fontSize = 11.sp,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                    }
-
-                                    Icon(
-                                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                        contentDescription = null,
-                                        tint = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = null,
+                                    tint = when {
+                                        !isEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                                        isSelected -> AppleRed
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = target.displayName,
+                                    fontSize = 12.5.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    color = when {
+                                        !isEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                                        isSelected -> AppleRed
+                                        else -> MaterialTheme.colorScheme.onSurface
+                                    },
+                                    maxLines = 1
+                                )
                             }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-                // 3. 音质规格选择 (折叠展开展示)
+                // 3. 音质规格选择（括号内显示预计文件大小，去除下方重复音质-码率）
                 Text(
                     text = "音质规格",
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -437,7 +464,7 @@ fun DownloadQualityChoiceDialog(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -445,29 +472,26 @@ fun DownloadQualityChoiceDialog(
                                     Surface(
                                         shape = RoundedCornerShape(6.dp),
                                         color = if (isSelected) AppleRed else MaterialTheme.colorScheme.surfaceVariant,
-                                        modifier = Modifier.padding(end = 10.dp)
+                                        modifier = Modifier
+                                            .padding(end = 10.dp)
+                                            .width(48.dp)
                                     ) {
                                         Text(
                                             text = quality.badge,
                                             fontSize = 10.sp,
                                             fontWeight = FontWeight.Bold,
                                             color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            modifier = Modifier
+                                                .padding(vertical = 2.dp)
+                                                .wrapContentWidth(Alignment.CenterHorizontally)
                                         )
                                     }
-                                    Column {
-                                        Text(
-                                            text = quality.label,
-                                            fontSize = 13.sp,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Text(
-                                            text = "封装格式: ${quality.format} · ${quality.bitrate} kbps",
-                                            fontSize = 10.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
+                                    Text(
+                                        text = quality.labelWithSize(song),
+                                        fontSize = 13.5.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
+                                    )
                                 }
 
                                 if (isSelected) {
@@ -517,8 +541,8 @@ fun DownloadQualityChoiceDialog(
                         Text(
                             text = when (selectedTarget) {
                                 DownloadTarget.LOCAL -> "开始本地下载"
-                                DownloadTarget.SERVER -> "缓存至服务器"
-                                DownloadTarget.BOTH -> "双方同步缓存"
+                                DownloadTarget.SERVER -> "开始服务器下载"
+                                DownloadTarget.BOTH -> "开始双端下载"
                             },
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold
@@ -736,3 +760,129 @@ fun SongSyncStatusTrailing(
         }
     }
 }
+
+/**
+ * 批量下载与缓存选择对话框 (支持多选、全选歌曲一键下载到本地/服务器/双端同步)
+ */
+@Composable
+fun BatchDownloadQualityChoiceDialog(
+    selectedCount: Int,
+    isServerConnected: Boolean = true,
+    initialTarget: DownloadTarget = DownloadTarget.LOCAL,
+    initialQuality: AudioQuality = AudioQuality.Q_320K,
+    onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val dummyBatchSong = remember(selectedCount) {
+        UnifiedSong(
+            id = "batch_download_$selectedCount",
+            title = "已选中 $selectedCount 首歌曲",
+            artist = "批量下载队列",
+            album = "",
+            durationMs = 215_000L,
+            coverUrl = "",
+            streamUrl = "",
+            serverId = "lemon_online"
+        )
+    }
+    DownloadQualityChoiceDialog(
+        song = dummyBatchSong,
+        isServerConnected = isServerConnected,
+        hasLocal = false,
+        hasServer = false,
+        initialTarget = initialTarget,
+        initialQuality = initialQuality,
+        onConfirm = onConfirm,
+        onDismiss = onDismiss
+    )
+}
+
+/**
+ * 判断列表项歌曲是否为当前正在播放的歌曲 (支持 ID 精确匹配或标准化的 歌名+歌手 匹配)
+ */
+fun isSamePlayingSong(song: UnifiedSong, currentPlayingSong: UnifiedSong?): Boolean {
+    if (currentPlayingSong == null) return false
+    if (song.id == currentPlayingSong.id) return true
+    if (!song.localFilePath.isNullOrBlank() && song.localFilePath == currentPlayingSong.localFilePath) return true
+    val normTitleA = com.lm.player.core.media.SongMatchingResolver.normalizeTrackTitle(song.title)
+    val normTitleB = com.lm.player.core.media.SongMatchingResolver.normalizeTrackTitle(currentPlayingSong.title)
+    if (normTitleA.isBlank() || normTitleA != normTitleB) return false
+    val normArtistA = com.lm.player.core.media.SongMatchingResolver.normalizeArtist(song.artist)
+    val normArtistB = com.lm.player.core.media.SongMatchingResolver.normalizeArtist(currentPlayingSong.artist)
+    return normArtistA.isBlank() || normArtistB.isBlank() || normArtistA == normArtistB
+}
+
+/**
+ * 歌曲后方正在播放动态跳动音波标志 (NowPlayingWaveIndicator)
+ */
+@Composable
+fun NowPlayingWaveIndicator(
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+    color: Color = AppleRed
+) {
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition(label = "now_playing_wave")
+    val bar1 by infiniteTransition.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 1.0f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(420, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "bar1"
+    )
+    val bar2 by infiniteTransition.animateFloat(
+        initialValue = 0.95f,
+        targetValue = 0.30f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(360, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "bar2"
+    )
+    val bar3 by infiniteTransition.animateFloat(
+        initialValue = 0.40f,
+        targetValue = 0.95f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(480, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "bar3"
+    )
+    val bar4 by infiniteTransition.animateFloat(
+        initialValue = 0.75f,
+        targetValue = 0.25f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(390, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "bar4"
+    )
+
+    val heights = if (isPlaying) listOf(bar1, bar2, bar3, bar4) else listOf(0.35f, 0.65f, 0.45f, 0.30f)
+
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = color.copy(alpha = 0.12f),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 6.dp, vertical = 4.dp)
+                .height(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.2.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            heights.forEach { ratio ->
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .width(2.4.dp)
+                        .fillMaxHeight(ratio.coerceIn(0.2f, 1f))
+                        .clip(RoundedCornerShape(1.2.dp))
+                        .background(color)
+                )
+            }
+        }
+    }
+}
+

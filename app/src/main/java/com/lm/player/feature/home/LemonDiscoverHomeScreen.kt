@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -20,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -29,15 +31,19 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
+import com.lm.player.core.designsystem.component.BatchDownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
+import com.lm.player.core.designsystem.component.isSamePlayingSong
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 柠檬音乐专属：现代轻奢发现主页 (Discover Home)
@@ -45,8 +51,8 @@ import kotlinx.coroutines.launch
  * 1. 顶部操作音源快捷切换 (酷我/网易/QQ/酷狗/咪咕) 与服务器下拉
  * 2. 热门推荐歌单横向画廊
  * 3. 官方权威榜单卡片
- * 4. 新歌首发曲目流 (即点即播 & 一键离线)
- * 5. 歌单与榜单曲目下钻浮层
+ * 4. 新歌首发曲目流 (即点即播 & 一键离线 & 多选批量下载)
+ * 5. 歌单与榜单曲目下钻浮层 (支持播放全部与多选/全选下载)
  */
 @Composable
 fun LemonDiscoverHomeScreen(
@@ -58,9 +64,16 @@ fun LemonDiscoverHomeScreen(
     allCachedSongs: List<UnifiedSong> = emptyList(),
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     activeDownloadCount: Int = 0,
+    currentPlayingSong: UnifiedSong? = null,
+    isPlaying: Boolean = false,
+    locateSongTrigger: Int = 0,
+    onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
+    onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { songs, target, quality ->
+        songs.forEach { onDownloadSongWithOptions(it, target, quality) }
+    },
     onSelectLocalServer: () -> Unit,
     onSelectServer: (ServerConfig) -> Unit,
     onSyncNow: () -> Unit,
@@ -76,6 +89,9 @@ fun LemonDiscoverHomeScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val dimensions = LocalAppDimensions.current
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val isCompactHeader = screenWidthDp < 390
+    val isUltraCompactHeader = screenWidthDp < 350
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = blurAlpha)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.10f)
@@ -91,33 +107,70 @@ fun LemonDiscoverHomeScreen(
     // 音源切换选择弹窗
     var isSourceSelectorOpen by remember { mutableStateOf(false) }
 
-    // 缓存下载音质与目标选择弹窗
+    // 缓存下载音质与目标选择弹窗（单曲 & 批量）
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
+    var songsForBatchDownloadChoice by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+
+    // 新歌首发多选状态
+    var isNewSongsMultiSelect by remember { mutableStateOf(false) }
+    var selectedNewSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    // 歌单/榜单下钻多选状态
+    var isCollectionMultiSelect by remember { mutableStateOf(false) }
+    var selectedCollectionSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     // 歌单/榜单下钻曲目抽屉
     var activeCollectionTitle by remember { mutableStateOf<String?>(null) }
+    var lastCollectionTitle by remember { mutableStateOf<String?>(null) }
     var activeCollectionCover by remember { mutableStateOf("") }
     var activeCollectionSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingCollection by remember { mutableStateOf(false) }
 
-    val isServerOk = configuredServers.any { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-
-    // 结合本地缓存曲库与下载中任务动态解析匹配状态（全绿勾双端、半截绿勾单端）
-    val resolvedNewSongs = remember(newSongs, allCachedSongs, activeDownloadTasks) {
-        if (allCachedSongs.isEmpty()) newSongs
-        else SongMatchingResolver.resolveSongList(newSongs, allCachedSongs, activeDownloadTasks)
+    val discoverListState = rememberLazyListState()
+    val collectionListState = rememberLazyListState()
+    val isAnyScrolling = discoverListState.isScrollInProgress || collectionListState.isScrollInProgress
+    LaunchedEffect(isAnyScrolling) {
+        onListScrollingChange(isAnyScrolling)
     }
 
-    val resolvedCollectionSongs = remember(activeCollectionSongs, allCachedSongs, activeDownloadTasks, activeCollectionCover) {
-        val songsWithCover = activeCollectionSongs.map { s ->
-            if (s.coverUrl.isNullOrBlank() && !activeCollectionCover.isNullOrBlank()) {
-                s.copy(coverUrl = activeCollectionCover)
-            } else {
-                s
+    val isServerOk = configuredServers.any { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+
+    // 结合本地缓存曲库与下载中任务在后台线程动态解析匹配状态，彻底避免主线程重组卡顿
+    val resolvedNewSongs by produceState(
+        initialValue = newSongs,
+        key1 = newSongs,
+        key2 = allCachedSongs,
+        key3 = activeDownloadTasks
+    ) {
+        value = if (allCachedSongs.isEmpty() || newSongs.isEmpty()) {
+            newSongs
+        } else {
+            withContext(Dispatchers.Default) {
+                SongMatchingResolver.resolveSongList(newSongs, allCachedSongs, activeDownloadTasks)
             }
         }
-        if (allCachedSongs.isEmpty()) songsWithCover
-        else SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, activeDownloadTasks)
+    }
+
+    val resolvedCollectionSongs by produceState(
+        initialValue = activeCollectionSongs,
+        key1 = activeCollectionSongs,
+        key2 = allCachedSongs,
+        key3 = activeDownloadTasks
+    ) {
+        value = withContext(Dispatchers.Default) {
+            val songsWithCover = activeCollectionSongs.map { s ->
+                if (s.coverUrl.isNullOrBlank() && activeCollectionCover.isNotBlank()) {
+                    s.copy(coverUrl = activeCollectionCover)
+                } else {
+                    s
+                }
+            }
+            if (allCachedSongs.isEmpty() || songsWithCover.isEmpty()) {
+                songsWithCover
+            } else {
+                SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, activeDownloadTasks)
+            }
+        }
     }
 
     // 动态拉取发现页内容：分块独立异步加载与流式渐进呈现，大幅提速首页载入
@@ -160,9 +213,36 @@ fun LemonDiscoverHomeScreen(
         isLoading = false
     }
 
+    // 定位正在播放的歌曲（自动切回所属歌单下钻列表或新歌首发列表并滚动定位）
+    LaunchedEffect(locateSongTrigger) {
+        if (locateSongTrigger > 0 && currentPlayingSong != null) {
+            val colIdx = resolvedCollectionSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
+            val newIdx = resolvedNewSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
+            if (colIdx >= 0 && (activeCollectionTitle != null || lastCollectionTitle != null)) {
+                if (activeCollectionTitle == null) {
+                    activeCollectionTitle = lastCollectionTitle
+                    kotlinx.coroutines.delay(80)
+                }
+                runCatching { collectionListState.animateScrollToItem(colIdx) }
+            } else if (newIdx >= 0) {
+                if (activeCollectionTitle != null) {
+                    activeCollectionTitle = null
+                    kotlinx.coroutines.delay(80)
+                }
+                var headerItems = 1 // 顶部 Header
+                if (recommendPlaylists.isNotEmpty()) headerItems++
+                if (toplists.isNotEmpty()) headerItems++
+                if (newAlbums.isNotEmpty()) headerItems++
+                headerItems++ // 新歌首发标题栏
+                runCatching { discoverListState.animateScrollToItem(headerItems + newIdx) }
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         if (activeCollectionTitle == null) {
             LazyColumn(
+                state = discoverListState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
@@ -172,8 +252,12 @@ fun LemonDiscoverHomeScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
-        // 1. 顶部 Header (发现标题 + 音源切换胶囊 + 搜索 + 下载 + 服务器切换)
+        // 1. 顶部 Header (发现标题 + 音源切换胶囊 + 下载 + 服务器切换，自适应不同分辨率)
         item {
+            val pillHorizontalPad = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp
+            val pillVerticalPad = if (isCompactHeader) 5.dp else 6.dp
+            val buttonGap = if (isUltraCompactHeader) 4.dp else 6.dp
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -182,26 +266,37 @@ fun LemonDiscoverHomeScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .padding(end = 6.dp)
+                ) {
                     Text(
                         text = "发现",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = TextStyle(
-                            fontSize = 32.sp * dimensions.fontScale,
+                            fontSize = dimensions.pageTitleSize,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onBackground
                         )
                     )
                     Text(
                         text = "在线云端曲库 · 柠檬音乐",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = TextStyle(
-                            fontSize = 12.sp,
+                            fontSize = dimensions.captionSize,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // 音源切换胶囊按钮 (操作音源 - 仿音频输出与共享展开风格)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(buttonGap)
+                ) {
+                    // 音源切换胶囊按钮 (操作音源)
                     Box {
                         Surface(
                             shape = RoundedCornerShape(20.dp),
@@ -212,28 +307,30 @@ fun LemonDiscoverHomeScreen(
                                 .clickable { isSourceSelectorOpen = true }
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.GraphicEq,
                                     contentDescription = "操作音源",
                                     tint = AppleRed,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
                                 )
-                                Spacer(modifier = Modifier.width(4.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
                                 Text(
-                                    text = currentSource.displayName.replace("音乐", "").replace("云", ""),
+                                    text = currentSource.shortName,
                                     color = AppleRed,
-                                    fontSize = 12.sp * dimensions.fontScale,
-                                    fontWeight = FontWeight.Bold
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    softWrap = false
                                 )
-                                Spacer(modifier = Modifier.width(2.dp))
+                                Spacer(modifier = Modifier.width(1.dp))
                                 Icon(
                                     imageVector = Icons.Default.ArrowDropDown,
                                     contentDescription = null,
                                     tint = AppleRed,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
                                 )
                             }
                         }
@@ -249,10 +346,6 @@ fun LemonDiscoverHomeScreen(
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(6.dp))
-
-
-
                     // 下载管理胶囊
                     Surface(
                         shape = RoundedCornerShape(20.dp),
@@ -264,28 +357,28 @@ fun LemonDiscoverHomeScreen(
                             .clickable(onClick = onOpenDownloads)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
                                 imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
                                 contentDescription = "下载管理",
                                 tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
                             )
                             if (activeDownloadCount > 0) {
-                                Spacer(modifier = Modifier.width(4.dp))
+                                Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
                                     color = AppleRed,
-                                    fontSize = 12.sp * dimensions.fontScale,
-                                    fontWeight = FontWeight.Bold
+                                    fontSize = dimensions.captionSize,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    softWrap = false
                                 )
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.width(6.dp))
 
                     // 服务器切换下拉按键
                     ServerSwitchDropdownButton(
@@ -350,7 +443,10 @@ fun LemonDiscoverHomeScreen(
                                     playlist = playlist,
                                     onClick = {
                                         activeCollectionTitle = playlist.name
+                                        lastCollectionTitle = playlist.name
                                         activeCollectionCover = playlist.coverUrl
+                                        isCollectionMultiSelect = false
+                                        selectedCollectionSongIds = emptySet()
                                         isLoadingCollection = true
                                         val plId = playlist.id
                                         coroutineScope.launch {
@@ -387,7 +483,10 @@ fun LemonDiscoverHomeScreen(
                                     toplist = toplist,
                                     onClick = {
                                         activeCollectionTitle = toplist.name
+                                        lastCollectionTitle = toplist.name
                                         activeCollectionCover = toplist.coverUrl
+                                        isCollectionMultiSelect = false
+                                        selectedCollectionSongIds = emptySet()
                                         isLoadingCollection = true
                                         val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
                                         coroutineScope.launch {
@@ -424,7 +523,10 @@ fun LemonDiscoverHomeScreen(
                                     album = album,
                                     onClick = {
                                         activeCollectionTitle = album.title
+                                        lastCollectionTitle = album.title
                                         activeCollectionCover = album.coverUrl
+                                        isCollectionMultiSelect = false
+                                        selectedCollectionSongIds = emptySet()
                                         isLoadingCollection = true
                                         coroutineScope.launch {
                                             activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
@@ -441,10 +543,43 @@ fun LemonDiscoverHomeScreen(
             // D. 【新歌首发】
             if (resolvedNewSongs.isNotEmpty()) {
                 item {
-                    SectionHeader(
-                        title = "新歌首发",
-                        subtitle = "今日全网新单，即点即播"
-                    )
+                    Column {
+                        SectionHeader(
+                            title = "新歌首发",
+                            subtitle = "今日全网新单，即点即播"
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        SongListPlayAndBatchDownloadBar(
+                            totalCount = resolvedNewSongs.size,
+                            isMultiSelectMode = isNewSongsMultiSelect,
+                            selectedCount = selectedNewSongIds.size,
+                            isAllSelected = resolvedNewSongs.isNotEmpty() && selectedNewSongIds.size == resolvedNewSongs.size,
+                            onPlayAll = {
+                                resolvedNewSongs.firstOrNull()?.let { onSongClick(it, resolvedNewSongs) }
+                            },
+                            onEnterMultiSelect = {
+                                isNewSongsMultiSelect = true
+                                selectedNewSongIds = emptySet()
+                            },
+                            onExitMultiSelect = {
+                                isNewSongsMultiSelect = false
+                                selectedNewSongIds = emptySet()
+                            },
+                            onToggleSelectAll = {
+                                selectedNewSongIds = if (selectedNewSongIds.size == resolvedNewSongs.size) {
+                                    emptySet()
+                                } else {
+                                    resolvedNewSongs.map { it.id }.toSet()
+                                }
+                            },
+                            onBatchDownloadClick = {
+                                val selectedSongs = resolvedNewSongs.filter { selectedNewSongIds.contains(it.id) }
+                                if (selectedSongs.isNotEmpty()) {
+                                    songsForBatchDownloadChoice = selectedSongs
+                                }
+                            }
+                        )
+                    }
                 }
 
                 items(
@@ -452,10 +587,22 @@ fun LemonDiscoverHomeScreen(
                     key = { it.id },
                     contentType = { "new_song_row" }
                 ) { song ->
+                    val isSelected = selectedNewSongIds.contains(song.id)
                     SongListItemRow(
                         song = song,
                         activeDownloadTasks = activeDownloadTasks,
                         isServerConnected = isServerOk,
+                        currentPlayingSong = currentPlayingSong,
+                        isPlaying = isPlaying,
+                        isMultiSelectMode = isNewSongsMultiSelect,
+                        isSelected = isSelected,
+                        onToggleSelect = {
+                            selectedNewSongIds = if (isSelected) {
+                                selectedNewSongIds - song.id
+                            } else {
+                                selectedNewSongIds + song.id
+                            }
+                        },
                         onClick = { onSongClick(song, resolvedNewSongs) },
                         onDownloadClick = { songForDownloadChoice = song },
                         onDownloadWithOptions = { s, target, quality ->
@@ -546,43 +693,66 @@ fun LemonDiscoverHomeScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 8.dp),
+                    .padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { activeCollectionTitle = null }) {
+                IconButton(onClick = {
+                    activeCollectionTitle = null
+                    isCollectionMultiSelect = false
+                    selectedCollectionSongIds = emptySet()
+                }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                 }
                 Spacer(modifier = Modifier.width(6.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = activeCollectionTitle ?: "",
-                        fontSize = 17.sp,
+                        fontSize = dimensions.sectionTitleSize,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         text = "${currentSource.displayName} · ${activeCollectionSongs.size} 首歌曲",
-                        fontSize = 12.sp,
+                        fontSize = dimensions.captionSize,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
 
-                // 一键播放全部按键 (并将当前歌单全部曲目同步注入播放队列)
-                if (resolvedCollectionSongs.isNotEmpty()) {
-                    Button(
-                        onClick = {
-                            resolvedCollectionSongs.firstOrNull()?.let { onSongClick(it, resolvedCollectionSongs) }
-                        },
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("播放全部", fontSize = 12.sp)
+            // 播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
+            if (resolvedCollectionSongs.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                SongListPlayAndBatchDownloadBar(
+                    totalCount = resolvedCollectionSongs.size,
+                    isMultiSelectMode = isCollectionMultiSelect,
+                    selectedCount = selectedCollectionSongIds.size,
+                    isAllSelected = resolvedCollectionSongs.isNotEmpty() && selectedCollectionSongIds.size == resolvedCollectionSongs.size,
+                    onPlayAll = {
+                        resolvedCollectionSongs.firstOrNull()?.let { onSongClick(it, resolvedCollectionSongs) }
+                    },
+                    onEnterMultiSelect = {
+                        isCollectionMultiSelect = true
+                        selectedCollectionSongIds = emptySet()
+                    },
+                    onExitMultiSelect = {
+                        isCollectionMultiSelect = false
+                        selectedCollectionSongIds = emptySet()
+                    },
+                    onToggleSelectAll = {
+                        selectedCollectionSongIds = if (selectedCollectionSongIds.size == resolvedCollectionSongs.size) {
+                            emptySet()
+                        } else {
+                            resolvedCollectionSongs.map { it.id }.toSet()
+                        }
+                    },
+                    onBatchDownloadClick = {
+                        val selectedSongs = resolvedCollectionSongs.filter { selectedCollectionSongIds.contains(it.id) }
+                        if (selectedSongs.isNotEmpty()) {
+                            songsForBatchDownloadChoice = selectedSongs
+                        }
                     }
-                }
+                )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -597,7 +767,7 @@ fun LemonDiscoverHomeScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         CircularProgressIndicator(modifier = Modifier.size(36.dp), color = AppleRed)
                         Spacer(modifier = Modifier.height(14.dp))
-                        Text("正在拉取榜单/歌单曲目...", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                        Text("正在拉取榜单/歌单曲目...", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = dimensions.bodySize)
                     }
                 }
             } else if (resolvedCollectionSongs.isEmpty()) {
@@ -607,10 +777,11 @@ fun LemonDiscoverHomeScreen(
                         .padding(top = 100.dp),
                     contentAlignment = Alignment.TopCenter
                 ) {
-                    Text("暂无曲目数据", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
+                    Text("暂无曲目数据", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = dimensions.bodySize)
                 }
             } else {
                 LazyColumn(
+                    state = collectionListState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(
                         bottom = contentPadding.calculateBottomPadding() + 24.dp
@@ -622,10 +793,22 @@ fun LemonDiscoverHomeScreen(
                         key = { it.id },
                         contentType = { "collection_song_row" }
                     ) { song ->
+                        val isSelected = selectedCollectionSongIds.contains(song.id)
                         SongListItemRow(
                             song = song,
                             activeDownloadTasks = activeDownloadTasks,
                             isServerConnected = isServerOk,
+                            currentPlayingSong = currentPlayingSong,
+                            isPlaying = isPlaying,
+                            isMultiSelectMode = isCollectionMultiSelect,
+                            isSelected = isSelected,
+                            onToggleSelect = {
+                                selectedCollectionSongIds = if (isSelected) {
+                                    selectedCollectionSongIds - song.id
+                                } else {
+                                    selectedCollectionSongIds + song.id
+                                }
+                            },
                             onClick = { onSongClick(song, resolvedCollectionSongs) },
                             onDownloadClick = { songForDownloadChoice = song },
                             onDownloadWithOptions = { s, target, quality ->
@@ -651,6 +834,24 @@ fun LemonDiscoverHomeScreen(
             onDismiss = { songForDownloadChoice = null }
         )
     }
+
+    // 批量多选下载音质与目标选择弹窗
+    if (songsForBatchDownloadChoice.isNotEmpty()) {
+        BatchDownloadQualityChoiceDialog(
+            selectedCount = songsForBatchDownloadChoice.size,
+            isServerConnected = isServerOk,
+            onConfirm = { target, quality ->
+                val batch = songsForBatchDownloadChoice
+                songsForBatchDownloadChoice = emptyList()
+                isNewSongsMultiSelect = false
+                selectedNewSongIds = emptySet()
+                isCollectionMultiSelect = false
+                selectedCollectionSongIds = emptySet()
+                onBatchDownloadSongsWithOptions(batch, target, quality)
+            },
+            onDismiss = { songsForBatchDownloadChoice = emptyList() }
+        )
+    }
 }
 
 /**
@@ -666,7 +867,7 @@ private fun SectionHeader(
         Text(
             text = title,
             style = TextStyle(
-                fontSize = 20.sp * dimensions.fontScale,
+                fontSize = dimensions.sectionTitleSize,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground
             )
@@ -676,7 +877,7 @@ private fun SectionHeader(
             Text(
                 text = subtitle,
                 style = TextStyle(
-                    fontSize = 12.sp,
+                    fontSize = dimensions.captionSize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             )
@@ -712,10 +913,10 @@ private fun DiscoverPlaylistCard(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 13.sp * dimensions.fontScale,
-                fontWeight = FontWeight.Bold,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface,
-                lineHeight = 16.sp
+                lineHeight = (dimensions.bodySize.value * 1.25f).sp
             )
         )
         Spacer(modifier = Modifier.height(2.dp))
@@ -723,7 +924,7 @@ private fun DiscoverPlaylistCard(
             text = if (playlist.songCount > 0) "${playlist.songCount} 首" else "精选推荐",
             maxLines = 1,
             style = TextStyle(
-                fontSize = 11.sp,
+                fontSize = dimensions.captionSize,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         )
@@ -762,8 +963,8 @@ private fun DiscoverToplistCard(
                     Text(
                         text = toplist.updateFrequency,
                         color = Color.White,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Medium,
+                        fontSize = dimensions.badgeSize,
+                        fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
                     )
                 }
@@ -775,8 +976,8 @@ private fun DiscoverToplistCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 13.sp * dimensions.fontScale,
-                fontWeight = FontWeight.Bold,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface
             )
         )
@@ -784,7 +985,7 @@ private fun DiscoverToplistCard(
         Text(
             text = "官方排行榜",
             style = TextStyle(
-                fontSize = 11.sp,
+                fontSize = dimensions.captionSize,
                 color = AppleRed
             )
         )
@@ -819,8 +1020,8 @@ private fun DiscoverAlbumCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 13.sp * dimensions.fontScale,
-                fontWeight = FontWeight.Bold,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface
             )
         )
@@ -830,7 +1031,7 @@ private fun DiscoverAlbumCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 11.sp,
+                fontSize = dimensions.captionSize,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         )
