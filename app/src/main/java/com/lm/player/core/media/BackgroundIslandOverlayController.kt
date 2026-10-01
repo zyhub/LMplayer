@@ -119,6 +119,11 @@ object BackgroundIslandOverlayController {
     fun triggerTemporaryPreview(context: Context) {
         mainHandler.post {
             DynamicIslandManager.ensureInitialized(context)
+            if (!DynamicIslandManager.systemIslandEnabledFlow.value) {
+                previewUntilTimestampMs = 0L
+                detachWindow()
+                return@post
+            }
             previewUntilTimestampMs = System.currentTimeMillis() + 5200L
             ensureInitializedView(context.applicationContext)
             refreshVisibilityAndState(context.applicationContext)
@@ -137,6 +142,15 @@ object BackgroundIslandOverlayController {
             val appCtx = context?.applicationContext ?: islandView?.context?.applicationContext ?: return@post
             DynamicIslandManager.ensureInitialized(appCtx)
 
+            val masterEnabled = DynamicIslandManager.systemIslandEnabledFlow.value
+            if (!masterEnabled) {
+                previewUntilTimestampMs = 0L
+                mainHandler.removeCallbacks(autoCollapseRunnable)
+                mainHandler.removeCallbacks(hidePreviewRunnable)
+                detachWindow()
+                return@post
+            }
+
             val isInBackground = DynamicIslandManager.isAppInBackgroundFlow.value
             val isPreviewActive = System.currentTimeMillis() < previewUntilTimestampMs
             val displayMode = DynamicIslandManager.islandDisplayModeFlow.value
@@ -147,13 +161,14 @@ object BackgroundIslandOverlayController {
                     player?.playbackState == androidx.media3.common.Player.STATE_READY
 
             // 核心规则：
-            // 1. 应用在前台时绝不显示灵动岛（除非处于设置页手动测试预览）
-            // 2. 应用在后台且有当前曲目时，根据系统与播放会话状态全程置顶显示（华为鸿蒙系统开启灵动岛时自动激活顶部流体胶囊）
+            // 1. 总开关关闭时绝不显示（已在上方拦截并销毁窗口）
+            // 2. 应用在前台时绝不显示灵动岛（除非处于设置页手动测试预览）
+            // 3. 应用在后台且有当前曲目时，根据系统与播放会话状态全程置顶显示（华为鸿蒙系统开启灵动岛时自动激活顶部流体胶囊）
             val shouldShow = hasOverlayPermission(appCtx) &&
                     (DynamicIslandManager.shouldUseOverlayIsland() || isPreviewActive) &&
                     currentSong != null &&
                     (isInBackground || isPreviewActive) &&
-                    (isPlaying || isBufferingOrReady || displayMode == IslandDisplayMode.ALWAYS_ON || isPreviewActive || isWindowAttached)
+                    (isPlaying || isBufferingOrReady || displayMode == IslandDisplayMode.ALWAYS_ON || isPreviewActive)
 
             if (!shouldShow) {
                 detachWindow()
@@ -174,7 +189,7 @@ object BackgroundIslandOverlayController {
                 accentColor = accentColor,
                 isPlaying = isPlaying,
                 currentLyric = DynamicIslandManager.currentLyricLineFlow.value,
-                nextLyric = DynamicIslandManager.nextLyricLineFlow.value,
+                nextLyric = DynamicIslandManager.currentLyricLineFlow.value.let { DynamicIslandManager.nextLyricLineFlow.value },
                 lineProgress = DynamicIslandManager.currentLineProgressFlow.value,
                 showLyricsInPill = DynamicIslandManager.showLyricsInPillFlow.value,
                 progressMs = (player?.currentPosition ?: 0L).coerceAtLeast(0L),
@@ -191,6 +206,7 @@ object BackgroundIslandOverlayController {
 
     fun destroy() {
         mainHandler.post {
+            previewUntilTimestampMs = 0L
             mainHandler.removeCallbacks(autoCollapseRunnable)
             mainHandler.removeCallbacks(hidePreviewRunnable)
             detachWindow()

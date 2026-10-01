@@ -211,6 +211,7 @@ class MainActivity : ComponentActivity() {
             val autoPlayPrefs = remember { getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE) }
             var autoPlayOnStartup by remember { mutableStateOf(autoPlayPrefs.getBoolean("auto_play_on_startup", true)) }
             var autoFallbackToLocal by remember { mutableStateOf(autoPlayPrefs.getBoolean("auto_fallback_to_local", true)) }
+            var autoLaunchOnBoot by remember { mutableStateOf(com.lm.player.core.media.BootCompletedReceiver.isAutoLaunchOnBootEnabled(this@MainActivity)) }
             var hasAutoPlayedOnStartup by remember { mutableStateOf(false) }
             var hasAutoCheckedServerOnStartup by remember { mutableStateOf(false) }
             var showBgIslandOverlayPrompt by remember {
@@ -407,12 +408,19 @@ class MainActivity : ComponentActivity() {
             BackHandler(
                 enabled = !isFullPlayerVisible && !isSearchDialogOpen && !isChildSubViewActive && currentScreen == Screen.HOME
             ) {
-                val now = System.currentTimeMillis()
-                if (now - lastBackPressTime < 2000) {
-                    exitAppCompletely()
+                if (isPlaying) {
+                    // 车机/手机正在播放音乐时按返回键：平滑退至后台桌面/导航页面并继续保活播放，绝不中断音乐
+                    PlaybackService.ensureServiceAlive(this@MainActivity)
+                    DynamicIslandManager.onAppBackgroundStateChanged(this@MainActivity, inBackground = true)
+                    moveTaskToBack(true)
                 } else {
-                    lastBackPressTime = now
-                    Toast.makeText(this@MainActivity, "再按一次彻底退出程序并停止播放", Toast.LENGTH_SHORT).show()
+                    val now = System.currentTimeMillis()
+                    if (now - lastBackPressTime < 2000) {
+                        exitAppCompletely()
+                    } else {
+                        lastBackPressTime = now
+                        Toast.makeText(this@MainActivity, "再按一次彻底退出程序（播放中按返回键将转入后台保活播放）", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
 
@@ -2280,6 +2288,16 @@ class MainActivity : ComponentActivity() {
                                             autoFallbackToLocal = isFallback
                                             autoPlayPrefs.edit().putBoolean("auto_fallback_to_local", isFallback).apply()
                                         },
+                                        autoLaunchOnBoot = autoLaunchOnBoot,
+                                        onAutoLaunchOnBootChange = { enabled ->
+                                            autoLaunchOnBoot = enabled
+                                            com.lm.player.core.media.BootCompletedReceiver.setAutoLaunchOnBootEnabled(this@MainActivity, enabled)
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                if (enabled) "已开启安卓系统开机自动启动软件" else "已关闭安卓系统开机自动启动软件",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        },
                                         onStreamQualityChanged = {
                                             LemonMusicProtocol.notifyStreamQualityConfigChanged()
                                             val activeSong = currentSong
@@ -2695,6 +2713,7 @@ class MainActivity : ComponentActivity() {
                                 onSeekTo = { seekPosition ->
                                     exoPlayer?.seekTo(seekPosition)
                                     localProgressMs = seekPosition
+                                    com.lm.player.core.media.AudioSharingManager.onPhoneSeekIfCasting(this@MainActivity, seekPosition)
                                 },
                                 onSelectSongFromQueue = { queueSong ->
                                     playSongWithQueue(queueSong, currentQueue.ifEmpty { songList })
@@ -2791,10 +2810,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+    private var isUserExplicitExit = false
+
     /**
-     * 彻底关闭程序与播放服务
+     * 彻底关闭程序与播放服务（仅在用户主动触发退出时调用）
      */
     private fun exitAppCompletely() {
+        isUserExplicitExit = true
         try {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
             PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
@@ -2948,18 +2970,21 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        isUserExplicitExit = false
         DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = false)
     }
 
     override fun onResume() {
         super.onResume()
+        isUserExplicitExit = false
         volumeControlStream = android.media.AudioManager.STREAM_MUSIC
         DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = false)
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (!isChangingConfigurations) {
+        if (!isChangingConfigurations && !isUserExplicitExit) {
+            PlaybackService.ensureServiceAlive(this)
             DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = true)
         }
     }
@@ -2967,16 +2992,20 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
         PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        if (!isUserExplicitExit) {
+            PlaybackService.ensureServiceAlive(this)
+        }
         super.onPause()
     }
 
     override fun onStop() {
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
         PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
-        super.onStop()
-        if (!isChangingConfigurations) {
+        if (!isChangingConfigurations && !isUserExplicitExit) {
+            PlaybackService.ensureServiceAlive(this)
             DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = true)
         }
+        super.onStop()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -2996,16 +3025,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startPlaybackService() {
-        try {
-            val serviceIntent = Intent(this, PlaybackService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-        } catch (e: Throwable) {
-            e.printStackTrace()
-        }
+        PlaybackService.ensureServiceAlive(this)
     }
 
     private fun requestAppPermissions() {
@@ -3027,6 +3047,23 @@ class MainActivity : ComponentActivity() {
             if (permissions.isNotEmpty()) {
                 permissionLauncher.launch(permissions.toTypedArray())
             }
+
+            // 针对车机与安卓后台保活：若尚未加入系统电池优化白名单，首次启动时引导开启后台无限制运行
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                val prefs = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                val alreadyPrompted = prefs.getBoolean("battery_keep_alive_prompted_v172", false)
+                if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName) && !alreadyPrompted) {
+                    prefs.edit().putBoolean("battery_keep_alive_prompted_v172", true).apply()
+                    try {
+                        val intent = Intent(
+                            android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            android.net.Uri.parse("package:$packageName")
+                        )
+                        startActivity(intent)
+                    } catch (_: Throwable) {}
+                }
+            }
         } catch (e: Throwable) {
             e.printStackTrace()
         }
@@ -3036,14 +3073,18 @@ class MainActivity : ComponentActivity() {
         mediaCommandReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
-        if (isFinishing) {
+        val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        if (isUserExplicitExit) {
+            // 仅在用户主动选择彻底退出软件时停止播放器与后台服务
             try {
-                val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-                PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 PlaybackService.stopServiceAndPlayback(this)
             } catch (_: Exception) {}
+        } else {
+            // 车机切换高德导航/桌面或系统回收后台 Activity 时：严禁停止播放，立即加固后台 PlaybackService
+            PlaybackService.ensureServiceAlive(this)
         }
         super.onDestroy()
     }

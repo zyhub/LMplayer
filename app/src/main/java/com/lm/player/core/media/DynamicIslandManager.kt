@@ -347,7 +347,12 @@ object DynamicIslandManager {
         _systemIslandEnabledFlow.value = enabled
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_SYSTEM_ISLAND_ENABLED, enabled).apply()
-        BackgroundIslandOverlayController.refreshVisibilityAndState(context)
+        if (!enabled) {
+            BackgroundIslandOverlayController.destroy()
+        } else {
+            BackgroundIslandOverlayController.refreshVisibilityAndState(context)
+        }
+        PlaybackService.syncSystemIslandMasterSwitch(context, enabled)
         val session = activeMediaSession
         val player = runCatching { Media3Factory.getSharedExoPlayer(context) }.getOrNull()
         if (session != null && player != null) {
@@ -376,6 +381,7 @@ object DynamicIslandManager {
      */
     fun triggerIslandPreview(context: Context) {
         ensureInitialized(context)
+        if (!_systemIslandEnabledFlow.value) return
         BackgroundIslandOverlayController.triggerTemporaryPreview(context)
     }
 
@@ -678,8 +684,8 @@ object DynamicIslandManager {
 
     /**
      * 构建符合各大厂商系统原生媒体上岛（小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊、华为实况窗）的纯净标准 MediaStyle 媒体通知：
-     * - 始终绑定有效 MediaSession Token，严防无 Session 通知覆盖导致几秒后掉岛
-     * - 移除非白名单签名会触发系统校验踢下岛的自定义焦点模板参数与高频 Ticker 标志
+     * - 当「启用挂后台手机灵动岛」开启时：绑定有效 MediaSession Token，使用 MediaStyle + CATEGORY_TRANSPORT 激活系统原生上岛
+     * - 当「启用挂后台手机灵动岛」关闭时：剥离 MediaStyle 与 EXTRA_MEDIA_SESSION，降级为普通后台服务通知并注入各厂商禁岛标志，彻底禁止系统上岛
      */
     fun buildIslandNotification(
         context: Context,
@@ -689,6 +695,7 @@ object DynamicIslandManager {
     ): Notification {
         ensureInitialized(context)
 
+        val islandEnabled = _systemIslandEnabledFlow.value
         val resolvedSession = mediaSession ?: activeMediaSession
         val currentSong = PlaybackQueueManager.currentSongFlow.value
         val currentMediaItem = exoPlayer?.currentMediaItem
@@ -739,10 +746,10 @@ object DynamicIslandManager {
             .setOngoing(isActiveSession)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
-            .setColorized(true)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setColorized(islandEnabled)
+            .setCategory(if (islandEnabled) NotificationCompat.CATEGORY_TRANSPORT else NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(if (islandEnabled) NotificationCompat.VISIBILITY_PUBLIC else NotificationCompat.VISIBILITY_SECRET)
+            .setPriority(if (islandEnabled) NotificationCompat.PRIORITY_DEFAULT else NotificationCompat.PRIORITY_LOW)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .addAction(
                 NotificationCompat.Action.Builder(
@@ -766,29 +773,48 @@ object DynamicIslandManager {
                 ).build()
             )
 
-        if (resolvedSession != null) {
+        if (islandEnabled && resolvedSession != null) {
             builder.setStyle(
                 MediaStyleNotificationHelper.MediaStyle(resolvedSession)
                     .setShowActionsInCompactView(0, 1, 2)
             )
-        }
-
-        // 仅在华为鸿蒙系统设备上注入鸿蒙实况窗/状态栏胶囊扩展参数，绝不影响小米澎湃与 vivo 原子岛的纯净 MediaStyle
-        if (isHuaweiOrHarmonyOS()) {
+            // 仅在开启灵动岛且为华为鸿蒙系统设备上注入鸿蒙实况窗/状态栏胶囊扩展参数
+            if (isHuaweiOrHarmonyOS()) {
+                try {
+                    val hwExtras = Bundle().apply {
+                        putBoolean("hw_enable_live_notification", true)
+                        putBoolean("hw_live_view", true)
+                        putInt("hw_live_notification_type", 2)
+                        putString("hw_capsule_title", displayTitle)
+                        putString("hw_capsule_content", rawArtist)
+                        putInt("hw_capsule_status", if (isPlaying) 1 else 0)
+                    }
+                    builder.addExtras(hwExtras)
+                } catch (_: Throwable) {}
+            }
+        } else {
+            // 灵动岛开关关闭时：显式注入各厂商关闭实况胶囊/焦点通知/原子岛/流体云参数
             try {
-                val hwExtras = Bundle().apply {
-                    putBoolean("hw_enable_live_notification", true)
-                    putBoolean("hw_live_view", true)
-                    putInt("hw_live_notification_type", 2)
-                    putString("hw_capsule_title", displayTitle)
-                    putString("hw_capsule_content", rawArtist)
-                    putInt("hw_capsule_status", if (isPlaying) 1 else 0)
+                val disableExtras = Bundle().apply {
+                    putBoolean("hw_enable_live_notification", false)
+                    putBoolean("hw_live_view", false)
+                    putInt("hw_capsule_status", 0)
+                    putBoolean("miui.focus.enable", false)
+                    putBoolean("oplus_fluid_cloud_enable", false)
+                    putBoolean("vivo.originos.atomic_island.enable", false)
                 }
-                builder.addExtras(hwExtras)
+                builder.addExtras(disableExtras)
             } catch (_: Throwable) {}
         }
 
         val notification = builder.build()
+        if (!islandEnabled) {
+            // 彻底移除 EXTRA_MEDIA_SESSION，防止小米澎湃 OS / vivo OriginOS / OPPO ColorOS 自动提取 Session 上岛
+            runCatching {
+                notification.extras?.remove(Notification.EXTRA_MEDIA_SESSION)
+                notification.extras?.remove("android.mediaSession")
+            }
+        }
         if (isActiveSession) {
             notification.flags = notification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
         }
@@ -814,7 +840,7 @@ object DynamicIslandManager {
 
     /**
      * 刷新系统前台通知、各大厂商原生灵动岛与后台顶部悬浮灵动岛状态
-     * 仅在曲目切换、播放/暂停状态改变或封面加载完成时更新，且必须持有有效 MediaSession
+     * 仅在曲目切换、播放/暂停状态改变、开关切换或封面加载完成时更新
      */
     fun notifySystemIsland(
         context: Context,
@@ -852,7 +878,7 @@ object DynamicIslandManager {
                 overrideBitmap = songId.takeIf { it.isNotEmpty() }?.let { bitmapCache.get(it) }
             )
             val callback = activeNotificationCallback
-            if (callback != null) {
+            if (_systemIslandEnabledFlow.value && callback != null) {
                 callback.onNotificationChanged(
                     MediaNotification(PlaybackService.NOTIFICATION_ID, notification)
                 )

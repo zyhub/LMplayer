@@ -329,22 +329,27 @@ object PlaybackQueueManager {
         }
     }
 
+    private var lastBgErrorRetrySongId: String = ""
+    private var lastBgErrorRetryTimeMs: Long = 0L
+
     fun ensurePlayerListener(context: Context) {
+        val appCtx = context.applicationContext
         if (appContext == null) {
-            appContext = context.applicationContext
+            appContext = appCtx
         }
         if (isListenerAttached) return
-        val player = Media3Factory.getSharedExoPlayer(context)
+        val player = Media3Factory.getSharedExoPlayer(appCtx)
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
                 if (playing) {
-                    startPeriodicPositionSave(context.applicationContext, player)
+                    PlaybackService.ensureServiceAlive(appCtx)
+                    startPeriodicPositionSave(appCtx, player)
                 } else {
                     positionSaveJob?.cancel()
                     val pos = player.currentPosition.coerceAtLeast(0L)
                     if (pos > 0L) {
-                        savePlaybackState(context.applicationContext, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                        savePlaybackState(appCtx, _currentSongFlow.value, positionMs = pos, commitSync = false)
                     }
                 }
             }
@@ -352,10 +357,29 @@ object PlaybackQueueManager {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     if (_isRepeatFlow.value && _currentSongFlow.value != null) {
-                        playSong(_currentSongFlow.value!!, context)
+                        playSong(_currentSongFlow.value!!, appCtx)
                     } else {
-                        playNext(context)
+                        playNext(appCtx)
                     }
+                }
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                // 车机/手机挂后台且主界面未处于前台时的自动容灾重连与切歌保障
+                val targetSong = _currentSongFlow.value ?: return
+                val resumePos = player.currentPosition.coerceAtLeast(0L)
+                val now = System.currentTimeMillis()
+                val canRetry = lastBgErrorRetrySongId != targetSong.id || (now - lastBgErrorRetryTimeMs) > 12_000L
+                if (canRetry) {
+                    lastBgErrorRetrySongId = targetSong.id
+                    lastBgErrorRetryTimeMs = now
+                    Log.w(TAG, "Background onPlayerError (${error.message}), auto-retrying ${targetSong.title} at ${resumePos}ms")
+                    playSong(
+                        targetSong = targetSong,
+                        context = appCtx,
+                        startPositionMs = resumePos,
+                        forceRefresh = true
+                    )
                 }
             }
         })
@@ -369,7 +393,9 @@ object PlaybackQueueManager {
         startPositionMs: Long = 0L,
         forceRefresh: Boolean = false
     ) {
-        ensurePlayerListener(context)
+        val appCtx = context.applicationContext
+        ensurePlayerListener(appCtx)
+        PlaybackService.ensureServiceAlive(appCtx)
         _currentSongFlow.value = targetSong
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist
@@ -381,7 +407,7 @@ object PlaybackQueueManager {
 
         // 立即同步持久化当前播放歌曲完整元数据、播放队列与起始进度，确保任意时刻关闭应用均可精准恢复
         savePlaybackState(
-            context = context,
+            context = appCtx,
             song = targetSong,
             positionMs = startPositionMs.coerceAtLeast(0L),
             commitSync = true
@@ -390,10 +416,10 @@ object PlaybackQueueManager {
         playJob?.cancel()
         playJob = coroutineScope.launch {
             try {
-                val db = ZdsDatabase.getInstance(context)
-                val router = PlaybackRouter(db.downloadDao(), context)
+                val db = ZdsDatabase.getInstance(appCtx)
+                val router = PlaybackRouter(db.downloadDao(), appCtx)
                 val mediaItem: MediaItem = router.resolveMediaItem(targetSong, forceRefresh = forceRefresh)
-                val player = Media3Factory.getSharedExoPlayer(context)
+                val player = Media3Factory.getSharedExoPlayer(appCtx)
                 if (startPositionMs > 0L) {
                     player.setMediaItem(mediaItem, startPositionMs)
                 } else {
@@ -401,6 +427,7 @@ object PlaybackQueueManager {
                 }
                 player.prepare()
                 player.play()
+                AudioSharingManager.onPhoneSongChangedIfCasting(appCtx, targetSong, startPositionMs)
                 Log.i(TAG, "playSong started: ${targetSong.title} (startPos=${startPositionMs}ms, forceRefresh=$forceRefresh)")
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -411,7 +438,8 @@ object PlaybackQueueManager {
     }
 
     fun playNext(context: Context) {
-        ensurePlayerListener(context)
+        val appCtx = context.applicationContext
+        ensurePlayerListener(appCtx)
         val list = _playlistFlow.value
         if (list.isEmpty()) {
             Log.w(TAG, "playNext called but playlist is empty")
@@ -432,11 +460,12 @@ object PlaybackQueueManager {
             }
         }
         Log.i(TAG, "playNext: switching to ${nextSong.title}")
-        playSong(nextSong, context)
+        playSong(nextSong, appCtx)
     }
 
     fun playPrevious(context: Context) {
-        ensurePlayerListener(context)
+        val appCtx = context.applicationContext
+        ensurePlayerListener(appCtx)
         val list = _playlistFlow.value
         if (list.isEmpty()) {
             Log.w(TAG, "playPrevious called but playlist is empty")
@@ -445,9 +474,8 @@ object PlaybackQueueManager {
         val current = _currentSongFlow.value
         val isShuffle = _isShuffleFlow.value
 
-        val prevSong: UnifiedSong = if (isShuffle) {
-            val candidates = if (list.size > 1) list.filter { it.id != current?.id } else list
-            candidates.random()
+        val prevSong: UnifiedSong = if (list.size > 1 && isShuffle) {
+            list.filter { it.id != current?.id }.random()
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex > 0) {
@@ -457,20 +485,24 @@ object PlaybackQueueManager {
             }
         }
         Log.i(TAG, "playPrevious: switching to ${prevSong.title}")
-        playSong(prevSong, context)
+        playSong(prevSong, appCtx)
     }
 
     fun togglePlay(context: Context) {
-        ensurePlayerListener(context)
-        val player = Media3Factory.getSharedExoPlayer(context)
+        val appCtx = context.applicationContext
+        ensurePlayerListener(appCtx)
+        PlaybackService.ensureServiceAlive(appCtx)
+        val player = Media3Factory.getSharedExoPlayer(appCtx)
         if (player.isPlaying) {
             player.pause()
+            AudioSharingManager.onPhonePlayStateChangedIfCasting(appCtx, false)
         } else {
             if (player.currentMediaItem == null && _currentSongFlow.value != null) {
-                val savedPos = getSavedPositionMs(context)
-                playSong(_currentSongFlow.value!!, context, startPositionMs = savedPos)
+                val savedPos = getSavedPositionMs(appCtx)
+                playSong(_currentSongFlow.value!!, appCtx, startPositionMs = savedPos)
             } else {
                 player.play()
+                AudioSharingManager.onPhonePlayStateChangedIfCasting(appCtx, true)
             }
         }
     }

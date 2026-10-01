@@ -34,43 +34,45 @@ class PlaybackRouter(
      * 5. 否则路由至远程流媒体 URL，自动接管 Media3 播放与缓存。
      */
     suspend fun resolveMediaItem(song: UnifiedSong, forceRefresh: Boolean = false): MediaItem {
-        val downloadRecord = downloadDao.getDownloadRecord(song.id)
-        val recordPath = downloadRecord?.localFilePath
-        val hasValidRecordFile = downloadRecord?.status == DownloadStatus.DOWNLOADED &&
-                !recordPath.isNullOrEmpty() &&
-                File(recordPath).let { it.exists() && it.length() > 0 }
-
-        val hasValidSongLocalFile = !song.localFilePath.isNullOrEmpty() &&
-                File(song.localFilePath).let { it.exists() && it.length() > 0 }
-
-        val isStreamUrlLocalFile = song.streamUrl.startsWith("/") &&
-                File(song.streamUrl).let { it.exists() && it.length() > 0 }
-
-        val defaultDownloadFile = File(File(context.getExternalFilesDir(null), "music"), "${song.id}.${song.format}")
-        val hasDefaultFile = defaultDownloadFile.exists() && defaultDownloadFile.length() > 0
-
-        val directLocalPath: String? = when {
-            hasValidRecordFile -> recordPath
-            hasValidSongLocalFile -> song.localFilePath
-            isStreamUrlLocalFile -> song.streamUrl
-            hasDefaultFile -> defaultDownloadFile.absolutePath
-            else -> null
-        }
-
-        // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（严格校验版本、专辑与时长）
-        val resolvedLocalPath: String? = directLocalPath ?: run {
+        val resolvedLocalPath: String? = withContext(Dispatchers.IO) {
             try {
-                val db = ZdsDatabase.getInstance(context)
-                val allSongs = db.songDao().getAllSongsList()
-                val matched = allSongs.firstOrNull { s ->
-                    val hasFile = !s.localFilePath.isNullOrBlank() && File(s.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                    hasFile && (s.id == song.id || SongMatchingResolver.isSongMatch(
-                        s.title, s.artist, s.durationMs,
-                        song.title, song.artist, song.durationMs,
-                        s.album, song.album
-                    ))
+                val downloadRecord = downloadDao.getDownloadRecord(song.id)
+                val recordPath = downloadRecord?.localFilePath
+                val hasValidRecordFile = downloadRecord?.status == DownloadStatus.DOWNLOADED &&
+                        !recordPath.isNullOrEmpty() &&
+                        File(recordPath).let { it.exists() && it.length() > 0 }
+
+                val hasValidSongLocalFile = !song.localFilePath.isNullOrEmpty() &&
+                        File(song.localFilePath).let { it.exists() && it.length() > 0 }
+
+                val isStreamUrlLocalFile = song.streamUrl.startsWith("/") &&
+                        File(song.streamUrl).let { it.exists() && it.length() > 0 }
+
+                val defaultDownloadFile = File(File(context.getExternalFilesDir(null), "music"), "${song.id}.${song.format}")
+                val hasDefaultFile = defaultDownloadFile.exists() && defaultDownloadFile.length() > 0
+
+                val directLocalPath: String? = when {
+                    hasValidRecordFile -> recordPath
+                    hasValidSongLocalFile -> song.localFilePath
+                    isStreamUrlLocalFile -> song.streamUrl
+                    hasDefaultFile -> defaultDownloadFile.absolutePath
+                    else -> null
                 }
-                matched?.localFilePath
+
+                // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（严格校验版本、专辑与时长）
+                directLocalPath ?: run {
+                    val db = ZdsDatabase.getInstance(context)
+                    val allSongs = db.songDao().getAllSongsList()
+                    val matched = allSongs.firstOrNull { s ->
+                        val hasFile = !s.localFilePath.isNullOrBlank() && File(s.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                        hasFile && (s.id == song.id || SongMatchingResolver.isSongMatch(
+                            s.title, s.artist, s.durationMs,
+                            song.title, song.artist, song.durationMs,
+                            s.album, song.album
+                        ))
+                    }
+                    matched?.localFilePath
+                }
             } catch (_: Exception) {
                 null
             }

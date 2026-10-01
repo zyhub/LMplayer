@@ -74,6 +74,7 @@ fun SettingsScreen(
     enableBottomBarAnimation: Boolean,
     autoPlayOnStartup: Boolean = true,
     autoFallbackToLocal: Boolean = true,
+    autoLaunchOnBoot: Boolean = false,
     currentOnlineSource: OnlineMusicSource = OnlineMusicSource.KUWO,
     onOnlineSourceChange: (OnlineMusicSource) -> Unit = {},
     onSelectServer: (ServerConfig) -> Unit,
@@ -87,6 +88,7 @@ fun SettingsScreen(
     onEnableBottomBarAnimationChange: (Boolean) -> Unit,
     onAutoPlayOnStartupChange: (Boolean) -> Unit = {},
     onAutoFallbackToLocalChange: (Boolean) -> Unit = {},
+    onAutoLaunchOnBootChange: (Boolean) -> Unit = {},
     onChooseDownloadDirectory: () -> Unit = {},
     onImportCustomFolder: () -> Unit = {},
     onLocalScanCompleted: () -> Unit = {},
@@ -1248,7 +1250,35 @@ fun SettingsScreen(
                     }
 
                     item {
+                        var isIgnoringBatteryOpt by remember {
+                            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                            mutableStateOf(
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                                    pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+                                } else true
+                            )
+                        }
+                        val lifecycleOwnerForBattery = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                        DisposableEffect(lifecycleOwnerForBattery) {
+                            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                                    val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                                    isIgnoringBatteryOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+                                }
+                            }
+                            lifecycleOwnerForBattery.lifecycle.addObserver(obs)
+                            onDispose { lifecycleOwnerForBattery.lifecycle.removeObserver(obs) }
+                        }
+
                         SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
+                            SettingSwitchRow(
+                                title = "安卓系统启动后自动启动软件",
+                                subtitle = "手机/车机开机或重启进入系统后自动启动 LMPlayer 并拉起后台音频保活服务",
+                                checked = autoLaunchOnBoot,
+                                onCheckedChange = onAutoLaunchOnBootChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
                                 title = "启动自动继续播放",
                                 subtitle = "打开应用时自动恢复上次关闭前的曲目并继续播放",
@@ -1262,6 +1292,39 @@ fun SettingsScreen(
                                 subtitle = "在线音频遇到网络超时或无法缓冲时，无缝切换至已下载的本地歌曲",
                                 checked = autoFallbackToLocal,
                                 onCheckedChange = onAutoFallbackToLocalChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingActionRow(
+                                title = "车机/手机后台常驻保活白名单",
+                                subtitle = if (isIgnoringBatteryOpt) {
+                                    "已开启后台无限制保活（已激活静音音轨 + 唤醒锁 + 前台看门狗 + 车载导航混音压音防杀后台）"
+                                } else {
+                                    "点击允许忽略电池优化，配合内置车载静音音轨与唤醒锁，彻底防止车机切换导航时杀后台"
+                                },
+                                actionText = if (isIgnoringBatteryOpt) "已加入白名单" else "一键开启保活",
+                                onAction = {
+                                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                                        try {
+                                            val intent = android.content.Intent(
+                                                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                                android.net.Uri.parse("package:${context.packageName}")
+                                            ).apply {
+                                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            context.startActivity(intent)
+                                        } catch (e: Exception) {
+                                            try {
+                                                val fallbackIntent = android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                                                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                }
+                                                context.startActivity(fallbackIntent)
+                                            } catch (_: Exception) {
+                                                Toast.makeText(context, "当前车机系统已默认放行后台服务", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    }
+                                }
                             )
                         }
                     }
@@ -1321,123 +1384,134 @@ fun SettingsScreen(
 
                             SettingSwitchRow(
                                 title = "启用挂后台手机灵动岛",
-                                subtitle = "退到后台播放音乐时自动激活小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊等系统原生媒体岛",
+                                subtitle = "退到后台播放音乐时自动激活小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊等系统原生媒体岛；关闭后彻底禁用后台上岛与悬浮胶囊",
                                 checked = systemIslandEnabled,
-                                onCheckedChange = { DynamicIslandManager.setSystemIslandEnabled(context, it) }
+                                onCheckedChange = { enabled ->
+                                    DynamicIslandManager.setSystemIslandEnabled(context, enabled)
+                                    Toast.makeText(
+                                        context,
+                                        if (enabled) "已开启挂后台手机灵动岛" else "已关闭挂后台手机灵动岛，后台不再上岛",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
                             )
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                            AnimatedVisibility(visible = systemIslandEnabled) {
+                                Column {
+                                    Spacer(modifier = Modifier.height(10.dp))
 
-                            SettingDropdownRow(
-                                title = "挂后台灵动岛通道模式",
-                                subtitle = "默认使用厂商系统原生媒体上岛，保持持久稳定在线不掉岛",
-                                selectedValue = islandDisplayMode,
-                                options = IslandDisplayMode.entries,
-                                getLabel = { it.label },
-                                getSubtitle = { it.subtitle },
-                                onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
-                            )
+                                    SettingDropdownRow(
+                                        title = "挂后台灵动岛通道模式",
+                                        subtitle = "默认使用厂商系统原生媒体上岛，保持持久稳定在线不掉岛",
+                                        selectedValue = islandDisplayMode,
+                                        options = IslandDisplayMode.entries,
+                                        getLabel = { it.label },
+                                        getSubtitle = { it.subtitle },
+                                        onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
+                                    )
 
-                            if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY || DynamicIslandManager.isHuaweiOrHarmonyOS()) {
-                                Spacer(modifier = Modifier.height(12.dp))
+                                    if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY || DynamicIslandManager.isHuaweiOrHarmonyOS()) {
+                                        Spacer(modifier = Modifier.height(12.dp))
 
-                                // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.10f) else Color(0xFFFF9500).copy(alpha = 0.12f),
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.35f) else Color(0xFFFF9500).copy(alpha = 0.45f)
-                                    ),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable {
-                                            if (!hasOverlayPerm) {
-                                                DynamicIslandManager.requestOverlayPermission(context)
-                                            }
-                                        }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            modifier = Modifier.weight(1f)
+                                        // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
+                                        Surface(
+                                            shape = RoundedCornerShape(12.dp),
+                                            color = if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.10f) else Color(0xFFFF9500).copy(alpha = 0.12f),
+                                            border = BorderStroke(
+                                                1.dp,
+                                                if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.35f) else Color(0xFFFF9500).copy(alpha = 0.45f)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .clickable {
+                                                    if (!hasOverlayPerm) {
+                                                        DynamicIslandManager.requestOverlayPermission(context)
+                                                    }
+                                                }
                                         ) {
-                                            Icon(
-                                                imageVector = if (hasOverlayPerm) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
-                                                contentDescription = null,
-                                                tint = if (hasOverlayPerm) Color(0xFF34C759) else Color(0xFFFF9500),
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Column {
-                                                Text(
-                                                    text = if (hasOverlayPerm) "概念版顶部悬浮胶囊权限：已授权" else "概念版顶部悬浮胶囊权限：未开启",
-                                                    fontSize = dimensions.bodySize,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.onSurface
-                                                )
-                                                Text(
-                                                    text = if (hasOverlayPerm) {
-                                                        "当按 Home 键退到手机桌面或切换应用时，手机顶部将自动浮现黑胶灵动岛胶囊"
-                                                    } else {
-                                                        "当前选择了概念版悬浮胶囊模式，请点击授予悬浮窗权限以在后台顶部展示胶囊"
-                                                    },
-                                                    fontSize = dimensions.captionSize,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    modifier = Modifier.weight(1f)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (hasOverlayPerm) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                                                        contentDescription = null,
+                                                        tint = if (hasOverlayPerm) Color(0xFF34C759) else Color(0xFFFF9500),
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    Column {
+                                                        Text(
+                                                            text = if (hasOverlayPerm) "概念版顶部悬浮胶囊权限：已授权" else "概念版顶部悬浮胶囊权限：未开启",
+                                                            fontSize = dimensions.bodySize,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                        Text(
+                                                            text = if (hasOverlayPerm) {
+                                                                "当按 Home 键退到手机桌面或切换应用时，手机顶部将自动浮现黑胶灵动岛胶囊"
+                                                            } else {
+                                                                "当前选择了概念版悬浮胶囊模式，请点击授予悬浮窗权限以在后台顶部展示胶囊"
+                                                            },
+                                                            fontSize = dimensions.captionSize,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                                if (!hasOverlayPerm) {
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    Surface(
+                                                        shape = RoundedCornerShape(8.dp),
+                                                        color = AppleRed
+                                                    ) {
+                                                        Text(
+                                                            text = "去开启",
+                                                            fontSize = dimensions.captionSize,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = Color.White,
+                                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
-                                        if (!hasOverlayPerm) {
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Surface(
-                                                shape = RoundedCornerShape(8.dp),
-                                                color = AppleRed
-                                            ) {
-                                                Text(
-                                                    text = "去开启",
-                                                    fontSize = dimensions.captionSize,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = Color.White,
-                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                                                )
-                                            }
+
+                                        Spacer(modifier = Modifier.height(10.dp))
+
+                                        SettingSwitchRow(
+                                            title = "后台紧凑胶囊优先滚动同步歌词",
+                                            subtitle = "在后台顶部紧凑胶囊中优先翻滚显示实时歌词，无歌词时显示歌名与歌手（长按胶囊可上下微调避开前摄挖孔）",
+                                            checked = showLyricsInPill,
+                                            onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
+                                        )
+
+                                        Spacer(modifier = Modifier.height(12.dp))
+
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (!DynamicIslandManager.hasOverlayPermission(context)) {
+                                                    Toast.makeText(context, "请先授予悬浮窗权限以启用手机后台顶部灵动岛", Toast.LENGTH_SHORT).show()
+                                                    DynamicIslandManager.requestOverlayPermission(context)
+                                                } else {
+                                                    DynamicIslandManager.triggerIslandPreview(context)
+                                                    Toast.makeText(context, "已在屏幕顶部启动 4.5 秒后台灵动岛真机预览（点击可展开/收起）", Toast.LENGTH_SHORT).show()
+                                                }
+                                            },
+                                            shape = RoundedCornerShape(12.dp),
+                                            border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
                                         }
                                     }
-                                }
-
-                                Spacer(modifier = Modifier.height(10.dp))
-
-                                SettingSwitchRow(
-                                    title = "后台紧凑胶囊优先滚动同步歌词",
-                                    subtitle = "在后台顶部紧凑胶囊中优先翻滚显示实时歌词，无歌词时显示歌名与歌手（长按胶囊可上下微调避开前摄挖孔）",
-                                    checked = showLyricsInPill,
-                                    onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
-                                )
-
-                                Spacer(modifier = Modifier.height(12.dp))
-
-                                OutlinedButton(
-                                    onClick = {
-                                        if (!DynamicIslandManager.hasOverlayPermission(context)) {
-                                            Toast.makeText(context, "请先授予悬浮窗权限以启用手机后台顶部灵动岛", Toast.LENGTH_SHORT).show()
-                                            DynamicIslandManager.requestOverlayPermission(context)
-                                        } else {
-                                            DynamicIslandManager.triggerIslandPreview(context)
-                                            Toast.makeText(context, "已在屏幕顶部启动 4.5 秒后台灵动岛真机预览（点击可展开/收起）", Toast.LENGTH_SHORT).show()
-                                        }
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }

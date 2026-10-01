@@ -119,7 +119,8 @@ object Media3Factory {
                 .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
-            // 车机/手机音频焦点配置：自动处理导航提示语音混音/压音 (Ducking) 与来电暂停
+            // 车机/手机音频属性：由 PlaybackService 智能管理音频焦点压音 (Ducking) 与通话暂停恢复，
+            // 防止车机导航 (高德/百度)/雷达/语音助手强抢 AUDIOFOCUS_GAIN 导致 ExoPlayer 永久停止后台播放
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -129,9 +130,9 @@ object Media3Factory {
                 .setRenderersFactory(renderersFactory)
                 .setLoadControl(loadControl)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(appContext).setDataSourceFactory(dataSourceFactory))
-                .setAudioAttributes(audioAttributes, true)
+                .setAudioAttributes(audioAttributes, false)
                 .setWakeMode(C.WAKE_MODE_NETWORK) // 同时持有 CPU WakeLock 与 WifiLock，防止息屏或后台流媒体休眠断流
-                .setHandleAudioBecomingNoisy(true) // 拔出耳机或蓝牙断开自动暂停
+                .setHandleAudioBecomingNoisy(false) // 避免车机蓝牙/通道切换广播 ACTION_AUDIO_BECOMING_NOISY 误停后台播放
                 .build()
         }
         return sharedExoPlayer!!

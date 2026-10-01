@@ -15,8 +15,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- 挂后台时手机顶部灵动岛悬浮窗权限 -->
+    <!-- 挂后台时手机顶部灵动岛悬浮窗权限、开机自启权限与车机/手机后台白名单保活权限 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- 在线应用自更新与安装器调起权限 (Android 8.0+) -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -55,10 +57,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Media3 后台播放服务 -->
+        <!-- Media3 后台播放服务 (stopWithTask="false" 确保车机切换导航/清理任务栈时后台服务持续保活) -->
         <service
             android:name=".core.media.PlaybackService"
             android:exported="true"
+            android:stopWithTask="false"
             android:foregroundServiceType="mediaPlayback"
             tools:ignore="ExportedService">
             <intent-filter>
@@ -67,6 +70,21 @@
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
         </service>
+
+        <!-- 安卓系统开机自动启动软件广播接收器 -->
+        <receiver
+            android:name=".core.media.BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
 
         <!-- FileProvider 配置 -->
         <provider

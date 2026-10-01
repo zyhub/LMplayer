@@ -1884,13 +1884,13 @@ fun AudioOutputDropdownMenu(
                             .padding(horizontal = 8.dp, vertical = 2.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .clickable {
-                                scope.launch {
-                                    if (activeCastDevice != null) {
-                                        AudioSharingManager.stopActiveCast(context)
-                                        Toast.makeText(context, "已断开局域网投射，恢复本机输出: ${route.name}", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        AudioSharingManager.launchSystemMediaOutputSwitcher(context)
-                                    }
+                                if (activeCastDevice != null) {
+                                    AudioSharingManager.stopActiveCastAsync(
+                                        context = context,
+                                        toastMessage = "已断开局域网投射，恢复本机输出: ${route.name}"
+                                    )
+                                } else {
+                                    AudioSharingManager.launchSystemMediaOutputSwitcher(context)
                                 }
                                 onDismissRequest()
                             }
@@ -1981,19 +1981,18 @@ fun AudioOutputDropdownMenu(
                                 .padding(horizontal = 8.dp, vertical = 2.dp)
                                 .clip(RoundedCornerShape(12.dp))
                                 .clickable {
-                                    scope.launch {
-                                        if (isCurrentCast) {
-                                            AudioSharingManager.stopActiveCast(context)
-                                            Toast.makeText(context, "已停止向 ${device.name} 投射音频", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            Toast.makeText(context, "正在连接 ${device.name} (${device.protocol.badge})...", Toast.LENGTH_SHORT).show()
-                                            val res = AudioSharingManager.castSongToDevice(context, device, song, progressMs)
-                                            res.onSuccess { msg ->
-                                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                            }.onFailure { err ->
-                                                Toast.makeText(context, err.message ?: "投射失败", Toast.LENGTH_LONG).show()
-                                            }
-                                        }
+                                    if (isCurrentCast) {
+                                        AudioSharingManager.stopActiveCastAsync(
+                                            context = context,
+                                            toastMessage = "已停止向 ${device.name} 投射音频"
+                                        )
+                                    } else {
+                                        AudioSharingManager.castSongToDeviceAsync(
+                                            context,
+                                            device,
+                                            song,
+                                            progressMs
+                                        )
                                     }
                                     onDismissRequest()
                                 }
