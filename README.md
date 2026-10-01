@@ -5,7 +5,7 @@
 <h1 align="center">🎵 LMPlayer (柠檬音乐客户端)</h1>
 
 <p align="center">
-  <strong>专为车载大屏与 Android 智能设备量身打造的高保真无损音乐播放器</strong>
+  <strong>专为大屏pad与 Android 智能设备量身打造的高保真无损音乐播放器</strong>
 </p>
 
 <p align="center">
