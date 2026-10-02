@@ -1611,7 +1611,36 @@ object BackgroundIslandOverlayController {
             invalidate()
             ioScope.launch {
                 try {
-                    ZdsDatabase.getInstance(context).songDao().updateFavorite(song.id, updated.isFavorite)
+                    val dao = ZdsDatabase.getInstance(context).songDao()
+                    // updateFavorite 只是 UPDATE ... WHERE id，对尚未入库的歌曲影响 0 行，
+                    // 收藏会静默丢失；先补一行再改标记
+                    if (dao.getSongById(song.id) == null) {
+                        dao.insertSongs(
+                            listOf(
+                                com.lm.player.core.database.entity.SongEntity(
+                                    id = updated.id,
+                                    title = updated.title.ifBlank { "未知曲目" },
+                                    artist = updated.artist.ifBlank { "未知歌手" },
+                                    artistId = updated.artistId.ifBlank { "artist_${updated.artist.hashCode()}" },
+                                    album = updated.album.ifBlank { "单曲精选" },
+                                    albumId = updated.albumId.ifBlank { "album_${updated.album.hashCode()}" },
+                                    durationMs = updated.durationMs,
+                                    coverUrl = updated.coverUrl,
+                                    streamUrl = updated.streamUrl,
+                                    serverId = updated.serverId.ifBlank { "local_storage" },
+                                    localFilePath = updated.localFilePath,
+                                    downloadStatus = updated.downloadStatus,
+                                    bitRate = updated.bitRate,
+                                    format = updated.format,
+                                    isFavorite = updated.isFavorite,
+                                    relativeFolderPath = updated.rawMetaJson ?: updated.relativeFolderPath,
+                                    addedTimestamp = System.currentTimeMillis()
+                                )
+                            )
+                        )
+                    } else {
+                        dao.updateFavorite(song.id, updated.isFavorite)
+                    }
                 } catch (_: Exception) {}
             }
         }

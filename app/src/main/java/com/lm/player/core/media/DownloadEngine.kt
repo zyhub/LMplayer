@@ -56,6 +56,29 @@ class DownloadEngine(
     )
 
     companion object {
+        /** 无损音频容器：凡属于此集合的音质档次与有损档次互不兼容 */
+        private val LOSSLESS_AUDIO_EXTS = setOf("flac", "wav", "ape", "alac", "dsf", "dff")
+
+        /**
+         * 实际下载音质的展示文案。
+         * 直链里带 320/128 标记时以它为准 —— 音源缺目标音质会逐级降级
+         * (flac24bit→flac→320k→128k)，此时请求的 320k 与实际到手的 128k 不同，
+         * 必须把降级结果如实告诉用户。
+         */
+        private fun actualQualityLabel(url: String?, format: String, bitRate: Int): String {
+            val ext = format.lowercase()
+            if (ext in LOSSLESS_AUDIO_EXTS) {
+                return if (bitRate >= 1200) "Hi-Res 无损" else "无损 ${ext.uppercase()}"
+            }
+            val lowerUrl = url?.lowercase().orEmpty()
+            val effectiveBitRate = when {
+                lowerUrl.contains("320") -> 320
+                lowerUrl.contains("128") -> 128
+                else -> bitRate
+            }
+            return if (effectiveBitRate > 0) "${effectiveBitRate}K" else ext.uppercase()
+        }
+
         /**
          * 将 SAF Tree URI (如 content://com.android.externalstorage.documents/tree/primary%3AMusic)
          * 解析为真实文件系统绝对路径 (如 /storage/emulated/0/Music)
@@ -372,18 +395,21 @@ class DownloadEngine(
             val destFile = getTargetDownloadFile(songToDownload, effectiveFolderHierarchy)
             val tempFile = File("${destFile.absolutePath}.download")
 
-            // 1. 防重复下载检测与核对：仅当目标同名同音质格式物理文件已存在且非空时才跳过下载
+            // 1. 防重复下载检测与核对：仅当目标同名**同音质档次**的物理文件已存在且非空时才跳过下载
             val record = downloadDao.getDownloadRecord(song.id)
             val requestedLossless = song.format.equals("flac", ignoreCase = true) || song.bitRate >= 800
             fun isExistingFileCompatible(path: String?): Boolean {
                 if (path.isNullOrBlank()) return false
                 val f = File(path)
                 if (!f.exists() || f.length() <= 0L || f.name.endsWith(".download")) return false
-                if (requestedLossless) {
-                    val realExt = detectAudioExtension(f) ?: f.extension.lowercase()
-                    return realExt in listOf("flac", "wav", "ape", "alac")
+                val realExt = (detectAudioExtension(f) ?: f.extension.lowercase()).lowercase()
+                return if (requestedLossless) {
+                    realExt in LOSSLESS_AUDIO_EXTS
+                } else {
+                    // 以前这里对任何有损请求都无条件放行 → 本地已有 FLAC 时选 320K 会被判为
+                    // "已下载完成"直接跳过，用户永远拿不到 320K。现在要求已有文件也必须是有损的。
+                    realExt !in LOSSLESS_AUDIO_EXTS
                 }
-                return true
             }
 
             val isDestFileValid = destFile.exists() && destFile.length() > 0 && !tempFile.exists() && isExistingFileCompatible(destFile.absolutePath)
@@ -414,7 +440,11 @@ class DownloadEngine(
                 removeTask(song.id)
                 urlResolverMap.remove(song.id)
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "「${song.title}」已在本地下载完成", Toast.LENGTH_SHORT).show()
+                    // 说清楚是"哪个音质档次"已有，用户才不会以为选 320K 被无视了。
+                    // 取已有文件自身的扩展名，而不是本次请求的格式
+                    val existingExt = File(validPath).extension.lowercase().ifBlank { song.format.lowercase() }
+                    val existingQuality = actualQualityLabel(validPath, existingExt, song.bitRate)
+                    Toast.makeText(context, "「${song.title}」已存在 $existingQuality 版本，无需重复下载", Toast.LENGTH_SHORT).show()
                 }
                 return@launch
             }
@@ -439,19 +469,21 @@ class DownloadEngine(
             downloadSemaphore.withPermit {
                 var actualDestFile = destFile
                 try {
-                    // 动态解析真实直链（若有传入 urlResolver 且 streamUrl 为空或占位协议）
+                    // 动态解析真实直链：**只要调用方传了解析器就以解析结果为准**。
+                    // 旧判断是"仅当 streamUrl 为空或为 lemon_online:// 占位时才解析"，而服务器曲库
+                    // 歌曲的 streamUrl 是 /api/play/local?path=…&token=…，两个条件都不满足 →
+                    // 解析器永远不会被调用 → 拖回的永远是服务器上的**原文件**（常见为无损），
+                    // 与用户所选的下载音质完全无关。这是"选低音质仍下到无损"的第二个根因。
                     var effectiveStreamUrl = song.streamUrl
                     val activeResolver = urlResolver ?: urlResolverMap[song.id]
-                    if (effectiveStreamUrl.isBlank() || effectiveStreamUrl.startsWith("lemon_online://")) {
-                        if (activeResolver != null) {
-                            val resolved = runCatching { activeResolver() }.getOrNull()
-                            if (!resolved.isNullOrBlank()) {
-                                effectiveStreamUrl = resolved
-                            }
+                    if (activeResolver != null) {
+                        val resolved = runCatching { activeResolver() }.getOrNull()
+                        if (!resolved.isNullOrBlank()) {
+                            effectiveStreamUrl = resolved
                         }
-                        if (effectiveStreamUrl.isBlank() && !record?.remoteUrl.isNullOrBlank() && record?.remoteUrl?.startsWith("http") == true) {
-                            effectiveStreamUrl = record.remoteUrl
-                        }
+                    }
+                    if (effectiveStreamUrl.isBlank() && !record?.remoteUrl.isNullOrBlank() && record?.remoteUrl?.startsWith("http") == true) {
+                        effectiveStreamUrl = record.remoteUrl
                     }
 
                     if (effectiveStreamUrl.isBlank() || (!effectiveStreamUrl.startsWith("http://") && !effectiveStreamUrl.startsWith("https://"))) {
@@ -581,7 +613,14 @@ class DownloadEngine(
                     Log.i(TAG, "Song ${song.title} downloaded and tagged successfully to ${actualDestFile.absolutePath}")
 
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "「${song.title}」已完成离线下载与标签内嵌", Toast.LENGTH_SHORT).show()
+                        // 如实告知**实际**拿到的音质：音源缺目标音质时会逐级降级
+                        // (flac24bit→flac→320k→128k)，用户选了 320K 实际下到 128K 时必须能看见
+                        val actualQuality = actualQualityLabel(effectiveStreamUrl, finalSong.format, finalSong.bitRate)
+                        Toast.makeText(
+                            context,
+                            "「${song.title}」已完成离线下载 [实际音质: $actualQuality]",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
 
                 } catch (e: Exception) {

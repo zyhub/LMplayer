@@ -72,6 +72,9 @@ import kotlinx.coroutines.launch
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
     downloadedSongs: List<UnifiedSong> = emptyList(),
+    recentlyPlayedSongs: List<UnifiedSong> = emptyList(),
+    recentlyAddedSongs: List<UnifiedSong> = emptyList(),
+    serverAlbums: List<UnifiedAlbum> = emptyList(),
     playlists: List<UnifiedPlaylist> = emptyList(),
     activeServerConfig: ServerConfig? = null,
     activeDownloadTasks: List<DownloadTask> = emptyList(),
@@ -121,7 +124,9 @@ fun LocalLibraryScreen(
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
     // 排序模式
-    var songSortMode by remember { mutableStateOf("default") } // default, name, artist, duration
+    // 程序启动默认按「加入时间」：在线模式 = 服务器文件的 mtime（服务器「最近添加」先后），
+    // 本地模式 = 本地下载完成时间。与 TV 车机版保持一致，"刚入库的排在前面"才是资料库第一直觉。
+    var songSortMode by remember { mutableStateOf("added") } // added, default, name, artist, duration, source
 
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
@@ -221,6 +226,27 @@ fun LocalLibraryScreen(
         }
     }
 
+    // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源
+    val favSongs = remember(allSongs) { allSongs.filter { it.isFavorite } }
+
+    // 我喜欢的音乐下钻视图联动刷新。
+    // 此前下钻视图只在点击卡片那一刻快照一次，已经进入列表后再点「喜欢」，
+    // 新增的歌曲不会出现 —— 这正是"加入喜欢后没有歌曲"的观感来源。
+    LaunchedEffect(favSongs) {
+        if (activeSubViewTitle == "我喜欢的音乐") {
+            activeSubViewSongs = favSongs
+            activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
+        }
+    }
+
+    // 最近播放聚合：优先使用宿主注入的真实播放足迹（在线模式取服务器播放记录，
+    // 离线模式取本地持久化记录），为空时才退回「曲库前 30 首」兜底展示。
+    // 此前这里直接拿 allSongs.take(30)，既不是播放历史也不是时间序，
+    // 与用户实际听过什么完全无关 —— 这正是"最近播放卡片歌曲不对"的根因。
+    val recentPlaySongs = remember(recentlyPlayedSongs, allSongs) {
+        if (recentlyPlayedSongs.isNotEmpty()) recentlyPlayedSongs else allSongs.take(30)
+    }
+
     // 动态聚合数据
     val artists = remember(allSongs) {
         val countMap = allSongs.groupingBy { it.artist.ifBlank { "未知歌手" } }.eachCount()
@@ -237,17 +263,70 @@ fun LocalLibraryScreen(
             }.sortedByDescending { it.songCount }
     }
 
-    val albums = remember(allSongs) {
-        allSongs.groupBy { it.album.ifBlank { "单曲精选" } }
-            .map { (albumName, songs) ->
-                UnifiedAlbum(
-                    id = "album_${albumName.hashCode()}",
-                    title = albumName,
-                    artist = songs.firstOrNull()?.artist ?: "各种艺术家",
-                    coverUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
-                    songCount = songs.size
-                )
-            }.sortedByDescending { it.songCount }
+    // 在线模式使用服务器 /api/library/albums 的专辑聚合（宿主注入），本地模式回落本地聚合。
+    // 服务器专辑 id 与曲目 albumId 同源 (lemon_album_${md5("$artist/$name")})，可直接做最近添加排序。
+    val albums = remember(allSongs, serverAlbums) {
+        if (serverAlbums.isNotEmpty()) {
+            // 服务器专辑接口若没给出封面（既无代表曲目路径也无外链封面），
+            // 用本地曲库里同专辑歌曲的封面兜底，避免专辑卡片全是占位图。
+            val coverByAlbumId = HashMap<String, String>(allSongs.size)
+            val coverByAlbumTitle = HashMap<String, String>(allSongs.size)
+            for (song in allSongs) {
+                if (song.coverUrl.isBlank()) continue
+                if (song.albumId.isNotBlank() && !coverByAlbumId.containsKey(song.albumId)) {
+                    coverByAlbumId[song.albumId] = song.coverUrl
+                }
+                val titleKey = song.album.ifBlank { "单曲精选" }
+                if (!coverByAlbumTitle.containsKey(titleKey)) {
+                    coverByAlbumTitle[titleKey] = song.coverUrl
+                }
+            }
+            serverAlbums.map { album ->
+                if (album.coverUrl.isNotBlank()) {
+                    album
+                } else {
+                    val fallback = coverByAlbumId[album.id] ?: coverByAlbumTitle[album.title] ?: ""
+                    if (fallback.isBlank()) album else album.copy(coverUrl = fallback)
+                }
+            }
+        } else {
+            allSongs.groupBy { it.album.ifBlank { "单曲精选" } }
+                .map { (albumName, songs) ->
+                    UnifiedAlbum(
+                        id = "album_${albumName.hashCode()}",
+                        title = albumName,
+                        artist = songs.firstOrNull()?.artist ?: "各种艺术家",
+                        coverUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
+                        songCount = songs.size
+                    )
+                }.sortedByDescending { it.songCount }
+        }
+    }
+
+    // 「最近添加专辑」按专辑内最新一首歌的加入时间倒序：新入库的专辑排在最前。
+    // 时间取服务器文件 mtime（在线）或下载完成时间（本地），与「按加入时间」同一口径。
+    val recentAddedAlbums = remember(albums, allSongs) {
+        if (albums.isEmpty()) {
+            emptyList()
+        } else {
+            val newestByAlbumId = HashMap<String, Long>(albums.size)
+            val newestByAlbumTitle = HashMap<String, Long>(allSongs.size)
+            for (song in allSongs) {
+                if (song.addedTimestamp <= 0L) continue
+                if (song.albumId.isNotBlank()) {
+                    val cur = newestByAlbumId[song.albumId] ?: 0L
+                    if (song.addedTimestamp > cur) newestByAlbumId[song.albumId] = song.addedTimestamp
+                }
+                val titleKey = song.album.ifBlank { "单曲精选" }
+                val curTitle = newestByAlbumTitle[titleKey] ?: 0L
+                if (song.addedTimestamp > curTitle) newestByAlbumTitle[titleKey] = song.addedTimestamp
+            }
+            albums.sortedWith(
+                compareByDescending<UnifiedAlbum> {
+                    newestByAlbumId[it.id] ?: newestByAlbumTitle[it.title] ?: 0L
+                }.thenByDescending { it.songCount }
+            )
+        }
     }
 
     // 自动同步服务器歌单 (进入资料库或服务器配置就绪时自动拉取)
@@ -383,20 +462,32 @@ fun LocalLibraryScreen(
                     .thenByDescending { it.addedTimestamp }
                     .thenBy { it.title }
             )
+            // 按加入时间倒序（新加入的在前）。时间戳缺失(0)的极少数条目自然排在末尾，属预期。
+            // addedTimestamp 的口径由调用方按模式注入，这里不区分：
+            //   在线模式 = 服务器文件的 mtime（即服务器「最近添加」的先后）
+            //   本地模式 = 本地下载完成时间（纯扫描入库的文件回落到文件修改时间）
+            "added" -> allSongs.sortedWith(
+                compareByDescending<UnifiedSong> { it.addedTimestamp }.thenBy { it.title }
+            )
             else -> allSongs
         }
     }
 
-    // 最近添加歌曲切片 (优先聚合已下载或有明确添加时间戳的曲目，按 addedTimestamp 倒序排序取前20首)
-    val recentAddedSongs = remember(allSongs) {
-        val downloadedOrTimestamped = allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || it.addedTimestamp > 0 }
-        if (downloadedOrTimestamped.isNotEmpty()) {
-            downloadedOrTimestamped.sortedWith(
-                compareByDescending<UnifiedSong> { it.addedTimestamp }
-                    .thenByDescending { it.downloadStatus == DownloadStatus.DOWNLOADED }
-            ).take(20)
+    // 最近添加歌曲切片：在线模式直接用宿主注入的服务器「最近添加」数据（服务器文件 mtime 倒序，
+    // 含尚未同步进本地库的新曲目），本地模式才从本地曲库按加入时间倒序推算。
+    val recentAddedSongs = remember(recentlyAddedSongs, allSongs) {
+        if (recentlyAddedSongs.isNotEmpty()) {
+            recentlyAddedSongs.take(20)
         } else {
-            allSongs.sortedByDescending { it.addedTimestamp }.take(20)
+            val downloadedOrTimestamped = allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || it.addedTimestamp > 0 }
+            if (downloadedOrTimestamped.isNotEmpty()) {
+                downloadedOrTimestamped.sortedWith(
+                    compareByDescending<UnifiedSong> { it.addedTimestamp }
+                        .thenByDescending { it.downloadStatus == DownloadStatus.DOWNLOADED }
+                ).take(20)
+            } else {
+                allSongs.sortedByDescending { it.addedTimestamp }.take(20)
+            }
         }
     }
 
@@ -680,7 +771,6 @@ fun LocalLibraryScreen(
 
                             // B. 我喜欢的音乐 (Favorites Card)
                             item {
-                                val favSongs = allSongs.filter { it.isFavorite }
                                 PlaylistSpecialCard(
                                     title = "我喜欢的音乐",
                                     subtitle = "${favSongs.size} 首歌曲",
@@ -697,17 +787,16 @@ fun LocalLibraryScreen(
 
                             // C. 最近播放 (Recent Card)
                             item {
-                                val recentSongs = allSongs.take(30)
                                 PlaylistSpecialCard(
                                     title = "最近播放",
-                                    subtitle = "${recentSongs.size} 首歌曲",
+                                    subtitle = "${recentPlaySongs.size} 首歌曲",
                                     icon = Icons.Default.History,
                                     gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
                                     onClick = {
                                         isFromAllPlaylists = false
                                         activeSubViewTitle = "最近播放"
-                                        activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentSongs.size} 首"
-                                        activeSubViewSongs = recentSongs
+                                        activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentPlaySongs.size} 首"
+                                        activeSubViewSongs = recentPlaySongs
                                         isDownloadManagementMode = false
                                         selectedDownloadSongIds.clear()
                                     }
@@ -1047,7 +1136,7 @@ fun LocalLibraryScreen(
                                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                                 contentPadding = PaddingValues(horizontal = 2.dp)
                             ) {
-                                items(albums.take(12), key = { it.id }) { album ->
+                                items(recentAddedAlbums.take(12), key = { it.id }) { album ->
                                     Column(
                                         modifier = Modifier
                                             .width(128.dp)
@@ -1129,6 +1218,7 @@ fun LocalLibraryScreen(
                                         "artist" -> "按歌手"
                                         "duration" -> "按时长"
                                         "source" -> "按加入方式"
+                                        "added" -> "按加入时间"
                                         else -> "默认排序"
                                     },
                                     fontSize = dimensions.captionSize,
@@ -1140,6 +1230,7 @@ fun LocalLibraryScreen(
                                             "name" -> "artist"
                                             "artist" -> "duration"
                                             "duration" -> "source"
+                                            "source" -> "added"
                                             else -> "default"
                                         }
                                     }
@@ -1503,7 +1594,6 @@ fun LocalLibraryScreen(
 
                         // B. 我喜欢的音乐
                         item {
-                            val favSongs = allSongs.filter { it.isFavorite }
                             PlaylistSpecialCard(
                                 title = "我喜欢的音乐",
                                 subtitle = "${favSongs.size} 首歌曲",
@@ -1523,17 +1613,16 @@ fun LocalLibraryScreen(
 
                         // C. 最近播放
                         item {
-                            val recentSongs = allSongs.take(30)
                             PlaylistSpecialCard(
                                 title = "最近播放",
-                                subtitle = "${recentSongs.size} 首歌曲",
+                                subtitle = "${recentPlaySongs.size} 首歌曲",
                                 icon = Icons.Default.History,
                                 gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = "最近播放"
-                                    activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentSongs.size} 首"
-                                    activeSubViewSongs = recentSongs
+                                    activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentPlaySongs.size} 首"
+                                    activeSubViewSongs = recentPlaySongs
                                     isDownloadManagementMode = false
                                     selectedDownloadSongIds.clear()
                                 },

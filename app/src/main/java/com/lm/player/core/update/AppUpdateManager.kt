@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.7.0"
-    const val CURRENT_VERSION_CODE = 35
+    const val CURRENT_VERSION_NAME = "1.7.5"
+    const val CURRENT_VERSION_CODE = 40
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -201,9 +201,10 @@ object AppUpdateManager {
                     latestVersion = currentVersionName,
                     latestVersionCode = currentVersionCode.toInt(),
                     releaseNotes = "当前已是最新版本 (v$currentVersionName)：\n\n" +
-                        "1. 多版本精准识别：严格区分同名歌曲的 Live、演唱会现场、黑胶、伴奏等版本，彻底修复跨版本误高亮、误标已缓存与点击串播问题\n" +
-                        "2. 播放与断点续播：还原大尺寸封面与 5 行滚动歌词，修复启动自动续播未恢复关闭前曲目与进度的问题\n" +
-                        "3. 界面与交互优化：自动清理歌名转义字符，修复深色模式二级页面标题可见度及系统返回键逐级返回逻辑",
+                        "1. 修复在线模式「最近添加专辑」专辑卡片空白：兼容服务端多种封面字段命名，缺图时自动回落到库内歌曲封面\n" +
+                        "2. 修复「最近播放」因程序退出或本地/在线模式来回切换被清空的问题：以本机播放足迹为准合并服务器记录，退出时同步落盘；同一首歌重复播放只置顶，不再重复入列\n" +
+                        "3. 移除后台常驻保活（唤醒锁、静默音轨、看门狗、闹钟自启、忽略电池优化引导），恢复系统默认的后台行为\n" +
+                        "4. 「下载管理 - 已完成」改为按完成下载时间倒序，最新下载的歌曲排在最前",
                     downloadUrl = ""
                 )
             )

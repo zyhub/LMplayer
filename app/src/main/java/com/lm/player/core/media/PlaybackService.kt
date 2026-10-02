@@ -51,12 +51,6 @@ class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    // 车机/手机后台强力保活锁与静音音轨句柄
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var silentKeepAliveAudioTrack: AudioTrack? = null
-    private var keepAliveWatchdogJob: Job? = null
-
     // 车载导航混音压音 (Ducking) 与通话焦点恢复管理
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -71,7 +65,6 @@ class PlaybackService : MediaSessionService() {
 
         const val ACTION_MEDIA_COMMAND = "com.lm.player.ACTION_MEDIA_COMMAND"
         const val ACTION_STOP_SERVICE = "com.lm.player.ACTION_STOP_SERVICE"
-        const val ACTION_KEEP_ALIVE_REVIVE = "com.lm.player.ACTION_KEEP_ALIVE_REVIVE"
         const val EXTRA_COMMAND = "EXTRA_COMMAND"
         const val CMD_PLAY = "CMD_PLAY"
         const val CMD_PAUSE = "CMD_PAUSE"
@@ -95,18 +88,17 @@ class PlaybackService : MediaSessionService() {
         private var isExplicitStopping: Boolean = false
 
         /**
-         * 确保后台播放服务处于活跃前台状态（车机切后台、切歌、Activity 回收时调用）
+         * 启动/唤醒前台播放服务。仅用于正常的播放场景（进入前台、开始播放），
+         * 不再承担"后台常驻保活"职责 —— 息屏/切后台后由系统按常规媒体应用策略管理。
          */
-        fun ensureServiceAlive(context: Context) {
+        fun startPlaybackService(context: Context) {
             try {
                 isExplicitStopping = false
                 val appCtx = context.applicationContext
-                val serviceIntent = Intent(appCtx, PlaybackService::class.java).apply {
-                    action = ACTION_KEEP_ALIVE_REVIVE
-                }
+                val serviceIntent = Intent(appCtx, PlaybackService::class.java)
                 ContextCompat.startForegroundService(appCtx, serviceIntent)
             } catch (e: Throwable) {
-                Log.w(TAG, "ensureServiceAlive startForegroundService warning: ${e.message}")
+                Log.w(TAG, "startPlaybackService warning: ${e.message}")
             }
         }
 
@@ -217,8 +209,6 @@ class PlaybackService : MediaSessionService() {
         activeInstance = this
         try {
             createNotificationChannel()
-            acquireKeepAliveLocks()
-            startSilentAudioKeepAliveTrack()
 
             // 1. 获取全局单例 ExoPlayer 并确保后台播放队列监听器已挂载
             val rawPlayer = Media3Factory.getSharedExoPlayer(this)
@@ -463,21 +453,18 @@ class PlaybackService : MediaSessionService() {
             DynamicIslandManager.bindMediaSession(session)
             DynamicIslandManager.ensureInitialized(this)
 
-            // 4. 挂载全品牌安卓灵动岛 MediaNotification.Provider 并始终注册 Session 以保障车机方向盘与后台前台服务存活
+            // 4. 挂载全品牌安卓灵动岛 MediaNotification.Provider 并注册 Session（方向盘与系统媒体控制入口）
             setMediaNotificationProvider(DynamicIslandManager.createMediaNotificationProvider(this))
             addSession(session)
 
-            // 5. 立即发布初始前台通知并启动后台常驻保活巡检看门狗
+            // 5. 发布初始前台通知
             startImmediateForeground()
-            startKeepAliveWatchdog()
 
             // 6. 监听播放状态与曲目切换，平滑同步系统原生媒体通知、音频焦点与悬浮胶囊
             rawPlayer.addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     if (isPlaying) {
                         registerCarSmartAudioFocus()
-                        ensureKeepAliveLocksHeld()
-                        ensureSilentAudioTrackPlaying()
                     }
                     startImmediateForeground()
                     updateForegroundNotification(isPlaying)
@@ -486,7 +473,6 @@ class PlaybackService : MediaSessionService() {
 
                 override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                     DynamicIslandManager.clearLyrics()
-                    ensureKeepAliveLocksHeld()
                     startImmediateForeground()
                     updateForegroundNotification(rawPlayer.isPlaying)
                     BackgroundIslandOverlayController.refreshVisibilityAndState(this@PlaybackService)
@@ -495,15 +481,6 @@ class PlaybackService : MediaSessionService() {
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to initialize PlaybackService", e)
         }
-    }
-
-    /**
-     * 接管 Media3 的通知更新回调，严禁 Media3 内部 MediaNotificationManager 在切歌缓冲或暂停时调用 stopForeground 降级服务，
-     * 确保车机与手机挂后台期间 100% 维持 FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK 前台优先级。
-     */
-    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
-        if (isExplicitStopping) return
-        startImmediateForeground()
     }
 
     /**
@@ -526,142 +503,6 @@ class PlaybackService : MediaSessionService() {
         } catch (e: Throwable) {
             Log.e(TAG, "Error handling island master switch change", e)
         }
-    }
-
-    /**
-     * 申请 CPU 唤醒锁 (PARTIAL_WAKE_LOCK) 与高性能 Wi-Fi 锁，防止车机切入导航后台或手机息屏后 CPU/网卡休眠断流
-     */
-    private fun acquireKeepAliveLocks() {
-        try {
-            if (wakeLock == null) {
-                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-                wakeLock = pm?.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "LMPlayer:CarMediaKeepAliveWakeLock"
-                )?.apply {
-                    setReferenceCounted(false)
-                }
-            }
-            if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire()
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "Failed to acquire PARTIAL_WAKE_LOCK", e)
-        }
-
-        try {
-            if (wifiLock == null) {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-                @Suppress("DEPRECATION")
-                val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
-                wifiLock = wm?.createWifiLock(lockMode, "LMPlayer:CarMediaKeepAliveWifiLock")?.apply {
-                    setReferenceCounted(false)
-                }
-            }
-            if (wifiLock?.isHeld == false) {
-                wifiLock?.acquire()
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "Failed to acquire WifiLock", e)
-        }
-    }
-
-    private fun ensureKeepAliveLocksHeld() {
-        try {
-            if (wakeLock?.isHeld != true || wifiLock?.isHeld != true) {
-                acquireKeepAliveLocks()
-            }
-        } catch (_: Throwable) {}
-    }
-
-    private fun releaseKeepAliveLocks() {
-        try {
-            if (wakeLock?.isHeld == true) {
-                wakeLock?.release()
-            }
-        } catch (_: Throwable) {}
-        try {
-            if (wifiLock?.isHeld == true) {
-                wifiLock?.release()
-            }
-        } catch (_: Throwable) {}
-    }
-
-    /**
-     * 启动零 CPU 占用的硬件级静音 AudioTrack 循环（MODE_STATIC）：
-     * 许多安卓车机系统（如比亚迪 DiLink、吉利银河/Flyme Auto、方易通/掌讯/8155车机）通过检测 AudioFlinger 是否有活跃音轨判定后台音乐应用活性。
-     * 在切歌缓冲或短暂暂停间隙维持一条 0 音量的静态 PCM 静音环路，可彻底阻止车机杀后台进程，且不占用 CPU、不发出任何底噪、不抢占其他应用音频焦点。
-     */
-    private fun startSilentAudioKeepAliveTrack() {
-        if (silentKeepAliveAudioTrack != null) return
-        try {
-            val sampleRate = 8000
-            val frameCount = 800 // 0.1 秒静音帧
-            val bufferSizeBytes = frameCount * 2 // 16-bit mono = 2 bytes/frame
-            val minBuf = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(bufferSizeBytes)
-
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    PlatformAudioAttributes.Builder()
-                        .setUsage(PlatformAudioAttributes.USAGE_MEDIA)
-                        .setContentType(PlatformAudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(minBuf)
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .build()
-
-            val silentBytes = ByteArray(minBuf)
-            val totalFrames = minBuf / 2
-            track.write(silentBytes, 0, silentBytes.size)
-            track.setVolume(0f)
-            track.setLoopPoints(0, totalFrames, -1)
-            track.play()
-            silentKeepAliveAudioTrack = track
-            Log.i(TAG, "Car silent keep-alive AudioTrack started (MODE_STATIC)")
-        } catch (e: Throwable) {
-            Log.w(TAG, "Failed to start silent keep-alive AudioTrack: ${e.message}")
-        }
-    }
-
-    private fun ensureSilentAudioTrackPlaying() {
-        try {
-            val track = silentKeepAliveAudioTrack
-            if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
-                silentKeepAliveAudioTrack = null
-                startSilentAudioKeepAliveTrack()
-            } else if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                track.setVolume(0f)
-                track.play()
-            }
-        } catch (_: Throwable) {}
-    }
-
-    private fun releaseSilentAudioKeepAliveTrack() {
-        try {
-            silentKeepAliveAudioTrack?.let { track ->
-                if (track.state == AudioTrack.STATE_INITIALIZED) {
-                    runCatching { track.stop() }
-                }
-                runCatching { track.release() }
-            }
-        } catch (_: Throwable) {}
-        silentKeepAliveAudioTrack = null
     }
 
     private fun registerCarSmartAudioFocus() {
@@ -712,59 +553,6 @@ class PlaybackService : MediaSessionService() {
         } catch (_: Throwable) {}
     }
 
-    /**
-     * 后台常驻保活巡检看门狗：
-     * 每 8 秒刷新一次前台服务绑定、唤醒锁状态、静音保活音轨与播放进度持久化，防止车机系统定时清理器回收后台服务
-     */
-    private fun startKeepAliveWatchdog() {
-        keepAliveWatchdogJob?.cancel()
-        keepAliveWatchdogJob = serviceScope.launch {
-            while (isActive && !isExplicitStopping) {
-                delay(8000L)
-                if (isExplicitStopping) break
-                try {
-                    ensureKeepAliveLocksHeld()
-                    ensureSilentAudioTrackPlaying()
-                    startImmediateForeground()
-                    val player = exoPlayer
-                    if (player != null && player.isPlaying) {
-                        val pos = player.currentPosition.coerceAtLeast(0L)
-                        if (pos > 0L) {
-                            PlaybackQueueManager.savePlaybackState(
-                                context = applicationContext,
-                                positionMs = pos,
-                                commitSync = false
-                            )
-                        }
-                    }
-                } catch (_: Throwable) {}
-            }
-        }
-    }
-
-    private fun scheduleSelfRevivalAlarm() {
-        if (isExplicitStopping) return
-        try {
-            val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-            val reviveIntent = Intent(applicationContext, PlaybackService::class.java).apply {
-                action = ACTION_KEEP_ALIVE_REVIVE
-            }
-            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            val pendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                PendingIntent.getForegroundService(applicationContext, 9001, reviveIntent, flags)
-            } else {
-                PendingIntent.getService(applicationContext, 9001, reviveIntent, flags)
-            }
-            alarmManager.set(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + 1200L,
-                pendingIntent
-            )
-        } catch (e: Throwable) {
-            Log.w(TAG, "Failed to schedule self-revival alarm: ${e.message}")
-        }
-    }
-
     private fun dispatchBroadcast(command: String) {
         try {
             val intent = Intent(ACTION_MEDIA_COMMAND).apply {
@@ -781,11 +569,8 @@ class PlaybackService : MediaSessionService() {
         if (intent?.action == ACTION_STOP_SERVICE) {
             isExplicitStopping = true
             try {
-                keepAliveWatchdogJob?.cancel()
                 BackgroundIslandOverlayController.destroy()
-                releaseSilentAudioKeepAliveTrack()
                 abandonCarSmartAudioFocus()
-                releaseKeepAliveLocks()
                 val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
                 PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
                 exoPlayer?.stop()
@@ -802,8 +587,6 @@ class PlaybackService : MediaSessionService() {
         }
 
         isExplicitStopping = false
-        ensureKeepAliveLocksHeld()
-        ensureSilentAudioTrackPlaying()
 
         if (intent?.action == ACTION_MEDIA_COMMAND) {
             val cmd = intent.getStringExtra(EXTRA_COMMAND)
@@ -842,25 +625,15 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
-     * 关键修复：车机系统切换到高德地图/倒车影像/车机桌面时经常自动清理后台 Activity 任务栈并触发 onTaskRemoved。
-     * 非用户主动退出时严禁调用 super.onTaskRemoved 或停止 ExoPlayer，而是立即加固前台服务与自唤醒闹钟，确保车机后台持续保活播放！
+     * 用户从最近任务划掉应用时，默认交由系统处置（保存进度后停止后台服务），
+     * 不再强行把自己拉回前台常驻 —— 后台常驻保活能力已按需求移除。
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (isExplicitStopping) {
-            super.onTaskRemoved(rootIntent)
-            return
-        }
         try {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
             PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
-            ensureKeepAliveLocksHeld()
-            ensureSilentAudioTrackPlaying()
-            startImmediateForeground()
-            scheduleSelfRevivalAlarm()
-            Log.i(TAG, "onTaskRemoved intercepted: keeping PlaybackService alive in background for car/phone")
-        } catch (e: Throwable) {
-            Log.e(TAG, "Error in onTaskRemoved keep-alive", e)
-        }
+        } catch (_: Throwable) {}
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
@@ -929,18 +702,14 @@ class PlaybackService : MediaSessionService() {
             activeInstance = null
         }
         if (!isExplicitStopping) {
-            // 若被车机系统极端内存回收意外销毁，保存当前进度并立即触发自唤醒拉起服务
+            // 保存当前进度，供下次进入时续播（不再自唤醒拉起后台服务）
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
             PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
-            scheduleSelfRevivalAlarm()
         }
         try {
-            keepAliveWatchdogJob?.cancel()
             duckRestoreJob?.cancel()
             BackgroundIslandOverlayController.destroy()
-            releaseSilentAudioKeepAliveTrack()
             abandonCarSmartAudioFocus()
-            releaseKeepAliveLocks()
             DynamicIslandManager.bindMediaSession(null)
             serviceScope.cancel()
             mediaSession?.run {

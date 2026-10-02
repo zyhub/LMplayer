@@ -560,11 +560,15 @@ object SongMatchingResolver {
                     )
                 }
             } else null
+            // 「加入时间」优先取服务器文件时间 (incoming，来自 getSongList 的 mtime)：
+            // 在线模式的「按加入时间」排序要还原服务器"最近添加"的先后，而本地库里的值
+            // 历史上是"首次同步那一刻"，若继续让 existing 优先，老库永远纠正不过来。
+            // 服务器没给时间时（如 /api/download/list 补全的条目）再依次回落。
             val finalTimestamp = when {
+                incoming.addedTimestamp > 0 -> incoming.addedTimestamp
                 existing != null && existing.addedTimestamp > 0 -> existing.addedTimestamp
                 existingMatch != null && existingMatch.addedTimestamp > 0 -> existingMatch.addedTimestamp
                 download != null && download.completedTimestamp > 0 -> download.completedTimestamp
-                incoming.addedTimestamp > 0 -> incoming.addedTimestamp
                 validLocalPath != null -> System.currentTimeMillis()
                 else -> 0L
             }

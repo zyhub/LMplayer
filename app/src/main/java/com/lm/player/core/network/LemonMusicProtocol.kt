@@ -457,7 +457,17 @@ class LemonMusicProtocol(
                                         bitRate = 320,
                                         format = filePath.substringAfterLast('.', "mp3").lowercase(),
                                         isFavorite = false,
-                                        relativeFolderPath = extractRelativeFolderPath(filePath, singer, album)
+                                        relativeFolderPath = extractRelativeFolderPath(filePath, singer, album),
+                                        // 这些是通过 /api/download/list 补全的条目，曲库接口里没有它们，
+                                        // 也就没有 mtime；给个时间戳而不是 0，否则「按加入时间」会把它们
+                                        // 一律甩到末尾，与"刚在服务器下载完 = 最近添加"的事实相反。
+                                        addedTimestamp = dlItem.optLong("mtime", 0L).let { m ->
+                                            when {
+                                                m > 10_000_000_000L -> m
+                                                m > 0L -> m * 1000L
+                                                else -> System.currentTimeMillis()
+                                            }
+                                        }
                                     )
                                     songIdToSongMap[songId] = song
                                     resultList.add(song)
@@ -569,14 +579,130 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 服务器「最近添加」曲目。
+     *
+     * 这里按 addedTimestamp（曲库解析时由服务器文件的 mtime 推得）倒序取前 limit 条，
+     * 与曲库「按加入时间」排序共用同一口径。此前是直接遍历 ConcurrentHashMap 取前 N 条，
+     * 拿到的是哈希顺序，既不等于服务器顺序也不等于时间顺序，导致"最近添加"卡片内容随机。
+     */
     fun getRecentlyAdded(limit: Int = 30): Result<List<UnifiedSong>> {
-        val list = songIdToSongMap.values.toList().take(limit)
-        return Result.success(list)
+        if (limit <= 0) return Result.success(emptyList())
+        val sorted = songIdToSongMap.values
+            .asSequence()
+            .filter { it.addedTimestamp > 0L }
+            .sortedByDescending { it.addedTimestamp }
+            .take(limit)
+            .toMutableList()
+        // 没有时间戳的条目（极少：服务器未提供 mtime）补位到末尾，不占掉有名额的时间序条目
+        if (sorted.size < limit) {
+            for (song in songIdToSongMap.values) {
+                if (sorted.size >= limit) break
+                if (song.addedTimestamp <= 0L) sorted.add(song)
+            }
+        }
+        return Result.success(sorted)
     }
 
-    fun getRecentlyPlayed(limit: Int = 30): Result<List<UnifiedSong>> {
-        val list = songIdToSongMap.values.toList().take(limit)
-        return Result.success(list)
+    /**
+     * 读取服务端「最近播放」足迹 (/api/library/user-data 的 recentPlays 字段)。
+     * 与服务端本地曲目、全网在线曲目两种记录形态兼容，返回可供「我的 → 最近播放」直接渲染的歌曲列表。
+     *
+     * 此前这个函数只是把曲库哈希表原样 take(30)，既不是播放历史也不是时间序，
+     * 于是资料库"最近播放"卡片内容与实际听过什么完全无关 —— 这就是该卡片"歌曲不对"的根因。
+     */
+    suspend fun getRecentlyPlayed(limit: Int = 30): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val userData = getLibraryUserData().getOrNull()
+                ?: return@withContext Result.success(emptyList())
+            val arr = userData.optJSONArray("recentPlays")
+                ?: userData.optJSONArray("recent_plays")
+                ?: userData.optJSONArray("recents")
+                ?: return@withContext Result.success(emptyList())
+
+            val list = ArrayList<UnifiedSong>(arr.length())
+            val seenIds = HashSet<String>()
+            for (i in 0 until arr.length()) {
+                if (list.size >= limit) break
+                val song = parseUserDataTrack(arr.opt(i)) ?: continue
+                if (seenIds.add(song.id)) list.add(song)
+            }
+            Result.success(list)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to fetch server recent plays", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 将 /api/library/user-data 中的单条曲目记录 (favorites / recentPlays 通用结构) 映射为 UnifiedSong。
+     * 同时兼容「服务端本地文件路径」与「全网在线音源」两种记录形态，无法识别时返回 null。
+     */
+    private fun parseUserDataTrack(item: Any?): UnifiedSong? {
+        val obj = item as? JSONObject ?: return null
+        val sName = SongMatchingResolver.unescapeMusicText(obj.optString("name").ifBlank { obj.optString("title") })
+        val sSinger = SongMatchingResolver.unescapeMusicText(obj.optString("singer").ifBlank { obj.optString("artist", "未知歌手") })
+        val sAlbum = SongMatchingResolver.unescapeMusicText(obj.optString("album", "未知专辑"))
+        val sLocalPath = obj.optString("localPath").ifBlank { obj.optString("filePath") }
+        val sSource = obj.optString("source").ifBlank { obj.optString("platform") }
+        val sSongId = obj.optString("songId").ifBlank { obj.optString("id") }
+        val durMs = (obj.optDouble("interval", obj.optDouble("duration", 0.0)) * 1000).toLong()
+        val key = obj.optString("key")
+        var sPic = obj.optString("picUrl").ifBlank { obj.optString("img") }
+        if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
+            sPic = "$cleanBase$sPic"
+        }
+
+        if (sLocalPath.isNotBlank() || key.startsWith("local:")) {
+            val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else key.removePrefix("local:")).trim()
+            if (cleanPath.isBlank()) return null
+            val songId = "lemon_${md5(cleanPath)}"
+            return UnifiedSong(
+                id = songId,
+                title = sName.ifBlank { cleanPath.substringAfterLast('/').substringBeforeLast('.') },
+                artist = sSinger,
+                artistId = "artist_${sSinger.hashCode()}",
+                album = sAlbum,
+                albumId = "album_${sAlbum.hashCode()}",
+                durationMs = durMs,
+                coverUrl = if (sPic.isNotBlank()) sPic else getCoverArtUrlForPath(cleanPath),
+                streamUrl = getStreamUrlForPath(cleanPath),
+                serverId = "lemon_music",
+                localFilePath = null,
+                downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                bitRate = 320,
+                format = cleanPath.substringAfterLast('.', "flac").lowercase(),
+                isFavorite = false,
+                relativeFolderPath = extractRelativeFolderPath(cleanPath, sSinger, sAlbum)
+            )
+        }
+
+        if (sSource.isNotBlank() && sSource != "local") {
+            val platform = sSource.ifBlank { "kw" }
+            val rawId = sSongId.ifBlank { key }
+            if (rawId.isBlank()) return null
+            val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_$rawId"
+            return UnifiedSong(
+                id = onlineId,
+                title = sName.ifBlank { "在线曲目" },
+                artist = sSinger,
+                artistId = "artist_${sSinger.hashCode()}",
+                album = sAlbum,
+                albumId = "album_${sAlbum.hashCode()}",
+                durationMs = durMs,
+                coverUrl = sPic,
+                streamUrl = "lemon_online://$platform/$rawId",
+                serverId = "lemon_online",
+                localFilePath = null,
+                downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                bitRate = 320,
+                format = "mp3",
+                isFavorite = false,
+                rawMetaJson = obj.toString()
+            )
+        }
+        return null
     }
 
     /**
@@ -600,19 +726,36 @@ class LemonMusicProtocol(
                     val name = item.optString("name").ifBlank { item.optString("album", "未知专辑") }
                     val artist = item.optString("artist", "未知歌手")
                     val count = item.optInt("count", 0)
-                    val samplePath = item.optString("samplePath")
+                    // 代表曲目路径的字段名各版本服务端不一致，逐个兜底，
+                    // 否则专辑卡片拿不到 /api/tag/cover 地址，全部显示成占位图。
+                    val samplePath = sequenceOf("samplePath", "sample", "path", "filePath", "cover")
+                        .map { item.optString(it) }
+                        .firstOrNull { it.isNotBlank() }
+                        .orEmpty()
                     val yearStr = item.optString("year")
                     val year = yearStr.toIntOrNull()
 
                     val sampleSongId = if (samplePath.isNotBlank()) "lemon_${md5(samplePath)}" else ""
                     if (samplePath.isNotBlank()) songIdToPathMap[sampleSongId] = samplePath
 
+                    // 服务端直接给了封面地址时优先用它（自定义封面/外链封面）；
+                    // 否则用代表曲目路径反查 /api/tag/cover 内嵌封面。
+                    val serverCover = sequenceOf("coverUrl", "cover_url", "picUrl", "img")
+                        .map { item.optString(it) }
+                        .firstOrNull { it.startsWith("http") }
+                        .orEmpty()
+                    val cover = when {
+                        serverCover.isNotBlank() -> serverCover
+                        sampleSongId.isNotBlank() -> getCoverArtUrl(sampleSongId)
+                        else -> ""
+                    }
+
                     albums.add(
                         UnifiedAlbum(
                             id = "lemon_album_${md5("$artist/$name")}",
                             title = name,
                             artist = artist,
-                            coverUrl = if (sampleSongId.isNotBlank()) getCoverArtUrl(sampleSongId) else "",
+                            coverUrl = cover,
                             songCount = count,
                             year = year
                         )
@@ -1547,23 +1690,24 @@ class LemonMusicProtocol(
      * 获取指定路径的音频 Range 流媒体播放链接
      * 自动识别 .ape 格式并路由至服务端 FFmpeg 实时 WAV 转码流端点 (/api/play/local-ape)
      */
-    fun getStreamUrlForPath(path: String): String {
+    fun getStreamUrlForPath(path: String, quality: String? = null): String {
         if (path.isBlank()) return ""
         val cleanPath = path.removePrefix("local:").trim()
         val isApe = cleanPath.substringAfterLast('.', "").lowercase() == "ape"
         val endpoint = if (isApe) "/api/play/local-ape" else "/api/play/local"
         val enc = try { URLEncoder.encode(cleanPath, "UTF-8").replace("+", "%20") } catch (_: Exception) { cleanPath }
+        val qParam = if (!quality.isNullOrBlank()) "&quality=$quality" else ""
         return if (authToken.isNotBlank()) {
-            "$cleanBase$endpoint?path=$enc&token=$authToken"
+            "$cleanBase$endpoint?path=$enc&token=$authToken$qParam"
         } else {
-            "$cleanBase$endpoint?path=$enc"
+            "$cleanBase$endpoint?path=$enc$qParam"
         }
     }
 
     /**
      * 通过服务端官方 POST /api/play/url 换取带 HMAC 签名票据 (?ticket=) 的服务器本地播放流链接
      */
-    suspend fun resolveServerLocalPlayUrl(filePath: String?, trackId: String? = null): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun resolveServerLocalPlayUrl(filePath: String?, trackId: String? = null, quality: String = "320k"): Result<String> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
             val cleanPath = filePath?.removePrefix("local:")?.trim().orEmpty()
@@ -1579,6 +1723,8 @@ class LemonMusicProtocol(
                 if (!trackId.isNullOrBlank()) {
                     put("trackId", trackId)
                 }
+                put("quality", quality)
+                put("type", quality)
             }
             val req = newAuthRequest("$cleanBase/api/play/url")
                 .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
@@ -1587,14 +1733,22 @@ class LemonMusicProtocol(
                 val body = resp.body?.string() ?: ""
                 if (resp.isSuccessful) {
                     val json = JSONObject(body)
-                    val url = json.optString("url")
-                    if (url.isNotBlank()) {
-                        val fullUrl = if (url.startsWith("/")) "$cleanBase$url" else url
+                    val url = json.optString("url").trim()
+                    if (url.isNotBlank() && !url.equals("null", ignoreCase = true)) {
+                        var fullUrl = if (url.startsWith("/")) "$cleanBase$url" else url
+                        if (fullUrl.startsWith(cleanBase) && authToken.isNotBlank() && !fullUrl.contains("token=") && !fullUrl.contains("ticket=")) {
+                            val sep = if (fullUrl.contains("?")) "&" else "?"
+                            fullUrl = "${fullUrl}${sep}token=$authToken"
+                        }
+                        if (quality.isNotBlank() && !fullUrl.contains("quality=")) {
+                            val sep = if (fullUrl.contains("?")) "&" else "?"
+                            fullUrl = "${fullUrl}${sep}quality=$quality"
+                        }
                         return@withContext Result.success(fullUrl)
                     }
                 }
                 if (cleanPath.isNotBlank()) {
-                    Result.success(getStreamUrlForPath(cleanPath))
+                    Result.success(getStreamUrlForPath(cleanPath, quality))
                 } else {
                     Result.failure(Exception("无法解析服务器本地曲目播放地址"))
                 }
@@ -1602,7 +1756,7 @@ class LemonMusicProtocol(
         } catch (e: Exception) {
             val cleanPath = filePath?.removePrefix("local:")?.trim().orEmpty()
             if (cleanPath.isNotBlank()) {
-                Result.success(getStreamUrlForPath(cleanPath))
+                Result.success(getStreamUrlForPath(cleanPath, quality))
             } else {
                 Result.failure(e)
             }

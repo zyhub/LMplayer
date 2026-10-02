@@ -28,6 +28,9 @@ object PlaybackQueueManager {
     private const val TAG = "PlaybackQueueManager"
     private const val AUTO_PLAY_PREFS = "zds_auto_play_prefs"
     private const val MAX_PERSISTED_QUEUE_SIZE = 120
+    private const val RECENT_PLAY_PREFS = "zds_recent_play_prefs"
+    private const val KEY_RECENT_PLAYED_SONGS = "recent_played_songs_json"
+    private const val MAX_RECENT_PLAY_SIZE = 50
 
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var playJob: Job? = null
@@ -47,6 +50,10 @@ object PlaybackQueueManager {
 
     private val _isRepeatFlow = MutableStateFlow(false)
     val isRepeatFlow: StateFlow<Boolean> = _isRepeatFlow.asStateFlow()
+
+    private val _recentPlayedSongsFlow = MutableStateFlow<List<UnifiedSong>>(emptyList())
+    val recentPlayedSongsFlow: StateFlow<List<UnifiedSong>> = _recentPlayedSongsFlow.asStateFlow()
+    @Volatile private var recentPlayedPrimed = false
 
     private var isListenerAttached = false
     private var appContext: Context? = null
@@ -170,6 +177,150 @@ object PlaybackQueueManager {
         }
     }
 
+    /**
+     * 记录一次真实播放：把 [song] 置顶到最近播放足迹。
+     *
+     * 同一首歌重复播放只做"置顶"，绝不新增第二条记录 —— 判定不只看 id，
+     * 还复用 [SongMatchingResolver.isSongMatch]（含专辑/版本/时长比对），
+     * 因为同一首歌从资料库、下载列表、搜索结果点播时可能带着不同的 id 进来。
+     */
+    fun addRecentPlayedSong(context: Context, song: UnifiedSong) {
+        try {
+            val current = _recentPlayedSongsFlow.value
+            var enriched = song
+            var duplicateOf: UnifiedSong? = null
+            for (s in current) {
+                if (s.id == song.id || SongMatchingResolver.isSongMatch(
+                        title1 = s.title, artist1 = s.artist, durationMs1 = s.durationMs,
+                        title2 = song.title, artist2 = song.artist, durationMs2 = song.durationMs,
+                        album1 = s.album, album2 = song.album
+                    )
+                ) {
+                    // 同曲重播：保留已有的本地路径/收藏等元数据，只把位置提到最前
+                    enriched = mergeSongMetadata(s, song)
+                    duplicateOf = s
+                    break
+                }
+            }
+
+            val updated = ArrayList<UnifiedSong>(MAX_RECENT_PLAY_SIZE)
+            updated.add(enriched)
+            for (s in current) {
+                if (updated.size >= MAX_RECENT_PLAY_SIZE) break
+                if (duplicateOf != null) {
+                    // 已经用置顶后的新条目代表这首歌，原位置的旧条目直接丢弃，避免重复
+                    if (s.id != duplicateOf.id && s.id != enriched.id) updated.add(s)
+                } else if (s.id != song.id) {
+                    updated.add(s)
+                }
+            }
+            _recentPlayedSongsFlow.value = updated
+            persistRecentPlayed(context, updated)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to record recent played song", e)
+        }
+    }
+
+    /**
+     * 用服务器返回的播放记录补齐本机足迹。
+     *
+     * 本机足迹是主账本 —— 它是唯一记录了"这台设备什么时候听了什么"的地方，
+     * 而服务器记录来自所有端且没有可用的时间戳。若让服务器记录整体前置或重排，
+     * 程序重启、切到本地再切回在线都会在下次同步后把本机足迹挤掉，
+     * 表现为"最近播放被重置"。
+     * 因此只在末尾追加本机还没有的曲目（其他端听过、这台设备没听过的），
+     * 保持本机已有顺序与位置完全不变。
+     */
+    fun rememberRecentPlayed(context: Context, songs: List<UnifiedSong>) {
+        if (songs.isEmpty()) return
+        try {
+            val current = _recentPlayedSongsFlow.value
+            if (current.isEmpty()) {
+                // 本机还没有足迹（全新安装/首次开启在线模式）：直接采用服务器记录
+                val seeded = ArrayList<UnifiedSong>(MAX_RECENT_PLAY_SIZE)
+                val seen = HashSet<String>(songs.size)
+                for (s in songs) {
+                    if (seeded.size >= MAX_RECENT_PLAY_SIZE) break
+                    if (seen.add(s.id)) seeded.add(s)
+                }
+                _recentPlayedSongsFlow.value = seeded
+                persistRecentPlayed(context, seeded)
+                return
+            }
+
+            val knownIds = HashSet<String>(current.size)
+            for (s in current) knownIds.add(s.id)
+            val merged = ArrayList<UnifiedSong>(MAX_RECENT_PLAY_SIZE)
+            merged.addAll(current)
+
+            for (s in songs) {
+                if (merged.size >= MAX_RECENT_PLAY_SIZE) break
+                // 已在榜：只做元数据增益（更新鲜的流地址/封面），位置不动
+                val existingIdx = merged.indexOfFirst { it.id == s.id }
+                if (existingIdx >= 0) {
+                    merged[existingIdx] = mergeSongMetadata(merged[existingIdx], s)
+                    continue
+                }
+                if (!knownIds.add(s.id)) continue
+                merged.add(s)
+            }
+
+            _recentPlayedSongsFlow.value = merged
+            persistRecentPlayed(context, merged)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to merge recent played songs", e)
+        }
+    }
+
+    /** 进程启动时从磁盘恢复足迹（只生效一次，幂等） */
+    fun primeRecentPlayedFromPrefs(context: Context) {
+        if (recentPlayedPrimed) return
+        recentPlayedPrimed = true
+        val loaded = try {
+            val prefs = context.getSharedPreferences(RECENT_PLAY_PREFS, Context.MODE_PRIVATE)
+            val raw = prefs.getString(KEY_RECENT_PLAYED_SONGS, null)
+            if (raw.isNullOrBlank()) {
+                emptyList()
+            } else {
+                val arr = JSONArray(raw)
+                val list = ArrayList<UnifiedSong>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    jsonToSong(obj)?.let { list.add(it) }
+                }
+                list
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse recent played songs", e)
+            emptyList()
+        }
+        if (loaded.isNotEmpty() && _recentPlayedSongsFlow.value.isEmpty()) {
+            _recentPlayedSongsFlow.value = loaded
+        }
+    }
+
+    private fun persistRecentPlayed(context: Context, songs: List<UnifiedSong>, commitSync: Boolean = false) {
+        try {
+            val arr = JSONArray()
+            for (s in songs) arr.put(songToJson(s))
+            val editor = context.getSharedPreferences(RECENT_PLAY_PREFS, Context.MODE_PRIVATE)
+                .edit().putString(KEY_RECENT_PLAYED_SONGS, arr.toString())
+            if (commitSync) editor.commit() else editor.apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to persist recent played songs", e)
+        }
+    }
+
+    /**
+     * 把最近播放足迹同步落盘。普通播放走 apply() 异步写盘即可，
+     * 但「彻底退出程序」会在写完之前销毁进程，异步写有丢失风险，
+     * 于是退出路径上额外用 commit() 强制刷一次 —— 这是"程序退出后最近播放被重置"的兜底。
+     */
+    fun flushRecentPlayed(context: Context? = appContext) {
+        val ctx = context ?: appContext ?: return
+        persistRecentPlayed(ctx, _recentPlayedSongsFlow.value, commitSync = true)
+    }
+
     fun savePlaybackState(
         context: Context? = appContext,
         song: UnifiedSong? = _currentSongFlow.value,
@@ -218,6 +369,10 @@ object PlaybackQueueManager {
             if (_currentSongFlow.value == null && savedSong != null) {
                 _currentSongFlow.value = savedSong
             }
+        } catch (_: Exception) {}
+
+        try {
+            primeRecentPlayedFromPrefs(context)
         } catch (_: Exception) {}
     }
 
@@ -276,6 +431,14 @@ object PlaybackQueueManager {
                     _currentSongFlow.value = merged
                     savePlaybackState(song = merged, commitSync = false)
                 }
+            }
+        }
+        // 最近播放足迹同样要跟上最新的本地化元数据：下载完成后点开「最近播放」应能直接播放本地文件
+        if (_recentPlayedSongsFlow.value.isNotEmpty()) {
+            val recentMap = songs.associateBy { it.id }
+            _recentPlayedSongsFlow.value = _recentPlayedSongsFlow.value.map { existing ->
+                val matched = recentMap[existing.id]
+                if (matched != null) mergeSongMetadata(existing, matched) else existing
             }
         }
     }
@@ -343,7 +506,7 @@ object PlaybackQueueManager {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
                 if (playing) {
-                    PlaybackService.ensureServiceAlive(appCtx)
+                    PlaybackService.startPlaybackService(appCtx)
                     startPeriodicPositionSave(appCtx, player)
                 } else {
                     positionSaveJob?.cancel()
@@ -395,7 +558,7 @@ object PlaybackQueueManager {
     ) {
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
-        PlaybackService.ensureServiceAlive(appCtx)
+        PlaybackService.startPlaybackService(appCtx)
         _currentSongFlow.value = targetSong
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist
@@ -404,6 +567,11 @@ object PlaybackQueueManager {
         } else if (_playlistFlow.value.none { it.id == targetSong.id }) {
             _playlistFlow.value = listOf(targetSong) + _playlistFlow.value
         }
+
+        // 播放足迹在这里统一记账：手动点播、上一首/下一首、自动续播、播放失败重连最终都汇聚到本方法。
+        // 此前只在界面点播处调用 addRecentPlayedSong，用上一首/下一首切歌不经过那里，
+        // 于是「最近播放」永远记不住切歌听过的曲目 —— 这正是本次要修的根因。
+        addRecentPlayedSong(appCtx, targetSong)
 
         // 立即同步持久化当前播放歌曲完整元数据、播放队列与起始进度，确保任意时刻关闭应用均可精准恢复
         savePlaybackState(
@@ -491,7 +659,7 @@ object PlaybackQueueManager {
     fun togglePlay(context: Context) {
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
-        PlaybackService.ensureServiceAlive(appCtx)
+        PlaybackService.startPlaybackService(appCtx)
         val player = Media3Factory.getSharedExoPlayer(appCtx)
         if (player.isPlaying) {
             player.pause()
