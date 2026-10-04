@@ -62,6 +62,13 @@ class LemonMusicProtocol(
         private val discoverNewAlbumsCache = ConcurrentHashMap<String, Pair<Long, List<UnifiedAlbum>>>()
         private const val DISCOVER_CACHE_TTL_MS = 5 * 60 * 1000L
 
+        fun clearDiscoverCache() {
+            discoverPlaylistsCache.clear()
+            discoverToplistsCache.clear()
+            discoverNewSongsCache.clear()
+            discoverNewAlbumsCache.clear()
+        }
+
         private val HEX_CHARS = "0123456789abcdef".toCharArray()
         private val md5MemoCache = ConcurrentHashMap<String, String>(2048)
 
@@ -833,14 +840,44 @@ class LemonMusicProtocol(
                     // A. 服务端「我的收藏」智能歌单 (放置在置顶首位)
                     val favArr = userData?.optJSONArray("favorites")
                     if (favArr != null && favArr.length() > 0) {
+                        val favPreviewCovers = ArrayList<String>()
+                        for (fIdx in 0 until favArr.length()) {
+                            if (favPreviewCovers.size >= 4) break
+                            val favItem = favArr.opt(fIdx)
+                            if (favItem is JSONObject) {
+                                var pic = favItem.optString("picUrl").ifBlank { favItem.optString("img") }
+                                if (pic.isBlank()) {
+                                    val lPath = favItem.optString("localPath").ifBlank { favItem.optString("filePath") }
+                                    val cleanPath = (if (lPath.isNotBlank()) lPath else favItem.optString("key").removePrefix("local:")).trim()
+                                    if (cleanPath.isNotBlank()) {
+                                        pic = getCoverArtUrlForPath(cleanPath)
+                                    }
+                                }
+                                if (pic.isNotBlank()) {
+                                    val fullUrl = if (pic.startsWith("http://") || pic.startsWith("https://") || pic.startsWith("data:")) pic else "$cleanBase$pic"
+                                    if (!favPreviewCovers.contains(fullUrl)) {
+                                        favPreviewCovers.add(fullUrl)
+                                    }
+                                }
+                            } else if (favItem is String && favItem.isNotBlank()) {
+                                val clean = favItem.removePrefix("local:").trim()
+                                if (clean.isNotBlank()) {
+                                    val pic = getCoverArtUrlForPath(clean)
+                                    if (pic.isNotBlank() && !favPreviewCovers.contains(pic)) {
+                                        favPreviewCovers.add(pic)
+                                    }
+                                }
+                            }
+                        }
                         playlists.add(
                             UnifiedPlaylist(
                                 id = "lemon_favorites",
                                 name = "我的收藏",
-                                coverUrl = "",
+                                coverUrl = favPreviewCovers.firstOrNull() ?: "",
                                 songCount = favArr.length(),
                                 isOnline = true,
                                 serverId = targetServerId,
+                                previewCovers = favPreviewCovers,
                                 isDiscover = false
                             )
                         )
@@ -858,17 +895,47 @@ class LemonMusicProtocol(
                                 var coverUrl = pl.optString("coverUrl")
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
-                                if (coverUrl.isBlank() && snapshots != null) {
+                                val previewCovers = ArrayList<String>()
+                                if (snapshots != null) {
                                     val it = snapshots.keys()
-                                    while (it.hasNext()) {
+                                    while (it.hasNext() && previewCovers.size < 4) {
                                         val k = it.next()
                                         val sn = snapshots.optJSONObject(k)
-                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        var p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        if (p.isBlank()) {
+                                            val localPath = sn?.optString("localPath")?.ifBlank { sn.optString("filePath") } ?: ""
+                                            val cleanLocalPath = if (localPath.isNotBlank()) localPath else if (k.startsWith("local:")) k.removePrefix("local:") else ""
+                                            if (cleanLocalPath.isNotBlank()) {
+                                                p = getCoverArtUrlForPath(cleanLocalPath)
+                                            }
+                                        }
                                         if (p.isNotBlank()) {
-                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            break
+                                            val fullUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
+                                            if (!previewCovers.contains(fullUrl)) {
+                                                previewCovers.add(fullUrl)
+                                            }
                                         }
                                     }
+                                }
+                                if (previewCovers.size < 4 && tracks.length() > 0) {
+                                    for (tIdx in 0 until tracks.length()) {
+                                        if (previewCovers.size >= 4) break
+                                        val tItem = tracks.opt(tIdx)
+                                        val rawPath = when (tItem) {
+                                            is String -> tItem
+                                            is JSONObject -> tItem.optString("localPath").ifBlank { tItem.optString("filePath").ifBlank { tItem.optString("key") } }
+                                            else -> ""
+                                        }
+                                        if (rawPath.startsWith("local:") || rawPath.contains("/") || rawPath.contains("\\")) {
+                                            val cover = getCoverArtUrlForPath(rawPath.removePrefix("local:"))
+                                            if (cover.isNotBlank() && !previewCovers.contains(cover)) {
+                                                previewCovers.add(cover)
+                                            }
+                                        }
+                                    }
+                                }
+                                if (coverUrl.isBlank() && previewCovers.isNotEmpty()) {
+                                    coverUrl = previewCovers.first()
                                 } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
                                     coverUrl = "$cleanBase$coverUrl"
                                 }
@@ -880,6 +947,7 @@ class LemonMusicProtocol(
                                         songCount = tracks.length(),
                                         isOnline = true,
                                         serverId = targetServerId,
+                                        previewCovers = previewCovers,
                                         isDiscover = false
                                     )
                                 )
@@ -907,17 +975,47 @@ class LemonMusicProtocol(
                                 var coverUrl = pl.optString("coverUrl")
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
-                                if (coverUrl.isBlank() && snapshots != null) {
+                                val previewCovers = ArrayList<String>()
+                                if (snapshots != null) {
                                     val it = snapshots.keys()
-                                    while (it.hasNext()) {
+                                    while (it.hasNext() && previewCovers.size < 4) {
                                         val k = it.next()
                                         val sn = snapshots.optJSONObject(k)
-                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        var p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        if (p.isBlank()) {
+                                            val localPath = sn?.optString("localPath")?.ifBlank { sn.optString("filePath") } ?: ""
+                                            val cleanLocalPath = if (localPath.isNotBlank()) localPath else if (k.startsWith("local:")) k.removePrefix("local:") else ""
+                                            if (cleanLocalPath.isNotBlank()) {
+                                                p = getCoverArtUrlForPath(cleanLocalPath)
+                                            }
+                                        }
                                         if (p.isNotBlank()) {
-                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            break
+                                            val fullUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
+                                            if (!previewCovers.contains(fullUrl)) {
+                                                previewCovers.add(fullUrl)
+                                            }
                                         }
                                     }
+                                }
+                                if (previewCovers.size < 4 && tracks.length() > 0) {
+                                    for (tIdx in 0 until tracks.length()) {
+                                        if (previewCovers.size >= 4) break
+                                        val tItem = tracks.opt(tIdx)
+                                        val rawPath = when (tItem) {
+                                            is String -> tItem
+                                            is JSONObject -> tItem.optString("localPath").ifBlank { tItem.optString("filePath").ifBlank { tItem.optString("key") } }
+                                            else -> ""
+                                        }
+                                        if (rawPath.startsWith("local:") || rawPath.contains("/") || rawPath.contains("\\")) {
+                                            val cover = getCoverArtUrlForPath(rawPath.removePrefix("local:"))
+                                            if (cover.isNotBlank() && !previewCovers.contains(cover)) {
+                                                previewCovers.add(cover)
+                                            }
+                                        }
+                                    }
+                                }
+                                if (coverUrl.isBlank() && previewCovers.isNotEmpty()) {
+                                    coverUrl = previewCovers.first()
                                 } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
                                     coverUrl = "$cleanBase$coverUrl"
                                 }
@@ -929,6 +1027,7 @@ class LemonMusicProtocol(
                                         songCount = tracks.length(),
                                         isOnline = true,
                                         serverId = targetServerId,
+                                        previewCovers = previewCovers,
                                         isDiscover = false
                                     )
                                 )
@@ -2251,7 +2350,10 @@ class LemonMusicProtocol(
         fallbackTitle: String? = null,
         fallbackArtist: String? = null,
         refresh: Boolean = false,
-        allowSearchFallback: Boolean = true
+        allowSearchFallback: Boolean = true,
+        // 「跨平台同档补源」调用时置 true：调用方刚刚在本平台试过同一档，直接跳到搜索补源阶段，
+        // 避免对同一个 songId 连发两次必然失败的取链请求。
+        skipDirectAttempt: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
@@ -2405,9 +2507,15 @@ class LemonMusicProtocol(
                 return Pair(code, body)
             }
 
-            val (firstCode, firstBody) = requestPlayUrlWithSourceFallback(actualSource, rawId, metaJson)
-            if (firstCode in 200..299) {
-                parsePlayUrlFromBody(firstBody)?.let { return@withContext Result.success(it) }
+            var firstCode = -1
+            var firstBody = ""
+            if (!skipDirectAttempt) {
+                val (code, body) = requestPlayUrlWithSourceFallback(actualSource, rawId, metaJson)
+                firstCode = code
+                firstBody = body
+                if (code in 200..299) {
+                    parsePlayUrlFromBody(body)?.let { return@withContext Result.success(it) }
+                }
             }
 
             // 仅在允许搜索回退且该歌曲自身的所有音质尝试均失败时，才通过搜索补全同版本曲目元数据重试（严格校验版本一致性，绝不回退到非匹配的首个搜索结果）
@@ -2442,21 +2550,31 @@ class LemonMusicProtocol(
                 }
             }
 
-            val errMsg = runCatching {
+            val errMsg = if (firstBody.isNotBlank()) runCatching {
                 val json = JSONObject(firstBody)
                 json.optString("error").ifBlank { json.optString("msg") }
-            }.getOrNull()
-            Result.failure(Exception(errMsg?.ifBlank { null } ?: "获取在线播放地址失败 (HTTP $firstCode)"))
+            }.getOrNull() else null
+            val reason = when {
+                !errMsg.isNullOrBlank() -> errMsg
+                firstCode >= 0 -> "获取在线播放地址失败 (HTTP $firstCode)"
+                else -> "当前平台无此音质，且未找到可用的同名同版本跨平台音源"
+            }
+            Result.failure(Exception(reason))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
     /**
-     * 按用户设置的试听音质及逐级回退策略 (flac24bit -> flac -> 320k -> 128k) 解析在线播放地址，
-     * 并返回实际生效的音质、格式与比特率，以便播放器界面实时展示准确音质标签。
-     * 优先在当前歌曲自身的 ID/metaJson 上完成全音质阶梯回退（避免因高音质不可用而过早跨源搜索串歌至录音室版），
-     * 仅当自身所有音质均失败时才启用版本严格匹配的搜索回退。
+     * 按用户设置的试听音质解析在线播放地址，并返回实际生效的音质、格式与比特率。
+     *
+     * 回退顺序：每一档音质都先「本平台本曲目取链」，失败后立刻「跨平台同档补源」，
+     * 本档在所有平台都拿不到才降到下一档，如此重复 (flac24bit -> flac -> 320k -> 128k)。
+     *
+     * 之所以这么排：用户选了最高音质却播不出来，绝大多数情况是「当前平台没有这一档」，
+     * 而不是「这首歌没有高音质」。旧实现是本平台一路降到 128k 之后才跨平台、且固定按 320k 取链，
+     * 于是网易云明明有 flac 也会给用户放 320k 甚至 128k —— 这正是「选最高音质无法播放」的根因。
+     * 跨平台搜索仍然走版本严格匹配 (SongMatchingResolver.isSongMatch)，不会串到别的 Live/翻唱版本。
      */
     suspend fun resolveOnlineStreamWithQuality(
         songId: String,
@@ -2492,18 +2610,22 @@ class LemonMusicProtocol(
                 detectedFormat == "mp3" && (cleanPath.contains("128") && !cleanPath.contains("320") && qEnum != AudioQuality.Q_320K) -> 128
                 else -> qEnum.bitrate
             }
-            Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey ($detectedFormat ${detectedBitRate}kbps)")
+            val requestedQuality = AudioQuality.fromKey(preferredQuality)
+            val isDowngraded = qEnum.bitrate < requestedQuality.bitrate
+            Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey (downgraded=$isDowngraded, $detectedFormat ${detectedBitRate}kbps)")
             return ResolvedOnlineStream(
                 url = url,
                 qualityKey = qKey,
                 format = detectedFormat,
-                bitRate = detectedBitRate
+                bitRate = detectedBitRate,
+                isDowngraded = isDowngraded
             )
         }
 
-        // 第一轮：仅针对当前歌曲自身的 songId 与 metaJson 逐级尝试音质，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
+        // 逐档下探：每一档都先走本平台，再走跨平台同档补源，本档彻底拿不到才降一档重来
         for ((index, qKey) in candidateQualities.withIndex()) {
-            val res = resolveOnlineStreamUrl(
+            // 1) 本平台、本曲目自身 ID/metaJson 取链，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
+            val directRes = resolveOnlineStreamUrl(
                 songId = songId,
                 source = source,
                 quality = qKey,
@@ -2513,31 +2635,27 @@ class LemonMusicProtocol(
                 refresh = refresh || index > 0,
                 allowSearchFallback = false
             )
-            val url = res.getOrNull()
-            if (!url.isNullOrBlank()) {
-                return@withContext Result.success(buildResolvedStream(url, qKey))
-            } else {
-                lastError = res.exceptionOrNull()
+            directRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+                return@withContext Result.success(buildResolvedStream(it, qKey))
             }
-        }
+            lastError = directRes.exceptionOrNull() ?: lastError
 
-        // 第二轮：若当前歌曲自身 ID 在所有音质下均无法取链，启用严格版本匹配的搜索回退
-        val fallbackQuality = candidateQualities.firstOrNull { it == AudioQuality.Q_320K.key } ?: candidateQualities.last()
-        val fallbackRes = resolveOnlineStreamUrl(
-            songId = songId,
-            source = source,
-            quality = fallbackQuality,
-            metaJson = metaJson,
-            fallbackTitle = fallbackTitle,
-            fallbackArtist = fallbackArtist,
-            refresh = true,
-            allowSearchFallback = true
-        )
-        val fallbackUrl = fallbackRes.getOrNull()
-        if (!fallbackUrl.isNullOrBlank()) {
-            return@withContext Result.success(buildResolvedStream(fallbackUrl, fallbackQuality))
-        } else {
-            lastError = fallbackRes.exceptionOrNull() ?: lastError
+            // 2) 同档跨平台补源：本平台没有这一档时，先去其它平台找同名同版本曲目，仍按当前这一档取链
+            val crossRes = resolveOnlineStreamUrl(
+                songId = songId,
+                source = source,
+                quality = qKey,
+                metaJson = metaJson,
+                fallbackTitle = fallbackTitle,
+                fallbackArtist = fallbackArtist,
+                refresh = true,
+                allowSearchFallback = true,
+                skipDirectAttempt = true
+            )
+            crossRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+                return@withContext Result.success(buildResolvedStream(it, qKey))
+            }
+            lastError = crossRes.exceptionOrNull() ?: lastError
         }
 
         Result.failure(lastError ?: Exception("未能获取可用的在线播放流地址"))
@@ -3042,6 +3160,163 @@ class LemonMusicProtocol(
     }
 
     /**
+     * 为任意歌曲（服务器本地曲目或全网在线曲目）构造标准服务端 key 与完整元数据快照 JSONObject
+     */
+    fun buildTrackKeyAndSnapshot(song: UnifiedSong): Pair<String, JSONObject> {
+        val srvPath = getServerFilePath(song.id, song.streamUrl, song.coverUrl)?.removePrefix("local:")?.trim().orEmpty()
+        val durationSec = ((song.durationMs.coerceAtLeast(0L)) / 1000L).toInt()
+        if (srvPath.isNotBlank()) {
+            val key = "local:$srvPath"
+            val snap = JSONObject().apply {
+                put("key", key)
+                put("localPath", srvPath)
+                put("filePath", srvPath)
+                put("name", song.title)
+                put("title", song.title)
+                put("singer", song.artist)
+                put("artist", song.artist)
+                put("album", song.album)
+                if (song.coverUrl.isNotBlank()) {
+                    put("picUrl", song.coverUrl)
+                    put("img", song.coverUrl)
+                }
+                if (durationSec > 0) {
+                    put("interval", durationSec)
+                    put("duration", durationSec)
+                }
+                put("source", "local")
+            }
+            return Pair(key, snap)
+        }
+
+        val isOnline = song.id.startsWith("lemon_online_") || song.serverId == "lemon_online"
+        if (isOnline) {
+            val clean = song.id.removePrefix("lemon_online_")
+            val platform = if (clean.contains("_")) clean.substringBefore("_").ifBlank { "kw" } else "kw"
+            val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+            val key = "$platform:$rawId"
+            val snap = JSONObject()
+            if (!song.rawMetaJson.isNullOrBlank()) {
+                runCatching {
+                    val rawObj = JSONObject(song.rawMetaJson)
+                    val iter = rawObj.keys()
+                    while (iter.hasNext()) {
+                        val k = iter.next()
+                        snap.put(k, rawObj.opt(k))
+                    }
+                }
+            }
+            snap.put("key", key)
+            snap.put("source", platform)
+            snap.put("platform", platform)
+            snap.put("songId", rawId)
+            snap.put("id", rawId)
+            snap.put("name", song.title)
+            snap.put("title", song.title)
+            snap.put("singer", song.artist)
+            snap.put("artist", song.artist)
+            snap.put("album", song.album)
+            if (song.coverUrl.isNotBlank()) {
+                snap.put("picUrl", song.coverUrl)
+                snap.put("img", song.coverUrl)
+            }
+            if (durationSec > 0) {
+                snap.put("interval", durationSec)
+                snap.put("duration", durationSec)
+            }
+            return Pair(key, snap)
+        }
+
+        val fallbackKey = song.id
+        val snap = JSONObject().apply {
+            put("key", fallbackKey)
+            put("id", song.id)
+            put("songId", song.id)
+            put("name", song.title)
+            put("title", song.title)
+            put("singer", song.artist)
+            put("artist", song.artist)
+            put("album", song.album)
+            if (song.coverUrl.isNotBlank()) {
+                put("picUrl", song.coverUrl)
+                put("img", song.coverUrl)
+            }
+            if (durationSec > 0) {
+                put("interval", durationSec)
+                put("duration", durationSec)
+            }
+            put("source", "local")
+        }
+        return Pair(fallbackKey, snap)
+    }
+
+    /**
+     * 将任意曲目（支持服务器本地曲目与在线曲目）的喜欢/收藏状态完整双向保存至服务器 (/api/library/user-data)
+     */
+    suspend fun toggleFavoriteSongOnServer(song: UnifiedSong, isFavorite: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val (targetKey, targetSnapshot) = buildTrackKeyAndSnapshot(song)
+            val cleanTargetPath = targetSnapshot.optString("localPath").ifBlank { targetSnapshot.optString("filePath") }.trim()
+            val targetSongId = targetSnapshot.optString("songId").ifBlank { song.id }.trim()
+
+            val userDataRes = getLibraryUserData()
+            val userData = userDataRes.getOrNull() ?: JSONObject()
+            val favArr = userData.optJSONArray("favorites") ?: JSONArray()
+            val keptItems = ArrayList<Any>()
+
+            for (i in 0 until favArr.length()) {
+                val item = favArr.opt(i) ?: continue
+                val matchesTarget = when (item) {
+                    is String -> {
+                        val s = item.trim()
+                        val sClean = s.removePrefix("local:").trim()
+                        s == targetKey || (cleanTargetPath.isNotBlank() && sClean == cleanTargetPath) || s == song.id
+                    }
+                    is JSONObject -> {
+                        val k = item.optString("key").trim()
+                        val p = item.optString("localPath").ifBlank { item.optString("filePath") }.removePrefix("local:").trim()
+                        val sid = item.optString("songId").ifBlank { item.optString("id") }.trim()
+                        val n = item.optString("name").ifBlank { item.optString("title") }.trim()
+                        val ar = item.optString("singer").ifBlank { item.optString("artist") }.trim()
+                        k == targetKey ||
+                            (cleanTargetPath.isNotBlank() && (p == cleanTargetPath || k.removePrefix("local:").trim() == cleanTargetPath)) ||
+                            (targetSongId.isNotBlank() && (sid == targetSongId || "lemon_online_${item.optString("source")}_$sid" == song.id)) ||
+                            (n.isNotBlank() && n.equals(song.title, ignoreCase = true) && ar.equals(song.artist, ignoreCase = true))
+                    }
+                    else -> false
+                }
+                if (!matchesTarget) {
+                    keptItems.add(item)
+                }
+            }
+
+            if (isFavorite) {
+                keptItems.add(0, targetSnapshot)
+            }
+
+            val newFavArr = JSONArray()
+            keptItems.forEach { newFavArr.put(it) }
+
+            val payload = JSONObject().apply {
+                put("favorites", newFavArr)
+            }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("保存收藏失败 (HTTP ${resp.code})"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "toggleFavoriteSongOnServer failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
      * 将曲目的喜欢/收藏状态双向保存至服务器 (/api/library/user-data)
      */
     suspend fun toggleFavoriteOnServer(serverFilePath: String, isFavorite: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
@@ -3049,32 +3324,49 @@ class LemonMusicProtocol(
             ensureAuthenticated()
             val cleanPath = serverFilePath.removePrefix("local:").trim()
             if (cleanPath.isBlank()) return@withContext Result.success(false)
+            val songId = "lemon_${md5(cleanPath)}"
+            val cachedSong = songIdToSongMap[songId]
+            if (cachedSong != null) {
+                return@withContext toggleFavoriteSongOnServer(cachedSong, isFavorite)
+            }
 
             val userDataRes = getLibraryUserData()
             val userData = userDataRes.getOrNull() ?: JSONObject()
             val favArr = userData.optJSONArray("favorites") ?: JSONArray()
-            val favSet = LinkedHashSet<String>()
+            val keptItems = ArrayList<Any>()
+            val serverKey = "local:$cleanPath"
+
             for (i in 0 until favArr.length()) {
-                val item = favArr.opt(i)
-                when (item) {
-                    is String -> favSet.add(item)
+                val item = favArr.opt(i) ?: continue
+                val matches = when (item) {
+                    is String -> item.removePrefix("local:").trim() == cleanPath
                     is JSONObject -> {
-                        val p = item.optString("filePath").ifBlank { item.optString("id") }
-                        if (p.isNotBlank()) favSet.add(p)
+                        val p = item.optString("localPath")
+                            .ifBlank { item.optString("filePath") }
+                            .ifBlank { item.optString("key") }
+                            .removePrefix("local:")
+                            .trim()
+                        p == cleanPath
                     }
+                    else -> false
+                }
+                if (!matches) {
+                    keptItems.add(item)
                 }
             }
 
-            val serverKey = "local:$cleanPath"
             if (isFavorite) {
-                favSet.add(serverKey)
-            } else {
-                favSet.remove(serverKey)
-                favSet.remove(cleanPath)
+                keptItems.add(0, JSONObject().apply {
+                    put("key", serverKey)
+                    put("localPath", cleanPath)
+                    put("filePath", cleanPath)
+                    put("name", cleanPath.substringAfterLast('/').substringBeforeLast('.'))
+                    put("source", "local")
+                })
             }
 
             val newFavArr = JSONArray()
-            favSet.forEach { newFavArr.put(it) }
+            keptItems.forEach { newFavArr.put(it) }
 
             val payload = JSONObject().apply {
                 put("favorites", newFavArr)

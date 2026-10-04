@@ -7,6 +7,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -129,6 +130,7 @@ object AudioSharingManager {
     private var httpServerPort: Int = 0
     private var appContextRef: Context? = null
     private val sharedFileRegistry = ConcurrentHashMap<String, File>()
+    private val sharedContentUriRegistry = ConcurrentHashMap<String, String>()
     private val sharedRemoteStreamRegistry = ConcurrentHashMap<String, RemoteStreamProxyEntry>()
     private val sharedCoverUrlRegistry = ConcurrentHashMap<String, RemoteStreamProxyEntry>()
 
@@ -820,9 +822,15 @@ object AudioSharingManager {
         val commonLocations = listOf(
             "http://$host:49152/description.xml",
             "http://$host:49153/description.xml",
+            "http://$host:49154/description.xml",
+            "http://$host:49155/description.xml",
             "http://$host:8200/rootDesc.xml",
+            "http://$host:8080/description.xml",
+            "http://$host:8088/description.xml",
             "http://$host:1400/xml/device_description.xml",
-            "http://$host:9197/dmr"
+            "http://$host:9197/dmr",
+            "http://$host:7676/smp_2_",
+            "http://$host:8008/ssdp/device-desc.xml"
         )
         for (url in commonLocations) {
             val dev = parseUpnpDeviceDescription(client, url)
@@ -893,8 +901,26 @@ object AudioSharingManager {
             return "http://$localIp:$port/media/$token.$ext"
         }
 
-        // 2. 解析远程 NAS 或在线音乐真实流 URL 与鉴权 Token
-        var remoteUrl = song.streamUrl
+        // 2. 若为 Android SAF 或系统媒体库 content:// URI，挂载至局域网 content 流服务器
+        val contentUriStr = listOfNotNull(song.localFilePath, song.streamUrl)
+            .firstOrNull { it.startsWith("content://") }
+        if (!contentUriStr.isNullOrBlank() && !localIp.isNullOrBlank() && port > 0) {
+            val ext = song.format.ifBlank { "mp3" }.lowercase(Locale.US)
+            val token = "content_${song.id.hashCode().toUInt()}"
+            sharedContentUriRegistry[token] = contentUriStr
+            return "http://$localIp:$port/content/$token.$ext"
+        }
+
+        // 3. 若当前手机已处于真实播放中且已换取到 HTTP 流地址，优先直接复用
+        val playingSong = PlaybackQueueManager.currentSongFlow.value
+        val activeStream = if (playingSong?.id == song.id && !playingSong.streamUrl.isNullOrBlank() &&
+            (playingSong.streamUrl.startsWith("http://") || playingSong.streamUrl.startsWith("https://"))
+        ) {
+            playingSong.streamUrl
+        } else null
+
+        // 4. 解析远程 NAS 或在线音乐真实流 URL 与鉴权 Token
+        var remoteUrl = activeStream ?: song.streamUrl
         var authHeader: String? = null
         val db = ZdsDatabase.getInstance(context)
         val active = db.serverDao().getActiveServer()
@@ -916,14 +942,22 @@ object AudioSharingManager {
                 } else {
                     val cleanId = song.id.removePrefix("lemon_online_")
                     val src = if (cleanId.contains("_")) cleanId.substringBefore("_") else "kw"
-                    remoteUrl = protocol.resolveOnlineStreamUrl(
-                        songId = song.id,
-                        source = src,
-                        quality = "320k",
-                        metaJson = song.rawMetaJson,
-                        fallbackTitle = song.title,
-                        fallbackArtist = song.artist
-                    ).getOrNull().orEmpty()
+                    val prefQ = LemonMusicProtocol.getPreferredStreamQuality(context)
+                    val qChain = LemonMusicProtocol.getFallbackQualities(prefQ)
+                    for (q in qChain) {
+                        val res = protocol.resolveOnlineStreamUrl(
+                            songId = song.id,
+                            source = src,
+                            quality = q,
+                            metaJson = song.rawMetaJson,
+                            fallbackTitle = song.title,
+                            fallbackArtist = song.artist
+                        ).getOrNull()
+                        if (!res.isNullOrBlank()) {
+                            remoteUrl = res
+                            break
+                        }
+                    }
                 }
             } else if (remoteUrl.startsWith("/") && active.serverUrl.isNotBlank()) {
                 remoteUrl = "${active.serverUrl.trimEnd('/')}$remoteUrl"
@@ -1005,7 +1039,7 @@ object AudioSharingManager {
         val totalSec = (song.durationMs / 1000L).coerceAtLeast(0L)
         val durationStr = String.format(Locale.US, "%02d:%02d:%02d", totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60)
 
-        val didlLite = buildString {
+        fun createDidl(protocolInfo: String): String = buildString {
             append("""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">""")
             append("""<item id="0" parentID="-1" restricted="1">""")
             append("""<dc:title>${escapeXml(song.title)}</dc:title>""")
@@ -1016,14 +1050,23 @@ object AudioSharingManager {
                 append("""<upnp:albumArtURI>${escapeXml(coverUrl)}</upnp:albumArtURI>""")
             }
             append("""<upnp:class>object.item.audioItem.musicTrack</upnp:class>""")
-            append("""<res duration="$durationStr" protocolInfo="http-get:*:$mimeType:$DLNA_CONTENT_FEATURES">${escapeXml(mediaUrl)}</res>""")
+            append("""<res duration="$durationStr" protocolInfo="$protocolInfo">${escapeXml(mediaUrl)}</res>""")
             append("""</item></DIDL-Lite>""")
         }
 
-        // 2. 优先使用完整 DIDL-Lite 元数据发送 SetAVTransportURI
-        var setOk = executeSoapSetAvTransportUri(client, controlUrl, mediaUrl, escapeXml(didlLite))
+        // 2. 依次尝试 3 种元数据兼容策略发送 SetAVTransportURI：
+        // 策略1：通用精简 DIDL-Lite (protocolInfo="http-get:*:$mimeType:*")，兼容小米、创维、海信、索尼、华为智慧屏及乐播投屏
+        // 策略2：标准 DLNA DLNA_CONTENT_FEATURES 规范
+        // 策略3：空元数据 ""（部分老旧或魔改电视固件只接受空元数据，否则报 714 / 501）
+        val didlGeneric = createDidl("http-get:*:$mimeType:*")
+        val didlDlna = createDidl("http-get:*:$mimeType:$DLNA_CONTENT_FEATURES")
+
+        var setOk = executeSoapSetAvTransportUri(client, controlUrl, mediaUrl, escapeXml(didlGeneric))
         if (!setOk) {
-            // 回退方案：部分智能电视（如部分海信/TCL/小米电视固件）对 DIDL-Lite XML 格式校验极严，使用空 CurrentURIMetaData 即可 100% 成功加载
+            Log.i(TAG, "Retrying SetAVTransportURI with DLNA_CONTENT_FEATURES for ${device.name}")
+            setOk = executeSoapSetAvTransportUri(client, controlUrl, mediaUrl, escapeXml(didlDlna))
+        }
+        if (!setOk) {
             Log.i(TAG, "Retrying SetAVTransportURI with empty metadata for ${device.name}")
             setOk = executeSoapSetAvTransportUri(client, controlUrl, mediaUrl, "")
         }
@@ -1031,7 +1074,7 @@ object AudioSharingManager {
 
         delay(150L)
 
-        // 3. 发送 Play 指令
+        // 3. 发送 Play 指令（带多轮重试与退避）
         val playOk = sendDlnaPlay(context, device)
         if (playOk && startPositionMs > 4000L) {
             scope.launch {
@@ -1078,7 +1121,7 @@ object AudioSharingManager {
         }.getOrDefault(false)
     }
 
-    private fun sendDlnaPlay(context: Context, device: LanShareDevice): Boolean {
+    private suspend fun sendDlnaPlay(context: Context, device: LanShareDevice): Boolean {
         val controlUrl = device.avTransportControlUrl
         if (controlUrl.isBlank()) return false
         val client = NetworkClientFactory.createOkHttpClient(context)
@@ -1101,9 +1144,22 @@ object AudioSharingManager {
             .post(playSoap.toRequestBody("text/xml; charset=utf-8".toMediaType()))
             .build()
 
-        return runCatching {
-            client.newCall(playReq).execute().use { it.isSuccessful }
-        }.getOrDefault(false)
+        // 许多电视在收到 SetAVTransportURI 后处于 TRANSITIONING 状态，立即 Play 会返回 701 错误。
+        // 进行最多 3 次带退避间隔的重试
+        for (attempt in 1..3) {
+            val success = runCatching {
+                client.newCall(playReq).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "Play attempt $attempt for ${device.name} HTTP ${resp.code}: ${resp.body?.string()?.take(200)}")
+                    }
+                    resp.isSuccessful
+                }
+            }.getOrDefault(false)
+
+            if (success) return true
+            if (attempt < 3) delay(250L * attempt)
+        }
+        return false
     }
 
     private fun sendDlnaPause(context: Context, device: LanShareDevice) {
@@ -1265,6 +1321,10 @@ object AudioSharingManager {
                         val token = rawPath.substringAfter("/media/").substringBefore(".")
                         serveLocalMediaFile(out, method, token, rangeHeader)
                     }
+                    rawPath.startsWith("/content/") -> {
+                        val token = rawPath.substringAfter("/content/").substringBefore(".")
+                        serveContentUriStream(out, method, token, rangeHeader)
+                    }
                     rawPath.startsWith("/proxy/") -> {
                         val token = rawPath.substringAfter("/proxy/").substringBefore(".")
                         val entry = sharedRemoteStreamRegistry[token]
@@ -1355,6 +1415,106 @@ object AudioSharingManager {
                 }
             }
         }
+        out.flush()
+    }
+
+    private fun serveContentUriStream(
+        out: OutputStream,
+        method: String,
+        token: String,
+        rangeHeader: String?
+    ) {
+        val ctx = appContextRef
+        val uriStr = sharedContentUriRegistry[token]
+        if (ctx == null || uriStr.isNullOrBlank()) {
+            val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            out.write(notFound.toByteArray(Charsets.UTF_8))
+            out.flush()
+            return
+        }
+
+        val uri = Uri.parse(uriStr)
+        val cr = ctx.contentResolver
+        val afd = try {
+            cr.openAssetFileDescriptor(uri, "r")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open afd for $uriStr", e)
+            null
+        }
+
+        val totalLen = afd?.length ?: -1L
+        val mime = cr.getType(uri)?.takeIf { it.isNotBlank() } ?: "audio/mpeg"
+
+        var startByte = 0L
+        var endByte = if (totalLen > 0L) totalLen - 1L else -1L
+        var isPartial = false
+
+        if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=")) {
+            val rangeSpec = rangeHeader.removePrefix("bytes=").substringBefore(",")
+            val startStr = rangeSpec.substringBefore("-").trim()
+            val endStr = rangeSpec.substringAfter("-", "").trim()
+            startByte = startStr.toLongOrNull() ?: 0L
+            if (totalLen > 0L) {
+                startByte = startByte.coerceIn(0L, totalLen - 1L)
+                endByte = if (endStr.isNotBlank()) {
+                    endStr.toLongOrNull()?.coerceIn(startByte, totalLen - 1L) ?: (totalLen - 1L)
+                } else {
+                    totalLen - 1L
+                }
+            } else if (endStr.isNotBlank()) {
+                endByte = endStr.toLongOrNull() ?: -1L
+            }
+            isPartial = true
+        }
+
+        val contentLen = if (totalLen > 0L && endByte >= startByte) {
+            endByte - startByte + 1L
+        } else -1L
+
+        val headers = buildString {
+            if (isPartial && totalLen > 0L) {
+                append("HTTP/1.1 206 Partial Content\r\n")
+                append("Content-Range: bytes $startByte-$endByte/$totalLen\r\n")
+            } else {
+                append("HTTP/1.1 200 OK\r\n")
+            }
+            append("Content-Type: $mime\r\n")
+            if (contentLen >= 0L) {
+                append("Content-Length: $contentLen\r\n")
+            }
+            append("Accept-Ranges: bytes\r\n")
+            append("contentFeatures.dlna.org: $DLNA_CONTENT_FEATURES\r\n")
+            append("transferMode.dlna.org: Streaming\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
+        }
+        out.write(headers.toByteArray(Charsets.UTF_8))
+
+        if (method != "HEAD") {
+            val inputStream = afd?.createInputStream() ?: runCatching { cr.openInputStream(uri) }.getOrNull()
+            if (inputStream != null) {
+                inputStream.use { rawIn ->
+                    val bis = BufferedInputStream(rawIn)
+                    var skipped = 0L
+                    while (skipped < startByte) {
+                        val n = bis.skip(startByte - skipped)
+                        if (n <= 0) break
+                        skipped += n
+                    }
+                    val buffer = ByteArray(32768)
+                    var remaining = if (contentLen >= 0L) contentLen else Long.MAX_VALUE
+                    while (remaining > 0L) {
+                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                        val read = bis.read(buffer, 0, toRead)
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                        if (contentLen >= 0L) remaining -= read
+                    }
+                }
+            }
+        }
+        runCatching { afd?.close() }
         out.flush()
     }
 

@@ -247,8 +247,9 @@ fun SongListItemRow(
     val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
     val activeTask = activeDownloadTasks.firstOrNull { it.song.id == song.id }
-    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED ||
-            (!song.localFilePath.isNullOrBlank() && (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists()))
+    val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() &&
+            (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
+    val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
     val isCurrentPlaying = com.lm.player.core.designsystem.component.isSamePlayingSong(song, currentPlayingSong)
@@ -917,7 +918,9 @@ private fun RecentlyAddedSongCard(
     onClick: () -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
-    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED
+    val isDownloaded = !song.localFilePath.isNullOrBlank() &&
+            (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists()) &&
+            (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
 
     Column(
         modifier = Modifier

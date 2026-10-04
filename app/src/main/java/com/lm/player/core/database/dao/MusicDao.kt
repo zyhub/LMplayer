@@ -179,6 +179,9 @@ interface PlaylistDao {
     @Query("SELECT s.* FROM songs s INNER JOIN playlist_songs ps ON s.id = ps.songId WHERE ps.playlistId = :playlistId ORDER BY ps.orderIndex ASC")
     suspend fun getSongsForPlaylist(playlistId: String): List<SongEntity>
 
+    @Query("SELECT s.coverUrl FROM songs s INNER JOIN playlist_songs ps ON s.id = ps.songId WHERE ps.playlistId = :playlistId AND s.coverUrl IS NOT NULL AND s.coverUrl != '' ORDER BY ps.orderIndex ASC LIMIT 4")
+    suspend fun getPlaylistCoverUrls(playlistId: String): List<String>
+
     @Query("UPDATE playlists SET songCount = (SELECT COUNT(*) FROM playlist_songs WHERE playlistId = :playlistId), updatedTimestamp = :timestamp WHERE id = :playlistId")
     suspend fun updateSongCount(playlistId: String, timestamp: Long = System.currentTimeMillis())
 

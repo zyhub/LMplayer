@@ -2,13 +2,16 @@ package com.lm.player.core.media
 
 import android.content.Context
 import android.util.Log
+import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.UnifiedSong
+import com.lm.player.core.network.LemonMusicProtocol
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -397,19 +400,65 @@ object PlaybackQueueManager {
         val validIncomingLocal = incoming.localFilePath?.takeIf {
             it.isNotBlank() && (it.startsWith("content://") || java.io.File(it).exists())
         }
-        val effectiveLocal = validIncomingLocal ?: validExistingLocal
+        val effectiveLocal = if (incoming.downloadStatus == DownloadStatus.NOT_DOWNLOADED && incoming.localFilePath == null) {
+            null
+        } else {
+            validIncomingLocal ?: validExistingLocal
+        }
         val effectiveStream = when {
             !effectiveLocal.isNullOrBlank() -> effectiveLocal
             incoming.streamUrl.isNotBlank() && !incoming.streamUrl.startsWith("lemon_online://") -> incoming.streamUrl
-            existing.streamUrl.isNotBlank() -> existing.streamUrl
+            existing.streamUrl.isNotBlank() && !existing.streamUrl.startsWith("/") -> existing.streamUrl
             else -> incoming.streamUrl
+        }
+        val effectiveDownloadStatus = if (!effectiveLocal.isNullOrBlank()) {
+            DownloadStatus.DOWNLOADED
+        } else {
+            if (incoming.downloadStatus == DownloadStatus.DOWNLOADED) DownloadStatus.NOT_DOWNLOADED else incoming.downloadStatus
         }
         return incoming.copy(
             localFilePath = effectiveLocal,
             streamUrl = effectiveStream,
-            downloadStatus = if (!effectiveLocal.isNullOrBlank()) DownloadStatus.DOWNLOADED else incoming.downloadStatus,
+            downloadStatus = effectiveDownloadStatus,
             rawMetaJson = incoming.rawMetaJson ?: existing.rawMetaJson
         )
+    }
+
+    /**
+     * 当本地已下载歌曲被删除时，立即同步清除播放队列、当前播放及最近播放中的已下载标志与本地路径
+     */
+    fun onSongsDownloadDeleted(songIds: Set<String>) {
+        if (songIds.isEmpty()) return
+        val current = _currentSongFlow.value
+        if (current != null && current.id in songIds) {
+            val updated = current.copy(
+                localFilePath = null,
+                downloadStatus = DownloadStatus.NOT_DOWNLOADED
+            )
+            _currentSongFlow.value = updated
+            savePlaybackState(song = updated, commitSync = true)
+        }
+        if (_playlistFlow.value.isNotEmpty()) {
+            _playlistFlow.value = _playlistFlow.value.map { song ->
+                if (song.id in songIds) {
+                    song.copy(
+                        localFilePath = null,
+                        downloadStatus = DownloadStatus.NOT_DOWNLOADED
+                    )
+                } else song
+            }
+        }
+        if (_recentPlayedSongsFlow.value.isNotEmpty()) {
+            _recentPlayedSongsFlow.value = _recentPlayedSongsFlow.value.map { song ->
+                if (song.id in songIds) {
+                    song.copy(
+                        localFilePath = null,
+                        downloadStatus = DownloadStatus.NOT_DOWNLOADED
+                    )
+                } else song
+            }
+            appContext?.let { flushRecentPlayed(it) }
+        }
     }
 
     fun updateMetadata(songs: List<UnifiedSong>) {
@@ -494,6 +543,7 @@ object PlaybackQueueManager {
 
     private var lastBgErrorRetrySongId: String = ""
     private var lastBgErrorRetryTimeMs: Long = 0L
+    private var lastBgErrorQualityIdx: Int = 0
 
     fun ensurePlayerListener(context: Context) {
         val appCtx = context.applicationContext
@@ -528,21 +578,43 @@ object PlaybackQueueManager {
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                // 车机/手机挂后台且主界面未处于前台时的自动容灾重连与切歌保障
+                // 车机/手机挂后台且主界面未处于前台时的自动容灾降级换源重连与切歌保障
                 val targetSong = _currentSongFlow.value ?: return
                 val resumePos = player.currentPosition.coerceAtLeast(0L)
-                val now = System.currentTimeMillis()
-                val canRetry = lastBgErrorRetrySongId != targetSong.id || (now - lastBgErrorRetryTimeMs) > 12_000L
-                if (canRetry) {
+                val prefQ = LemonMusicProtocol.getPreferredStreamQuality(appCtx)
+                val qChain = LemonMusicProtocol.getFallbackQualities(prefQ)
+                val currentIdx = if (lastBgErrorRetrySongId == targetSong.id) lastBgErrorQualityIdx else 0
+                val nextIdx = currentIdx + 1
+                if (nextIdx < qChain.size) {
                     lastBgErrorRetrySongId = targetSong.id
-                    lastBgErrorRetryTimeMs = now
-                    Log.w(TAG, "Background onPlayerError (${error.message}), auto-retrying ${targetSong.title} at ${resumePos}ms")
+                    lastBgErrorQualityIdx = nextIdx
+                    val nextQ = qChain[nextIdx]
+                    val label = AudioQuality.fromKey(nextQ).label
+                    coroutineScope.launch(Dispatchers.Main) {
+                        Toast.makeText(appCtx, "当前音质无法缓冲，已自动为您换源降至【$label】播放", Toast.LENGTH_SHORT).show()
+                    }
                     playSong(
                         targetSong = targetSong,
                         context = appCtx,
                         startPositionMs = resumePos,
-                        forceRefresh = true
+                        forceRefresh = true,
+                        overrideQuality = nextQ
                     )
+                } else {
+                    val now = System.currentTimeMillis()
+                    val canRetry = lastBgErrorRetrySongId != targetSong.id || (now - lastBgErrorRetryTimeMs) > 12_000L
+                    if (canRetry) {
+                        lastBgErrorRetrySongId = targetSong.id
+                        lastBgErrorRetryTimeMs = now
+                        lastBgErrorQualityIdx = 0
+                        Log.w(TAG, "Background onPlayerError (${error.message}), auto-retrying ${targetSong.title} at ${resumePos}ms")
+                        playSong(
+                            targetSong = targetSong,
+                            context = appCtx,
+                            startPositionMs = resumePos,
+                            forceRefresh = true
+                        )
+                    }
                 }
             }
         })
@@ -554,7 +626,8 @@ object PlaybackQueueManager {
         context: Context,
         newPlaylist: List<UnifiedSong>? = null,
         startPositionMs: Long = 0L,
-        forceRefresh: Boolean = false
+        forceRefresh: Boolean = false,
+        overrideQuality: String? = null
     ) {
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
@@ -586,7 +659,11 @@ object PlaybackQueueManager {
             try {
                 val db = ZdsDatabase.getInstance(appCtx)
                 val router = PlaybackRouter(db.downloadDao(), appCtx)
-                val mediaItem: MediaItem = router.resolveMediaItem(targetSong, forceRefresh = forceRefresh)
+                val mediaItem: MediaItem = router.resolveMediaItem(
+                    targetSong,
+                    forceRefresh = forceRefresh,
+                    overrideQuality = overrideQuality
+                )
                 val player = Media3Factory.getSharedExoPlayer(appCtx)
                 if (startPositionMs > 0L) {
                     player.setMediaItem(mediaItem, startPositionMs)

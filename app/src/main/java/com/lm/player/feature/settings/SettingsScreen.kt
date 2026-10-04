@@ -142,6 +142,9 @@ fun SettingsScreen(
     var streamCacheEnabled by remember {
         mutableStateOf(prefs.getBoolean("stream_cache_enabled_v2", false))
     }
+    var stopPlaybackOnExit by remember {
+        mutableStateOf(prefs.getBoolean("stop_playback_on_exit", false))
+    }
 
     // 弹窗状态
     var showAddServerDialog by remember { mutableStateOf(false) }
@@ -536,9 +539,9 @@ fun SettingsScreen(
                                             latestVersion = curVerName,
                                             latestVersionCode = curVerCode.toInt(),
                                             releaseNotes = "【v${curVerName} 更新日志】\n\n" +
-                                                "1. 多版本精准识别：严格区分同名歌曲的 Live、演唱会现场、黑胶、伴奏等版本，修复跨版本误高亮、误标已缓存及串播问题\n" +
-                                                "2. 播放与断点续播：还原大尺寸封面与 5 行滚动渐变歌词，精准恢复关闭前播放曲目与进度\n" +
-                                                "3. 界面与交互优化：清理歌名转义字符，修复深色模式二级页面标题可见度与系统返回键逻辑",
+                                                "1. 我喜欢的音乐：改为以柠檬服务器收藏为准加载，本地模式按「服务器收藏 ∩ 已下载」枚举，下载过的才显示\n" +
+                                                "2. 试听与下载音质修复：选最高音质无法播放的问题已解决，本平台无该音质时先跨平台同名曲同档补源，仍拿不到才逐档降级；批量下载同样生效，本地文件不受影响\n" +
+                                                "3. 搜索结果翻页：在线结果新增上一页/下一页，手机端每页 20 首",
                                             downloadUrl = ""
                                         )
                                         showVersionNotesDialog = true
@@ -1250,24 +1253,8 @@ fun SettingsScreen(
                     }
 
                     item {
-                        var isIgnoringBatteryOpt by remember {
-                            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-                            mutableStateOf(
-                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                                    pm?.isIgnoringBatteryOptimizations(context.packageName) == true
-                                } else true
-                            )
-                        }
-                        val lifecycleOwnerForBattery = androidx.compose.ui.platform.LocalLifecycleOwner.current
-                        DisposableEffect(lifecycleOwnerForBattery) {
-                            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
-                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                                    val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-                                    isIgnoringBatteryOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
-                                }
-                            }
-                            lifecycleOwnerForBattery.lifecycle.addObserver(obs)
-                            onDispose { lifecycleOwnerForBattery.lifecycle.removeObserver(obs) }
+                        var stopPlaybackOnExit by remember {
+                            mutableStateOf(prefs.getBoolean("stop_playback_on_exit", true))
                         }
 
                         SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
@@ -1295,35 +1282,13 @@ fun SettingsScreen(
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))
-                            SettingActionRow(
-                                title = "车机/手机后台常驻保活白名单",
-                                subtitle = if (isIgnoringBatteryOpt) {
-                                    "已开启后台无限制保活（已激活静音音轨 + 唤醒锁 + 前台看门狗 + 车载导航混音压音防杀后台）"
-                                } else {
-                                    "点击允许忽略电池优化，配合内置车载静音音轨与唤醒锁，彻底防止车机切换导航时杀后台"
-                                },
-                                actionText = if (isIgnoringBatteryOpt) "已加入白名单" else "一键开启保活",
-                                onAction = {
-                                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                                        try {
-                                            val intent = android.content.Intent(
-                                                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                                                android.net.Uri.parse("package:${context.packageName}")
-                                            ).apply {
-                                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            }
-                                            context.startActivity(intent)
-                                        } catch (e: Exception) {
-                                            try {
-                                                val fallbackIntent = android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
-                                                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                }
-                                                context.startActivity(fallbackIntent)
-                                            } catch (_: Exception) {
-                                                Toast.makeText(context, "当前车机系统已默认放行后台服务", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    }
+                            SettingSwitchRow(
+                                title = "退出应用时停止播放",
+                                subtitle = "双击返回键退出或从最近任务卡片划掉应用时停止音乐播放并释放后台服务",
+                                checked = stopPlaybackOnExit,
+                                onCheckedChange = { checked ->
+                                    stopPlaybackOnExit = checked
+                                    prefs.edit().putBoolean("stop_playback_on_exit", checked).apply()
                                 }
                             )
                         }
@@ -1563,6 +1528,17 @@ fun SettingsScreen(
                                 subtitle = "页面向上滚动时自动收起导航栏，为列表展示释放最大可视区域",
                                 checked = enableBottomBarAnimation,
                                 onCheckedChange = onEnableBottomBarAnimationChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "退出应用时停止播放",
+                                subtitle = "默认关闭（退至后台/桌面时继续放歌）。开启后，双击返回键退出应用或划掉后台任务时将彻底停止放歌并释放播放服务",
+                                checked = stopPlaybackOnExit,
+                                onCheckedChange = { enabled ->
+                                    stopPlaybackOnExit = enabled
+                                    prefs.edit().putBoolean("stop_playback_on_exit", enabled).apply()
+                                }
                             )
                         }
                     }

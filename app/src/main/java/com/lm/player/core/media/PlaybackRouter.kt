@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import com.lm.player.core.database.ZdsDatabase
@@ -33,7 +34,11 @@ class PlaybackRouter(
      * 4. 若为在线歌曲且流媒体链接未就绪，自动通过柠檬音乐协议后台快速解析真实流媒体链接。
      * 5. 否则路由至远程流媒体 URL，自动接管 Media3 播放与缓存。
      */
-    suspend fun resolveMediaItem(song: UnifiedSong, forceRefresh: Boolean = false): MediaItem {
+    suspend fun resolveMediaItem(
+        song: UnifiedSong,
+        forceRefresh: Boolean = false,
+        overrideQuality: String? = null
+    ): MediaItem {
         val resolvedLocalPath: String? = withContext(Dispatchers.IO) {
             try {
                 val downloadRecord = downloadDao.getDownloadRecord(song.id)
@@ -78,9 +83,9 @@ class PlaybackRouter(
             }
         }
 
-        val currentPreferredQuality = LemonMusicProtocol.getPreferredStreamQuality(context)
+        val currentPreferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
         val targetBitRate = com.lm.player.core.model.AudioQuality.fromKey(currentPreferredQuality).bitrate
-        val isStaleProxyQuality = song.streamUrl.contains("/api/play/proxy") && song.bitRate != targetBitRate
+        val isStaleProxyQuality = (song.streamUrl.contains("/api/play/proxy") && song.bitRate != targetBitRate) || overrideQuality != null
 
         var finalStreamUrl = if ((forceRefresh || isStaleProxyQuality) && (song.id.startsWith("lemon_online_") || song.streamUrl.contains("/api/play/proxy"))) {
             ""
@@ -157,7 +162,7 @@ class PlaybackRouter(
                             val meta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
                                 ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
 
-                            val preferredQuality = LemonMusicProtocol.getPreferredStreamQuality(context)
+                            val preferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
                             val resolvedStream = protocol.resolveOnlineStreamWithQuality(
                                 songId = song.id,
                                 source = source,
@@ -172,6 +177,13 @@ class PlaybackRouter(
                                 finalStreamUrl = resolvedStream.url
                                 resolvedFormat = resolvedStream.format
                                 resolvedBitRate = resolvedStream.bitRate
+                                val globalPrefQ = LemonMusicProtocol.getPreferredStreamQuality(context)
+                                if (resolvedStream.isDowngraded || (overrideQuality != null && overrideQuality != globalPrefQ)) {
+                                    val qLabel = com.lm.player.core.model.AudioQuality.fromKey(resolvedStream.qualityKey).label
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(context.applicationContext, "已自动为您换源降至【$qLabel】播放", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
                             } else {
                                 // 兜底：若第三方音源暂时不可用，回退匹配资料库内完全同版本已就绪的服务端曲目流地址
                                 val allSongs = db.songDao().getAllSongsList()

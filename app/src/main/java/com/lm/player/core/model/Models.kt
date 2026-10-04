@@ -53,7 +53,8 @@ data class UnifiedPlaylist(
     val isOnline: Boolean = false,
     val serverId: String = "local_storage",
     val previewCovers: List<String> = emptyList(),
-    val isDiscover: Boolean = false
+    val isDiscover: Boolean = false,
+    val updatedTimestamp: Long = 0L
 )
 
 @Immutable
@@ -345,7 +346,8 @@ data class ResolvedOnlineStream(
     val url: String,
     val qualityKey: String,
     val format: String,
-    val bitRate: Int
+    val bitRate: Int,
+    val isDowngraded: Boolean = false
 )
 
 @Immutable

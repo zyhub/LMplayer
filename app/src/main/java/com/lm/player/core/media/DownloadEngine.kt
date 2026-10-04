@@ -962,6 +962,7 @@ class DownloadEngine(
             } else {
                 songDao.updateDownloadStatus(song.id, DownloadStatus.NOT_DOWNLOADED, null)
             }
+            PlaybackQueueManager.onSongsDownloadDeleted(setOf(song.id))
 
             withContext(Dispatchers.Main) {
                 Toast.makeText(context, "已删除本地离线歌曲: ${song.title}", Toast.LENGTH_SHORT).show()
@@ -1011,6 +1012,7 @@ class DownloadEngine(
                     songDao.updateDownloadStatus(song.id, DownloadStatus.NOT_DOWNLOADED, null)
                 }
             }
+            PlaybackQueueManager.onSongsDownloadDeleted(songs.map { it.id }.toSet())
 
             val freedFormatted = if (freedBytes >= 1024 * 1024 * 1024) {
                 String.format(java.util.Locale.getDefault(), "%.2f GB", freedBytes / (1024.0 * 1024.0 * 1024.0))

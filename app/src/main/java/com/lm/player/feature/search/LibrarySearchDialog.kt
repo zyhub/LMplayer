@@ -43,6 +43,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
+ * 在线搜索结果每页条数（手机端）。
+ * 手机竖屏一屏约能容纳 8~10 行，取 20 是为了"一页够看、翻页不至于太碎"；
+ * TV 端大屏遥控器逐行移动更慢，那边用的是更小的页容量，见 LMPlayerTV 的同名文件。
+ */
+private const val ONLINE_SEARCH_PAGE_SIZE = 20
+
+/**
  * 搜索结果面板 (已移除空状态下的「弹出式全局搜索」提示框)
  * - 当未输入关键词时，仅保留底栏左滑搜索框，不遮挡主界面
  * - 当输入关键词后，展示歌曲 / 专辑 / 歌单检索结果，支持点击专辑或歌单直接展开内部曲目播放与下载
@@ -62,8 +69,8 @@ fun LibrarySearchDialog(
     onOnlineSourceChanged: ((OnlineMusicSource) -> Unit)? = null,
     selectedSearchType: SearchContentType = SearchContentType.SONG,
     onSearchTypeChanged: ((SearchContentType) -> Unit)? = null,
-    onOnlineSearch: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
-    onOnlineSearchAlbums: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
+    // page/limit 透传给服务端 /api/search，实现搜索结果翻页；每页条数由调用方按客户端注入
+    onOnlineSearch: (suspend (keyword: String, source: OnlineMusicSource, page: Int, limit: Int) -> List<UnifiedSong>)? = null,    onOnlineSearchAlbums: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
     onOnlineSearchPlaylists: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedPlaylist>)? = null,
     onFetchCollectionSongs: (suspend (collectionId: String) -> List<UnifiedSong>)? = null,
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
@@ -111,13 +118,25 @@ fun LibrarySearchDialog(
     var onlinePlaylistResults by remember { mutableStateOf<List<UnifiedPlaylist>>(emptyList()) }
     var isSearchingOnline by remember { mutableStateOf(false) }
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
+    // 在线结果翻页：服务端 /api/search 原生支持 page/limit，这里只维护当前页码。
+    // hasMore 用「本页返回条数是否已满」推断，因为服务端响应里没有 total/pages 字段。
+    var onlinePage by remember { mutableStateOf(1) }
+    var onlinePageHasMore by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
 
+    // 关键词 / 音源 / 搜索类型一变就回到第 1 页。
+    // 放在下面取数 effect 之前：两者同帧重启时，本 effect 先把页码归位，
+    // 取数 effect 因页码变化被取消重启，280ms 防抖期内不会真的发出多余请求。
     LaunchedEffect(query, selectedSource, selectedSearchType) {
+        if (onlinePage != 1) onlinePage = 1
+    }
+
+    LaunchedEffect(query, selectedSource, selectedSearchType, onlinePage) {
         if (query.isBlank()) {
             onlineSongResults = emptyList()
             onlineAlbumResults = emptyList()
             onlinePlaylistResults = emptyList()
+            onlinePageHasMore = false
             isSearchingOnline = false
             return@LaunchedEffect
         }
@@ -126,6 +145,7 @@ fun LibrarySearchDialog(
             isSearchingOnline = true
             try {
                 onlineSongResults = onParseExternalPlaylist(trimmed, selectedSource)
+                onlinePageHasMore = false
             } catch (_: Exception) {
                 onlineSongResults = emptyList()
             } finally {
@@ -138,7 +158,9 @@ fun LibrarySearchDialog(
         try {
             when (selectedSearchType) {
                 SearchContentType.SONG -> {
-                    onlineSongResults = onOnlineSearch?.invoke(trimmed, selectedSource).orEmpty()
+                    val fetched = onOnlineSearch?.invoke(trimmed, selectedSource, onlinePage, ONLINE_SEARCH_PAGE_SIZE).orEmpty()
+                    onlineSongResults = fetched
+                    onlinePageHasMore = fetched.size >= ONLINE_SEARCH_PAGE_SIZE
                 }
                 SearchContentType.ALBUM -> {
                     onlineAlbumResults = onOnlineSearchAlbums?.invoke(trimmed, selectedSource).orEmpty()
@@ -521,6 +543,20 @@ fun LibrarySearchDialog(
                                                 }
                                             )
                                         }
+                                        // 翻页条：每页 ONLINE_SEARCH_PAGE_SIZE 首，由服务端按 page 取。
+                                        // 只在「不在第一页」或「还有下一页」时出现，空结果不会挂一个没用的翻页条。
+                                        if (onlinePage > 1 || onlinePageHasMore) {
+                                            item(key = "online_pager") {
+                                                SearchPagerBar(
+                                                    page = onlinePage,
+                                                    hasMore = onlinePageHasMore,
+                                                    isLoading = isSearchingOnline,
+                                                    accent = AppleRed,
+                                                    onPrev = { if (onlinePage > 1) onlinePage -= 1 },
+                                                    onNext = { if (onlinePageHasMore) onlinePage += 1 }
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -838,6 +874,76 @@ private fun SearchPlaylistListItem(
             imageVector = Icons.Default.ChevronRight,
             contentDescription = "查看歌单曲目",
             tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/**
+ * 搜索结果翻页条。
+ * 在线结果由服务端 /api/search 的 page/limit 分页，这里只负责切换页码与展示当前页。
+ */
+@Composable
+private fun SearchPagerBar(
+    page: Int,
+    hasMore: Boolean,
+    isLoading: Boolean,
+    accent: Color,
+    onPrev: () -> Unit,
+    onNext: () -> Unit
+) {
+    val dimensions = LocalAppDimensions.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SearchPagerChip(
+            text = "上一页",
+            enabled = page > 1 && !isLoading,
+            accent = accent,
+            onClick = onPrev
+        )
+        Text(
+            text = if (isLoading) "第 $page 页 · 加载中" else "第 $page 页",
+            fontSize = dimensions.bodySize,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 14.dp)
+        )
+        SearchPagerChip(
+            text = "下一页",
+            enabled = hasMore && !isLoading,
+            accent = accent,
+            onClick = onNext
+        )
+    }
+}
+
+@Composable
+private fun SearchPagerChip(
+    text: String,
+    enabled: Boolean,
+    accent: Color,
+    onClick: () -> Unit
+) {
+    val dimensions = LocalAppDimensions.current
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = if (enabled) {
+            accent.copy(alpha = 0.14f)
+        } else {
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+        },
+        modifier = Modifier.clickable(enabled = enabled) { onClick() }
+    ) {
+        Text(
+            text = text,
+            fontSize = dimensions.captionSize,
+            fontWeight = FontWeight.SemiBold,
+            color = if (enabled) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+            modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
         )
     }
 }

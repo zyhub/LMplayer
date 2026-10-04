@@ -15,10 +15,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- 挂后台时手机顶部灵动岛悬浮窗权限、开机自启权限与车机/手机后台白名单保活权限 -->
+    <!-- 挂后台时手机顶部灵动岛悬浮窗权限与开机自启权限 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- 在线应用自更新与安装器调起权限 (Android 8.0+) -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />

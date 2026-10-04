@@ -1,11 +1,23 @@
 package com.lm.player.feature.home
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -20,8 +32,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -89,6 +105,7 @@ fun LemonDiscoverHomeScreen(
     onSubViewActiveChange: (Boolean) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
+    val context = LocalContext.current
     val dimensions = LocalAppDimensions.current
     val screenWidthDp = LocalConfiguration.current.screenWidthDp
     val isCompactHeader = screenWidthDp < 390
@@ -104,6 +121,31 @@ fun LemonDiscoverHomeScreen(
     var newAlbums by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var reloadTrigger by remember { mutableStateOf(0) }
+
+    // 官方权威排行榜独立全景下钻层
+    var isToplistsOverviewOpen by remember { mutableStateOf(false) }
+
+    // 最新专辑首发全景下钻层
+    var isAlbumsOverviewOpen by remember { mutableStateOf(false) }
+
+    // 换一批轮换种子 (保证今日推荐与列表每次点击呈现新曲目)
+    var recommendSeed by remember { mutableStateOf(0) }
+
+    // 私人漫游播放状态追踪 (仅当点击私人漫游触发的播放且正在播放漫游池中曲目时，才显示波形动画)
+    var isRoamingPlaying by remember { mutableStateOf(false) }
+    var roamingSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    val playNonRoamingSong: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, list ->
+        isRoamingPlaying = false
+        onSongClick(song, list)
+    }
+
+    LaunchedEffect(currentPlayingSong?.id) {
+        if (currentPlayingSong != null && !roamingSongIds.contains(currentPlayingSong.id)) {
+            isRoamingPlaying = false
+        }
+    }
+
 
     // 音源切换选择弹窗
     var isSourceSelectorOpen by remember { mutableStateOf(false) }
@@ -127,8 +169,8 @@ fun LemonDiscoverHomeScreen(
     var activeCollectionSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingCollection by remember { mutableStateOf(false) }
 
-    // 安卓系统返回键逐级回退：多选状态 -> 歌单/榜单详情抽屉 -> 首页
-    val hasActiveSubView = isCollectionMultiSelect || activeCollectionTitle != null || isNewSongsMultiSelect
+    // 安卓系统返回键逐级回退：多选状态 -> 歌单/榜单/专辑详情抽屉 -> 榜单/专辑全景 -> 首页
+    val hasActiveSubView = isCollectionMultiSelect || activeCollectionTitle != null || isNewSongsMultiSelect || isToplistsOverviewOpen || isAlbumsOverviewOpen
     LaunchedEffect(hasActiveSubView) {
         onSubViewActiveChange(hasActiveSubView)
     }
@@ -146,6 +188,12 @@ fun LemonDiscoverHomeScreen(
                     activeCollectionTitle = null
                     isCollectionMultiSelect = false
                     selectedCollectionSongIds = emptySet()
+                }
+                isToplistsOverviewOpen -> {
+                    isToplistsOverviewOpen = false
+                }
+                isAlbumsOverviewOpen -> {
+                    isAlbumsOverviewOpen = false
                 }
                 isNewSongsMultiSelect -> {
                     isNewSongsMultiSelect = false
@@ -211,21 +259,21 @@ fun LemonDiscoverHomeScreen(
             launch {
                 val pl = runCatching { onFetchDiscoverPlaylists(currentSource) }.getOrDefault(emptyList())
                 if (pl.isNotEmpty()) {
-                    recommendPlaylists = pl
+                    recommendPlaylists = if (reloadTrigger > 0) pl.shuffled() else pl
                     isLoading = false
                 }
             }
             launch {
                 val tl = runCatching { onFetchDiscoverToplists(currentSource) }.getOrDefault(emptyList())
                 if (tl.isNotEmpty()) {
-                    toplists = tl
+                    toplists = if (reloadTrigger > 0) tl.shuffled() else tl
                     isLoading = false
                 }
             }
             launch {
                 val ns = runCatching { onFetchDiscoverNewSongs(currentSource) }.getOrDefault(emptyList())
                 if (ns.isNotEmpty()) {
-                    newSongs = ns
+                    newSongs = if (reloadTrigger > 0) ns.shuffled() else ns
                     isLoading = false
                 }
             }
@@ -233,13 +281,73 @@ fun LemonDiscoverHomeScreen(
                 launch {
                     val na = runCatching { onFetchDiscoverNewAlbums(currentSource) }.getOrDefault(emptyList())
                     if (na.isNotEmpty()) {
-                        newAlbums = na
+                        newAlbums = if (reloadTrigger > 0) na.shuffled() else na
                         isLoading = false
                     }
                 }
             }
         }
         isLoading = false
+    }
+
+    // 今日推荐最少 3 首曲目池计算（换一批时通过 recommendSeed 偏移轮转，保证每次呈现新推荐）
+    val todaySongs = remember(resolvedNewSongs, allCachedSongs, recommendSeed) {
+        val pool = if (resolvedNewSongs.isNotEmpty()) {
+            resolvedNewSongs
+        } else {
+            allCachedSongs
+        }
+        if (pool.isEmpty()) {
+            emptyList()
+        } else {
+            val offset = (recommendSeed * 3) % pool.size
+            val rotated = pool.drop(offset) + pool.take(offset)
+            if (rotated.size < 3 && allCachedSongs.isNotEmpty()) {
+                (rotated + allCachedSongs).distinctBy { it.id }.take(3)
+            } else {
+                rotated.take(3)
+            }
+        }
+    }
+
+    // 最新专辑最少 3 张专辑池计算（换一批时通过 recommendSeed 偏移轮转，保证展示至少 3 张精选专辑）
+    val todayAlbums = remember(newAlbums, allCachedSongs, recommendSeed) {
+        val pool = if (newAlbums.isNotEmpty()) {
+            newAlbums
+        } else {
+            allCachedSongs.filter { it.album.isNotBlank() }
+                .groupBy { it.album }
+                .map { (albumTitle, songs) ->
+                    val first = songs.first()
+                    UnifiedAlbum(
+                        id = "cached_${albumTitle}",
+                        title = albumTitle,
+                        artist = first.artist,
+                        coverUrl = first.coverUrl ?: "",
+                        songCount = songs.size
+                    )
+                }
+        }
+        if (pool.isEmpty()) {
+            listOf(
+                UnifiedAlbum(id = "album_def_1", title = "流行新碟速递", artist = "群星新单", coverUrl = "", songCount = 10),
+                UnifiedAlbum(id = "album_def_2", title = "热播原声精选", artist = "原声音轨", coverUrl = "", songCount = 8),
+                UnifiedAlbum(id = "album_def_3", title = "风向潮流首发", artist = "新碟典藏", coverUrl = "", songCount = 12)
+            )
+        } else {
+            val offset = (recommendSeed * 3) % pool.size
+            val rotated = pool.drop(offset) + pool.take(offset)
+            if (rotated.size < 3) {
+                val fallback = listOf(
+                    UnifiedAlbum(id = "album_def_1", title = "流行新碟速递", artist = "群星新单", coverUrl = "", songCount = 10),
+                    UnifiedAlbum(id = "album_def_2", title = "热播原声精选", artist = "原声音轨", coverUrl = "", songCount = 8),
+                    UnifiedAlbum(id = "album_def_3", title = "风向潮流首发", artist = "新碟典藏", coverUrl = "", songCount = 12)
+                )
+                (rotated + fallback).distinctBy { it.title }.take(3)
+            } else {
+                rotated.take(3)
+            }
+        }
     }
 
     // 定位正在播放的歌曲（自动切回所属歌单下钻列表或新歌首发列表并滚动定位）
@@ -258,18 +366,18 @@ fun LemonDiscoverHomeScreen(
                     activeCollectionTitle = null
                     kotlinx.coroutines.delay(80)
                 }
-                var headerItems = 1 // 顶部 Header
-                if (recommendPlaylists.isNotEmpty()) headerItems++
-                if (toplists.isNotEmpty()) headerItems++
-                if (newAlbums.isNotEmpty()) headerItems++
-                headerItems++ // 新歌首发标题栏
+                isToplistsOverviewOpen = false
+                isAlbumsOverviewOpen = false
+                var headerItems = 2 // 顶部 Header + 2大3小卡片矩阵
+                if (recommendPlaylists.isNotEmpty()) headerItems++ // 热门推荐歌单
+                headerItems++ // 新歌首发标题栏与选项卡
                 runCatching { discoverListState.animateScrollToItem(headerItems + newIdx) }
             }
         }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (activeCollectionTitle == null) {
+        if (activeCollectionTitle == null && !isToplistsOverviewOpen && !isAlbumsOverviewOpen) {
             LazyColumn(
                 state = discoverListState,
                 modifier = Modifier
@@ -375,6 +483,8 @@ fun LemonDiscoverHomeScreen(
                         )
                     }
 
+
+
                     // 下载管理胶囊
                     Surface(
                         shape = RoundedCornerShape(20.dp),
@@ -444,6 +554,318 @@ fun LemonDiscoverHomeScreen(
                 }
             }
         } else {
+            // ==================== 2 大 3 小动态液态光影卡片矩阵 ====================
+            item(key = "discover_bento_hero") {
+                val topRank = toplists.firstOrNull()
+                val topAlbum = newAlbums.firstOrNull()
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    // 第一行：2 大卡片【今日推荐】(最少推荐3首) + 【最新专辑】(最少展示3条专辑)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // 大卡 1：今日推荐 (Ocean Cyan 动态液态流光大卡，展示至少 3 首推荐曲目)
+                        DiscoverLiquidCard(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(196.dp),
+                            title = "今日推荐",
+                            badgeText = "精选 3首",
+                            icon = Icons.Default.AutoAwesome,
+                            iconColor = Color(0xFF00D2FF),
+                            gradientColors = listOf(Color(0xFF0C3852), Color(0xFF061826)),
+                            glowColor = Color(0xFF00D2FF),
+                            secondaryGlowColor = Color(0xFF38EF7D),
+                            onClick = {
+                                todaySongs.firstOrNull()?.let {
+                                    playNonRoamingSong(it, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
+                                }
+                            }
+                        ) {
+                            if (todaySongs.isNotEmpty()) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    todaySongs.take(3).forEach { song ->
+                                        val isThisPlaying = isSamePlayingSong(song, currentPlayingSong)
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    playNonRoamingSong(song, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
+                                                }
+                                                .padding(vertical = 2.dp, horizontal = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            AlbumArtworkImage(
+                                                model = song.coverUrl,
+                                                seedId = song.id,
+                                                modifier = Modifier.size(32.dp),
+                                                cornerRadius = 6.dp
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = song.title,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = if (isThisPlaying) FontWeight.ExtraBold else FontWeight.Bold,
+                                                    color = if (isThisPlaying) Color(0xFF00D2FF) else Color.White,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = song.artist,
+                                                    fontSize = 9.sp,
+                                                    color = if (isThisPlaying) Color(0xFF00D2FF).copy(alpha = 0.85f) else Color.White.copy(alpha = 0.75f),
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            if (isThisPlaying) {
+                                                com.lm.player.core.designsystem.component.NowPlayingWaveIndicator(
+                                                    isPlaying = isPlaying,
+                                                    color = Color.White
+                                                )
+                                            } else {
+                                                Icon(
+                                                    imageVector = Icons.Default.PlayArrow,
+                                                    contentDescription = null,
+                                                    tint = Color.White.copy(alpha = 0.85f),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "今日精选好歌 · 点击即播",
+                                        fontSize = 11.sp,
+                                        color = Color.White.copy(alpha = 0.70f)
+                                    )
+                                }
+                            }
+                        }
+
+                        // 大卡 2：最新专辑 (Sunset Amber 动态液态流光大卡，展示至少 3 张精选专辑并可下钻全览)
+                        DiscoverLiquidCard(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(196.dp),
+                            title = "最新专辑",
+                            badgeText = "新碟首发",
+                            icon = Icons.Default.Album,
+                            iconColor = Color(0xFFFF9500),
+                            gradientColors = listOf(Color(0xFF5A250D), Color(0xFF2E1005)),
+                            glowColor = Color(0xFFFF7A45),
+                            secondaryGlowColor = Color(0xFFFFD200),
+                            onClick = {
+                                isAlbumsOverviewOpen = true
+                            }
+                        ) {
+                            if (todayAlbums.isNotEmpty()) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    todayAlbums.take(3).forEach { album ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    isAlbumsOverviewOpen = true
+                                                }
+                                                .padding(vertical = 2.dp, horizontal = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            AlbumArtworkImage(
+                                                model = album.coverUrl,
+                                                seedId = album.id,
+                                                modifier = Modifier.size(32.dp),
+                                                cornerRadius = 6.dp
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = album.title,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = album.artist.ifBlank { "最新专辑" },
+                                                    fontSize = 9.sp,
+                                                    color = Color.White.copy(alpha = 0.75f),
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            Icon(
+                                                imageVector = Icons.Default.ChevronRight,
+                                                contentDescription = null,
+                                                tint = Color.White.copy(alpha = 0.80f),
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "最新热碟速递 · 点击全览",
+                                        fontSize = 11.sp,
+                                        color = Color.White.copy(alpha = 0.70f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // 第二行：【权威排行榜】(左侧卡片) + 【私人漫游】与【换一批】(右侧2张小长方形卡片)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(154.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // 左侧：权威排行榜 (Royal Indigo 动态液态流光卡片)
+                        DiscoverLiquidCard(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight(),
+                            title = "权威排行榜",
+                            badgeText = "官方热榜",
+                            icon = Icons.Default.Leaderboard,
+                            iconColor = Color(0xFFA78BFA),
+                            gradientColors = listOf(Color(0xFF251A4A), Color(0xFF130D2E)),
+                            glowColor = Color(0xFF8B5CF6),
+                            secondaryGlowColor = Color(0xFFC084FC),
+                            onClick = {
+                                isToplistsOverviewOpen = true
+                            }
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                Text(
+                                    text = topRank?.name ?: "热歌榜 · 飙升榜",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "各大音乐官方风向标 · 共 ${toplists.size} 个榜单",
+                                    fontSize = 10.sp,
+                                    color = Color.White.copy(alpha = 0.75f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "点击浏览全榜",
+                                    fontSize = 10.sp,
+                                    color = Color.White.copy(alpha = 0.70f)
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.ChevronRight,
+                                    contentDescription = null,
+                                    tint = Color.White.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        // 右侧：垂直排列的 2 张小长方形卡片【私人漫游】+【换一批】
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            // 小长方形卡片 1：私人漫游 (音乐播放时显示跳动动态波形)
+                            DiscoverLiquidSmallCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f),
+                                title = "私人漫游",
+                                subtitle = "随心而动 · 智能雷达",
+                                badgeText = "心动",
+                                icon = Icons.Default.Shuffle,
+                                iconColor = Color(0xFFE040FB),
+                                trailingIcon = Icons.Default.PlayArrow,
+                                isCurrentlyPlaying = isRoamingPlaying && isPlaying && currentPlayingSong != null && roamingSongIds.contains(currentPlayingSong.id),
+                                gradientColors = listOf(Color(0xFF4A154B), Color(0xFF250B28)),
+                                glowColor = Color(0xFFE040FB),
+                                secondaryGlowColor = Color(0xFFFF80AB),
+                                onClick = {
+                                    val pool = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }.shuffled()
+                                    if (pool.isNotEmpty()) {
+                                        roamingSongIds = pool.map { it.id }.toSet()
+                                        isRoamingPlaying = true
+                                        onSongClick(pool.first(), pool)
+                                    }
+                                }
+                            )
+
+                            // 小长方形卡片 2：换一批
+                            DiscoverLiquidSmallCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f),
+                                title = "换一批",
+                                subtitle = "探索全网全新好歌",
+                                badgeText = "刷新",
+                                icon = Icons.Default.Refresh,
+                                iconColor = Color(0xFF34D399),
+                                trailingIcon = Icons.Default.AutoAwesome,
+                                gradientColors = listOf(Color(0xFF064E3B), Color(0xFF022C22)),
+                                glowColor = Color(0xFF34D399),
+                                secondaryGlowColor = Color(0xFF6EE7B7),
+                                onClick = {
+                                    com.lm.player.core.network.LemonMusicProtocol.clearDiscoverCache()
+                                    recommendSeed++
+                                    if (recommendPlaylists.size > 1) {
+                                        recommendPlaylists = recommendPlaylists.shuffled()
+                                    }
+                                    if (toplists.size > 1) {
+                                        toplists = toplists.shuffled()
+                                    }
+                                    if (newSongs.size > 1) {
+                                        newSongs = newSongs.shuffled()
+                                    }
+                                    if (newAlbums.size > 1) {
+                                        newAlbums = newAlbums.shuffled()
+                                    }
+                                    reloadTrigger++
+                                    android.widget.Toast.makeText(context, "已为您换一批推荐内容", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
             // A. 【热门推荐歌单】
             if (recommendPlaylists.isNotEmpty()) {
                 item {
@@ -490,93 +912,21 @@ fun LemonDiscoverHomeScreen(
                 }
             }
 
-            // B. 【官方权威榜单】
-            if (toplists.isNotEmpty()) {
-                item {
-                    Column {
-                        SectionHeader(
-                            title = "官方权威排行榜",
-                            subtitle = "${currentSource.displayName} 潮流热播榜单"
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(14.dp),
-                            contentPadding = PaddingValues(vertical = 4.dp)
-                        ) {
-                            items(
-                                items = toplists,
-                                key = { it.id },
-                                contentType = { "discover_toplist" }
-                            ) { toplist ->
-                                DiscoverToplistCard(
-                                    toplist = toplist,
-                                    onClick = {
-                                        activeCollectionTitle = toplist.name
-                                        lastCollectionTitle = toplist.name
-                                        activeCollectionCover = toplist.coverUrl
-                                        isCollectionMultiSelect = false
-                                        selectedCollectionSongIds = emptySet()
-                                        isLoadingCollection = true
-                                        val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
-                                        coroutineScope.launch {
-                                            activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
-                                            isLoadingCollection = false
-                                        }
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // C. 【新碟首发】 (New Albums)
-            if (newAlbums.isNotEmpty()) {
-                item {
-                    Column {
-                        SectionHeader(
-                            title = "新碟首发",
-                            subtitle = "${currentSource.displayName} 最新潮流专辑"
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(14.dp),
-                            contentPadding = PaddingValues(vertical = 4.dp)
-                        ) {
-                            items(
-                                items = newAlbums,
-                                key = { it.id },
-                                contentType = { "discover_album" }
-                            ) { album ->
-                                DiscoverAlbumCard(
-                                    album = album,
-                                    onClick = {
-                                        activeCollectionTitle = album.title
-                                        lastCollectionTitle = album.title
-                                        activeCollectionCover = album.coverUrl
-                                        isCollectionMultiSelect = false
-                                        selectedCollectionSongIds = emptySet()
-                                        isLoadingCollection = true
-                                        coroutineScope.launch {
-                                            activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
-                                            isLoadingCollection = false
-                                        }
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // D. 【新歌首发】
+            // B. 【新歌首发】 (新单即点即播，新碟已整合移动至“最新专辑”大卡及全览专栏)
             if (resolvedNewSongs.isNotEmpty()) {
                 item {
                     Column {
-                        SectionHeader(
-                            title = "新歌首发",
-                            subtitle = "今日全网新单，即点即播"
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SectionHeader(
+                                title = "新歌首发",
+                                subtitle = "今日全网新单，即点即播"
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(10.dp))
                         SongListPlayAndBatchDownloadBar(
                             totalCount = resolvedNewSongs.size,
@@ -584,7 +934,7 @@ fun LemonDiscoverHomeScreen(
                             selectedCount = selectedNewSongIds.size,
                             isAllSelected = resolvedNewSongs.isNotEmpty() && selectedNewSongIds.size == resolvedNewSongs.size,
                             onPlayAll = {
-                                resolvedNewSongs.firstOrNull()?.let { onSongClick(it, resolvedNewSongs) }
+                                resolvedNewSongs.firstOrNull()?.let { playNonRoamingSong(it, resolvedNewSongs) }
                             },
                             onEnterMultiSelect = {
                                 isNewSongsMultiSelect = true
@@ -632,7 +982,7 @@ fun LemonDiscoverHomeScreen(
                                 selectedNewSongIds + song.id
                             }
                         },
-                        onClick = { onSongClick(song, resolvedNewSongs) },
+                        onClick = { playNonRoamingSong(song, resolvedNewSongs) },
                         onDownloadClick = { songForDownloadChoice = song },
                         onDownloadWithOptions = { s, target, quality ->
                             onDownloadSongWithOptions(s, target, quality)
@@ -708,8 +1058,168 @@ fun LemonDiscoverHomeScreen(
                 }
             }
         }
+        }
     }
-}
+
+        // 官方权威排行榜全景下钻层 (点击【权威排行榜】大卡时展开，减少主页重复列表)
+        if (isToplistsOverviewOpen && activeCollectionTitle == null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = { isToplistsOverviewOpen = false }) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "官方权威排行榜",
+                            fontSize = dimensions.sectionTitleSize,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "${currentSource.displayName} · 共 ${toplists.size} 个官方热榜",
+                            fontSize = dimensions.captionSize,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 140.dp),
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    contentPadding = PaddingValues(bottom = contentPadding.calculateBottomPadding() + 24.dp)
+                ) {
+                    items(
+                        items = toplists,
+                        key = { it.id }
+                    ) { toplist ->
+                        DiscoverToplistCard(
+                            toplist = toplist,
+                            onClick = {
+                                activeCollectionTitle = toplist.name
+                                lastCollectionTitle = toplist.name
+                                activeCollectionCover = toplist.coverUrl
+                                isCollectionMultiSelect = false
+                                selectedCollectionSongIds = emptySet()
+                                isLoadingCollection = true
+                                val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
+                                coroutineScope.launch {
+                                    activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
+                                    isLoadingCollection = false
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        // 最新专辑全景下钻层 (点击【最新专辑】大卡时展开，集中展示新碟首发)
+        if (isAlbumsOverviewOpen && activeCollectionTitle == null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = { isAlbumsOverviewOpen = false }) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "最新专辑",
+                            fontSize = dimensions.sectionTitleSize,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "${currentSource.displayName} · 共 ${newAlbums.size} 张新碟首发",
+                            fontSize = dimensions.captionSize,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (newAlbums.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "暂无最新专辑",
+                            fontSize = dimensions.bodySize,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 140.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                        contentPadding = PaddingValues(bottom = contentPadding.calculateBottomPadding() + 24.dp)
+                    ) {
+                        items(
+                            items = newAlbums,
+                            key = { it.id }
+                        ) { album ->
+                            DiscoverAlbumCard(
+                                album = album,
+                                onClick = {
+                                    activeCollectionTitle = album.title
+                                    lastCollectionTitle = album.title
+                                    activeCollectionCover = album.coverUrl
+                                    isCollectionMultiSelect = false
+                                    selectedCollectionSongIds = emptySet()
+                                    isLoadingCollection = true
+                                    coroutineScope.launch {
+                                        activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
+                                        isLoadingCollection = false
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
 
 
@@ -767,7 +1277,7 @@ fun LemonDiscoverHomeScreen(
                     selectedCount = selectedCollectionSongIds.size,
                     isAllSelected = resolvedCollectionSongs.isNotEmpty() && selectedCollectionSongIds.size == resolvedCollectionSongs.size,
                     onPlayAll = {
-                        resolvedCollectionSongs.firstOrNull()?.let { onSongClick(it, resolvedCollectionSongs) }
+                        resolvedCollectionSongs.firstOrNull()?.let { playNonRoamingSong(it, resolvedCollectionSongs) }
                     },
                     onEnterMultiSelect = {
                         isCollectionMultiSelect = true
@@ -847,7 +1357,7 @@ fun LemonDiscoverHomeScreen(
                                     selectedCollectionSongIds + song.id
                                 }
                             },
-                            onClick = { onSongClick(song, resolvedCollectionSongs) },
+                            onClick = { playNonRoamingSong(song, resolvedCollectionSongs) },
                             onDownloadClick = { songForDownloadChoice = song },
                             onDownloadWithOptions = { s, target, quality ->
                                 onDownloadSongWithOptions(s, target, quality)
@@ -1179,4 +1689,369 @@ fun OnlineSourceDropdownMenu(
         }
     }
 }
+
+/**
+ * 绘制有机非规则变形液态光斑 Path
+ * 采用谐波正整倍数角频率波动，保证在 [0, 2π] 周期内首尾连续闭合无缝循环，告别突变卡顿
+ */
+private fun buildOrganicLiquidPath(
+    cx: Float,
+    cy: Float,
+    baseRadius: Float,
+    phaseRad: Float,
+    h1: Float = 1.0f,
+    h2: Float = 2.0f,
+    h3: Float = 3.0f
+): Path {
+    val path = Path()
+    val pointsCount = 8
+    val step = (2.0 * Math.PI / pointsCount).toFloat()
+    val pts = ArrayList<Offset>(pointsCount)
+
+    for (i in 0 until pointsCount) {
+        val angle = i * step
+        // phaseRad 乘数均为整数 (1, -1, 2)，保证 phaseRad 在 0 与 2π 时值与一阶导数完全恒等，实现完美无缝连贯循环
+        val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
+                   0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
+                   0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
+        val r = baseRadius * (1f + wave)
+        val px = cx + r * kotlin.math.cos(angle)
+        val py = cy + r * kotlin.math.sin(angle)
+        pts.add(Offset(px, py))
+    }
+
+    if (pts.isNotEmpty()) {
+        val firstMid = Offset((pts[0].x + pts[1].x) / 2f, (pts[0].y + pts[1].y) / 2f)
+        path.moveTo(firstMid.x, firstMid.y)
+        for (i in 0 until pointsCount) {
+            val pNext = pts[(i + 1) % pointsCount]
+            val pAfterNext = pts[(i + 2) % pointsCount]
+            val mid = Offset((pNext.x + pAfterNext.x) / 2f, (pNext.y + pAfterNext.y) / 2f)
+            path.quadraticBezierTo(pNext.x, pNext.y, mid.x, mid.y)
+        }
+        path.close()
+    }
+    return path
+}
+
+/**
+ * 发现页动态液态光影大卡/正方卡 (非规则阿米巴流体变形光斑 + 渐变边框动画，无限连贯循环)
+ */
+@Composable
+private fun DiscoverLiquidCard(
+    modifier: Modifier = Modifier,
+    title: String,
+    badgeText: String,
+    icon: ImageVector,
+    iconColor: Color,
+    gradientColors: List<Color>,
+    glowColor: Color,
+    secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
+    shape: RoundedCornerShape = RoundedCornerShape(18.dp),
+    onClick: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "discover_liquid_light")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 8000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+    val rad2 = rad1 + Math.PI.toFloat()
+
+    val cosP = kotlin.math.cos(rad1)
+    val sinP = kotlin.math.sin(rad1)
+
+    Surface(
+        shape = shape,
+        color = Color.Transparent,
+        border = BorderStroke(
+            width = 1.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    glowColor.copy(alpha = 0.85f),
+                    Color.White.copy(alpha = 0.45f),
+                    glowColor.copy(alpha = 0.20f),
+                    glowColor.copy(alpha = 0.85f)
+                ),
+                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+            )
+        ),
+        shadowElevation = 4.dp,
+        modifier = modifier
+            .clip(shape)
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(colors = gradientColors))
+                .drawBehind {
+                    val w = size.width
+                    val h = size.height
+
+                    // 1. 第一主液态流光核（谐波化整连贯连续流动）
+                    val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
+                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
+                    val path1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.60f, rad1)
+                    drawPath(
+                        path = path1,
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                glowColor.copy(alpha = 0.62f),
+                                glowColor.copy(alpha = 0.22f),
+                                Color.Transparent
+                            ),
+                            center = Offset(cx1, cy1),
+                            radius = size.maxDimension * 0.75f
+                        )
+                    )
+
+                    // 2. 第二辅液态对流核（相位偏移 π 逆向循环流动）
+                    val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
+                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
+                    val path2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
+                    drawPath(
+                        path = path2,
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                secondaryGlowColor.copy(alpha = 0.42f),
+                                secondaryGlowColor.copy(alpha = 0.12f),
+                                Color.Transparent
+                            ),
+                            center = Offset(cx2, cy2),
+                            radius = size.maxDimension * 0.60f
+                        )
+                    )
+                }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                // 顶部标题与角标
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        modifier = Modifier.weight(1f, fill = false)
+                    ) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            tint = iconColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = title,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Color.White.copy(alpha = 0.18f)
+                    ) {
+                        Text(
+                            text = badgeText,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color.White.copy(alpha = 0.90f),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
+                // 卡片主体与底部内容
+                content()
+            }
+        }
+    }
+}
+
+/**
+ * 发现页动态液态光影小长方形卡片 (如私人漫游、换一批，专为小长方形定制的横向布局，支持播放中动态音波动画)
+ */
+@Composable
+private fun DiscoverLiquidSmallCard(
+    modifier: Modifier = Modifier,
+    title: String,
+    subtitle: String,
+    badgeText: String,
+    icon: ImageVector,
+    iconColor: Color,
+    trailingIcon: ImageVector,
+    isCurrentlyPlaying: Boolean = false,
+    gradientColors: List<Color>,
+    glowColor: Color,
+    secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
+    shape: RoundedCornerShape = RoundedCornerShape(16.dp),
+    onClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "small_liquid_light")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 7500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+    val rad2 = rad1 + Math.PI.toFloat()
+
+    val cosP = kotlin.math.cos(rad1)
+    val sinP = kotlin.math.sin(rad1)
+
+    Surface(
+        shape = shape,
+        color = Color.Transparent,
+        border = BorderStroke(
+            width = 1.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    glowColor.copy(alpha = 0.85f),
+                    Color.White.copy(alpha = 0.45f),
+                    glowColor.copy(alpha = 0.20f),
+                    glowColor.copy(alpha = 0.85f)
+                ),
+                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+            )
+        ),
+        shadowElevation = 3.dp,
+        modifier = modifier
+            .clip(shape)
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(colors = gradientColors))
+                .drawBehind {
+                    val w = size.width
+                    val h = size.height
+
+                    val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
+                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
+                    val p1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.55f, rad1)
+                    drawPath(
+                        path = p1,
+                        brush = Brush.radialGradient(
+                            colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
+                            center = Offset(cx1, cy1),
+                            radius = size.maxDimension * 0.70f
+                        )
+                    )
+
+                    val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
+                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
+                    val p2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
+                    drawPath(
+                        path = p2,
+                        brush = Brush.radialGradient(
+                            colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
+                            center = Offset(cx2, cy2),
+                            radius = size.maxDimension * 0.55f
+                        )
+                    )
+                }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = Color.White.copy(alpha = 0.20f),
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                tint = iconColor,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = title,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color.White.copy(alpha = 0.20f)
+                            ) {
+                                Text(
+                                    text = badgeText,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White.copy(alpha = 0.92f),
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = subtitle,
+                            fontSize = 10.sp,
+                            color = Color.White.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                if (isCurrentlyPlaying) {
+                    com.lm.player.core.designsystem.component.NowPlayingWaveIndicator(
+                        isPlaying = true,
+                        color = Color.White
+                    )
+                } else {
+                    Icon(
+                        imageVector = trailingIcon,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.85f),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
 

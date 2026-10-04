@@ -9,9 +9,17 @@ import kotlinx.coroutines.withContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -35,12 +43,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -71,6 +82,9 @@ import kotlinx.coroutines.launch
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
+    // 「我喜欢的音乐」的数据源由宿主注入：在线模式=服务器收藏，本地/已下载模式=服务器收藏 ∩ 已下载。
+    // 为空时回落到 allSongs.filter { isFavorite }，保证断网等异常场景下收藏卡片不会整块消失。
+    favoriteSongs: List<UnifiedSong> = emptyList(),
     downloadedSongs: List<UnifiedSong> = emptyList(),
     recentlyPlayedSongs: List<UnifiedSong> = emptyList(),
     recentlyAddedSongs: List<UnifiedSong> = emptyList(),
@@ -117,6 +131,7 @@ fun LocalLibraryScreen(
     val coroutineScope = rememberCoroutineScope()
     val dimensions = LocalAppDimensions.current
     val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val isLandscape = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
     val isCompactHeader = screenWidthDp < 390
     val isUltraCompactHeader = screenWidthDp < 350
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
@@ -211,7 +226,7 @@ fun LocalLibraryScreen(
         if (downloadedSongs.isNotEmpty()) {
             downloadedSongs
         } else {
-            allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || (!it.localFilePath.isNullOrBlank() && File(it.localFilePath).exists()) }
+            allSongs.filter { !it.localFilePath.isNullOrBlank() && (it.localFilePath!!.startsWith("content://") || File(it.localFilePath!!).exists()) }
         }
     }
     var isDownloadManagementMode by remember { mutableStateOf(false) }
@@ -226,8 +241,11 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源
-    val favSongs = remember(allSongs) { allSongs.filter { it.isFavorite } }
+    // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源。
+    // 优先用宿主注入的服务器收藏口径，只有宿主拿不到时才退回本地 isFavorite 标记。
+    val favSongs = remember(allSongs, favoriteSongs) {
+        if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }
+    }
 
     // 我喜欢的音乐下钻视图联动刷新。
     // 此前下钻视图只在点击卡片那一刻快照一次，已经进入列表后再点「喜欢」，
@@ -326,6 +344,146 @@ fun LocalLibraryScreen(
                     newestByAlbumId[it.id] ?: newestByAlbumTitle[it.title] ?: 0L
                 }.thenByDescending { it.songCount }
             )
+        }
+    }
+
+    // 歌单排序：最新加入数据的歌单在最前，依次递减显示
+    val sortedPlaylists = remember(playlists) {
+        playlists.sortedByDescending { it.updatedTimestamp }
+    }
+
+    // 动态提取/加载歌单内部歌曲图片 (前 4 首) 用于 4 格子展示
+    val localPlaylistCovers by produceState<Map<String, List<String>>>(
+        initialValue = emptyMap(),
+        key1 = sortedPlaylists,
+        key2 = allSongs
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
+            val map = HashMap<String, List<String>>()
+            for (pl in sortedPlaylists) {
+                val covers = ArrayList<String>()
+
+                // 1. 如果已有 previewCovers，先放入
+                if (pl.previewCovers.isNotEmpty()) {
+                    for (c in pl.previewCovers) {
+                        if (c.isNotBlank() && !covers.contains(c) && covers.size < 4) {
+                            covers.add(c)
+                        }
+                    }
+                }
+
+                // 2. 如果 coverUrl 包含多张 "|" 切割的图片
+                if (covers.size < 4 && pl.coverUrl.contains("|")) {
+                    for (c in pl.coverUrl.split("|")) {
+                        val tc = c.trim()
+                        if (tc.isNotBlank() && !covers.contains(tc) && covers.size < 4) {
+                            covers.add(tc)
+                        }
+                    }
+                }
+
+                // 3. 查本地数据库 playlist_songs 关联的封面与音频文件
+                if (covers.size < 4) {
+                    val dbCovers = db.playlistDao().getPlaylistCoverUrls(pl.id)
+                    for (c in dbCovers) {
+                        if (c.isNotBlank() && !covers.contains(c) && covers.size < 4) {
+                            covers.add(c)
+                        }
+                    }
+                }
+
+                // 4. 若仍不足 4 首，遍历歌单内具体歌曲，并核查 allSongs 或歌曲所在文件夹 cover/folder 图片
+                if (covers.size < 4) {
+                    val plSongs = db.playlistDao().getSongsForPlaylist(pl.id)
+                    for (s in plSongs) {
+                        if (covers.size >= 4) break
+                        var c = s.coverUrl
+                        if (c.isNullOrBlank()) {
+                            val matched = allSongs.firstOrNull { it.id == s.id || (s.localFilePath != null && it.localFilePath == s.localFilePath) }
+                            c = matched?.coverUrl ?: ""
+                        }
+                        if (c.isNullOrBlank() && !s.localFilePath.isNullOrBlank()) {
+                            try {
+                                val parent = java.io.File(s.localFilePath).parentFile
+                                if (parent != null && parent.exists() && parent.isDirectory) {
+                                    val files = parent.listFiles { f ->
+                                        val ext = f.extension.lowercase()
+                                        ext in listOf("jpg", "jpeg", "png", "webp")
+                                    }
+                                    val targetImg = files?.firstOrNull {
+                                        val name = it.nameWithoutExtension.lowercase()
+                                        name in listOf("cover", "folder", "front", "album", "artwork")
+                                    } ?: files?.firstOrNull()
+                                    if (targetImg != null) {
+                                        c = android.net.Uri.fromFile(targetImg).toString()
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        if (!c.isNullOrBlank() && !covers.contains(c)) {
+                            covers.add(c)
+                        }
+                    }
+                }
+
+                // 5. 模糊对齐本地 allSongs 中同名专辑或同名文件夹的歌曲封面
+                if (covers.size < 4) {
+                    val matchedFromAll = allSongs.filter {
+                        it.album.equals(pl.name, ignoreCase = true) ||
+                        (!it.relativeFolderPath.isNullOrBlank() && (it.relativeFolderPath == pl.name || it.relativeFolderPath.endsWith("/${pl.name}")))
+                    }
+                    for (s in matchedFromAll) {
+                        if (covers.size >= 4) break
+                        val c = s.coverUrl
+                        if (!c.isNullOrBlank() && !covers.contains(c)) {
+                            covers.add(c)
+                        } else if (!s.localFilePath.isNullOrBlank()) {
+                            try {
+                                val parent = java.io.File(s.localFilePath).parentFile
+                                if (parent != null && parent.exists() && parent.isDirectory) {
+                                    val files = parent.listFiles { f ->
+                                        val ext = f.extension.lowercase()
+                                        ext in listOf("jpg", "jpeg", "png", "webp")
+                                    }
+                                    val targetImg = files?.firstOrNull {
+                                        val name = it.nameWithoutExtension.lowercase()
+                                        name in listOf("cover", "folder", "front", "album", "artwork")
+                                    } ?: files?.firstOrNull()
+                                    if (targetImg != null) {
+                                        val uri = android.net.Uri.fromFile(targetImg).toString()
+                                        if (!covers.contains(uri)) covers.add(uri)
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+
+                // 6. 如果是云端歌单且仍不足 4 首，可轻量异步拉取一次歌单歌曲
+                if (covers.size < 4 && pl.isOnline && onFetchPlaylistSongs != null) {
+                    try {
+                        val fetched = onFetchPlaylistSongs(pl.id, true)
+                        for (s in fetched) {
+                            if (covers.size >= 4) break
+                            val c = s.coverUrl
+                            if (!c.isNullOrBlank() && !covers.contains(c)) {
+                                covers.add(c)
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                // 7. 回退 fallbackCoverUrl
+                if (covers.isEmpty() && pl.coverUrl.isNotBlank() && !pl.coverUrl.contains("|")) {
+                    covers.add(pl.coverUrl)
+                }
+
+                if (covers.isNotEmpty()) {
+                    map[pl.id] = covers.take(4)
+                }
+            }
+            map
         }
     }
 
@@ -504,11 +662,9 @@ fun LocalLibraryScreen(
                     activeSubViewTitle = null
                     delay(80)
                 }
-                var headerCount = 4 // Header + 歌单 + 音乐风格 + 全部歌曲标题栏
+                var headerCount = 4 // Header + Bento卡片 + 歌单 + 全部歌曲标题栏
                 if (recentAddedSongs.isNotEmpty()) headerCount++
                 if (localFolders.isNotEmpty()) headerCount++
-                if (artists.isNotEmpty()) headerCount++
-                if (albums.isNotEmpty()) headerCount++
                 runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
             } else if (subIdx >= 0 && lastSubViewTitle != null) {
                 activeSubViewTitle = lastSubViewTitle
@@ -626,92 +782,482 @@ fun LocalLibraryScreen(
                                 )
                             }
                         }
+                    }
+                }
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                // ==================== 1.5 核心入口流光卡片 (动态液态光影设计) ====================
+                item(key = "lib_top_bento_cards") {
+                    val topAlbum = albums.firstOrNull()
 
-                        // 柠檬服务端扫描与曲库概览卡片 (对标柠檬音乐 Library.vue 的 library-scan-summary)
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = surfaceColor,
-                            border = BorderStroke(1.dp, borderColor),
-                            modifier = Modifier.fillMaxWidth()
+                    @Composable
+                    fun ServerStatusCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidCard(
+                            modifier = cardModifier,
+                            gradientColors = if (isServerOk) listOf(Color(0xFF133624), Color(0xFF0A1F15)) else listOf(Color(0xFF332410), Color(0xFF1C1308)),
+                            glowColor = if (isServerOk) Color(0xFF34C759) else Color(0xFFFF9500),
+                            secondaryGlowColor = if (isServerOk) Color(0xFF30D158) else Color(0xFFFFB340),
+                            onClick = {
+                                val active = configuredServers.firstOrNull { it.isCurrentActive } ?: configuredServers.firstOrNull()
+                                if (active != null) onSelectServer(active) else onGoToSettings()
+                            }
                         ) {
+                            // 顶部图标与状态
                             Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.weight(1f)
+                                Surface(
+                                    shape = CircleShape,
+                                    color = Color.White.copy(alpha = 0.22f),
+                                    modifier = Modifier.size(34.dp)
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .clip(CircleShape)
-                                            .background(if (serverScanStatus?.isScanning == true) AppleRed else Color(0xFF4CAF50))
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column {
-                                        Text(
-                                            text = if (isServerOk) {
-                                                if (serverScanStatus?.isScanning == true) {
-                                                    "服务端正在扫描曲库 (${serverScanStatus?.cachedCount ?: 0} / ${serverScanStatus?.total ?: 0})"
-                                                } else {
-                                                    "已连接柠檬音乐 · 共 ${allSongs.size} 首歌曲"
-                                                }
-                                            } else {
-                                                "本地离线曲库 · 共 ${allSongs.size} 首歌曲"
-                                            },
-                                            fontSize = dimensions.bodySize,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Text(
-                                            text = "${playlists.size} 个歌单 · ${artists.size} 位歌手 · ${albums.size} 张专辑",
-                                            fontSize = dimensions.captionSize,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = if (isServerOk) Icons.Default.CloudDone else Icons.Default.FolderSpecial,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(18.dp)
                                         )
                                     }
                                 }
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = Color.White.copy(alpha = 0.20f)
+                                ) {
+                                    Text(
+                                        text = if (isServerOk) "云端服务" else "本地离线",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
 
-                                if (isServerOk && onTriggerServerScan != null) {
-                                    TextButton(
-                                        onClick = {
-                                            coroutineScope.launch {
-                                                isTriggeringScan = true
-                                                onTriggerServerScan()
-                                                Toast.makeText(context, "已触发柠檬服务器后台扫描与刮削", Toast.LENGTH_SHORT).show()
-                                                delay(1000L)
-                                                isTriggeringScan = false
+                            // 中间服务名与曲库概览
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = if (isServerOk) currentServerName else "本地离线曲库",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (isServerOk) "全库 ${allSongs.size} 首 · 已存 ${finalDownloadedSongs.size} 首" else "本地共 ${allSongs.size} 首歌曲",
+                                    fontSize = 10.sp,
+                                    color = Color.White.copy(alpha = 0.82f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            // 底部快捷操作微胶囊 (同步 / 模式切换)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isServerOk) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = Color.White.copy(alpha = 0.18f),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { onSyncNow() }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                        ) {
+                                            Icon(Icons.Default.Sync, contentDescription = null, tint = Color(0xFFFFC947), modifier = Modifier.size(11.dp))
+                                            Text("同步", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                        }
+                                    }
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = Color.White.copy(alpha = 0.18f),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable {
+                                            if (isServerOk) onSelectLocalServer() else {
+                                                val active = configuredServers.firstOrNull { it.isCurrentActive } ?: configuredServers.firstOrNull()
+                                                if (active != null) onSelectServer(active) else onGoToSettings()
                                             }
-                                        },
-                                        enabled = !isTriggeringScan,
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Default.Refresh,
-                                            contentDescription = "扫描",
-                                            tint = AppleRed,
-                                            modifier = Modifier.size(14.dp)
+                                            imageVector = if (isServerOk) Icons.Default.Storage else Icons.Default.CloudQueue,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(11.dp)
                                         )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            text = if (isTriggeringScan) "请求中" else "刷新库",
-                                            fontSize = dimensions.captionSize,
-                                            color = AppleRed,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        Text(if (isServerOk) "切本地" else "连服务", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
                                     }
                                 }
                             }
                         }
                     }
+
+                    @Composable
+                    fun RecentAlbumCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidCard(
+                            modifier = cardModifier,
+                            gradientColors = listOf(Color(0xFF5A250D), Color(0xFF2E1005)),
+                            glowColor = Color(0xFFFF7A45),
+                            secondaryGlowColor = Color(0xFFFFD200),
+                            onClick = {
+                                isFromAllAlbums = false
+                                activeSubViewTitle = "全部专辑"
+                                activeSubViewSubtitle = "共 ${albums.size} 张专辑"
+                                activeSubViewSongs = allSongs
+                            }
+                        ) {
+                            // 顶部图标与专辑计数
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = Color.White.copy(alpha = 0.22f),
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Default.Album,
+                                            contentDescription = null,
+                                            tint = Color(0xFFFF9500),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = Color.White.copy(alpha = 0.20f)
+                                ) {
+                                    Text(
+                                        text = "共 ${albums.size} 张",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+
+                            // 中间封面与专辑信息
+                            if (topAlbum != null) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    AlbumArtworkImage(
+                                        model = topAlbum.coverUrl,
+                                        seedId = topAlbum.title,
+                                        modifier = Modifier.size(36.dp),
+                                        cornerRadius = 8.dp
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = topAlbum.title,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = topAlbum.artist,
+                                            fontSize = 10.sp,
+                                            color = Color.White.copy(alpha = 0.75f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        text = "最近专辑",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "精选数字专辑集锦",
+                                        fontSize = 10.sp,
+                                        color = Color.White.copy(alpha = 0.82f)
+                                    )
+                                }
+                            }
+
+                            // 底部全览引导
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "查看全部专辑",
+                                    fontSize = 10.sp,
+                                    color = Color.White.copy(alpha = 0.75f)
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.ChevronRight,
+                                    contentDescription = null,
+                                    tint = Color.White.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    @Composable
+                    fun FavoriteSongsCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidCard(
+                            modifier = cardModifier,
+                            gradientColors = listOf(Color(0xFFDC2626), Color(0xFF7F1D1D)),
+                            glowColor = Color(0xFFFF4D4D),
+                            onClick = {
+                                isFromAllPlaylists = false
+                                activeSubViewTitle = "我喜欢的音乐"
+                                activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
+                                activeSubViewSongs = favSongs
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = Color.White.copy(alpha = 0.22f),
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Default.Favorite,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                                if (favSongs.isNotEmpty()) {
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = Color.White.copy(alpha = 0.28f),
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(CircleShape)
+                                            .clickable {
+                                                onSongClick(favSongs.first(), favSongs)
+                                            }
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(
+                                                imageVector = Icons.Default.PlayArrow,
+                                                contentDescription = "播放",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "我喜欢的音乐",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${favSongs.size} 首专属珍藏",
+                                    fontSize = 11.sp,
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    @Composable
+                    fun AllSongsCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidSmallCard(
+                            modifier = cardModifier,
+                            title = "全部歌曲",
+                            subtitle = "${filteredSongs.size} 首资料库曲目",
+                            badgeText = if (isTriggeringScan || serverScanStatus?.isScanning == true) "扫描中" else "全库",
+                            icon = Icons.Default.MusicNote,
+                            iconColor = Color(0xFF60A5FA),
+                            gradientColors = listOf(Color(0xFF2563EB), Color(0xFF1E3A8A)),
+                            glowColor = Color(0xFF60A5FA),
+                            onClick = {
+                                activeSubViewTitle = "全部歌曲"
+                                activeSubViewSubtitle = "资料库曲目 · 共 ${filteredSongs.size} 首"
+                                activeSubViewSongs = filteredSongs
+                            }
+                        )
+                    }
+
+                    @Composable
+                    fun DownloadedSongsCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidSmallCard(
+                            modifier = cardModifier,
+                            title = "已下载",
+                            subtitle = "${finalDownloadedSongs.size} 首本机离线",
+                            badgeText = "离线",
+                            icon = Icons.Default.FileDownload,
+                            iconColor = Color(0xFF34D399),
+                            gradientColors = listOf(Color(0xFF047857), Color(0xFF064E3B)),
+                            glowColor = Color(0xFF34D399),
+                            onClick = {
+                                isFromAllPlaylists = false
+                                activeSubViewTitle = "本地下载"
+                                activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
+                                activeSubViewSongs = finalDownloadedSongs
+                                isDownloadManagementMode = false
+                                selectedDownloadSongIds.clear()
+                            }
+                        )
+                    }
+
+                    @Composable
+                    fun RecentPlaySongsCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidSmallCard(
+                            modifier = cardModifier,
+                            title = "最近播放",
+                            subtitle = "${recentPlaySongs.size} 首聆听足迹",
+                            badgeText = "历史",
+                            icon = Icons.Default.History,
+                            iconColor = Color(0xFFA78BFA),
+                            gradientColors = listOf(Color(0xFF6D28D9), Color(0xFF4C1D95)),
+                            glowColor = Color(0xFFA78BFA),
+                            onClick = {
+                                isFromAllPlaylists = false
+                                activeSubViewTitle = "最近播放"
+                                activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentPlaySongs.size} 首"
+                                activeSubViewSongs = recentPlaySongs
+                                isDownloadManagementMode = false
+                                selectedDownloadSongIds.clear()
+                            }
+                        )
+                    }
+
+                    @Composable
+                    fun ArtistsCard(cardModifier: Modifier = Modifier) {
+                        LibraryLiquidSmallCard(
+                            modifier = cardModifier,
+                            title = "歌手",
+                            subtitle = "${artists.size} 位唱作歌手",
+                            badgeText = "专栏",
+                            icon = Icons.Default.Person,
+                            iconColor = Color(0xFFFBBF24),
+                            gradientColors = listOf(Color(0xFFD97706), Color(0xFF78350F)),
+                            glowColor = Color(0xFFFBBF24),
+                            onClick = {
+                                isFromAllArtists = false
+                                activeSubViewTitle = "全部歌手"
+                                activeSubViewSubtitle = "共 ${artists.size} 位歌手"
+                                activeSubViewSongs = allSongs
+                            }
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (isLandscape) {
+                            // 横屏模式：优化卡片高度，避免 1:1 aspectRatio 在横向大宽度下撑得巨大
+                            // 第一行：3 张卡片【在线服务状态】 + 【最近专辑】 + 【我喜欢的音乐】
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(125.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                ServerStatusCard(Modifier.weight(1f).fillMaxHeight())
+                                RecentAlbumCard(Modifier.weight(1f).fillMaxHeight())
+                                FavoriteSongsCard(Modifier.weight(1f).fillMaxHeight())
+                            }
+                            // 第二行：4 张小长方形卡片【全部歌曲】 + 【已下载】 + 【最近播放】 + 【歌手】
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(68.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                AllSongsCard(Modifier.weight(1f).fillMaxHeight())
+                                DownloadedSongsCard(Modifier.weight(1f).fillMaxHeight())
+                                RecentPlaySongsCard(Modifier.weight(1f).fillMaxHeight())
+                                ArtistsCard(Modifier.weight(1f).fillMaxHeight())
+                            }
+                        } else {
+                            // 竖屏模式：固定高度 154.dp（替代 aspectRatio(1f)），杜绝宽屏下过高
+                            // 第一行：2 张卡片【在线服务状态】 + 【最近专辑】
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(154.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                ServerStatusCard(Modifier.weight(1f).fillMaxHeight())
+                                RecentAlbumCard(Modifier.weight(1f).fillMaxHeight())
+                            }
+                            // 第二行：【我喜欢的音乐】 + 【全部歌曲】与【已下载】
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(154.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                FavoriteSongsCard(Modifier.weight(1f).fillMaxHeight())
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight(),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    AllSongsCard(Modifier.fillMaxWidth().weight(1f))
+                                    DownloadedSongsCard(Modifier.fillMaxWidth().weight(1f))
+                                }
+                            }
+                            // 第三行：2 张小长方形卡片【最近播放】 + 【歌手】
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(73.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                RecentPlaySongsCard(Modifier.weight(1f).fillMaxHeight())
+                                ArtistsCard(Modifier.weight(1f).fillMaxHeight())
+                            }
+                        }
+                    }
                 }
 
-                // 2. 【歌单】板块 (Playlists Horizontal Row)
+                // 2. 【自建与云端歌单】板块 (Playlists Horizontal Row)
                 item {
                     Column {
                         Row(
@@ -720,7 +1266,7 @@ fun LocalLibraryScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "歌单",
+                                text = "自建与云端歌单",
                                 fontSize = dimensions.sectionTitleSize,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onBackground
@@ -743,13 +1289,13 @@ fun LocalLibraryScreen(
                                     }
                                 }
                                 Text(
-                                    text = "全部 ${playlists.size + 3} 个",
+                                    text = "全部 ${playlists.size} 个",
                                     fontSize = dimensions.captionSize,
                                     fontWeight = FontWeight.Medium,
                                     color = AppleRed,
                                     modifier = Modifier.clickable {
                                         activeSubViewTitle = "全部歌单"
-                                        activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
+                                        activeSubViewSubtitle = "共 ${playlists.size} 个歌单"
                                         isFromAllPlaylists = false
                                     }
                                 )
@@ -762,69 +1308,11 @@ fun LocalLibraryScreen(
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
                             contentPadding = PaddingValues(horizontal = 2.dp)
                         ) {
-                            // A. 新建歌单快捷卡片 (突出展示自建歌单入口)
-                            item {
-                                CreatePlaylistActionCard(
-                                    onClick = { isCreatePlaylistDialogOpen = true }
-                                )
-                            }
-
-                            // B. 我喜欢的音乐 (Favorites Card)
-                            item {
-                                PlaylistSpecialCard(
-                                    title = "我喜欢的音乐",
-                                    subtitle = "${favSongs.size} 首歌曲",
-                                    icon = Icons.Default.Favorite,
-                                    gradient = listOf(Color(0xFFFA233B), Color(0xFFFF5E3A)),
-                                    onClick = {
-                                        isFromAllPlaylists = false
-                                        activeSubViewTitle = "我喜欢的音乐"
-                                        activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
-                                        activeSubViewSongs = favSongs
-                                    }
-                                )
-                            }
-
-                            // C. 最近播放 (Recent Card)
-                            item {
-                                PlaylistSpecialCard(
-                                    title = "最近播放",
-                                    subtitle = "${recentPlaySongs.size} 首歌曲",
-                                    icon = Icons.Default.History,
-                                    gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
-                                    onClick = {
-                                        isFromAllPlaylists = false
-                                        activeSubViewTitle = "最近播放"
-                                        activeSubViewSubtitle = "最近聆听足迹 · 共 ${recentPlaySongs.size} 首"
-                                        activeSubViewSongs = recentPlaySongs
-                                        isDownloadManagementMode = false
-                                        selectedDownloadSongIds.clear()
-                                    }
-                                )
-                            }
-
-                            // D. 本地下载 (Downloaded Folder Card)
-                            item {
-                                PlaylistSpecialCard(
-                                    title = "本地下载",
-                                    subtitle = "${finalDownloadedSongs.size} 首歌曲",
-                                    icon = Icons.Default.Folder,
-                                    gradient = listOf(Color(0xFF007AFF), Color(0xFF5AC8FA)),
-                                    onClick = {
-                                        isFromAllPlaylists = false
-                                        activeSubViewTitle = "本地下载"
-                                        activeSubViewSubtitle = "本机离线歌曲 · 共 ${finalDownloadedSongs.size} 首"
-                                        activeSubViewSongs = finalDownloadedSongs
-                                        isDownloadManagementMode = false
-                                        selectedDownloadSongIds.clear()
-                                    }
-                                )
-                            }
-
-                            // D. 自建与服务端歌单 (Custom & Server Playlists)
-                            items(playlists, key = { it.id }) { pl ->
+                            // A. 自建与服务端歌单（最新加入数据的歌单在最前，依次递减显示）
+                            items(sortedPlaylists, key = { it.id }) { pl ->
                                 PlaylistCardItem(
                                     playlist = pl,
+                                    covers = localPlaylistCovers[pl.id] ?: pl.previewCovers,
                                     onClick = {
                                         isFromAllPlaylists = false
                                         activeSubViewTitle = pl.name
@@ -839,6 +1327,13 @@ fun LocalLibraryScreen(
                                             activeSubViewSongs = allSongs.filter { it.album == pl.name }
                                         }
                                     }
+                                )
+                            }
+
+                            // B. 新建歌单快捷卡片 (放置在最后面)
+                            item {
+                                CreatePlaylistActionCard(
+                                    onClick = { isCreatePlaylistDialogOpen = true }
                                 )
                             }
                         }
@@ -941,243 +1436,7 @@ fun LocalLibraryScreen(
                     }
                 }
 
-                // 4. 【音乐风格】板块 (Genres Flow)
-                item {
-                    Column {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "音乐风格",
-                                fontSize = dimensions.sectionTitleSize,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onBackground
-                            )
-                        }
 
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        val displayGenres = remember(serverGenres, defaultGenres) {
-                            if (serverGenres.isNotEmpty()) {
-                                serverGenres.map { it.name to it.trackCount }
-                            } else {
-                                defaultGenres.map { it to 0 }
-                            }
-                        }
-
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            contentPadding = PaddingValues(horizontal = 2.dp)
-                        ) {
-                            items(displayGenres, key = { it.first }) { (genreName, count) ->
-                                Surface(
-                                    shape = RoundedCornerShape(16.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                                    border = BorderStroke(1.dp, borderColor),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(16.dp))
-                                        .clickable {
-                                            isFromAllPlaylists = false
-                                            isFromAllFolders = false
-                                            isFromAllArtists = false
-                                            isFromAllAlbums = false
-                                            activeSubViewTitle = "风格 · $genreName"
-                                            activeSubViewSubtitle = if (count > 0) "共 $count 首歌曲" else "精选曲目流"
-                                            activeSubViewSongs = allSongs.filter {
-                                                it.title.contains(genreName, ignoreCase = true) ||
-                                                it.artist.contains(genreName, ignoreCase = true) ||
-                                                it.album.contains(genreName, ignoreCase = true) ||
-                                                it.relativeFolderPath?.contains(genreName, ignoreCase = true) == true
-                                            }.ifEmpty { allSongs.shuffled().take(20) }
-                                        }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = if (count > 0) "$genreName · $count" else genreName,
-                                            fontSize = dimensions.captionSize,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Icon(
-                                            imageVector = Icons.Default.PlayArrow,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(12.dp),
-                                            tint = AppleRed
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 4. 【歌手】板块 (Artists Row)
-                if (artists.isNotEmpty()) {
-                    item {
-                        Column {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "歌手",
-                                    fontSize = dimensions.sectionTitleSize,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onBackground
-                                )
-                                Text(
-                                    text = "全部 ${artists.size} 位",
-                                    fontSize = dimensions.captionSize,
-                                    fontWeight = FontWeight.Medium,
-                                    color = AppleRed,
-                                    modifier = Modifier.clickable {
-                                        isFromAllArtists = false
-                                        activeSubViewTitle = "全部歌手"
-                                        activeSubViewSubtitle = "共 ${artists.size} 位歌手"
-                                        activeSubViewSongs = allSongs
-                                    }
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                contentPadding = PaddingValues(horizontal = 2.dp)
-                            ) {
-                                items(artists.take(15), key = { it.id }) { artist ->
-                                    Surface(
-                                        shape = RoundedCornerShape(18.dp),
-                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                                        border = BorderStroke(1.dp, borderColor),
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(18.dp))
-                                            .clickable {
-                                                val artistSongs = allSongs.filter { it.artist == artist.name }
-                                                isFromAllArtists = false
-                                                activeSubViewTitle = artist.name
-                                                activeSubViewSubtitle = "歌手专栏 · 共 ${artistSongs.size} 首歌曲"
-                                                activeSubViewSongs = artistSongs
-                                            }
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            AlbumArtworkImage(
-                                                model = artist.avatarUrl,
-                                                seedId = artist.name,
-                                                modifier = Modifier.size(32.dp),
-                                                cornerRadius = 16.dp
-                                            )
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Column {
-                                                Text(
-                                                    text = artist.name,
-                                                    fontSize = dimensions.bodySize,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    color = MaterialTheme.colorScheme.onSurface,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                                Text(
-                                                    text = "${artist.songCount} 首",
-                                                    fontSize = dimensions.captionSize,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 5. 【最近添加专辑】板块 (Albums Row)
-                if (albums.isNotEmpty()) {
-                    item {
-                        Column {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "最近添加专辑",
-                                    fontSize = dimensions.sectionTitleSize,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onBackground
-                                )
-                                Text(
-                                    text = "全部 ${albums.size} 张",
-                                    fontSize = dimensions.captionSize,
-                                    fontWeight = FontWeight.Medium,
-                                    color = AppleRed,
-                                    modifier = Modifier.clickable {
-                                        isFromAllAlbums = false
-                                        activeSubViewTitle = "全部专辑"
-                                        activeSubViewSubtitle = "共 ${albums.size} 张专辑"
-                                        activeSubViewSongs = allSongs
-                                    }
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                contentPadding = PaddingValues(horizontal = 2.dp)
-                            ) {
-                                items(recentAddedAlbums.take(12), key = { it.id }) { album ->
-                                    Column(
-                                        modifier = Modifier
-                                            .width(128.dp)
-                                            .clickable {
-                                                val albumSongs = allSongs.filter { it.album == album.title }
-                                                isFromAllAlbums = false
-                                                activeSubViewTitle = album.title
-                                                activeSubViewSubtitle = "${album.artist} · 共 ${albumSongs.size} 首"
-                                                activeSubViewSongs = albumSongs
-                                            }
-                                    ) {
-                                        AlbumArtworkImage(
-                                            model = album.coverUrl,
-                                            seedId = album.title,
-                                            modifier = Modifier
-                                                .size(128.dp)
-                                                .shadow(2.dp, RoundedCornerShape(12.dp)),
-                                            cornerRadius = 12.dp
-                                        )
-                                        Spacer(modifier = Modifier.height(6.dp))
-                                        Text(
-                                            text = album.title,
-                                            fontSize = dimensions.bodySize,
-                                            fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Text(
-                                            text = album.artist,
-                                            fontSize = dimensions.captionSize,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
 
                 // 6. 【歌曲】板块 (Songs Header & Full List)
                 item {
@@ -1582,17 +1841,7 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        // A. 新建歌单快捷卡片
-                        item {
-                            CreatePlaylistActionCard(
-                                onClick = { isCreatePlaylistDialogOpen = true },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
-                        }
-
-                        // B. 我喜欢的音乐
+                        // A. 我喜欢的音乐
                         item {
                             PlaylistSpecialCard(
                                 title = "我喜欢的音乐",
@@ -1611,7 +1860,7 @@ fun LocalLibraryScreen(
                             )
                         }
 
-                        // C. 最近播放
+                        // B. 最近播放
                         item {
                             PlaylistSpecialCard(
                                 title = "最近播放",
@@ -1632,7 +1881,7 @@ fun LocalLibraryScreen(
                             )
                         }
 
-                        // D. 本地下载
+                        // C. 本地下载
                         item {
                             PlaylistSpecialCard(
                                 title = "本地下载",
@@ -1653,10 +1902,11 @@ fun LocalLibraryScreen(
                             )
                         }
 
-                        // E. 自建与服务端歌单
-                        items(playlists, key = { it.id }) { pl ->
+                        // D. 自建与服务端歌单（最新加入数据的歌单在最前，依次递减显示）
+                        items(sortedPlaylists, key = { it.id }) { pl ->
                             PlaylistCardItem(
                                 playlist = pl,
+                                covers = localPlaylistCovers[pl.id] ?: pl.previewCovers,
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = pl.name
@@ -1672,6 +1922,16 @@ fun LocalLibraryScreen(
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        // E. 新建歌单快捷卡片 (放置在最后面)
+                        item {
+                            CreatePlaylistActionCard(
+                                onClick = { isCreatePlaylistDialogOpen = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(0.85f)
                             )
                         }
                     }
@@ -2210,11 +2470,107 @@ private fun PlaylistSpecialCard(
 }
 
 /**
- * 标准自建/云端歌单卡片
+ * 歌单 4 格子歌曲封面组件 (2x2 展示歌单内部曲目封面，少于 4 张优雅降级)
+ */
+@Composable
+fun PlaylistFourGridCover(
+    covers: List<String>,
+    fallbackCoverUrl: String = "",
+    seedId: String = "",
+    modifier: Modifier = Modifier,
+    cornerRadius: Dp = 14.dp
+) {
+    val validCovers = remember(covers, fallbackCoverUrl) {
+        val list = covers.filter { it.isNotBlank() }.toMutableList()
+        if (list.isEmpty() && fallbackCoverUrl.isNotBlank()) {
+            if (fallbackCoverUrl.contains("|")) {
+                list.addAll(fallbackCoverUrl.split("|").filter { it.isNotBlank() })
+            } else {
+                list.add(fallbackCoverUrl)
+            }
+        }
+        list
+    }
+
+    Surface(
+        shape = RoundedCornerShape(cornerRadius),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        shadowElevation = 3.dp,
+        modifier = modifier
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(cornerRadius))
+    ) {
+        val (c0, c1, c2, c3) = remember(validCovers) {
+            when {
+                validCovers.size >= 4 -> listOf(validCovers[0], validCovers[1], validCovers[2], validCovers[3])
+                validCovers.size == 3 -> listOf(validCovers[0], validCovers[1], validCovers[2], validCovers[0])
+                validCovers.size == 2 -> listOf(validCovers[0], validCovers[1], validCovers[1], validCovers[0])
+                validCovers.size == 1 -> listOf(validCovers[0], validCovers[0], validCovers[0], validCovers[0])
+                else -> listOf("", "", "", "")
+            }
+        }
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    AlbumArtworkImage(
+                        model = c0,
+                        seedId = "${seedId}_0",
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        cornerRadius = 0.dp
+                    )
+                    Spacer(modifier = Modifier.width(1.dp).fillMaxHeight().background(Color.Black.copy(alpha = 0.25f)))
+                    AlbumArtworkImage(
+                        model = c1,
+                        seedId = "${seedId}_1",
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        cornerRadius = 0.dp
+                    )
+                }
+                Spacer(modifier = Modifier.height(1.dp).fillMaxWidth().background(Color.Black.copy(alpha = 0.25f)))
+                Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    AlbumArtworkImage(
+                        model = c2,
+                        seedId = "${seedId}_2",
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        cornerRadius = 0.dp
+                    )
+                    Spacer(modifier = Modifier.width(1.dp).fillMaxHeight().background(Color.Black.copy(alpha = 0.25f)))
+                    AlbumArtworkImage(
+                        model = c3,
+                        seedId = "${seedId}_3",
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        cornerRadius = 0.dp
+                    )
+                }
+            }
+
+            if (validCovers.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.QueueMusic,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.7f),
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 标准自建/云端歌单卡片（4 格子展示歌单歌曲图片）
  */
 @Composable
 private fun PlaylistCardItem(
     playlist: UnifiedPlaylist,
+    covers: List<String> = emptyList(),
     onClick: () -> Unit,
     modifier: Modifier = Modifier.width(136.dp)
 ) {
@@ -2222,13 +2578,16 @@ private fun PlaylistCardItem(
         modifier = modifier
             .clickable(onClick = onClick)
     ) {
-        AlbumArtworkImage(
-            model = playlist.coverUrl,
+        val displayCovers = remember(covers, playlist.previewCovers) {
+            if (covers.isNotEmpty()) covers else playlist.previewCovers
+        }
+        PlaylistFourGridCover(
+            covers = displayCovers,
+            fallbackCoverUrl = playlist.coverUrl,
             seedId = playlist.id,
             modifier = Modifier
                 .aspectRatio(1f)
-                .fillMaxWidth()
-                .shadow(3.dp, RoundedCornerShape(14.dp)),
+                .fillMaxWidth(),
             cornerRadius = 14.dp
         )
         Spacer(modifier = Modifier.height(6.dp))
@@ -2379,5 +2738,314 @@ private fun RecentAddedSongCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+    }
+}
+
+/**
+ * 绘制有机非规则变形液态光斑 Path
+ * 通过 8 点谐波多极波动生成平滑变幻的阿米巴流体波形，告别僵硬圆形旋转
+ */
+private fun buildOrganicLiquidPath(
+    cx: Float,
+    cy: Float,
+    baseRadius: Float,
+    phaseRad: Float,
+    h1: Float = 1.0f,
+    h2: Float = 2.0f,
+    h3: Float = 3.0f
+): Path {
+    val path = Path()
+    val pointsCount = 8
+    val step = (2.0 * Math.PI / pointsCount).toFloat()
+    val pts = ArrayList<Offset>(pointsCount)
+
+    for (i in 0 until pointsCount) {
+        val angle = i * step
+        // phaseRad 乘数均为整数 (1, -1, 2)，保证 phaseRad 在 0 与 2π 时值与一阶导数完全恒等，实现无缝连贯循环
+        val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
+                   0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
+                   0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
+        val r = baseRadius * (1f + wave)
+        val px = cx + r * kotlin.math.cos(angle)
+        val py = cy + r * kotlin.math.sin(angle)
+        pts.add(Offset(px, py))
+    }
+
+    if (pts.isNotEmpty()) {
+        val firstMid = Offset((pts[0].x + pts[1].x) / 2f, (pts[0].y + pts[1].y) / 2f)
+        path.moveTo(firstMid.x, firstMid.y)
+        for (i in 0 until pointsCount) {
+            val pNext = pts[(i + 1) % pointsCount]
+            val pAfterNext = pts[(i + 2) % pointsCount]
+            val mid = Offset((pNext.x + pAfterNext.x) / 2f, (pNext.y + pAfterNext.y) / 2f)
+            path.quadraticBezierTo(pNext.x, pNext.y, mid.x, mid.y)
+        }
+        path.close()
+    }
+    return path
+}
+
+/**
+ * 资料库液态光影流动大卡/正方卡 (非规则阿米巴流体变形光斑 + 渐变边框动画，连贯无缝循环)
+ */
+@Composable
+private fun LibraryLiquidCard(
+    modifier: Modifier = Modifier,
+    gradientColors: List<Color>,
+    glowColor: Color,
+    secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
+    shape: RoundedCornerShape = RoundedCornerShape(18.dp),
+    onClick: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "lib_liquid_light")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 8000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+    val rad2 = rad1 + Math.PI.toFloat()
+
+    val cosP = kotlin.math.cos(rad1)
+    val sinP = kotlin.math.sin(rad1)
+
+    Surface(
+        shape = shape,
+        color = Color.Transparent,
+        border = BorderStroke(
+            width = 1.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    glowColor.copy(alpha = 0.85f),
+                    Color.White.copy(alpha = 0.45f),
+                    glowColor.copy(alpha = 0.20f),
+                    glowColor.copy(alpha = 0.85f)
+                ),
+                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+            )
+        ),
+        shadowElevation = 4.dp,
+        modifier = modifier
+            .clip(shape)
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(gradientColors))
+                .drawBehind {
+                    val w = size.width
+                    val h = size.height
+
+                    val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
+                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
+                    val path1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.60f, rad1)
+                    drawPath(
+                        path = path1,
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                glowColor.copy(alpha = 0.62f),
+                                glowColor.copy(alpha = 0.22f),
+                                Color.Transparent
+                            ),
+                            center = Offset(cx1, cy1),
+                            radius = size.maxDimension * 0.75f
+                        )
+                    )
+
+                    val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
+                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
+                    val path2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
+                    drawPath(
+                        path = path2,
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                secondaryGlowColor.copy(alpha = 0.42f),
+                                secondaryGlowColor.copy(alpha = 0.12f),
+                                Color.Transparent
+                            ),
+                            center = Offset(cx2, cy2),
+                            radius = size.maxDimension * 0.60f
+                        )
+                    )
+                }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+/**
+ * 资料库动态液态光影小长方形卡片 (已下载、全部歌曲、最近播放、歌手，连贯无缝循环)
+ */
+@Composable
+private fun LibraryLiquidSmallCard(
+    modifier: Modifier = Modifier,
+    title: String,
+    subtitle: String,
+    badgeText: String,
+    icon: ImageVector,
+    iconColor: Color,
+    trailingIcon: ImageVector = Icons.Default.ChevronRight,
+    gradientColors: List<Color>,
+    glowColor: Color,
+    secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
+    shape: RoundedCornerShape = RoundedCornerShape(16.dp),
+    onClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "lib_small_liquid")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 7500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+    val rad2 = rad1 + Math.PI.toFloat()
+
+    val cosP = kotlin.math.cos(rad1)
+    val sinP = kotlin.math.sin(rad1)
+
+    Surface(
+        shape = shape,
+        color = Color.Transparent,
+        border = BorderStroke(
+            width = 1.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    glowColor.copy(alpha = 0.85f),
+                    Color.White.copy(alpha = 0.45f),
+                    glowColor.copy(alpha = 0.20f),
+                    glowColor.copy(alpha = 0.85f)
+                ),
+                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+            )
+        ),
+        shadowElevation = 3.dp,
+        modifier = modifier
+            .clip(shape)
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(colors = gradientColors))
+                .drawBehind {
+                    val w = size.width
+                    val h = size.height
+
+                    val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
+                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
+                    val p1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.55f, rad1)
+                    drawPath(
+                        path = p1,
+                        brush = Brush.radialGradient(
+                            colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
+                            center = Offset(cx1, cy1),
+                            radius = size.maxDimension * 0.70f
+                        )
+                    )
+
+                    val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
+                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
+                    val p2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
+                    drawPath(
+                        path = p2,
+                        brush = Brush.radialGradient(
+                            colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
+                            center = Offset(cx2, cy2),
+                            radius = size.maxDimension * 0.55f
+                        )
+                    )
+                }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = Color.White.copy(alpha = 0.20f),
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                tint = iconColor,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = title,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color.White.copy(alpha = 0.20f)
+                            ) {
+                                Text(
+                                    text = badgeText,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White.copy(alpha = 0.92f),
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = subtitle,
+                            fontSize = 10.sp,
+                            color = Color.White.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                Icon(
+                    imageVector = trailingIcon,
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = 0.85f),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
     }
 }

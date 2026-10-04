@@ -633,6 +633,18 @@ class PlaybackService : MediaSessionService() {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
             PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
         } catch (_: Throwable) {}
+        val stopPlaybackOnExit = try {
+            getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                .getBoolean("stop_playback_on_exit", true)
+        } catch (_: Throwable) { true }
+        if (stopPlaybackOnExit) {
+            try {
+                exoPlayer?.stop()
+                exoPlayer?.clearMediaItems()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            } catch (_: Throwable) {}
+        }
         super.onTaskRemoved(rootIntent)
     }
 
