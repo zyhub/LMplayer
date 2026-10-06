@@ -29,12 +29,20 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import androidx.media3.session.CommandButton
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.lm.player.MainActivity
 import com.lm.player.R
+import com.lm.player.core.media.DownloadRequestPlanner
+import com.lm.player.core.model.AudioQuality
+import com.lm.player.core.model.ServerType
+import com.lm.player.core.network.LemonMusicProtocol
+import com.lm.player.core.network.NetworkClientFactory
+import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,6 +51,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
@@ -71,6 +80,7 @@ class PlaybackService : MediaSessionService() {
         const val CMD_TOGGLE = "CMD_TOGGLE"
         const val CMD_NEXT = "CMD_NEXT"
         const val CMD_PREV = "CMD_PREV"
+        const val CMD_FAVORITE = "CMD_FAVORITE"
 
         // 仅在手机端关闭「启用挂后台手机灵动岛」时屏蔽的手机系统通知中心/状态栏胶囊包名（不影响车机桌面与蓝牙播控）
         private val PHONE_SYSTEM_ISLAND_PACKAGES = setOf(
@@ -249,22 +259,30 @@ class PlaybackService : MediaSessionService() {
 
                 override fun seekToNext() {
                     PlaybackQueueManager.playNext(this@PlaybackService)
-                    dispatchBroadcast(CMD_NEXT)
                 }
 
                 override fun seekToNextMediaItem() {
                     PlaybackQueueManager.playNext(this@PlaybackService)
-                    dispatchBroadcast(CMD_NEXT)
                 }
 
                 override fun seekToPrevious() {
                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                    dispatchBroadcast(CMD_PREV)
                 }
 
                 override fun seekToPreviousMediaItem() {
                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                    dispatchBroadcast(CMD_PREV)
+                }
+
+                // 系统媒体控制（通知栏/锁屏/灵动岛）的播放暂停命令由框架直接调到这两个方法，
+                // 统一走 togglePlay（含无媒体项时恢复上次歌曲的逻辑），不再二次广播
+                override fun play() {
+                    val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                    if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
+                }
+
+                override fun pause() {
+                    val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                    if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
                 }
             }
 
@@ -292,6 +310,7 @@ class PlaybackService : MediaSessionService() {
                         .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
                         .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
                         .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
+                        .add(SessionCommand(CMD_FAVORITE, Bundle.EMPTY))
                         .build()
                     val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
                         .add(Player.COMMAND_SEEK_TO_NEXT)
@@ -321,25 +340,51 @@ class PlaybackService : MediaSessionService() {
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
                             PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
                         }
                         CMD_PREV -> {
                             PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
                         }
                         CMD_TOGGLE -> {
                             PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
                         }
                         CMD_PLAY -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PLAY)
                         }
                         CMD_PAUSE -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PAUSE)
+                        }
+                        CMD_FAVORITE -> {
+                            val current = PlaybackQueueManager.currentSongFlow.value
+                            if (current != null) {
+                                val newFav = !current.isFavorite
+                                val updated = current.copy(isFavorite = newFav)
+                                PlaybackQueueManager.updateCurrentSong(updated)
+                                CoroutineScope(Dispatchers.IO).launch {
+                                    try {
+                                        val db = com.lm.player.core.database.ZdsDatabase.getInstance(this@PlaybackService)
+                                        val existing = db.songDao().getSongById(current.id)
+                                        if (existing != null) {
+                                            db.songDao().updateFavorite(current.id, newFav)
+                                        }
+                                        if (newFav) {
+                                            db.playlistDao().addSongToPlaylist(
+                                                com.lm.player.core.database.entity.PlaylistSongEntity(
+                                                    playlistId = "lemon_favorites",
+                                                    songId = current.id
+                                                )
+                                            )
+                                        } else {
+                                            db.playlistDao().removeSongFromPlaylist("lemon_favorites", current.id)
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "CMD_FAVORITE db update failed: ${e.message}")
+                                    }
+                                }
+                                // 与 MainActivity.handleToggleFavorite 对齐：同步服务器收藏 + 可选自动推送到服务器下载
+                                syncFavoriteToServerAndAutoDownload(current, updated, newFav)
+                            }
                         }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -375,7 +420,6 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_NEXT,
                                 KeyEvent.KEYCODE_PAGE_DOWN -> {
                                     PlaybackQueueManager.playNext(this@PlaybackService)
-                                    dispatchBroadcast(CMD_NEXT)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PREVIOUS,
@@ -387,27 +431,23 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
                                 KeyEvent.KEYCODE_PAGE_UP -> {
                                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PREV)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                                 KeyEvent.KEYCODE_HEADSETHOOK,
                                 KeyEvent.KEYCODE_BUTTON_START -> {
                                     PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_TOGGLE)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PLAY)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PAUSE,
                                 KeyEvent.KEYCODE_MEDIA_STOP -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PAUSE)
                                     return true
                                 }
                             }
@@ -422,26 +462,18 @@ class PlaybackService : MediaSessionService() {
                     controllerInfo: MediaSession.ControllerInfo,
                     playerCommand: Int
                 ): Int {
-                    when (playerCommand) {
+                    // 只放行权限，不手动执行：返回 SUCCESS 后 media3 框架会把命令
+                    // 转发给 ForwardingPlayer 的对应方法执行一次。之前在这里手动执行 +
+                    // 发广播，框架又执行一次，广播再触发 MainActivity 接收器执行两次，
+                    // 导致系统媒体控件点一下"下一首"跳 4 首歌
+                    return when (playerCommand) {
                         Player.COMMAND_SEEK_TO_NEXT,
-                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
                         Player.COMMAND_SEEK_TO_PREVIOUS,
-                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
-                            return SessionResult.RESULT_SUCCESS
-                        }
-                        Player.COMMAND_PLAY_PAUSE -> {
-                            PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                        Player.COMMAND_PLAY_PAUSE -> SessionResult.RESULT_SUCCESS
+                        else -> super.onPlayerCommandRequest(session, controllerInfo, playerCommand)
                     }
-                    return super.onPlayerCommandRequest(session, controllerInfo, playerCommand)
                 }
             }
 
@@ -456,6 +488,21 @@ class PlaybackService : MediaSessionService() {
             // 4. 挂载全品牌安卓灵动岛 MediaNotification.Provider 并注册 Session（方向盘与系统媒体控制入口）
             setMediaNotificationProvider(DynamicIslandManager.createMediaNotificationProvider(this))
             addSession(session)
+
+            // 4.5 发布收藏自定义按钮到 MediaSession customLayout —— 系统下拉通知栏媒体卡片
+            // 在 Android 11+ 是根据 MediaSession 的 customLayout 渲染自定义按钮的，
+            // 仅往 Notification.addAction 里塞 PendingIntent 在部分 ROM 上不会显示。
+            publishFavoriteCustomLayout()
+            serviceScope.launch {
+                var lastFavKey: String? = null
+                PlaybackQueueManager.currentSongFlow.collect { song ->
+                    val key = song?.let { it.id + "|" + it.isFavorite }
+                    if (key != lastFavKey) {
+                        lastFavKey = key
+                        publishFavoriteCustomLayout()
+                    }
+                }
+            }
 
             // 5. 发布初始前台通知
             startImmediateForeground()
@@ -588,30 +635,64 @@ class PlaybackService : MediaSessionService() {
 
         isExplicitStopping = false
 
+        // 桌面歌词悬浮窗：开启设置后随播放服务自动恢复显示
+        try {
+            if (DesktopLyricOverlayController.isEnabled(this)) {
+                DesktopLyricOverlayController.show(this)
+            }
+        } catch (_: Throwable) {}
+
         if (intent?.action == ACTION_MEDIA_COMMAND) {
             val cmd = intent.getStringExtra(EXTRA_COMMAND)
             when (cmd) {
                 CMD_NEXT -> {
                     PlaybackQueueManager.playNext(this)
-                    dispatchBroadcast(CMD_NEXT)
                 }
                 CMD_PREV -> {
                     PlaybackQueueManager.playPrevious(this)
-                    dispatchBroadcast(CMD_PREV)
                 }
                 CMD_TOGGLE -> {
                     PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_TOGGLE)
                 }
                 CMD_PLAY -> {
                     val p = Media3Factory.getSharedExoPlayer(this)
                     if (!p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PLAY)
                 }
                 CMD_PAUSE -> {
                     val p = Media3Factory.getSharedExoPlayer(this)
                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PAUSE)
+                }
+                CMD_FAVORITE -> {
+                    val current = PlaybackQueueManager.currentSongFlow.value
+                    if (current != null) {
+                        val newFav = !current.isFavorite
+                        val updated = current.copy(isFavorite = newFav)
+                        PlaybackQueueManager.updateCurrentSong(updated)
+                        CoroutineScope(Dispatchers.IO).launch {
+                            try {
+                                val db = com.lm.player.core.database.ZdsDatabase.getInstance(this@PlaybackService)
+                                val existing = db.songDao().getSongById(current.id)
+                                if (existing != null) {
+                                    db.songDao().updateFavorite(current.id, newFav)
+                                }
+                                if (newFav) {
+                                    db.playlistDao().addSongToPlaylist(
+                                        com.lm.player.core.database.entity.PlaylistSongEntity(
+                                            playlistId = "lemon_favorites",
+                                            songId = current.id
+                                        )
+                                    )
+                                } else {
+                                    db.playlistDao().removeSongFromPlaylist("lemon_favorites", current.id)
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "CMD_FAVORITE db update failed: ${e.message}")
+                            }
+                        }
+                        // 桌面小部件/悬浮歌词与通知栏收藏同一全链路：服务器收藏同步 + 按设置自动推送云端下载
+                        syncFavoriteToServerAndAutoDownload(current, updated, newFav)
+                        updateForegroundNotification(exoPlayer?.isPlaying == true)
+                    }
                 }
             }
             startImmediateForeground()
@@ -622,6 +703,51 @@ class PlaybackService : MediaSessionService() {
         startImmediateForeground()
         super.onStartCommand(intent, flags, startId)
         return START_STICKY
+    }
+
+    /**
+     * 收藏全链路（与 App 内收藏按钮一致）：服务器收藏同步 + 按「favorite_auto_server_download」设置
+     * 自动推送云端下载 + FAVORITES_CHANGED 广播刷新 UI。通知栏、桌面小部件、桌面歌词共用此链路。
+     */
+    private fun syncFavoriteToServerAndAutoDownload(current: com.lm.player.core.model.UnifiedSong, updated: com.lm.player.core.model.UnifiedSong, newFav: Boolean) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val db = com.lm.player.core.database.ZdsDatabase.getInstance(this@PlaybackService)
+                val active = db.serverDao().getAllServers().firstOrNull { it.isCurrentActive && it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+                    ?: db.serverDao().getAllServers().firstOrNull { it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+                if (active != null) {
+                    val proto = com.lm.player.core.network.LemonMusicProtocol(
+                        com.lm.player.core.network.NetworkClientFactory.createOkHttpClient(this@PlaybackService),
+                        active.serverUrl, active.username, active.tokenOrApiKey
+                    )
+                    proto.toggleFavoriteSongOnServer(updated, newFav)
+                    // 收藏已写服务端，通知主界面刷新收藏列表（两个收藏入口共用该 state）
+                    sendBroadcast(android.content.Intent("com.lm.player.action.FAVORITES_CHANGED").setPackage(packageName))
+                    val prefs = this@PlaybackService.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                    if (newFav && prefs.getBoolean("favorite_auto_server_download", false)) {
+                        val favQualityKey = prefs.getString("default_download_quality", com.lm.player.core.model.AudioQuality.Q_320K.key)
+                            ?: com.lm.player.core.model.AudioQuality.Q_320K.key
+                        val favQuality = com.lm.player.core.model.AudioQuality.entries.firstOrNull { it.key == favQualityKey }
+                            ?: com.lm.player.core.model.AudioQuality.Q_320K
+                        val favTask = DownloadRequestPlanner.buildServerDownloadTask(updated, favQuality)
+                        val dlRes = proto.addServerDownloadTasks(listOf(favTask))
+                        if (dlRes.isSuccess) {
+                            try { db.songDao().updateServerId(current.id, "lemon_music") } catch (_: Exception) {}
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(this@PlaybackService, "已同步缓存至服务器: ${updated.title}", Toast.LENGTH_SHORT).show()
+                            }
+                            // 服务器下载需要数秒：延迟再通知刷新一次，让已下载状态及时反映
+                            launch {
+                                kotlinx.coroutines.delay(12000)
+                                sendBroadcast(android.content.Intent("com.lm.player.action.FAVORITES_CHANGED").setPackage(packageName))
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "CMD_FAVORITE server sync failed: ${e.message}")
+            }
+        }
     }
 
     /**
@@ -680,6 +806,31 @@ class PlaybackService : MediaSessionService() {
         )
     }
 
+    /**
+     * 把「收藏」按钮发布到 MediaSession customLayout。
+     * Android 11+ 下拉通知栏/锁屏媒体卡片依据 customLayout 渲染自定义按钮，
+     * 歌曲切换或收藏状态变化时需重新发布以刷新图标（空心/实心心形）。
+     */
+    private fun publishFavoriteCustomLayout() {
+        val session = mediaSession ?: return
+        try {
+            val current = PlaybackQueueManager.currentSongFlow.value
+            val isFav = current?.isFavorite == true
+            val favButton = CommandButton.Builder()
+                .setSessionCommand(SessionCommand(CMD_FAVORITE, Bundle.EMPTY))
+                .setDisplayName(if (isFav) "已收藏" else "收藏")
+                .setIconResId(
+                    if (isFav) R.drawable.ic_notification_favorite_on
+                    else R.drawable.ic_notification_favorite_off
+                )
+                .setExtras(Bundle.EMPTY)
+                .build()
+            session.setCustomLayout(ImmutableList.of(favButton))
+        } catch (e: Throwable) {
+            Log.w(TAG, "publishFavoriteCustomLayout failed: ${e.message}")
+        }
+    }
+
     private fun startImmediateForeground() {
         if (isExplicitStopping) return
         try {
@@ -721,6 +872,7 @@ class PlaybackService : MediaSessionService() {
         try {
             duckRestoreJob?.cancel()
             BackgroundIslandOverlayController.destroy()
+            DesktopLyricOverlayController.hide()
             abandonCarSmartAudioFocus()
             DynamicIslandManager.bindMediaSession(null)
             serviceScope.cancel()

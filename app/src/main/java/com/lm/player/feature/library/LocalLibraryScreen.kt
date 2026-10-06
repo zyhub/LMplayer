@@ -72,7 +72,7 @@ import kotlinx.coroutines.launch
  * 现代轻奢音乐资料库 (对标柠檬音乐 Library.vue 架构重构)
  * 包含：
  * 1. 顶部检索与状态指示条 (快速过滤歌曲/歌手/专辑/歌单、刷新同步、新建歌单)
- * 2. 歌单画廊 (我喜欢的音乐、最近播放、自建与云端歌单)
+ * 2. 歌单画廊 (我的收藏、最近播放、自建与云端歌单)
  * 3. 音乐风格流派 (流派气泡筛选)
  * 4. 歌手胶囊流 (歌手头像、曲目数、即点即播)
  * 5. 专辑矩阵 (最新专辑卡片流)
@@ -82,7 +82,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
-    // 「我喜欢的音乐」的数据源由宿主注入：在线模式=服务器收藏，本地/已下载模式=服务器收藏 ∩ 已下载。
+    // 「我的收藏」的数据源由宿主注入：在线模式=服务器收藏，本地/已下载模式=服务器收藏 ∩ 已下载。
     // 为空时回落到 allSongs.filter { isFavorite }，保证断网等异常场景下收藏卡片不会整块消失。
     favoriteSongs: List<UnifiedSong> = emptyList(),
     downloadedSongs: List<UnifiedSong> = emptyList(),
@@ -96,6 +96,7 @@ fun LocalLibraryScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
     onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
@@ -146,6 +147,7 @@ fun LocalLibraryScreen(
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
     var activeSubViewSubtitle by remember { mutableStateOf<String>("") }
+    var activePlaylistId by remember { mutableStateOf<String?>(null) }
     var lastSubViewTitle by remember { mutableStateOf<String?>(null) }
     var lastSubViewSubtitle by remember { mutableStateOf<String>("") }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
@@ -241,17 +243,17 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源。
+    // 我的收藏实时聚合：卡片计数与下钻视图共用同一份记忆化数据源。
     // 优先用宿主注入的服务器收藏口径，只有宿主拿不到时才退回本地 isFavorite 标记。
     val favSongs = remember(allSongs, favoriteSongs) {
         if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }
     }
 
-    // 我喜欢的音乐下钻视图联动刷新。
+    // 我的收藏下钻视图联动刷新。
     // 此前下钻视图只在点击卡片那一刻快照一次，已经进入列表后再点「喜欢」，
     // 新增的歌曲不会出现 —— 这正是"加入喜欢后没有歌曲"的观感来源。
     LaunchedEffect(favSongs) {
-        if (activeSubViewTitle == "我喜欢的音乐") {
+        if (activeSubViewTitle == "我的收藏") {
             activeSubViewSongs = favSongs
             activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
         }
@@ -505,21 +507,26 @@ fun LocalLibraryScreen(
         } else if (activeSubViewTitle != "全部歌单" && isFromAllPlaylists) {
             activeSubViewTitle = "全部歌单"
             activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
+            activePlaylistId = null
             isFromAllPlaylists = false
         } else if (activeSubViewTitle != "全部文件夹" && isFromAllFolders) {
             activeSubViewTitle = "全部文件夹"
             activeSubViewSubtitle = "共 ${localFolders.size} 个本地文件夹"
+            activePlaylistId = null
             isFromAllFolders = false
         } else if (activeSubViewTitle != "全部歌手" && isFromAllArtists) {
             activeSubViewTitle = "全部歌手"
             activeSubViewSubtitle = "共 ${artists.size} 位歌手"
+            activePlaylistId = null
             isFromAllArtists = false
         } else if (activeSubViewTitle != "全部专辑" && isFromAllAlbums) {
             activeSubViewTitle = "全部专辑"
             activeSubViewSubtitle = "共 ${albums.size} 张专辑"
+            activePlaylistId = null
             isFromAllAlbums = false
         } else {
             activeSubViewTitle = null
+            activePlaylistId = null
             isFromAllPlaylists = false
             isFromAllFolders = false
             isFromAllArtists = false
@@ -656,7 +663,7 @@ fun LocalLibraryScreen(
             val subIdx = activeSubViewSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             val mainIdx = filteredSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             if (activeSubViewTitle != null && !isGridSubView && subIdx >= 0) {
-                runCatching { subViewListState.animateScrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx) }
             } else if (mainIdx >= 0) {
                 if (activeSubViewTitle != null) {
                     activeSubViewTitle = null
@@ -665,12 +672,23 @@ fun LocalLibraryScreen(
                 var headerCount = 4 // Header + Bento卡片 + 歌单 + 全部歌曲标题栏
                 if (recentAddedSongs.isNotEmpty()) headerCount++
                 if (localFolders.isNotEmpty()) headerCount++
-                runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
+                runCatching { libraryListState.scrollToItem(headerCount + mainIdx) }
             } else if (subIdx >= 0 && lastSubViewTitle != null) {
                 activeSubViewTitle = lastSubViewTitle
                 activeSubViewSubtitle = lastSubViewSubtitle
                 delay(80)
-                runCatching { subViewListState.animateScrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx) }
+            }
+        }
+    }
+
+    // 回到列表顶部（与「定位当前歌曲」由悬浮按钮轮换触发）
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            if (activeSubViewTitle != null) {
+                runCatching { subViewListState.scrollToItem(0) }
+            } else {
+                runCatching { libraryListState.scrollToItem(0) }
             }
         }
     }
@@ -1034,7 +1052,7 @@ fun LocalLibraryScreen(
                             glowColor = Color(0xFFFF4D4D),
                             onClick = {
                                 isFromAllPlaylists = false
-                                activeSubViewTitle = "我喜欢的音乐"
+                                activeSubViewTitle = "我的收藏"
                                 activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
                                 activeSubViewSongs = favSongs
                             }
@@ -1083,7 +1101,7 @@ fun LocalLibraryScreen(
 
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(
-                                    text = "我喜欢的音乐",
+                                    text = "我的收藏",
                                     fontSize = 14.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White,
@@ -1190,7 +1208,7 @@ fun LocalLibraryScreen(
                     ) {
                         if (isLandscape) {
                             // 横屏模式：优化卡片高度，避免 1:1 aspectRatio 在横向大宽度下撑得巨大
-                            // 第一行：3 张卡片【在线服务状态】 + 【最近专辑】 + 【我喜欢的音乐】
+                            // 第一行：3 张卡片【在线服务状态】 + 【最近专辑】 + 【我的收藏】
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1225,7 +1243,7 @@ fun LocalLibraryScreen(
                                 ServerStatusCard(Modifier.weight(1f).fillMaxHeight())
                                 RecentAlbumCard(Modifier.weight(1f).fillMaxHeight())
                             }
-                            // 第二行：【我喜欢的音乐】 + 【全部歌曲】与【已下载】
+                            // 第二行：【我的收藏】 + 【全部歌曲】与【已下载】
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1317,6 +1335,7 @@ fun LocalLibraryScreen(
                                         isFromAllPlaylists = false
                                         activeSubViewTitle = pl.name
                                         activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
+                                        activePlaylistId = pl.id
                                         if (onFetchPlaylistSongs != null) {
                                             isLoadingSubView = true
                                             coroutineScope.launch {
@@ -1726,6 +1745,35 @@ fun LocalLibraryScreen(
                                 }
                             }
                         }
+                    } else if (activePlaylistId != null) {
+                        // 自定义歌单：显示删除按钮（同步删除服务端与本地）
+                        var showDeleteConfirm by remember { mutableStateOf(false) }
+                        IconButton(onClick = { showDeleteConfirm = true }) {
+                            Icon(
+                                imageVector = Icons.Default.DeleteOutline,
+                                contentDescription = "删除歌单",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (showDeleteConfirm) {
+                            AlertDialog(
+                                onDismissRequest = { showDeleteConfirm = false },
+                                title = { Text("删除歌单") },
+                                text = { Text("确定要删除「${activeSubViewTitle}」吗？该操作会同时删除云端歌单，且不可恢复。") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        showDeleteConfirm = false
+                                        val plId = activePlaylistId
+                                        activePlaylistId = null
+                                        activeSubViewTitle = null
+                                        if (plId != null) onDeletePlaylist(plId)
+                                    }) { Text("删除", color = Color(0xFFFF3B30)) }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
+                                }
+                            )
+                        }
                     }
                 }
 
@@ -1841,16 +1889,16 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        // A. 我喜欢的音乐
+                        // A. 我的收藏
                         item {
                             PlaylistSpecialCard(
-                                title = "我喜欢的音乐",
+                                title = "我的收藏",
                                 subtitle = "${favSongs.size} 首歌曲",
                                 icon = Icons.Default.Favorite,
                                 gradient = listOf(Color(0xFFFA233B), Color(0xFFFF5E3A)),
                                 onClick = {
                                     isFromAllPlaylists = true
-                                    activeSubViewTitle = "我喜欢的音乐"
+                                    activeSubViewTitle = "我的收藏"
                                     activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
                                     activeSubViewSongs = favSongs
                                 },
@@ -1911,6 +1959,7 @@ fun LocalLibraryScreen(
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = pl.name
                                     activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
+                                    activePlaylistId = pl.id
                                     if (onFetchPlaylistSongs != null) {
                                         isLoadingSubView = true
                                         coroutineScope.launch {
@@ -2414,7 +2463,7 @@ private fun FolderCardItem(
 }
 
 /**
- * 特色歌单卡片 (我喜欢的音乐 / 最近播放)
+ * 特色歌单卡片 (我的收藏 / 最近播放)
  */
 @Composable
 private fun PlaylistSpecialCard(

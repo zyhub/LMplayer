@@ -240,6 +240,94 @@ class PlaybackRouter(
 
         val isOffline = uri.scheme == "file" || uri.scheme == "content"
 
+        // 服务器本地文件流（/api/play/local）：先用 Range 请求探测文件是否仍存在。
+        // 文件已从 NAS 删除时服务端返回 403/404，此时自动回退在线音源，避免 ExoPlayer 报「网络不通」。
+        val isLocalPlayStream = finalStreamUrl.contains("/api/play/local") || finalStreamUrl.contains("/api/stream/local")
+        val isStaleLocalPlay = resolvedLocalPath == null && isLocalPlayStream && withContext(Dispatchers.IO) {
+            try {
+                val probeClient = NetworkClientFactory.createOkHttpClient(context).newBuilder()
+                    .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                val probeReq = okhttp3.Request.Builder()
+                    .url(finalStreamUrl)
+                    .header("Range", "bytes=0-0")
+                    .build()
+                probeClient.newCall(probeReq).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "Local play stream probe failed (${resp.code}) for ${song.title}, will try online fallback")
+                    }
+                    resp.code !in 400..499  // 4xx 视为文件已删；网络异常由 catch 兜底为可达
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Local play stream probe error for ${song.title}: ${e.message}")
+                true  // 网络异常不误回退，交给播放器自身重试与报错
+            }
+        }
+        if (isStaleLocalPlay) {
+            val fallbackOnline = withContext(Dispatchers.IO) {
+                try {
+                    val db = ZdsDatabase.getInstance(context)
+                    val active = db.serverDao().getActiveServer()
+                        ?: db.serverDao().getAllServers().firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                    if (active != null) {
+                        val client = NetworkClientFactory.createOkHttpClient(context)
+                        val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
+                        val allSongs = db.songDao().getAllSongsList()
+                        val onlineMatch = allSongs.firstOrNull { s ->
+                            s.serverId == "lemon_online" && SongMatchingResolver.isSongMatch(
+                                s.title, s.artist, s.durationMs,
+                                song.title, song.artist, song.durationMs,
+                                s.album, song.album
+                            )
+                        }
+                        if (onlineMatch != null) {
+                            val meta = onlineMatch.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
+                            val resolvedStream = protocol.resolveOnlineStreamWithQuality(
+                                songId = onlineMatch.id,
+                                source = onlineMatch.id.removePrefix("lemon_online_").substringBefore("_"),
+                                preferredQuality = LemonMusicProtocol.getPreferredStreamQuality(context),
+                                metaJson = meta,
+                                fallbackTitle = onlineMatch.title,
+                                fallbackArtist = onlineMatch.artist,
+                                refresh = false
+                            ).getOrNull()
+                            if (resolvedStream != null && resolvedStream.url.isNotBlank()) {
+                                Log.i(TAG, "Server file deleted, fallback to online source for ${song.title}")
+                                PlaybackQueueManager.updateCurrentSong(song.copy(
+                                    streamUrl = resolvedStream.url,
+                                    format = resolvedStream.format,
+                                    bitRate = resolvedStream.bitRate
+                                ))
+                                return@withContext resolvedStream.url
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Fallback to online source failed for ${song.title}", e)
+                }
+                null
+            }
+            if (fallbackOnline != null) {
+                return MediaItem.Builder()
+                    .setMediaId(song.id)
+                    .setUri(Uri.parse(fallbackOnline))
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle(song.title)
+                            .setDisplayTitle(song.title)
+                            .setArtist(song.artist)
+                            .setAlbumTitle(song.album)
+                            .setIsBrowsable(false)
+                            .setIsPlayable(true)
+                            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                            .setArtworkUri(if (song.coverUrl.isNotEmpty()) Uri.parse(song.coverUrl) else null)
+                            .build()
+                    )
+                    .build()
+            }
+        }
+
         var cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(song.id)
         if (cachedArtworkBytes == null) {
             try {

@@ -461,6 +461,49 @@ object PlaybackQueueManager {
         }
     }
 
+    /**
+     * 服务器曲目被「彻底删除」（NAS 物理文件已删，曲库记录也消失）时调用：
+     * 从播放队列、最近播放中物理移除；若正在播放的正是被删曲目，自动切到下一首，
+     * 队列空了则停止播放并清空持久化的恢复状态，避免下次启动又把幽灵曲目加载回来。
+     */
+    fun onServerSongsPermanentlyDeleted(songIds: Set<String>, context: Context) {
+        if (songIds.isEmpty()) return
+        val appCtx = context.applicationContext
+        val currentDeleted = _currentSongFlow.value?.id in songIds
+
+        var queueChanged = false
+        val updatedQueue = _playlistFlow.value.filter { it.id !in songIds }
+        if (updatedQueue.size != _playlistFlow.value.size) {
+            _playlistFlow.value = updatedQueue
+            queueChanged = true
+        }
+
+        val updatedRecent = _recentPlayedSongsFlow.value.filter { it.id !in songIds }
+        if (updatedRecent.size != _recentPlayedSongsFlow.value.size) {
+            _recentPlayedSongsFlow.value = updatedRecent
+            flushRecentPlayed(appCtx)
+        }
+
+        if (currentDeleted) {
+            if (updatedQueue.isNotEmpty()) {
+                playNext(appCtx)
+            } else {
+                _currentSongFlow.value = null
+                runCatching { Media3Factory.getSharedExoPlayer(appCtx).stop() }
+                appCtx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE).edit()
+                    .remove("last_played_song_id")
+                    .remove("last_played_song_title")
+                    .remove("last_played_song_artist")
+                    .remove("last_played_song_json")
+                    .remove("last_played_queue_json")
+                    .remove("last_played_position_ms")
+                    .apply()
+            }
+        } else if (queueChanged) {
+            savePlaybackState(commitSync = true)
+        }
+    }
+
     fun updateMetadata(songs: List<UnifiedSong>) {
         if (_playlistFlow.value.isEmpty()) {
             _playlistFlow.value = songs
@@ -508,6 +551,8 @@ object PlaybackQueueManager {
         _currentSongFlow.value = song
         _playlistFlow.value = _playlistFlow.value.map { if (it.id == song.id) song else it }
         savePlaybackState(song = song, commitSync = false)
+        // 收藏状态/元数据变化同步刷新桌面小部件
+        try { appContext?.let { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(it) } } catch (_: Throwable) {}
     }
 
     fun setShuffle(shuffle: Boolean) {
@@ -555,6 +600,8 @@ object PlaybackQueueManager {
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
+                // 播放/暂停状态同步刷新桌面小部件
+                try { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(appCtx) } catch (_: Throwable) {}
                 if (playing) {
                     PlaybackService.startPlaybackService(appCtx)
                     startPeriodicPositionSave(appCtx, player)
@@ -633,6 +680,8 @@ object PlaybackQueueManager {
         ensurePlayerListener(appCtx)
         PlaybackService.startPlaybackService(appCtx)
         _currentSongFlow.value = targetSong
+        // 切歌同步刷新桌面小部件
+        try { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(appCtx) } catch (_: Throwable) {}
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist
         } else if (_playlistFlow.value.isEmpty()) {

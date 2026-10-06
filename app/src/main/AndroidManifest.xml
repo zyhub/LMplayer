@@ -96,6 +96,44 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- 桌面小部件 4x2 -->
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider4x2"
+            android:exported="false"
+            android:label="@string/widget_4x2_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_4x2_info" />
+        </receiver>
+
+        <!-- 桌面小部件 4x1 -->
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider4x1"
+            android:exported="false"
+            android:label="@string/widget_4x1_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_4x1_info" />
+        </receiver>
+
+        <!-- 桌面小部件按钮命令接收器 -->
+        <receiver
+            android:name=".core.widget.MusicWidgetActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.lm.player.action.WIDGET_TOGGLE" />
+                <action android:name="com.lm.player.action.WIDGET_NEXT" />
+                <action android:name="com.lm.player.action.WIDGET_PREV" />
+                <action android:name="com.lm.player.action.WIDGET_FAVORITE" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

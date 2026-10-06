@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg">
+
+    <ImageView
+        android:id="@+id/widget_bg_img"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitXY"
+        android:background="@drawable/widget_bg_clip"
+        android:clipToOutline="true" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <ProgressBar
+            android:id="@+id/widget_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:max="100"
+            android:progress="0"
+            android:progressDrawable="@drawable/widget_progress"
+            android:progressTint="#FA2D48"
+            android:progressBackgroundTint="@color/widget_progress_track" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="10dp"
+            android:paddingTop="2dp"
+            android:paddingBottom="4dp"
+            android:paddingEnd="4dp">
+
+            <ImageView
+                android:id="@+id/widget_cover"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:scaleType="centerCrop"
+                android:background="@drawable/widget_cover_bg"
+                android:clipToOutline="true"
+                android:src="@mipmap/ic_launcher" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="10dp"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/widget_title"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:ellipsize="end"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/widget_text_primary"
+                    android:text="LMPlayer" />
+
+                <TextView
+                    android:id="@+id/widget_artist"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:singleLine="true"
+                    android:ellipsize="end"
+                    android:textSize="11sp"
+                    android:textColor="@color/widget_text_secondary"
+                    android:text="未在播放" />
+            </LinearLayout>
+
+            <ImageView
+                android:id="@+id/widget_btn_prev"
+                android:layout_width="42dp"
+                android:layout_height="42dp"
+                android:scaleType="center"
+                android:src="@drawable/ic_widget_prev"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:tint="@color/widget_text_primary"
+                android:contentDescription="上一首" />
+
+            <ImageView
+                android:id="@+id/widget_btn_play"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:scaleType="center"
+                android:src="@drawable/ic_widget_play"
+                android:background="@drawable/widget_btn_play_circle"
+                android:contentDescription="播放/暂停" />
+
+            <ImageView
+                android:id="@+id/widget_btn_next"
+                android:layout_width="42dp"
+                android:layout_height="42dp"
+                android:scaleType="center"
+                android:src="@drawable/ic_widget_next"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:tint="@color/widget_text_primary"
+                android:contentDescription="下一首" />
+
+            <ImageView
+                android:id="@+id/widget_btn_favorite"
+                android:layout_width="42dp"
+                android:layout_height="42dp"
+                android:scaleType="center"
+                android:src="@drawable/ic_widget_heart"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="收藏" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

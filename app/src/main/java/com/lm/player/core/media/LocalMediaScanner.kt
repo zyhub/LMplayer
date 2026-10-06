@@ -779,7 +779,24 @@ object LocalMediaScanner {
             for (server in serverSongs) {
                 val downloadRec = downloadRecords[server.id]
                 val currentPath = server.localFilePath
+                // NAS 路径（服务端曲库路径，如 /vol1/...）在安卓本地不存在，
+                // 不能用 File(path).exists() 判断，否则所有 NAS 歌曲都会被误判为未下载，
+                // 导致 getDownloadedSongsWithLocalPath() 查不到数据、收藏/歌单快照升级无法执行。
+                val isNasPath = currentPath?.isNotBlank() == true &&
+                    !currentPath.startsWith("content://") &&
+                    !currentPath.startsWith("/storage/") &&
+                    !currentPath.startsWith("/sdcard/") &&
+                    !currentPath.startsWith("/data/")
                 val isCurrentFileValid = !currentPath.isNullOrBlank() && File(currentPath).let { it.exists() && it.length() > 0 }
+
+                // NAS 路径直接保留为已下载，不检查本地文件
+                if (isNasPath && !currentPath.isNullOrBlank()) {
+                    if (server.downloadStatus != DownloadStatus.DOWNLOADED) {
+                        database.songDao().updateDownloadStatus(server.id, DownloadStatus.DOWNLOADED, currentPath)
+                        updatedCount++
+                    }
+                    continue
+                }
 
                 if (isCurrentFileValid && !currentPath.isNullOrBlank()) {
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())

@@ -418,8 +418,8 @@ class LemonMusicProtocol(
                         coverUrl = getCoverArtUrl(songId),
                         streamUrl = getStreamUrl(songId),
                         serverId = "lemon_music",
-                        localFilePath = null,
-                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                        localFilePath = filePath,
+                        downloadStatus = DownloadStatus.DOWNLOADED,
                         bitRate = bitRate,
                         format = format,
                         isFavorite = false,
@@ -459,8 +459,8 @@ class LemonMusicProtocol(
                                         coverUrl = getCoverArtUrl(songId),
                                         streamUrl = getStreamUrl(songId),
                                         serverId = "lemon_music",
-                                        localFilePath = null,
-                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                        localFilePath = filePath,
+                                        downloadStatus = DownloadStatus.DOWNLOADED,
                                         bitRate = 320,
                                         format = filePath.substringAfterLast('.', "mp3").lowercase(),
                                         isFavorite = false,
@@ -892,6 +892,11 @@ class LemonMusicProtocol(
                             val id = pl.optString("id", "lemon_pl_$i")
                             if (seenIds.add(id)) {
                                 val name = pl.optString("name", "未命名歌单")
+                                // 去重：服务端 playlists 中若存在「我喜欢的音乐/我的收藏」自建歌单，
+                                // 与 lemon_favorites（来自 favorites 数组）语义重复，统一只保留 lemon_favorites。
+                                if (name == "我喜欢的音乐" || name == "我的收藏" || name == "我喜欢") {
+                                    continue
+                                }
                                 var coverUrl = pl.optString("coverUrl")
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
@@ -972,6 +977,11 @@ class LemonMusicProtocol(
                             val id = pl.optString("id", "lemon_pl_$i")
                             if (seenIds.add(id)) {
                                 val name = pl.optString("name", "未命名歌单")
+                                // 去重：服务端 playlists 中若存在「我喜欢的音乐/我的收藏」自建歌单，
+                                // 与 lemon_favorites（来自 favorites 数组）语义重复，统一只保留 lemon_favorites。
+                                if (name == "我喜欢的音乐" || name == "我的收藏" || name == "我喜欢") {
+                                    continue
+                                }
                                 var coverUrl = pl.optString("coverUrl")
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
@@ -1486,6 +1496,8 @@ class LemonMusicProtocol(
                                     val songId = "lemon_${md5(cleanPath)}"
                                     val streamUrl = getStreamUrlForPath(cleanPath)
                                     val coverUrl = if (sPic.isNotBlank()) sPic else getCoverArtUrlForPath(cleanPath)
+                                    // 该曲目已存在于 NAS 本地曲库（有 localPath），标记为已下载，
+                                    // 这样「我喜欢的音乐」里能正确显示已下载状态，而非在线状态
                                     val song = UnifiedSong(
                                         id = songId,
                                         title = sName.ifBlank { cleanPath.substringAfterLast('/').substringBeforeLast('.') },
@@ -1497,8 +1509,8 @@ class LemonMusicProtocol(
                                         coverUrl = coverUrl,
                                         streamUrl = streamUrl,
                                         serverId = "lemon_music",
-                                        localFilePath = null,
-                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                                        localFilePath = cleanPath,
+                                        downloadStatus = DownloadStatus.DOWNLOADED,
                                         bitRate = 320,
                                         format = cleanPath.substringAfterLast('.', "flac").lowercase(),
                                         isFavorite = true,
@@ -1724,6 +1736,25 @@ class LemonMusicProtocol(
                     Log.w(TAG, "Failed to query tracks by paths fallback", e)
                 }
             }
+
+            // 去重：同一首歌可能在 favorites 中同时存在在线条目和本地路径条目
+            // （升级过程中产生的中间态），按标题+艺术家分组，优先保留已下载（本地/NAS）版本。
+            val dedupMap = LinkedHashMap<String, UnifiedSong>()
+            for (song in songs) {
+                val key = "${song.title.trim().lowercase()}|${song.artist.trim().lowercase()}"
+                val existing = dedupMap[key]
+                if (existing == null) {
+                    dedupMap[key] = song
+                } else {
+                    val existingDownloaded = existing.downloadStatus == DownloadStatus.DOWNLOADED
+                    val newDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED
+                    if (newDownloaded && !existingDownloaded) {
+                        dedupMap[key] = song
+                    }
+                }
+            }
+            songs.clear()
+            songs.addAll(dedupMap.values)
 
             Result.success(songs)
         } catch (e: Exception) {
@@ -2718,6 +2749,225 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 查询服务器端下载任务列表 (/api/download/list)
+     * 返回全部任务（含进行中/排队/已完成/失败），App 下载管理页用于展示服务器下载状态。
+     */
+    suspend fun getServerDownloadTasks(): Result<List<com.lm.player.core.model.DownloadTask>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/download/list").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("获取服务器下载任务失败 (${resp.code})"))
+                }
+                val body = resp.body?.string() ?: "[]"
+                val arr = JSONArray(body)
+                val result = ArrayList<com.lm.player.core.model.DownloadTask>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val statusStr = item.optString("status", "").lowercase()
+                    val status = when (statusStr) {
+                        "completed", "finished" -> com.lm.player.core.model.DownloadStatus.DOWNLOADED
+                        "downloading", "running" -> com.lm.player.core.model.DownloadStatus.DOWNLOADING
+                        "paused" -> com.lm.player.core.model.DownloadStatus.PAUSED
+                        "failed", "error" -> com.lm.player.core.model.DownloadStatus.FAILED
+                        // pending/queued/waiting 等排队状态按下载中展示（progress 通常为 0）
+                        else -> com.lm.player.core.model.DownloadStatus.DOWNLOADING
+                    }
+                    val meta = item.optJSONObject("meta")
+                    val coverImg = meta?.optString("picUrl", "")?.ifBlank { meta.optString("img", "") } ?: ""
+                    val intervalStr = item.optString("interval", "")
+                    val durationMs = runCatching {
+                        val parts = intervalStr.split(":")
+                        if (parts.size == 2) (parts[0].toLong() * 60 + parts[1].toLong()) * 1000L else 0L
+                    }.getOrDefault(0L)
+                    val filePath = item.optString("file_path").ifBlank { item.optString("filePath", "") }
+                    val song = com.lm.player.core.model.UnifiedSong(
+                        id = "svrdl_" + item.optString("id", ""),
+                        title = SongMatchingResolver.unescapeMusicText(item.optString("name", "未命名歌曲")),
+                        artist = SongMatchingResolver.unescapeMusicText(item.optString("singer", "未知歌手")),
+                        artistId = "",
+                        album = SongMatchingResolver.unescapeMusicText(item.optString("album", "未知专辑")),
+                        albumId = "",
+                        durationMs = durationMs,
+                        coverUrl = coverImg,
+                        streamUrl = "",
+                        serverId = "lemon_music",
+                        localFilePath = null,
+                        downloadStatus = status,
+                        bitRate = 320,
+                        format = filePath.substringAfterLast('.', "mp3").lowercase(),
+                        isFavorite = false,
+                        relativeFolderPath = null,
+                        addedTimestamp = item.optLong("created_at", 0L).let { t ->
+                            when {
+                                t > 10_000_000_000L -> t
+                                t > 0L -> t * 1000L
+                                else -> 0L
+                            }
+                        }
+                    )
+                    val totalSize = item.optLong("total_size", 0L)
+                    val downloadedSize = item.optLong("downloaded_size", 0L)
+                    val progress = when {
+                        status == com.lm.player.core.model.DownloadStatus.DOWNLOADED -> 1f
+                        totalSize > 0 -> (downloadedSize.toFloat() / totalSize).coerceIn(0f, 1f)
+                        else -> item.optDouble("progress", 0.0).toFloat().coerceIn(0f, 1f)
+                    }
+                    result.add(
+                        com.lm.player.core.model.DownloadTask(
+                            song = song,
+                            progress = progress,
+                            bytesDownloaded = downloadedSize,
+                            totalBytes = totalSize,
+                            speedKbps = 0L,
+                            status = status,
+                            isServerTask = true,
+                            errorMessage = item.optString("error", "").ifBlank { null },
+                            serverFilePath = filePath.ifBlank { null }
+                        )
+                    )
+                }
+                // 最新创建的任务排前面
+                result.sortByDescending { it.song.addedTimestamp }
+                Result.success(result)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 删除 NAS 曲库中的物理音乐文件 (POST /api/library/delete-files)。
+     * 服务端删除文件并同步移除曲库记录；入参为 NAS 绝对路径（如 /vol1/1000/.../x.flac），
+     * 与网页端「删除文件」调用完全一致（body: {"filePaths": [...]}）。
+     */
+    suspend fun deleteServerLibraryFiles(filePaths: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        val paths = filePaths.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        if (paths.isEmpty()) return@withContext Result.failure(Exception("没有可删除的服务器文件路径"))
+        try {
+            ensureAuthenticated()
+            val payload = JSONObject()
+            val arr = JSONArray()
+            paths.forEach { arr.put(it) }
+            payload.put("filePaths", arr)
+            val req = newAuthRequest("$cleanBase/api/library/delete-files")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    val errMsg = runCatching { JSONObject(body).optString("error") }.getOrNull()
+                    return@withContext Result.failure(Exception(errMsg?.ifBlank { null } ?: "服务端删除文件失败 (${resp.code})"))
+                }
+                Result.success(true)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 曲目文件被物理删除后，清理服务端用户数据中的残留引用：
+     * 从 /api/library/user-data 的 favorites、recentPlays、playlists.tracks 中
+     * 移除 filePath/localPath/key 匹配已删 NAS 路径的条目，并 PUT 写回（字段级 merge）。
+     * 否则收藏列表（「我喜欢的音乐」）刷新后会把幽灵曲目重新拉回客户端。
+     */
+    suspend fun removeDeletedFilesFromUserData(filePaths: Set<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        val paths = filePaths.map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        if (paths.isEmpty()) return@withContext Result.success(true)
+        try {
+            ensureAuthenticated()
+            val userData = getLibraryUserData().getOrNull() ?: return@withContext Result.success(true)
+
+            fun matchesDeleted(item: Any?): Boolean = when (item) {
+                is String -> item.trim().removePrefix("local:").trim() in paths
+                is JSONObject -> {
+                    val key = item.optString("key").trim().removePrefix("local:").trim()
+                    val path = item.optString("localPath").ifBlank { item.optString("filePath") }.trim()
+                    (path.isNotBlank() && path in paths) || (key.isNotBlank() && key in paths)
+                }
+                else -> false
+            }
+
+            val payload = JSONObject()
+            userData.optJSONArray("favorites")?.let { arr ->
+                val kept = JSONArray()
+                var changed = false
+                for (i in 0 until arr.length()) {
+                    val item = arr.opt(i)
+                    if (matchesDeleted(item)) changed = true else kept.put(item)
+                }
+                if (changed) payload.put("favorites", kept)
+            }
+            userData.optJSONArray("recentPlays")?.let { arr ->
+                val kept = JSONArray()
+                var changed = false
+                for (i in 0 until arr.length()) {
+                    val item = arr.opt(i)
+                    if (matchesDeleted(item)) changed = true else kept.put(item)
+                }
+                if (changed) payload.put("recentPlays", kept)
+            }
+            userData.optJSONArray("playlists")?.let { arr ->
+                var changed = false
+                for (i in 0 until arr.length()) {
+                    val pl = arr.optJSONObject(i) ?: continue
+                    val tracks = pl.optJSONArray("tracks") ?: continue
+                    val kept = JSONArray()
+                    var tChanged = false
+                    for (t in 0 until tracks.length()) {
+                        val item = tracks.opt(t)
+                        if (matchesDeleted(item)) { tChanged = true; changed = true } else kept.put(item)
+                    }
+                    if (tChanged) pl.put("tracks", kept)
+                }
+                if (changed) payload.put("playlists", arr)
+            }
+
+            if (payload.length() == 0) return@withContext Result.success(true)
+
+            val req = newAuthRequest("$cleanBase/api/library/user-data")
+                .put(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("清理服务端用户数据失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "removeDeletedFilesFromUserData failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 删除服务器端下载任务记录 (DELETE /api/download/{id})。
+     * 仅移除下载任务记录，不删除已下载到 NAS 的音乐文件（文件仍在曲库里）。
+     * taskId 为服务端任务的原始 ID（即去掉 "svrdl_" 前缀后的 ID）。
+     */
+    suspend fun deleteServerDownloadTask(taskId: String, alsoDeleteFile: Boolean = false): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val encodedId = try {
+                java.net.URLEncoder.encode(taskId, "UTF-8")
+            } catch (_: Exception) { taskId }
+            val req = newAuthRequest("$cleanBase/api/download/$encodedId")
+                .delete()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    val errMsg = runCatching { JSONObject(body).optString("error") }.getOrNull()
+                    return@withContext Result.failure(Exception(errMsg?.ifBlank { null } ?: "服务端删除下载任务失败 (${resp.code})"))
+                }
+                Result.success(true)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     // ==================== 音源与脚本管理 API (LX Music Source Scripts) ====================
 
     /**
@@ -3107,6 +3357,94 @@ class LemonMusicProtocol(
     }
 
     /**
+     * 升级服务端歌单中某首曲目的快照（用于在线曲目下载到 NAS 后，
+     * 把歌单 trackKeys / trackSnapshots 从「在线 key」升级为「NAS 本地路径 key」）。
+     * 策略：遍历所有自建歌单，对匹配 oldSong 的曲目，若其仍是在线形态
+     * （trackKey 非 local: 开头、快照无 localPath），则替换为 newSong 的本地路径快照。
+     */
+    suspend fun upgradePlaylistTrackToLocalPath(oldSong: UnifiedSong, newSong: UnifiedSong): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            val newSrvPath = getServerFilePath(newSong.id, newSong.streamUrl, newSong.coverUrl)
+                ?.removePrefix("local:")?.trim().orEmpty()
+            if (newSrvPath.isBlank()) return@withContext Result.success(0)
+
+            ensureAuthenticated()
+            val playlists = fetchExistingPlaylistsRaw()
+            val (newKey, newSnapshot) = buildTrackKeyAndSnapshot(newSong)
+            val oldKey = buildTrackKeyAndSnapshot(oldSong).first
+            val oldSongId = oldSong.id
+            val newTitle = newSong.title.trim()
+            val newArtist = newSong.artist.trim()
+
+            var totalReplaced = 0
+            for (pl in playlists) {
+                val trackKeysArr = pl.optJSONArray("trackKeys") ?: JSONArray()
+                val snapshotsObj = pl.optJSONObject("trackSnapshots") ?: JSONObject()
+                var plChanged = false
+
+                // 判定某个 key/条目是否匹配待升级曲目：
+                // 优先 ID 匹配，回退到标题+艺术家匹配（下载后 ID 变化场景）
+                val matchesKey: (String) -> Boolean = { k ->
+                    if (k == oldKey || k == oldSongId) true
+                    else {
+                        val snap = snapshotsObj.optJSONObject(k)
+                        if (snap != null && newTitle.isNotBlank() && newArtist.isNotBlank()) {
+                            val t = snap.optString("name").ifBlank { snap.optString("title") }.trim()
+                            val a = snap.optString("singer").ifBlank { snap.optString("artist") }.trim()
+                            t.equals(newTitle, ignoreCase = true) && a.equals(newArtist, ignoreCase = true)
+                        } else false
+                    }
+                }
+
+                // 1. 替换 trackKeys 中的在线 key 为本地路径 key
+                val newTrackKeys = JSONArray()
+                for (i in 0 until trackKeysArr.length()) {
+                    val k = trackKeysArr.optString(i)
+                    if (matchesKey(k) && !k.startsWith("local:")) {
+                        newTrackKeys.put(newKey)
+                        plChanged = true
+                        totalReplaced++
+                    } else {
+                        newTrackKeys.put(k)
+                    }
+                }
+                if (plChanged) pl.put("trackKeys", newTrackKeys)
+
+                // 2. 替换 trackSnapshots 中对应 key 的快照
+                val keyToRemove = mutableListOf<String>()
+                val snapshotIter = snapshotsObj.keys()
+                while (snapshotIter.hasNext()) {
+                    val snapKey = snapshotIter.next()
+                    if (matchesKey(snapKey)) {
+                        keyToRemove.add(snapKey)
+                    }
+                }
+                if (keyToRemove.isNotEmpty()) {
+                    keyToRemove.forEach { snapshotsObj.remove(it) }
+                    snapshotsObj.put(newKey, newSnapshot)
+                    pl.put("trackSnapshots", snapshotsObj)
+                    plChanged = true
+                }
+
+                if (plChanged) {
+                    pl.put("updatedAt", System.currentTimeMillis())
+                }
+            }
+
+            if (totalReplaced == 0) return@withContext Result.success(0)
+
+            val saveArr = JSONArray()
+            playlists.forEach { saveArr.put(it) }
+            val saveRes = saveCustomPlaylists(saveArr)
+            if (saveRes.isSuccess) Result.success(totalReplaced)
+            else Result.failure(saveRes.exceptionOrNull() ?: Exception("保存歌单快照升级失败"))
+        } catch (e: Exception) {
+            Log.w(TAG, "upgradePlaylistTrackToLocalPath failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
      * 获取服务端音乐库曲目总数 (/api/library/tracks/count)
      */
     suspend fun getLibraryTracksCount(): Result<Int> = withContext(Dispatchers.IO) {
@@ -3312,6 +3650,263 @@ class LemonMusicProtocol(
             }
         } catch (e: Exception) {
             Log.w(TAG, "toggleFavoriteSongOnServer failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 将本机最近播放足迹同步到服务端 (/api/library/user-data 的 recentPlays 字段)。
+     * 采用「去重 + 最新优先」策略：服务端已有记录与本机记录合并，本机刚播放的排最前，
+     * 最多保留 50 条。仅对有在线服务器时生效，失败静默。
+     */
+    suspend fun syncRecentPlaysToServer(recentSongs: List<UnifiedSong>): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            if (recentSongs.isEmpty()) return@withContext Result.success(true)
+            ensureAuthenticated()
+
+            val userDataRes = getLibraryUserData()
+            val userData = userDataRes.getOrNull() ?: JSONObject()
+            val serverArr = userData.optJSONArray("recentPlays") ?: JSONArray()
+
+            val merged = ArrayList<JSONObject>()
+            val seenKeys = HashSet<String>()
+
+            // 1. 本机最近播放排最前（最新优先）
+            for (song in recentSongs.take(50)) {
+                val (key, snapshot) = buildTrackKeyAndSnapshot(song)
+                if (seenKeys.add(key)) {
+                    merged.add(snapshot)
+                }
+            }
+
+            // 2. 服务端已有记录去重后追加
+            for (i in 0 until serverArr.length()) {
+                if (merged.size >= 50) break
+                val item = serverArr.opt(i) ?: continue
+                val itemKey = when (item) {
+                    is String -> item
+                    is JSONObject -> item.optString("key").ifBlank { item.optString("songId") }
+                    else -> continue
+                }
+                if (seenKeys.add(itemKey)) {
+                    merged.add(item as? JSONObject ?: JSONObject().put("key", itemKey))
+                }
+            }
+
+            val newArr = JSONArray()
+            merged.forEach { newArr.put(it) }
+
+            val payload = JSONObject().apply { put("recentPlays", newArr) }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("同步最近播放失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "syncRecentPlaysToServer failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 更新服务端收藏中某首曲目的快照（用于在线曲目下载到服务器后，
+     * 把收藏条目从「在线 key」升级为「NAS 本地路径 key」，
+     * 使收藏列表能正确显示为已下载状态而非在线状态）。
+     *
+     * 策略：在 favorites 数组中查找与 oldSong 匹配的条目，
+     * 若匹配项仍是在线形态（无 localPath），而 newSong 已有 NAS 本地路径，
+     * 则用 newSong 的快照替换之。
+     */
+    suspend fun upgradeFavoriteToLocalPath(oldSong: UnifiedSong, newSong: UnifiedSong): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            // 只有当新曲目有 NAS 本地路径时才需要升级
+            val newSrvPath = getServerFilePath(newSong.id, newSong.streamUrl, newSong.coverUrl)
+                ?.removePrefix("local:")?.trim().orEmpty()
+            if (newSrvPath.isBlank()) return@withContext Result.success(false)
+
+            ensureAuthenticated()
+            val userDataRes = getLibraryUserData()
+            val userData = userDataRes.getOrNull() ?: JSONObject()
+            val favArr = userData.optJSONArray("favorites") ?: JSONArray()
+            if (favArr.length() == 0) return@withContext Result.success(false)
+
+            val (newKey, newSnapshot) = buildTrackKeyAndSnapshot(newSong)
+            val oldKey = buildTrackKeyAndSnapshot(oldSong).first
+            val oldSongId = oldSong.id
+            val newTitle = newSong.title.trim()
+            val newArtist = newSong.artist.trim()
+
+            var changed = false
+            val newFavArr = JSONArray()
+            for (i in 0 until favArr.length()) {
+                val item = favArr.opt(i) ?: continue
+                val itemKey = when (item) {
+                    is String -> item
+                    is JSONObject -> item.optString("key").ifBlank { item.optString("songId") }
+                    else -> ""
+                }
+                val matches = run {
+                    if (itemKey == oldKey || itemKey == oldSongId) return@run true
+                    // 下载后歌曲 ID 变为 lemon_md5(path)，与服务端在线 key(wy:xxx) 无法直接匹配，
+                    // 回退到标题+艺术家匹配（忽略大小写与首尾空白）
+                    if (item is JSONObject && newTitle.isNotBlank() && newArtist.isNotBlank()) {
+                        val itemTitle = item.optString("name").ifBlank { item.optString("title") }.trim()
+                        val itemArtist = item.optString("singer").ifBlank { item.optString("artist") }.trim()
+                        itemTitle.equals(newTitle, ignoreCase = true) &&
+                            itemArtist.equals(newArtist, ignoreCase = true)
+                    } else false
+                }
+
+                if (matches && item is JSONObject) {
+                    // 仅当原条目还是在线形态（无 localPath/filePath）时才升级
+                    val hadLocalPath = item.optString("localPath").isNotBlank() || item.optString("filePath").isNotBlank()
+                    if (!hadLocalPath) {
+                        newFavArr.put(newSnapshot)
+                        changed = true
+                        continue
+                    }
+                }
+                newFavArr.put(item)
+            }
+
+            if (!changed) return@withContext Result.success(false)
+
+            val payload = JSONObject().apply { put("favorites", newFavArr) }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) Result.success(true)
+                else Result.failure(Exception("升级收藏本地路径失败 (HTTP ${resp.code})"))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "upgradeFavoriteToLocalPath failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 批量升级：把所有已下载到 NAS 的曲目在服务端 favorites / 自建歌单中的在线条目
+     * 一次性升级为本地路径 key。原先对每首已下载歌曲分别调用 upgradeFavoriteToLocalPath /
+     * upgradePlaylistTrackToLocalPath，每首都会 GET user-data + GET playlists（N+1 网络风暴，
+     * 100 首已下载 = 200+ 次串行请求，是全量同步耗时 30~60 秒的主因）。
+     * 这里一次拉取、内存批量匹配、有变化才一次写回。
+     * @return Pair<升级收藏条数, 歌单替换条数>
+     */
+    suspend fun upgradeDownloadedTracksLocalPaths(downloadedSongs: List<UnifiedSong>): Result<Pair<Int, Int>> = withContext(Dispatchers.IO) {
+        try {
+            data class Up(val newKey: String, val newSnapshot: JSONObject, val title: String, val artist: String, val oldId: String)
+            val ups = downloadedSongs.mapNotNull { s ->
+                val path = getServerFilePath(s.id, s.streamUrl, s.coverUrl)?.removePrefix("local:")?.trim().orEmpty()
+                if (path.isBlank() || s.title.isBlank()) null
+                else {
+                    val (k, snap) = buildTrackKeyAndSnapshot(s)
+                    Up(k, snap, s.title.trim(), s.artist.trim(), s.id)
+                }
+            }
+            if (ups.isEmpty()) return@withContext Result.success(0 to 0)
+
+            ensureAuthenticated()
+
+            // ---- 1. 收藏升级（一次 GET + 至多一次 PUT）----
+            var favUpgraded = 0
+            val userData = getLibraryUserData().getOrNull()
+            val favArr = userData?.optJSONArray("favorites")
+            if (favArr != null && favArr.length() > 0) {
+                val newFavArr = JSONArray()
+                var favChanged = false
+                for (i in 0 until favArr.length()) {
+                    val item = favArr.opt(i)
+                    if (item !is JSONObject) { newFavArr.put(item); continue }
+                    val hadLocalPath = item.optString("localPath").isNotBlank() || item.optString("filePath").isNotBlank()
+                    if (hadLocalPath) { newFavArr.put(item); continue }
+                    val itemTitle = item.optString("name").ifBlank { item.optString("title") }.trim()
+                    val itemArtist = item.optString("singer").ifBlank { item.optString("artist") }.trim()
+                    val itemKey = item.optString("key").ifBlank { item.optString("songId") }
+                    val hit = ups.firstOrNull { u ->
+                        (itemKey.isNotBlank() && (itemKey == u.newKey || itemKey == u.oldId)) ||
+                            (itemTitle.equals(u.title, true) && itemArtist.equals(u.artist, true))
+                    }
+                    if (hit != null) {
+                        newFavArr.put(hit.newSnapshot)
+                        favChanged = true
+                        favUpgraded++
+                    } else newFavArr.put(item)
+                }
+                if (favChanged) {
+                    val payload = JSONObject().apply { put("favorites", newFavArr) }
+                    val req = newAuthRequest("$cleanBase/api/library/user-data")
+                        .put(payload.toString().toRequestBody(JSON_MEDIA_TYPE)).build()
+                    client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) Log.w(TAG, "Batch upgrade favorites failed (HTTP ${resp.code})")
+                    }
+                }
+            }
+
+            // ---- 2. 自建歌单升级（一次 GET + 至多一次 PUT）----
+            var plReplaced = 0
+            val playlists = fetchExistingPlaylistsRaw()
+            if (playlists.isNotEmpty()) {
+                var anyPlChanged = false
+                for (pl in playlists) {
+                    val trackKeysArr = pl.optJSONArray("trackKeys") ?: continue
+                    val snapshotsObj = pl.optJSONObject("trackSnapshots") ?: JSONObject()
+                    var plChanged = false
+
+                    val matchesUp: (String) -> Up? = { k ->
+                        val snap = snapshotsObj.optJSONObject(k)
+                        ups.firstOrNull { u ->
+                            k == u.newKey || k == u.oldId ||
+                                (snap != null &&
+                                    snap.optString("name").ifBlank { snap.optString("title") }.trim().equals(u.title, true) &&
+                                    snap.optString("singer").ifBlank { snap.optString("artist") }.trim().equals(u.artist, true))
+                        }
+                    }
+
+                    val newTrackKeys = JSONArray()
+                    for (i in 0 until trackKeysArr.length()) {
+                        val k = trackKeysArr.optString(i)
+                        val hit = if (k.startsWith("local:")) null else matchesUp(k)
+                        if (hit != null) {
+                            newTrackKeys.put(hit.newKey)
+                            plChanged = true
+                            plReplaced++
+                        } else newTrackKeys.put(k)
+                    }
+                    if (plChanged) pl.put("trackKeys", newTrackKeys)
+
+                    val toRemove = mutableListOf<Pair<String, Up>>()
+                    val iter = snapshotsObj.keys()
+                    while (iter.hasNext()) {
+                        val snapKey = iter.next()
+                        if (!snapKey.startsWith("local:")) {
+                            val hit = matchesUp(snapKey)
+                            if (hit != null) toRemove.add(snapKey to hit)
+                        }
+                    }
+                    if (toRemove.isNotEmpty()) {
+                        toRemove.forEach { (oldK, hit) ->
+                            snapshotsObj.remove(oldK)
+                            snapshotsObj.put(hit.newKey, hit.newSnapshot)
+                        }
+                        pl.put("trackSnapshots", snapshotsObj)
+                        plChanged = true
+                    }
+                    if (plChanged) {
+                        pl.put("updatedAt", System.currentTimeMillis())
+                        anyPlChanged = true
+                    }
+                }
+                if (anyPlChanged) {
+                    val saveArr = JSONArray()
+                    playlists.forEach { saveArr.put(it) }
+                    saveCustomPlaylists(saveArr)
+                }
+            }
+
+            Result.success(favUpgraded to plReplaced)
+        } catch (e: Exception) {
+            Log.w(TAG, "upgradeDownloadedTracksLocalPaths failed", e)
             Result.failure(e)
         }
     }

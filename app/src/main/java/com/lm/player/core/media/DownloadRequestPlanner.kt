@@ -101,14 +101,22 @@ object DownloadRequestPlanner {
     }
 
     /**
-     * 按**目标音质**解析该歌曲的下载直链。服务器曲库歌曲与原文件音质不符时，
-     * 会优先改走音源取对应音质，而不是把服务器上的原文件原样拖下来。
+     * 按**目标音质**解析该歌曲的下载直链，返回**按优先级排序的候选 URL 列表**。
+     *
+     * 优先级（可由 DownloadSettings.downloadSourcePriority 调整）：
+     * - CLOUD_FIRST（默认）：服务器原文件 → 音源在线 → 服务器本地流回退
+     * - ONLINE_FIRST：音源在线 → 服务器本地流 → 服务器原文件
+     *
+     * 下载引擎会按顺序逐个尝试，某条 URL 下载失败（HTTP 4xx/5xx、网络错误等）
+     * 自动切换到下一条候选，全部失败才报失败。这解决了"在线音源临时抽风导致
+     * 下载失败、明明服务器上有文件却不回退"的问题。
      */
-    suspend fun resolveStreamAtQuality(
+    suspend fun resolveStreamCandidates(
         protocol: LemonMusicProtocol,
         song: UnifiedSong,
-        quality: AudioQuality
-    ): ResolvedDownloadStream? {
+        quality: AudioQuality,
+        priority: com.lm.player.core.model.DownloadSourcePriority = com.lm.player.core.model.DownloadSourcePriority.CLOUD_FIRST
+    ): List<ResolvedDownloadStream> {
         protocol.ensureAuthenticated()
 
         val serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
@@ -124,66 +132,85 @@ object DownloadRequestPlanner {
             AudioQuality.Q_HIRES -> serverExt in LOSSLESS_EXTS && song.bitRate >= 1200
         }
 
-        var url: String? = null
-        var format = quality.format.lowercase()
-        var bitRate = quality.bitrate
+        val candidates = mutableListOf<ResolvedDownloadStream>()
 
-        // 步骤 2：服务器原文件不是目标音质 → 优先向音源按目标音质解析（含逐级降级 + 同名搜索回退）
-        if (!serverMatchesTarget) {
-            val meta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
-                ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
-            val resolved = try {
-                protocol.resolveOnlineStreamWithQuality(
-                    songId = song.id,
-                    source = resolveOnlineSource(song),
-                    preferredQuality = quality.key,
-                    metaJson = meta,
-                    fallbackTitle = song.title,
-                    fallbackArtist = song.artist
-                ).getOrNull()
-            } catch (_: Exception) {
-                null
-            }
-            if (resolved != null && resolved.url.isNotBlank()) {
-                url = resolved.url
-                format = resolved.format
-                bitRate = resolved.bitRate
+        // 候选 A：服务器原文件（音质匹配时直接拖原文件，最稳最快）
+        if (serverMatchesTarget && serverPath != null) {
+            val serverUrl = try {
+                protocol.resolveServerLocalPlayUrl(serverPath, trackId, quality = quality.key).getOrNull()
+            } catch (_: Exception) { null }
+            val url = serverUrl?.takeIf { it.isNotBlank() }
+                ?: protocol.getStreamUrlForPath(serverPath, quality = quality.key).takeIf { it.isNotBlank() }
+            if (!url.isNullOrBlank()) {
+                candidates.add(ResolvedDownloadStream(url, serverExt, song.bitRate))
             }
         }
 
-        // 步骤 3：音源未命中 → 退回服务器本地流（带 quality 参数换取对应音质）
-        if (url.isNullOrBlank() && (serverPath != null || trackId != null)) {
+        // 候选 B：音源在线按目标音质解析（含逐级降级 + 同名搜索回退）
+        val meta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
+            ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
+        val onlineResolved = try {
+            protocol.resolveOnlineStreamWithQuality(
+                songId = song.id,
+                source = resolveOnlineSource(song),
+                preferredQuality = quality.key,
+                metaJson = meta,
+                fallbackTitle = song.title,
+                fallbackArtist = song.artist
+            ).getOrNull()
+        } catch (_: Exception) { null }
+        if (onlineResolved != null && onlineResolved.url.isNotBlank()) {
+            candidates.add(ResolvedDownloadStream(onlineResolved.url, onlineResolved.format, onlineResolved.bitRate))
+        }
+
+        // 候选 C：服务器本地流（带 quality 参数让服务端给对应音质）—— 永远的兜底
+        if ((serverPath != null || trackId != null) && !serverMatchesTarget) {
             val serverUrl = try {
                 protocol.resolveServerLocalPlayUrl(serverPath, trackId, quality = quality.key).getOrNull()
-            } catch (_: Exception) {
-                null
-            }
-            url = serverUrl?.takeIf { it.isNotBlank() }
+            } catch (_: Exception) { null }
+            val url = serverUrl?.takeIf { it.isNotBlank() }
                 ?: serverPath?.let {
                     protocol.getStreamUrlForPath(it, quality = quality.key).takeIf { u -> u.isNotBlank() }
                 }
+            if (!url.isNullOrBlank()) {
+                candidates.add(ResolvedDownloadStream(url, quality.format.lowercase(), quality.bitrate))
+            }
         }
 
-        // 兜底：歌曲自带的直链。必须是 http(s) 绝对地址 ——
-        // 已下载到本地的歌曲 streamUrl 会被改写成**本地文件路径**，那种地址交给引擎只会得
-        // 到"未能解析或获取有效的音频直链"，不如在这里就返回 null 让调用方走本地分支；
-        // 服务器流地址则补上 quality 参数，尽量拿目标音质而不是服务器原文件。
-        if (url.isNullOrBlank()) {
-            url = song.streamUrl
-                .takeIf { it.isNotBlank() && !it.startsWith("lemon_online://") }
-                ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
-                ?.let { streamUrl ->
-                    if (streamUrl.contains("/api/play/local") && !streamUrl.contains("quality=")) {
-                        "$streamUrl&quality=${quality.key}"
-                    } else {
-                        streamUrl
-                    }
-                }
+        // 候选 D：歌曲自带直链兜底
+        val fallbackUrl = song.streamUrl
+            .takeIf { it.isNotBlank() && !it.startsWith("lemon_online://") }
+            ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+            ?.let { streamUrl ->
+                if (streamUrl.contains("/api/play/local") && !streamUrl.contains("quality=")) {
+                    "$streamUrl&quality=${quality.key}"
+                } else streamUrl
+            }
+        if (!fallbackUrl.isNullOrBlank()) {
+            candidates.add(ResolvedDownloadStream(fallbackUrl, quality.format.lowercase(), quality.bitrate))
         }
 
-        val finalUrl = url?.takeIf { it.isNotBlank() } ?: return null
-        return ResolvedDownloadStream(finalUrl, format, bitRate)
+        // 按优先级重排：CLOUD_FIRST 保持当前顺序（服务器→在线→服务器流→自带）；
+        // ONLINE_FIRST 把在线候选提到最前。
+        return if (priority == com.lm.player.core.model.DownloadSourcePriority.ONLINE_FIRST) {
+            // 把非 /api/play 的在线 URL 移到首位
+            val onlineCandidate = candidates.firstOrNull { !it.url.contains("/api/play/") && !it.url.contains("lemon_music") }
+            if (onlineCandidate != null) {
+                listOf(onlineCandidate) + candidates.filter { it !== onlineCandidate }
+            } else candidates
+        } else {
+            candidates
+        }.distinctBy { it.url }
     }
+
+    /**
+     * 向后兼容：返回优先级最高的候选 URL。
+     */
+    suspend fun resolveStreamAtQuality(
+        protocol: LemonMusicProtocol,
+        song: UnifiedSong,
+        quality: AudioQuality
+    ): ResolvedDownloadStream? = resolveStreamCandidates(protocol, song, quality).firstOrNull()
 
     private fun hasAudioExt(path: String): Boolean {
         val ext = path.substringAfterLast('.', "").lowercase()

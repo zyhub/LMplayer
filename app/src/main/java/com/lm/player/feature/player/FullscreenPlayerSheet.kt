@@ -441,12 +441,15 @@ fun FullscreenPlayerSheet(
                                     ) {
                                         val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
                                         val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
-                                        if (isDownloaded && isServerCached) {
-                                            Icon(Icons.Default.CheckCircle, contentDescription = "双端已同步", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
-                                        } else if (isDownloaded || isServerCached) {
-                                            Icon(Icons.Default.CheckCircleOutline, contentDescription = "单端已缓存", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
-                                        } else {
-                                            Icon(Icons.Default.FileDownload, contentDescription = "下载", tint = primaryTextColor, modifier = Modifier.size(headerIconSize))
+                                        when {
+                                            isDownloaded && isServerCached ->
+                                                Icon(Icons.Default.CheckCircle, contentDescription = "本地+服务器已下载", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
+                                            isDownloaded ->
+                                                Icon(Icons.Default.PhoneAndroid, contentDescription = "已下载到本地", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
+                                            isServerCached ->
+                                                Icon(Icons.Default.CloudDone, contentDescription = "已下载到服务器", tint = Color(0xFF34C759), modifier = Modifier.size(headerIconSize))
+                                            else ->
+                                                Icon(Icons.Default.FileDownload, contentDescription = "下载", tint = primaryTextColor, modifier = Modifier.size(headerIconSize))
                                         }
                                     }
                                     DownloadQualityDropdownMenu(
@@ -1309,27 +1312,39 @@ fun FullscreenPlayerSheet(
                             ) {
                                 val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
                                 val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
-                                if (isDownloaded && isServerCached) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = "双端已同步",
-                                        tint = Color(0xFF34C759),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                } else if (isDownloaded || isServerCached) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircleOutline,
-                                        contentDescription = "单端已缓存",
-                                        tint = Color(0xFF34C759),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = Icons.Default.FileDownload,
-                                        contentDescription = "下载",
-                                        tint = primaryTextColor,
-                                        modifier = Modifier.size(20.dp)
-                                    )
+                                when {
+                                    isDownloaded && isServerCached -> {
+                                        Icon(
+                                            imageVector = Icons.Default.CheckCircle,
+                                            contentDescription = "本地+服务器已下载",
+                                            tint = Color(0xFF34C759),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    isDownloaded -> {
+                                        Icon(
+                                            imageVector = Icons.Default.PhoneAndroid,
+                                            contentDescription = "已下载到本地",
+                                            tint = Color(0xFF34C759),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    isServerCached -> {
+                                        Icon(
+                                            imageVector = Icons.Default.CloudDone,
+                                            contentDescription = "已下载到服务器",
+                                            tint = Color(0xFF34C759),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    else -> {
+                                        Icon(
+                                            imageVector = Icons.Default.FileDownload,
+                                            contentDescription = "下载",
+                                            tint = primaryTextColor,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
                                 }
                             }
 
@@ -1732,7 +1747,12 @@ fun AudioSpecsDropdownMenu(
     val qualityTag = if (isLossless && realBitRate >= 1200) "Hi-Res 无损母带" else if (isLossless) "无损品质音频" else if (realBitRate >= 320) "极高品质音频" else "标准音频"
     val sizeText: String = realLocalSizeStr
 
-    val locationText: String = if (isLocal) (song.localFilePath ?: "本地存储") else (song.streamUrl.takeIf { it.isNotBlank() } ?: "在线 NAS 媒体流")
+    val locationText = when {
+        song.localFilePath != null && song.localFilePath.isNotBlank() -> song.localFilePath
+        song.relativeFolderPath != null && song.relativeFolderPath.isNotBlank() -> "NAS: ${song.relativeFolderPath}"
+        song.streamUrl.isNotBlank() -> "在线播放 · 流媒体"
+        else -> "未知"
+    }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     Dialog(

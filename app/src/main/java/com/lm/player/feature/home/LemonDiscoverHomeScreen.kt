@@ -83,6 +83,7 @@ fun LemonDiscoverHomeScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
     onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
@@ -372,6 +373,17 @@ fun LemonDiscoverHomeScreen(
                 if (recommendPlaylists.isNotEmpty()) headerItems++ // 热门推荐歌单
                 headerItems++ // 新歌首发标题栏与选项卡
                 runCatching { discoverListState.animateScrollToItem(headerItems + newIdx) }
+            }
+        }
+    }
+
+    // 回到列表顶部（与「定位当前歌曲」由悬浮按钮轮换触发）
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            if (activeCollectionTitle != null) {
+                runCatching { collectionListState.animateScrollToItem(0) }
+            } else {
+                runCatching { discoverListState.animateScrollToItem(0) }
             }
         }
     }

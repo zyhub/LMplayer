@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.database
+package com.lm.player.core.database
 
 import android.content.Context
 import androidx.room.Database
@@ -51,3 +51,5 @@ abstract class ZdsDatabase : RoomDatabase() {
         }
     }
 }
+
+
