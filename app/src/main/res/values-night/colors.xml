@@ -1,0 +1,9 @@
+<resources>
+    <!-- 桌面小部件 (深色模式，跟随系统) -->
+    <color name="widget_bg">#F226262A</color>
+    <color name="widget_text_primary">#FFFFFFFF</color>
+    <color name="widget_text_secondary">#FF98989D</color>
+    <color name="widget_btn_bg">#FF5A5A5E</color>
+    <color name="widget_progress_track">#33FFFFFF</color>
+    <color name="widget_cover_placeholder">#FF3A3A3C</color>
+</resources>

@@ -32,8 +32,23 @@ interface SongDao {
     @Update
     suspend fun updateSong(song: SongEntity)
 
-    @Query("SELECT * FROM songs")
-    suspend fun getAllSongsList(): List<SongEntity>
+    // 大曲库一次性 SELECT * 会撑爆 CursorWindow 2MB 上限（500+ 首时必现
+    // "Couldn't read row N from CursorWindow" 崩溃），改为分页读取后聚合
+    @Query("SELECT * FROM songs LIMIT :limit OFFSET :offset")
+    suspend fun getSongsPaged(limit: Int, offset: Int): List<SongEntity>
+
+    suspend fun getAllSongsList(): List<SongEntity> {
+        val result = ArrayList<SongEntity>()
+        val pageSize = 200
+        var offset = 0
+        while (true) {
+            val page = getSongsPaged(pageSize, offset)
+            result.addAll(page)
+            if (page.size < pageSize) break
+            offset += pageSize
+        }
+        return result
+    }
 
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath WHERE id = :songId")
     suspend fun updateDownloadStatus(songId: String, status: DownloadStatus, localPath: String?)
@@ -52,6 +67,20 @@ interface SongDao {
 
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
     suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
+
+    // 同步服务端收藏前先清空所有「非本地扫描」曲目的收藏标记，
+    // 避免在服务端已取消收藏的曲目（如「心墙」）因本地 isFavorite 残留而继续出现在收藏列表。
+    // 本地扫描曲目（local_storage/local_folder/local_saf）不受影响，保留用户本地收藏。
+    @Query("UPDATE songs SET isFavorite = 0 WHERE serverId NOT IN ('local_storage', 'local_folder', 'local_saf')")
+    suspend fun clearServerFavorites()
+
+    // 查询"已收藏且已有本地/NAS 路径"的曲目，用于把服务端收藏从在线 key 升级为本地路径 key
+    @Query("SELECT * FROM songs WHERE isFavorite = 1 AND localFilePath IS NOT NULL AND localFilePath != ''")
+    suspend fun getFavoriteSongsWithLocalPath(): List<SongEntity>
+
+    // 查询"已下载到 NAS 且有本地路径"的曲目，用于把服务端歌单快照从在线 key 升级为本地路径 key
+    @Query("SELECT * FROM songs WHERE downloadStatus = 'DOWNLOADED' AND localFilePath IS NOT NULL AND localFilePath != ''")
+    suspend fun getDownloadedSongsWithLocalPath(): List<SongEntity>
 
     @Query("UPDATE songs SET lastPlayedTimestamp = :timestamp WHERE id = :songId")
     suspend fun updateLastPlayed(songId: String, timestamp: Long)
@@ -172,6 +201,9 @@ interface PlaylistDao {
 
     @Query("DELETE FROM playlist_songs WHERE playlistId = :playlistId")
     suspend fun clearSongsForPlaylist(playlistId: String)
+
+    @Query("DELETE FROM playlist_songs WHERE songId = :songId")
+    suspend fun removeSongFromAllPlaylists(songId: String)
 
     @Query("SELECT s.* FROM songs s INNER JOIN playlist_songs ps ON s.id = ps.songId WHERE ps.playlistId = :playlistId ORDER BY ps.orderIndex ASC")
     fun getSongsForPlaylistFlow(playlistId: String): Flow<List<SongEntity>>

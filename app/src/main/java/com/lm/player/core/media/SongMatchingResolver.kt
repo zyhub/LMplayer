@@ -515,13 +515,22 @@ object SongMatchingResolver {
             val normIncomingTitle = normalizeTrackTitle(incoming.title)
 
             // 检查已记录的本地路径有效性
+            // NAS 路径（来自服务端曲库的 localFilePath，如 /vol1/...）在安卓本地不存在，
+            // 不能用 File(path).exists() 判断，否则所有 NAS 歌曲都会被误判为未下载，
+            // 导致 getDownloadedSongsWithLocalPath() 查不到数据、收藏/歌单快照升级无法执行。
             val existingPath = existing?.localFilePath
             val isExistingFileValid = checkFileExists(existingPath)
+            val isNasPath = existingPath?.isNotBlank() == true &&
+                !existingPath.startsWith("content://") &&
+                !existingPath.startsWith("/storage/") &&
+                !existingPath.startsWith("/sdcard/") &&
+                !existingPath.startsWith("/data/")
 
             val downloadPath = download?.localFilePath
             val isDownloadFileValid = checkFileExists(downloadPath)
 
             var validLocalPath = when {
+                isNasPath -> existingPath
                 isExistingFileValid -> existingPath
                 isDownloadFileValid -> downloadPath
                 else -> null
@@ -573,13 +582,22 @@ object SongMatchingResolver {
                 else -> 0L
             }
 
-            val finalDownloadStatus = if (validLocalPath != null) DownloadStatus.DOWNLOADED else DownloadStatus.NOT_DOWNLOADED
+            // incoming.localFilePath 是服务端曲库返回的 NAS 路径（如 /vol1/...），
+            // 必须保留，不能被 validLocalPath（本地匹配结果）覆盖。
+            // NAS 路径在安卓本地不存在，checkFileExists 返回 false，
+            // 所以需要单独判断：有 NAS 路径就标记为已下载。
+            val incomingNasPath = incoming.localFilePath?.takeIf {
+                it.isNotBlank() && !it.startsWith("content://") &&
+                    !it.startsWith("/storage/") && !it.startsWith("/sdcard/") && !it.startsWith("/data/")
+            }
+            val finalLocalPath = validLocalPath ?: incomingNasPath
+            val finalDownloadStatus = if (finalLocalPath != null) DownloadStatus.DOWNLOADED else DownloadStatus.NOT_DOWNLOADED
             val finalIsFavorite = incoming.isFavorite || (existing?.isFavorite == true) || (existingMatch?.isFavorite == true)
             val candidateRelPath = incoming.relativeFolderPath ?: existing?.relativeFolderPath ?: existingMatch?.relativeFolderPath
             val finalRelPath = candidateRelPath?.takeIf { !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100 }
             val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existing?.coverUrl ?: existingMatch?.coverUrl ?: "")
 
-            val localExt = validLocalPath?.takeIf { !it.startsWith("content://") }
+            val localExt = finalLocalPath?.takeIf { !it.startsWith("content://") }
                 ?.substringAfterLast('.', "")
                 ?.lowercase()
                 ?.takeIf { it in listOf("flac", "wav", "mp3", "m4a", "aac", "ogg", "ape", "alac") }
@@ -591,7 +609,7 @@ object SongMatchingResolver {
             }
 
             incoming.copy(
-                localFilePath = validLocalPath,
+                localFilePath = finalLocalPath,
                 downloadStatus = finalDownloadStatus,
                 format = finalFormat,
                 bitRate = finalBitRate,

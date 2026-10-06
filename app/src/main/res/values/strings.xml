@@ -23,4 +23,6 @@
     <string name="favorites">我喜欢</string>
     <string name="channel_name">音频播放</string>
     <string name="channel_desc">用于在通知栏展示音乐播放状态与控制按钮</string>
+    <string name="widget_4x2_desc">LMPlayer 音乐控制小部件 (4×2)</string>
+    <string name="widget_4x1_desc">LMPlayer 音乐控制小部件 (4×1)</string>
 </resources>

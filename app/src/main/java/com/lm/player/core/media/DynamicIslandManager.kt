@@ -735,6 +735,8 @@ object DynamicIslandManager {
         val prevPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_PREV, 101)
         val togglePendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_TOGGLE, 102)
         val nextPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_NEXT, 103)
+        val favoritePendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_FAVORITE, 104)
+        val isFavorite = currentSong?.isFavorite == true
 
         val builder = NotificationCompat.Builder(context, PlaybackService.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -751,6 +753,13 @@ object DynamicIslandManager {
             .setVisibility(if (islandEnabled) NotificationCompat.VISIBILITY_PUBLIC else NotificationCompat.VISIBILITY_SECRET)
             .setPriority(if (islandEnabled) NotificationCompat.PRIORITY_DEFAULT else NotificationCompat.PRIORITY_LOW)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    if (isFavorite) R.drawable.ic_notification_favorite_on else R.drawable.ic_notification_favorite_off,
+                    if (isFavorite) "已收藏" else "收藏",
+                    favoritePendingIntent
+                ).build()
+            )
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_media_previous,
@@ -776,7 +785,7 @@ object DynamicIslandManager {
         if (islandEnabled && resolvedSession != null) {
             builder.setStyle(
                 MediaStyleNotificationHelper.MediaStyle(resolvedSession)
-                    .setShowActionsInCompactView(0, 1, 2)
+                    .setShowActionsInCompactView(1, 2, 3)
             )
             // 仅在开启灵动岛且为华为鸿蒙系统设备上注入鸿蒙实况窗/状态栏胶囊扩展参数
             if (isHuaweiOrHarmonyOS()) {

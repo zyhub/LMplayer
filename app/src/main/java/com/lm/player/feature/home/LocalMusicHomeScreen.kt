@@ -382,9 +382,9 @@ fun SongListItemRow(
 
         Spacer(modifier = Modifier.width(6.dp))
 
-        val hasLocal = (song.downloadStatus == DownloadStatus.DOWNLOADED) ||
-                (!song.localFilePath.isNullOrBlank()) ||
-                (song.serverId in listOf("local_storage", "local_folder", "local_saf"))
+        // hasLocal 必须基于物理本地文件是否真实存在，不能仅凭 downloadStatus==DOWNLOADED 或 localFilePath 非空，
+        // 否则 NAS 服务器曲库（localFilePath 是 /vol1/...、downloadStatus 被标记为 DOWNLOADED）会被误判为「本地有」。
+        val hasLocal = hasPhysicalLocal
         val hasServer = (song.serverId == "lemon_music" ||
                 (isServerConnected && song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")))
 
@@ -472,6 +472,7 @@ fun LocalMusicHomeScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
     onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
@@ -581,6 +582,12 @@ fun LocalMusicHomeScreen(
                 if (homeDisplayConfig.showArtists && artists.isNotEmpty()) headerOffset++
                 listState.animateScrollToItem((headerOffset + songIdx).coerceAtLeast(0))
             }
+        }
+    }
+
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            runCatching { listState.animateScrollToItem(0) }
         }
     }
 

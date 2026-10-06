@@ -11,4 +11,12 @@
     <color name="apple_text_secondary_dark">#98989D</color>
     <color name="apple_pill_bg">#E5E5EA</color>
     <color name="car_dock_bg">#1A1A1E</color>
+
+    <!-- 桌面小部件 (浅色模式，跟随系统) -->
+    <color name="widget_bg">#F2FFFFFF</color>
+    <color name="widget_text_primary">#FF1C1C1E</color>
+    <color name="widget_text_secondary">#FF6E6E73</color>
+    <color name="widget_btn_bg">#FF6E6E73</color>
+    <color name="widget_progress_track">#33000000</color>
+    <color name="widget_cover_placeholder">#FFD8D8DC</color>
 </resources>

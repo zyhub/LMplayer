@@ -35,6 +35,7 @@ import androidx.compose.ui.window.Dialog
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.designsystem.theme.*
 import com.lm.player.core.media.DynamicIslandManager
+import com.lm.player.core.media.DesktopLyricOverlayController
 import com.lm.player.core.media.IslandDisplayMode
 import com.lm.player.core.media.LocalMediaScanner
 import com.lm.player.core.media.Media3Factory
@@ -127,6 +128,9 @@ fun SettingsScreen(
     }
     var downloadLrcFile by remember {
         mutableStateOf(prefs.getBoolean("download_lrc_file_v2", false))
+    }
+    var favoriteAutoServerDownload by remember {
+        mutableStateOf(prefs.getBoolean("favorite_auto_server_download", false))
     }
     var maxConcurrentDownloads by remember(downloadSettings.maxConcurrent) {
         mutableIntStateOf(downloadSettings.maxConcurrent.coerceIn(1, 6))
@@ -1095,6 +1099,20 @@ fun SettingsScreen(
                                 }
                             )
 
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingDropdownRow(
+                                title = "下载来源优先级",
+                                subtitle = "选择从云端(NAS)还是在线音源优先下载，失败时自动回退到另一来源",
+                                selectedValue = downloadSettings.downloadSourcePriority,
+                                options = com.lm.player.core.model.DownloadSourcePriority.entries,
+                                getLabel = { it.label },
+                                getSubtitle = { it.label },
+                                onSelect = { priority ->
+                                    onDownloadSettingsChange(downloadSettings.copy(downloadSourcePriority = priority))
+                                }
+                            )
+
                             Spacer(modifier = Modifier.height(14.dp))
                             SettingSwitchRow(
                                 title = "内嵌高清专辑封面",
@@ -1158,6 +1176,31 @@ fun SettingsScreen(
                                             proto.updateServerSettings(mapOf("download.isDownloadLrc" to it.toString()))
                                         }
                                     }
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "收藏后自动缓存到服务器",
+                                subtitle = "加入「我喜欢的音乐」时自动向柠檬音乐服务端提交下载任务，音质取上方默认下载音质 (默认关闭)",
+                                checked = favoriteAutoServerDownload,
+                                onCheckedChange = {
+                                    favoriteAutoServerDownload = it
+                                    prefs.edit().putBoolean("favorite_auto_server_download", it).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            var playlistAutoServerDownload by remember {
+                                mutableStateOf(prefs.getBoolean("playlist_auto_server_download", false))
+                            }
+                            SettingSwitchRow(
+                                title = "添加到歌单时自动缓存到服务器",
+                                subtitle = "把歌曲加入自建/云端歌单时自动向服务端提交下载任务，音质取上方默认下载音质 (默认关闭)",
+                                checked = playlistAutoServerDownload,
+                                onCheckedChange = {
+                                    playlistAutoServerDownload = it
+                                    prefs.edit().putBoolean("playlist_auto_server_download", it).apply()
                                 }
                             )
                         }
@@ -1256,6 +1299,15 @@ fun SettingsScreen(
                         var stopPlaybackOnExit by remember {
                             mutableStateOf(prefs.getBoolean("stop_playback_on_exit", true))
                         }
+                        var libraryRefreshOnSwitch by remember {
+                            mutableStateOf(prefs.getBoolean("library_refresh_on_switch", true))
+                        }
+                        val refreshIntervalOptions = remember {
+                            listOf(0, 15, 30, 60, 180, 360, 720, 1440)
+                        }
+                        var libraryRefreshIntervalMin by remember {
+                            mutableStateOf(prefs.getInt("library_refresh_interval_min", 0))
+                        }
 
                         SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
                             SettingSwitchRow(
@@ -1280,6 +1332,48 @@ fun SettingsScreen(
                                 checked = autoFallbackToLocal,
                                 onCheckedChange = onAutoFallbackToLocalChange
                             )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "切换到资料库时自动刷新",
+                                subtitle = "开启：每次切到资料库都从服务器同步曲库与收藏；关闭：仅手动下拉刷新或按下方间隔定时刷新",
+                                checked = libraryRefreshOnSwitch,
+                                onCheckedChange = { checked ->
+                                    libraryRefreshOnSwitch = checked
+                                    prefs.edit().putBoolean("library_refresh_on_switch", checked).apply()
+                                }
+                            )
+
+                            if (!libraryRefreshOnSwitch) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                SettingDropdownRow(
+                                    title = "资料库定时刷新间隔",
+                                    subtitle = "按设定间隔在后台自动同步服务器曲库与收藏（选「关闭」则只靠下拉刷新）",
+                                    selectedValue = libraryRefreshIntervalMin,
+                                    options = refreshIntervalOptions,
+                                    getLabel = { mins ->
+                                        when (mins) {
+                                            0 -> "关闭（仅下拉刷新）"
+                                            15 -> "每 15 分钟"
+                                            30 -> "每 30 分钟"
+                                            60 -> "每 1 小时"
+                                            180 -> "每 3 小时"
+                                            360 -> "每 6 小时"
+                                            720 -> "每 12 小时"
+                                            1440 -> "每 24 小时"
+                                            else -> "每 $mins 分钟"
+                                        }
+                                    },
+                                    getSubtitle = { mins ->
+                                        if (mins == 0) "不自动定时刷新，需要时在资料库页面下拉刷新"
+                                        else "应用运行期间每隔 $mins 分钟自动同步一次"
+                                    },
+                                    onSelect = { mins ->
+                                        libraryRefreshIntervalMin = mins
+                                        prefs.edit().putInt("library_refresh_interval_min", mins).apply()
+                                    }
+                                )
+                            }
 
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
@@ -1477,6 +1571,132 @@ fun SettingsScreen(
                                             Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    item {
+                        var desktopLyricEnabled by remember { mutableStateOf(DesktopLyricOverlayController.isEnabled(context)) }
+                        var desktopLyricAlpha by remember { mutableStateOf(DesktopLyricOverlayController.getAlphaPercent(context).toFloat()) }
+                        var desktopLyricPerm by remember { mutableStateOf(DesktopLyricOverlayController.hasOverlayPermission(context)) }
+                        val desktopLyricLifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                        DisposableEffect(desktopLyricLifecycleOwner) {
+                            val desktopLyricObserver = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                                    desktopLyricPerm = DesktopLyricOverlayController.hasOverlayPermission(context)
+                                }
+                            }
+                            desktopLyricLifecycleOwner.lifecycle.addObserver(desktopLyricObserver)
+                            onDispose { desktopLyricLifecycleOwner.lifecycle.removeObserver(desktopLyricObserver) }
+                        }
+
+                        SettingsCard(title = "桌面歌词悬浮窗", icon = Icons.Default.Lyrics) {
+                            SettingSwitchRow(
+                                title = "启用桌面歌词",
+                                subtitle = "在系统桌面上全局悬浮显示三行同步歌词（当前句红色高亮）与播放控制（上一首/播放暂停/下一首/收藏/锁定），按住歌词区可自由拖动位置",
+                                checked = desktopLyricEnabled,
+                                onCheckedChange = { enabled ->
+                                    if (enabled && !DesktopLyricOverlayController.hasOverlayPermission(context)) {
+                                        Toast.makeText(context, "请先授予悬浮窗权限以启用桌面歌词", Toast.LENGTH_SHORT).show()
+                                        DesktopLyricOverlayController.requestOverlayPermission(context)
+                                    } else {
+                                        DesktopLyricOverlayController.setEnabled(context, enabled)
+                                        desktopLyricEnabled = enabled
+                                        Toast.makeText(
+                                            context,
+                                            if (enabled) "已开启桌面歌词，回到桌面即可看到" else "已关闭桌面歌词",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            )
+
+                            AnimatedVisibility(visible = desktopLyricEnabled) {
+                                Column {
+                                    if (!desktopLyricPerm) {
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Surface(
+                                            shape = RoundedCornerShape(12.dp),
+                                            color = Color(0xFFFF9500).copy(alpha = 0.12f),
+                                            border = BorderStroke(1.dp, Color(0xFFFF9500).copy(alpha = 0.45f)),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.WarningAmber,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFFFF9500),
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    text = "悬浮窗权限未开启，点击此处前往授权",
+                                                    fontSize = dimensions.bodySize,
+                                                    color = MaterialTheme.colorScheme.onSurface,
+                                                    modifier = Modifier.clickable {
+                                                        DesktopLyricOverlayController.requestOverlayPermission(context)
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(14.dp))
+                                    Text(
+                                        "背景不透明度 (${desktopLyricAlpha.toInt()}%)",
+                                        fontSize = dimensions.bodySize,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Slider(
+                                        value = desktopLyricAlpha,
+                                        onValueChange = {
+                                            desktopLyricAlpha = it
+                                            DesktopLyricOverlayController.setAlphaPercent(context, it.toInt())
+                                        },
+                                        valueRange = 0f..100f,
+                                        colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                                    )
+
+                                    Text(
+                                        "拖到 0% 即为全透明背景（只保留歌词与按钮）。锁定按钮可防误触穿透，如需解锁请关闭再重新开启桌面歌词。",
+                                        fontSize = dimensions.captionSize,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+
+                                    Spacer(modifier = Modifier.height(14.dp))
+                                    var desktopLyricTextSize by remember { mutableStateOf(DesktopLyricOverlayController.getTextSizeSp(context).toFloat()) }
+                                    Text(
+                                        "歌词字号 (${desktopLyricTextSize.toInt()}sp)",
+                                        fontSize = dimensions.bodySize,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Slider(
+                                        value = desktopLyricTextSize,
+                                        onValueChange = {
+                                            desktopLyricTextSize = it
+                                            DesktopLyricOverlayController.setTextSizeSp(context, it.toInt())
+                                        },
+                                        valueRange = 13f..24f,
+                                        colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                                    )
+
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    var desktopLyricTextDark by remember { mutableStateOf(DesktopLyricOverlayController.isTextDark(context)) }
+                                    SettingSwitchRow(
+                                        title = "深色歌词文字",
+                                        subtitle = "壁纸为白色/浅色或使用全透明背景时开启，歌词改为深色显示更清晰",
+                                        checked = desktopLyricTextDark,
+                                        onCheckedChange = { dark ->
+                                            DesktopLyricOverlayController.setTextDark(context, dark)
+                                            desktopLyricTextDark = dark
+                                        }
+                                    )
                                 }
                             }
                         }

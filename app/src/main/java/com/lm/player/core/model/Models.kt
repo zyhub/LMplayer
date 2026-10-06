@@ -137,7 +137,13 @@ data class DownloadTask(
     val bytesDownloaded: Long = 0L,
     val totalBytes: Long = 0L,
     val speedKbps: Long = 0L,
-    val status: DownloadStatus = DownloadStatus.DOWNLOADING
+    val status: DownloadStatus = DownloadStatus.DOWNLOADING,
+    /** 是否为服务器端下载任务（由 NAS 服务端执行，App 只负责展示进度） */
+    val isServerTask: Boolean = false,
+    /** 服务器任务的错误信息（status 为 FAILED 时展示） */
+    val errorMessage: String? = null,
+    /** 服务器下载任务对应的服务端文件路径（已完成时用于构造流地址播放） */
+    val serverFilePath: String? = null
 )
 
 @Immutable
@@ -146,8 +152,26 @@ data class DownloadSettings(
     val bitrate: String = "原始无损 (FLAC/高码率)",
     val wifiOnly: Boolean = false,
     val autoTagging: Boolean = true,
-    val customDownloadPath: String = ""
+    val customDownloadPath: String = "",
+    val downloadSourcePriority: DownloadSourcePriority = DownloadSourcePriority.CLOUD_FIRST
 )
+
+/**
+ * 本地下载时的音源优先级。
+ * - CLOUD_FIRST（默认）：优先从 NAS/云端服务器原文件下载，失败再回退到在线音源。
+ *   适合服务器曲库已有的歌曲，速度快、不占在线音源配额。
+ * - ONLINE_FIRST：优先从在线音源下载目标音质，失败再回退到服务器。
+ *   适合想要特定音质（如服务器只有无损但想要 320K）的场景。
+ */
+enum class DownloadSourcePriority(val key: String, val label: String) {
+    CLOUD_FIRST("cloud_first", "云端优先（失败自动回退在线）"),
+    ONLINE_FIRST("online_first", "在线优先（失败自动回退云端）");
+
+    companion object {
+        fun fromKey(key: String?): DownloadSourcePriority =
+            entries.firstOrNull { it.key == key } ?: CLOUD_FIRST
+    }
+}
 
 @Immutable
 data class HomeScreenDisplayConfig(

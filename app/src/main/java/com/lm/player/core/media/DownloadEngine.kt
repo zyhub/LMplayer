@@ -46,7 +46,10 @@ class DownloadEngine(
             maxConcurrent = prefs.getInt("max_concurrent", 3),
             customDownloadPath = resolveFilesystemPath(prefs.getString("custom_download_path", "") ?: ""),
             wifiOnly = prefs.getBoolean("wifi_only", false),
-            autoTagging = prefs.getBoolean("auto_tagging", true)
+            autoTagging = prefs.getBoolean("auto_tagging", true),
+            downloadSourcePriority = com.lm.player.core.model.DownloadSourcePriority.fromKey(
+                prefs.getString("download_source_priority", null)
+            )
         )
     )
 
@@ -129,6 +132,7 @@ class DownloadEngine(
             .putString("custom_download_path", normalizedSettings.customDownloadPath)
             .putBoolean("wifi_only", normalizedSettings.wifiOnly)
             .putBoolean("auto_tagging", normalizedSettings.autoTagging)
+            .putString("download_source_priority", normalizedSettings.downloadSourcePriority.key)
             .apply()
 
         if (oldMax != normalizedSettings.maxConcurrent) {
@@ -148,7 +152,8 @@ class DownloadEngine(
         .stateIn(coroutineScope, SharingStarted.Eagerly, emptyList())
 
     private val jobMap = ConcurrentHashMap<String, Job>()
-    private val urlResolverMap = ConcurrentHashMap<String, suspend () -> String?>()
+    // urlResolver 返回按优先级排序的候选 URL 列表；下载引擎逐个尝试，失败自动回退到下一条。
+    private val urlResolverMap = ConcurrentHashMap<String, suspend () -> List<String>>()
 
     /**
      * 从文件魔数头 (Magic Bytes)、Content-Type 或 URL 参数精准识别音频真实封装扩展名
@@ -356,7 +361,7 @@ class DownloadEngine(
     fun startDownload(
         song: UnifiedSong,
         folderHierarchy: String? = null,
-        urlResolver: (suspend () -> String?)? = null
+        urlResolver: (suspend () -> List<String>)? = null
     ) {
         if (jobMap.containsKey(song.id)) {
             coroutineScope.launch(Dispatchers.Main) {
@@ -469,121 +474,148 @@ class DownloadEngine(
             downloadSemaphore.withPermit {
                 var actualDestFile = destFile
                 try {
-                    // 动态解析真实直链：**只要调用方传了解析器就以解析结果为准**。
-                    // 旧判断是"仅当 streamUrl 为空或为 lemon_online:// 占位时才解析"，而服务器曲库
-                    // 歌曲的 streamUrl 是 /api/play/local?path=…&token=…，两个条件都不满足 →
-                    // 解析器永远不会被调用 → 拖回的永远是服务器上的**原文件**（常见为无损），
-                    // 与用户所选的下载音质完全无关。这是"选低音质仍下到无损"的第二个根因。
-                    var effectiveStreamUrl = song.streamUrl
+                    // 解析候选 URL 列表（按优先级排序）：解析器返回多条时，下载失败自动回退到下一条，
+                    // 解决"在线音源临时抽风导致下载失败、服务器上明明有文件却不回退"的问题。
                     val activeResolver = urlResolver ?: urlResolverMap[song.id]
-                    if (activeResolver != null) {
-                        val resolved = runCatching { activeResolver() }.getOrNull()
-                        if (!resolved.isNullOrBlank()) {
-                            effectiveStreamUrl = resolved
-                        }
-                    }
-                    if (effectiveStreamUrl.isBlank() && !record?.remoteUrl.isNullOrBlank() && record?.remoteUrl?.startsWith("http") == true) {
-                        effectiveStreamUrl = record.remoteUrl
-                    }
+                    val candidateUrls: List<String> = if (activeResolver != null) {
+                        runCatching { activeResolver() }.getOrNull()?.filter { it.isNotBlank() } ?: emptyList()
+                    } else emptyList()
 
-                    if (effectiveStreamUrl.isBlank() || (!effectiveStreamUrl.startsWith("http://") && !effectiveStreamUrl.startsWith("https://"))) {
+                    // 兜底：解析器没给或全部为空时，用歌曲自带 streamUrl / 历史记录里的 remoteUrl
+                    val fallbackUrls = listOfNotNull(
+                        song.streamUrl.takeIf { it.startsWith("http://") || it.startsWith("https://") },
+                        record?.remoteUrl?.takeIf { it.startsWith("http") }
+                    )
+                    val allCandidates = (candidateUrls + fallbackUrls).distinct()
+
+                    if (allCandidates.isEmpty()) {
                         throw Exception("未能解析或获取有效的音频直链")
                     }
 
-                    // 初步根据 URL 校准后缀扩展名
-                    val preDetectedExt = detectAudioExtension(null, effectiveStreamUrl, "")
-                    if (preDetectedExt != null && !destFile.name.endsWith(".$preDetectedExt", ignoreCase = true)) {
-                        actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$preDetectedExt")
-                    }
+                    var lastError: Exception? = null
+                    var downloadedSuccess = false
+                    var finalStreamUrl = ""
 
-                    val tempDestFile = File("${actualDestFile.absolutePath}.download")
-                    var existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
-
-                    fun buildDownloadRequest(rangeStart: Long): Request {
-                        val rb = Request.Builder()
-                            .url(effectiveStreamUrl)
-                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                            .header("Accept", "*/*")
-                        if (rangeStart > 0L) {
-                            rb.header("Range", "bytes=$rangeStart-")
+                    for ((candidateIdx, candidateUrl) in allCandidates.withIndex()) {
+                        if (candidateIdx > 0) {
+                            Log.i(TAG, "Download fallback for ${song.title}: trying candidate ${candidateIdx + 1}/${allCandidates.size}")
                         }
-                        return rb.build()
-                    }
+                        try {
+                            var effectiveStreamUrl = candidateUrl
 
-                    var response = okHttpClient.newCall(buildDownloadRequest(existingBytes)).execute()
-                    if (response.code == 416 && existingBytes > 0L) {
-                        response.close()
-                        tempDestFile.delete()
-                        existingBytes = 0L
-                        response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
-                    }
+                            // 初步根据 URL 校准后缀扩展名
+                            val preDetectedExt = detectAudioExtension(null, effectiveStreamUrl, "")
+                            if (preDetectedExt != null && !destFile.name.endsWith(".$preDetectedExt", ignoreCase = true)) {
+                                actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$preDetectedExt")
+                            }
 
-                    response.use { resp ->
-                        if (!resp.isSuccessful) {
-                            throw Exception("HTTP 下载失败: ${resp.code}")
-                        }
+                            val tempDestFile = File("${actualDestFile.absolutePath}.download")
+                            var existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
 
-                        val isRangeOk = resp.code == 206
-                        val append = isRangeOk && existingBytes > 0L
-                        val body = resp.body ?: throw Exception("响应体为空")
-                        val contentTypeHeader = resp.header("Content-Type").orEmpty()
-                        val totalLength = if (isRangeOk) {
-                            existingBytes + body.contentLength()
-                        } else {
-                            if (!append && tempDestFile.exists()) tempDestFile.delete()
-                            body.contentLength()
-                        }
+                            fun buildDownloadRequest(rangeStart: Long): Request {
+                                val rb = Request.Builder()
+                                    .url(effectiveStreamUrl)
+                                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                    .header("Accept", "*/*")
+                                if (rangeStart > 0L) {
+                                    rb.header("Range", "bytes=$rangeStart-")
+                                }
+                                return rb.build()
+                            }
 
-                        var lastTime = System.currentTimeMillis()
-                        var lastBytes = if (append) existingBytes else 0L
-                        var totalRead = if (append) existingBytes else 0L
+                            var response = okHttpClient.newCall(buildDownloadRequest(existingBytes)).execute()
+                            if (response.code == 416 && existingBytes > 0L) {
+                                response.close()
+                                tempDestFile.delete()
+                                existingBytes = 0L
+                                response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
+                            }
 
-                        body.byteStream().use { input ->
-                            FileOutputStream(tempDestFile, append).use { output ->
-                                val buffer = ByteArray(8 * 1024)
-                                var bytesRead: Int
+                            response.use { resp ->
+                                if (!resp.isSuccessful) {
+                                    throw Exception("HTTP 下载失败: ${resp.code}")
+                                }
 
-                                while (input.read(buffer).also { bytesRead = it } != -1) {
-                                    output.write(buffer, 0, bytesRead)
-                                    totalRead += bytesRead
+                                val isRangeOk = resp.code == 206
+                                val append = isRangeOk && existingBytes > 0L
+                                val body = resp.body ?: throw Exception("响应体为空")
+                                val contentTypeHeader = resp.header("Content-Type").orEmpty()
+                                val totalLength = if (isRangeOk) {
+                                    existingBytes + body.contentLength()
+                                } else {
+                                    if (!append && tempDestFile.exists()) tempDestFile.delete()
+                                    body.contentLength()
+                                }
 
-                                    val now = System.currentTimeMillis()
-                                    if (now - lastTime >= 300 || totalRead == totalLength) {
-                                        val speed = if (now > lastTime) ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L else 0L
-                                        lastTime = now
-                                        lastBytes = totalRead
-                                        val progress = if (totalLength > 0) (totalRead.toFloat() / totalLength).coerceIn(0f, 1f) else 0f
-                                        updateTask(
-                                            DownloadTask(
-                                                song = song.copy(streamUrl = effectiveStreamUrl),
-                                                progress = progress,
-                                                bytesDownloaded = totalRead,
-                                                totalBytes = totalLength,
-                                                speedKbps = speed,
-                                                status = DownloadStatus.DOWNLOADING
-                                            )
-                                        )
+                                var lastTime = System.currentTimeMillis()
+                                var lastBytes = if (append) existingBytes else 0L
+                                var totalRead = if (append) existingBytes else 0L
+
+                                body.byteStream().use { input ->
+                                    FileOutputStream(tempDestFile, append).use { output ->
+                                        val buffer = ByteArray(8 * 1024)
+                                        var bytesRead: Int
+
+                                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                                            output.write(buffer, 0, bytesRead)
+                                            totalRead += bytesRead
+
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastTime >= 300 || totalRead == totalLength) {
+                                                val speed = if (now > lastTime) ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L else 0L
+                                                lastTime = now
+                                                lastBytes = totalRead
+                                                val progress = if (totalLength > 0) (totalRead.toFloat() / totalLength).coerceIn(0f, 1f) else 0f
+                                                updateTask(
+                                                    DownloadTask(
+                                                        song = song.copy(streamUrl = effectiveStreamUrl),
+                                                        progress = progress,
+                                                        bytesDownloaded = totalRead,
+                                                        totalBytes = totalLength,
+                                                        speedKbps = speed,
+                                                        status = DownloadStatus.DOWNLOADING
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        output.flush()
                                     }
                                 }
-                                output.flush()
+
+                                // 下载完成后，通过文件魔数头与 Content-Type 二次精准校准真实文件扩展名
+                                val realAudioExt = detectAudioExtension(tempDestFile, effectiveStreamUrl, contentTypeHeader)
+                                if (realAudioExt != null && !actualDestFile.name.endsWith(".$realAudioExt", ignoreCase = true)) {
+                                    actualDestFile = File(actualDestFile.parentFile, "${actualDestFile.nameWithoutExtension}.$realAudioExt")
+                                }
                             }
-                        }
 
-                        // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
-                        val realAudioExt = detectAudioExtension(tempDestFile, effectiveStreamUrl, contentTypeHeader)
-                        if (realAudioExt != null && !actualDestFile.name.endsWith(".$realAudioExt", ignoreCase = true)) {
-                            actualDestFile = File(actualDestFile.parentFile, "${actualDestFile.nameWithoutExtension}.$realAudioExt")
+                            // 原子化重命名临时文件为正式音频文件
+                            if (actualDestFile.exists()) {
+                                actualDestFile.delete()
+                            }
+                            if (!tempDestFile.renameTo(actualDestFile)) {
+                                tempDestFile.copyTo(actualDestFile, overwrite = true)
+                                tempDestFile.delete()
+                            }
+
+                            downloadedSuccess = true
+                            finalStreamUrl = effectiveStreamUrl
+                            break
+                        } catch (e: Exception) {
+                            lastError = e
+                            // 清理本条候选产生的临时文件，避免污染下一条候选
+                            val tempFile = File("${actualDestFile.absolutePath}.download")
+                            if (tempFile.exists()) tempFile.delete()
+                            // 还有下一条候选就继续，否则抛出最后错误
+                            if (candidateIdx == allCandidates.size - 1) break
                         }
                     }
 
-                    // 原子化重命名临时文件为正式音频文件
-                    if (actualDestFile.exists()) {
-                        actualDestFile.delete()
+                    if (!downloadedSuccess) {
+                        throw lastError ?: Exception("所有下载源均失败")
                     }
-                    if (!tempDestFile.renameTo(actualDestFile)) {
-                        tempDestFile.copyTo(actualDestFile, overwrite = true)
-                        tempDestFile.delete()
-                    }
+
+                    val effectiveStreamUrl = finalStreamUrl
 
                     val finalExt = actualDestFile.extension.lowercase().ifBlank { song.format.lowercase() }
                     val finalSong = song.copy(
