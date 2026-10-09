@@ -1,5 +1,6 @@
 package com.lm.player.core.network
 
+import android.content.Context
 import android.util.Log
 import com.lm.player.core.media.EmbeddedLyricsExtractor
 import com.lm.player.core.media.LrcParser
@@ -43,9 +44,54 @@ class LemonMusicProtocol(
     private val authCacheKey = "${cleanBase}_${username.trim()}"
     private var authToken: String = sharedAuthTokens[authCacheKey].orEmpty()
 
+    init {
+        activeInstance = this
+    }
+
     companion object {
         private const val TAG = "LemonMusicProtocol"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        @Volatile
+        var activeInstance: LemonMusicProtocol? = null
+
+        suspend fun getActiveOrNew(context: Context): LemonMusicProtocol? {
+            activeInstance?.let { return it }
+            val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
+            val server = db.serverDao().getActiveServer()
+                ?: db.serverDao().getAllServers().firstOrNull { it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+            if (server != null) {
+                val client = NetworkClientFactory.createOkHttpClient(context)
+                val proto = LemonMusicProtocol(client, server.serverUrl, server.username, server.tokenOrApiKey)
+                activeInstance = proto
+                return proto
+            }
+            return null
+        }
+
+        suspend fun fetchServerDownloadList(context: Context? = null): Result<List<com.lm.player.core.model.LemonServerDownloadTaskRecord>> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.fetchServerDownloadList()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun deleteServerDownloadTask(taskId: String, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.deleteServerDownloadTask(taskId)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun clearCompletedServerDownloads(context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.clearCompletedServerDownloads()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
 
         // 跨实例共享的已认证 Bearer Token 缓存 (消除多组件并发实例化时的重复 /api/auth/login 请求)
         private val sharedAuthTokens = ConcurrentHashMap<String, String>()
@@ -2718,7 +2764,140 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 获取服务端所有下载任务及历史记录列表 (/api/download/list)
+     * 按最新下载创建时间倒序排列
+     */
+    suspend fun fetchServerDownloadList(): Result<List<com.lm.player.core.model.LemonServerDownloadTaskRecord>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/download/list").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("获取服务端下载列表失败 (${resp.code})"))
+                }
+                val body = resp.body?.string() ?: "[]"
+                val trimmed = body.trim()
+                val arr = if (trimmed.startsWith("[")) {
+                    JSONArray(trimmed)
+                } else if (trimmed.startsWith("{")) {
+                    val root = JSONObject(trimmed)
+                    root.optJSONArray("data")
+                        ?: root.optJSONArray("list")
+                        ?: root.optJSONArray("tasks")
+                        ?: root.optJSONArray("items")
+                        ?: JSONArray()
+                } else {
+                    JSONArray()
+                }
+                val list = mutableListOf<com.lm.player.core.model.LemonServerDownloadTaskRecord>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val id = obj.optString("id", i.toString())
+                    val name = obj.optString("name", "未知歌曲")
+                    val singer = obj.optString("singer", "未知歌手")
+                    val album = obj.optString("album", "")
+                    val quality = obj.optString("quality", "320k")
+                    val status = obj.optString("status", "waiting")
+                    val progress = obj.optInt("progress", if (status == "completed") 100 else 0)
+                    val error = obj.optString("error", "")
+                    val createdAt = obj.optLong("created_at", obj.optLong("createdAt", obj.optLong("mtime", 0L)))
+                    val filePath = obj.optString("filePath", obj.optString("path", ""))
+                    val songId = obj.optString("songId", "")
+                    val metaObj = obj.optJSONObject("meta")
+                    var coverUrl = obj.optString("coverUrl")
+                        .ifBlank { obj.optString("img") }
+                        .ifBlank { obj.optString("picUrl") }
+                        .ifBlank { metaObj?.optString("img") ?: "" }
+                        .ifBlank { metaObj?.optString("picUrl") ?: "" }
+                    if (coverUrl.isNotBlank() && !coverUrl.startsWith("http://") && !coverUrl.startsWith("https://") && !coverUrl.startsWith("data:")) {
+                        coverUrl = if (coverUrl.startsWith("/")) "$cleanBase$coverUrl" else "$cleanBase/$coverUrl"
+                    }
+                    list.add(
+                        com.lm.player.core.model.LemonServerDownloadTaskRecord(
+                            id = id,
+                            name = name,
+                            singer = singer,
+                            album = album,
+                            quality = quality,
+                            status = status,
+                            progress = progress,
+                            error = error,
+                            createdAt = createdAt,
+                            filePath = filePath,
+                            songId = songId,
+                            coverUrl = coverUrl
+                        )
+                    )
+                }
+                list.sortByDescending { it.createdAt }
+                Result.success(list)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchServerDownloadList failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 删除服务端下载任务或历史记录 (/api/download/:id 或 /api/download/dismiss)
+     */
+    suspend fun deleteServerDownloadTask(taskId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            // 优先调用 DELETE /api/download/:id
+            val delReq = newAuthRequest("$cleanBase/api/download/$taskId").delete().build()
+            val delResp = client.newCall(delReq).execute()
+            if (delResp.isSuccessful) {
+                delResp.close()
+                return@withContext Result.success(true)
+            }
+            delResp.close()
+
+            // 兜底调用 POST /api/download/dismiss 移除列表记录
+            val payload = JSONObject().apply {
+                put("ids", JSONArray().put(taskId))
+            }
+            val dismissReq = newAuthRequest("$cleanBase/api/download/dismiss")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(dismissReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("删除服务端任务失败 (${resp.code})"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "deleteServerDownloadTask failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 清空服务端所有已完成下载记录 (/api/download/clear-completed)
+     */
+    suspend fun clearCompletedServerDownloads(): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val req = newAuthRequest("$cleanBase/api/download/clear-completed")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("清空已完成记录失败 (${resp.code})"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "clearCompletedServerDownloads failed", e)
+            Result.failure(e)
+        }
+    }
+
     // ==================== 音源与脚本管理 API (LX Music Source Scripts) ====================
+
 
     /**
      * 获取服务端安装的所有音源脚本列表 (/api/source/list)
@@ -2746,16 +2925,62 @@ class LemonMusicProtocol(
                     val item = arr.optJSONObject(i) ?: continue
                     val sourcesList = mutableListOf<String>()
                     val sourcesObj = item.optJSONObject("sources")
+                    val disabledList = mutableListOf<String>()
                     if (sourcesObj != null) {
                         val keys = sourcesObj.keys()
                         while (keys.hasNext()) {
-                            sourcesList.add(keys.next())
+                            val k = keys.next()
+                            sourcesList.add(k)
+                            val v = sourcesObj.opt(k)
+                            val isPlatformEnabled = when (v) {
+                                is Boolean -> v
+                                is JSONObject -> v.optBoolean("enabled", true)
+                                else -> true
+                            }
+                            if (!isPlatformEnabled) {
+                                disabledList.add(k)
+                            }
                         }
                     } else {
                         val sourcesArr = item.optJSONArray("sources")
                         if (sourcesArr != null) {
                             for (k in 0 until sourcesArr.length()) {
                                 sourcesList.add(sourcesArr.optString(k))
+                            }
+                        }
+                    }
+                    val disabledArr = item.optJSONArray("disabledSources")
+                        ?: item.optJSONArray("disabledPlatforms")
+                        ?: item.optJSONArray("disabled_platforms")
+                    if (disabledArr != null) {
+                        for (k in 0 until disabledArr.length()) {
+                            val p = disabledArr.optString(k)
+                            if (p.isNotBlank() && !disabledList.contains(p)) {
+                                disabledList.add(p)
+                            }
+                        }
+                    }
+                    // 对齐柠檬服务端：从 /api/settings 中的 source.enabledPlatforms 读取禁用状态
+                    val srvPlatformsRaw = runCatching {
+                        val sObj = getServerSettings().getOrNull()
+                        sObj?.optString("source.enabledPlatforms")
+                    }.getOrNull()
+                    if (!srvPlatformsRaw.isNullOrBlank()) {
+                        runCatching {
+                            val pJson = JSONObject(srvPlatformsRaw)
+                            val sid = item.optString("id").ifBlank { (i + 1).toString() }
+                            if (pJson.has(sid)) {
+                                val enabledArr = pJson.optJSONArray(sid) ?: JSONArray()
+                                val enabledSet = mutableSetOf<String>()
+                                for (k in 0 until enabledArr.length()) {
+                                    enabledSet.add(enabledArr.optString(k).lowercase())
+                                }
+                                val allPlats = if (sourcesList.isNotEmpty()) sourcesList else listOf("kw", "wy", "tx", "kg", "mg")
+                                for (p in allPlats) {
+                                    if (!enabledSet.contains(p.lowercase()) && !disabledList.contains(p)) {
+                                        disabledList.add(p)
+                                    }
+                                }
                             }
                         }
                     }
@@ -2767,6 +2992,7 @@ class LemonMusicProtocol(
                             author = item.optString("author", "开源社区"),
                             version = item.optString("version", "1.0.0"),
                             supportedPlatforms = if (sourcesList.isNotEmpty()) sourcesList else listOf("kw", "wy", "tx"),
+                            disabledPlatforms = disabledList,
                             isActive = item.optBoolean("active", true),
                             healthSummary = item.optString("health", "就绪")
                         )
@@ -2897,6 +3123,81 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("删除音源失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 更新音源脚本下特定平台的解析状态
+     * 严格对齐柠檬音乐最新源码：将各音源可用平台存入 /api/settings 的 source.enabledPlatforms
+     */
+    suspend fun updateSourcePlatformStatus(sourceId: String, platform: String, enabled: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val cleanPlatform = platform.lowercase().trim()
+            val cleanSourceId = sourceId.trim()
+
+            // 1. 获取现有设置中 source.enabledPlatforms 的映射
+            val settingsObj = getServerSettings().getOrNull()
+            val existingRaw = settingsObj?.optString("source.enabledPlatforms")
+            val platformMap = mutableMapOf<String, MutableSet<String>>()
+            if (!existingRaw.isNullOrBlank()) {
+                runCatching {
+                    val json = JSONObject(existingRaw)
+                    val keys = json.keys()
+                    while (keys.hasNext()) {
+                        val sid = keys.next()
+                        val arr = json.optJSONArray(sid)
+                        val set = mutableSetOf<String>()
+                        if (arr != null) {
+                            for (k in 0 until arr.length()) {
+                                set.add(arr.optString(k).lowercase())
+                            }
+                        }
+                        platformMap[sid] = set
+                    }
+                }
+            }
+
+            // 2. 更新指定 sourceId 下的 platform 列表
+            val currentSet = platformMap[cleanSourceId] ?: mutableSetOf("kw", "kg", "tx", "wy", "mg")
+            if (enabled) {
+                currentSet.add(cleanPlatform)
+            } else {
+                currentSet.remove(cleanPlatform)
+            }
+            platformMap[cleanSourceId] = currentSet
+
+            // 3. 序列化并通过 PUT /api/settings 保存
+            val serializedObj = JSONObject()
+            val ordered = listOf("tx", "wy", "kw", "kg", "mg")
+            platformMap.forEach { (sid, set) ->
+                val arr = JSONArray()
+                ordered.filter { it in set }.forEach { arr.put(it) }
+                set.filter { it !in ordered }.forEach { arr.put(it) }
+                serializedObj.put(sid, arr)
+            }
+            val updateRes = updateServerSettings(mapOf("source.enabledPlatforms" to serializedObj.toString()))
+            if (updateRes.isSuccess) {
+                return@withContext Result.success(true)
+            }
+
+            // 4. 兼容尝试专用接口 /api/source/$sourceId/toggle-platform 与 /api/source/update
+            val payload = JSONObject().apply {
+                put("id", cleanSourceId)
+                put("platform", cleanPlatform)
+                put("source", cleanPlatform)
+                put("enabled", enabled)
+            }
+            runCatching {
+                val req1 = newAuthRequest("$cleanBase/api/source/$cleanSourceId/toggle-platform")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                client.newCall(req1).execute().use { if (it.isSuccessful) return@withContext Result.success(true) }
+            }
+            Result.success(false)
+        } catch (e: Exception) {
+            Log.e(TAG, "updateSourcePlatformStatus failed", e)
             Result.failure(e)
         }
     }

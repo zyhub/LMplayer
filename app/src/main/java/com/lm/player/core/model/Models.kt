@@ -234,6 +234,7 @@ data class LemonSourceScriptInfo(
     val version: String = "",
     val homepage: String = "",
     val supportedPlatforms: List<String> = emptyList(),
+    val disabledPlatforms: List<String> = emptyList(),
     val isActive: Boolean = false,
     val healthSummary: String = ""
 )
@@ -328,6 +329,23 @@ data class LemonServerDownloadTask(
     val pic: String = img,
     val raw: String = ""
 )
+
+@Immutable
+data class LemonServerDownloadTaskRecord(
+    val id: String,
+    val name: String,
+    val singer: String,
+    val album: String = "",
+    val quality: String = "320k",
+    val status: String = "waiting", // waiting, downloading, completed, error, paused, await_confirm
+    val progress: Int = 0,
+    val error: String = "",
+    val createdAt: Long = 0L,
+    val filePath: String = "",
+    val songId: String = "",
+    val coverUrl: String = ""
+)
+
 
 @Immutable
 data class LemonDownloadPreferences(

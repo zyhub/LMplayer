@@ -27,7 +27,9 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import com.lm.player.feature.home.ALL_RANDOM_LIQUID_PALETTES
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -96,6 +98,8 @@ fun LocalLibraryScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
+    onScrollPositionChange: (Boolean) -> Unit = {},
     onListScrollingChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
@@ -138,10 +142,14 @@ fun LocalLibraryScreen(
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
+    // 每次打开资料库随机选取5组不同光影配色，确保5张卡片视觉各异
+    val libPalettes = remember { ALL_RANDOM_LIQUID_PALETTES.shuffled().take(5) }
+
     // 排序模式
     // 程序启动默认按「加入时间」：在线模式 = 服务器文件的 mtime（服务器「最近添加」先后），
     // 本地模式 = 本地下载完成时间。与 TV 车机版保持一致，"刚入库的排在前面"才是资料库第一直觉。
     var songSortMode by remember { mutableStateOf("added") } // added, default, name, artist, duration, source
+    var isPullRefreshing by remember { mutableStateOf(false) }
 
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
@@ -167,6 +175,31 @@ fun LocalLibraryScreen(
     val isAnyScrolling = libraryListState.isScrollInProgress || subViewListState.isScrollInProgress
     LaunchedEffect(isAnyScrolling) {
         onListScrollingChange(isAnyScrolling)
+    }
+
+    // 监听是否离开顶部，联动通知外部显示置顶按钮
+    val isScrolledAway = remember {
+        derivedStateOf {
+            if (activeSubViewTitle != null) {
+                subViewListState.firstVisibleItemIndex > 0 || subViewListState.firstVisibleItemScrollOffset > 80
+            } else {
+                libraryListState.firstVisibleItemIndex > 0 || libraryListState.firstVisibleItemScrollOffset > 80
+            }
+        }
+    }
+    LaunchedEffect(isScrolledAway.value) {
+        onScrollPositionChange(isScrolledAway.value)
+    }
+
+    // 触发置顶
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            if (activeSubViewTitle != null) {
+                runCatching { subViewListState.scrollToItem(0) }
+            } else {
+                runCatching { libraryListState.scrollToItem(0) }
+            }
+        }
     }
 
     LaunchedEffect(activeSubViewTitle) {
@@ -196,10 +229,9 @@ fun LocalLibraryScreen(
                     p.trimEnd('/').substringAfterLast('/')
                 }
                 !song.localFilePath.isNullOrBlank() -> {
-                    try {
-                        val f = File(song.localFilePath)
-                        f.parentFile?.name
-                    } catch (_: Exception) { null }
+                    val p = song.localFilePath!!.replace('\\', '/')
+                    val parent = p.substringBeforeLast('/', "")
+                    if (parent.isNotBlank()) parent.substringAfterLast('/', "") else null
                 }
                 else -> null
             }?.trim()?.ifBlank { null }
@@ -226,7 +258,7 @@ fun LocalLibraryScreen(
         if (downloadedSongs.isNotEmpty()) {
             downloadedSongs
         } else {
-            allSongs.filter { !it.localFilePath.isNullOrBlank() && (it.localFilePath!!.startsWith("content://") || File(it.localFilePath!!).exists()) }
+            allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || !it.localFilePath.isNullOrBlank() }
         }
     }
     var isDownloadManagementMode by remember { mutableStateOf(false) }
@@ -352,15 +384,38 @@ fun LocalLibraryScreen(
         playlists.sortedByDescending { it.updatedTimestamp }
     }
 
-    // 动态提取/加载歌单内部歌曲图片 (前 4 首) 用于 4 格子展示
+    // 动态提取/加载歌单内部歌曲图片 (前 4 首) 用于 4 格子展示，优化高量曲目下(2000+)的检索开销
     val localPlaylistCovers by produceState<Map<String, List<String>>>(
         initialValue = emptyMap(),
         key1 = sortedPlaylists,
-        key2 = allSongs
+        key2 = allSongs.size
     ) {
         value = withContext(Dispatchers.IO) {
             val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
             val map = HashMap<String, List<String>>()
+            
+            // 建立 O(1) 预索引，避免千级歌曲反复线性遍历与卡顿
+            val songById = HashMap<String, UnifiedSong>(allSongs.size)
+            val songByPath = HashMap<String, UnifiedSong>(allSongs.size)
+            val songsByAlbum = HashMap<String, MutableList<UnifiedSong>>()
+            val songsByFolder = HashMap<String, MutableList<UnifiedSong>>()
+            for (s in allSongs) {
+                if (s.id.isNotBlank()) songById[s.id] = s
+                if (!s.localFilePath.isNullOrBlank()) songByPath[s.localFilePath!!] = s
+                if (s.album.isNotBlank()) {
+                    songsByAlbum.getOrPut(s.album.lowercase()) { ArrayList() }.add(s)
+                }
+                val rp = s.relativeFolderPath?.trim()?.replace('\\', '/')
+                if (!rp.isNullOrBlank()) {
+                    songsByFolder.getOrPut(rp.lowercase()) { ArrayList() }.add(s)
+                    val folderName = rp.trimEnd('/').substringAfterLast('/')
+                    if (folderName.isNotBlank()) {
+                        songsByFolder.getOrPut(folderName.lowercase()) { ArrayList() }.add(s)
+                    }
+                }
+            }
+            val diskFolderCoverCache = HashMap<String, String?>()
+
             for (pl in sortedPlaylists) {
                 val covers = ArrayList<String>()
 
@@ -400,26 +455,30 @@ fun LocalLibraryScreen(
                         if (covers.size >= 4) break
                         var c = s.coverUrl
                         if (c.isNullOrBlank()) {
-                            val matched = allSongs.firstOrNull { it.id == s.id || (s.localFilePath != null && it.localFilePath == s.localFilePath) }
+                            val matched = songById[s.id] ?: (if (!s.localFilePath.isNullOrBlank()) songByPath[s.localFilePath!!] else null)
                             c = matched?.coverUrl ?: ""
                         }
                         if (c.isNullOrBlank() && !s.localFilePath.isNullOrBlank()) {
-                            try {
-                                val parent = java.io.File(s.localFilePath).parentFile
-                                if (parent != null && parent.exists() && parent.isDirectory) {
-                                    val files = parent.listFiles { f ->
-                                        val ext = f.extension.lowercase()
-                                        ext in listOf("jpg", "jpeg", "png", "webp")
-                                    }
-                                    val targetImg = files?.firstOrNull {
-                                        val name = it.nameWithoutExtension.lowercase()
-                                        name in listOf("cover", "folder", "front", "album", "artwork")
-                                    } ?: files?.firstOrNull()
-                                    if (targetImg != null) {
-                                        c = android.net.Uri.fromFile(targetImg).toString()
-                                    }
+                            val parentPath = s.localFilePath!!.replace('\\', '/').substringBeforeLast('/', "")
+                            if (parentPath.isNotBlank()) {
+                                val diskCover = diskFolderCoverCache.getOrPut(parentPath) {
+                                    try {
+                                        val parent = java.io.File(parentPath)
+                                        if (parent.exists() && parent.isDirectory) {
+                                            val files = parent.listFiles { f ->
+                                                val ext = f.extension.lowercase()
+                                                ext in listOf("jpg", "jpeg", "png", "webp")
+                                            }
+                                            val targetImg = files?.firstOrNull {
+                                                val name = it.nameWithoutExtension.lowercase()
+                                                name in listOf("cover", "folder", "front", "album", "artwork")
+                                            } ?: files?.firstOrNull()
+                                            targetImg?.let { android.net.Uri.fromFile(it).toString() }
+                                        } else null
+                                    } catch (_: Exception) { null }
                                 }
-                            } catch (_: Exception) {}
+                                if (!diskCover.isNullOrBlank()) c = diskCover
+                            }
                         }
                         if (!c.isNullOrBlank() && !covers.contains(c)) {
                             covers.add(c)
@@ -429,33 +488,13 @@ fun LocalLibraryScreen(
 
                 // 5. 模糊对齐本地 allSongs 中同名专辑或同名文件夹的歌曲封面
                 if (covers.size < 4) {
-                    val matchedFromAll = allSongs.filter {
-                        it.album.equals(pl.name, ignoreCase = true) ||
-                        (!it.relativeFolderPath.isNullOrBlank() && (it.relativeFolderPath == pl.name || it.relativeFolderPath.endsWith("/${pl.name}")))
-                    }
+                    val plNameLower = pl.name.lowercase()
+                    val matchedFromAll = songsByAlbum[plNameLower] ?: songsByFolder[plNameLower] ?: emptyList()
                     for (s in matchedFromAll) {
                         if (covers.size >= 4) break
                         val c = s.coverUrl
                         if (!c.isNullOrBlank() && !covers.contains(c)) {
                             covers.add(c)
-                        } else if (!s.localFilePath.isNullOrBlank()) {
-                            try {
-                                val parent = java.io.File(s.localFilePath).parentFile
-                                if (parent != null && parent.exists() && parent.isDirectory) {
-                                    val files = parent.listFiles { f ->
-                                        val ext = f.extension.lowercase()
-                                        ext in listOf("jpg", "jpeg", "png", "webp")
-                                    }
-                                    val targetImg = files?.firstOrNull {
-                                        val name = it.nameWithoutExtension.lowercase()
-                                        name in listOf("cover", "folder", "front", "album", "artwork")
-                                    } ?: files?.firstOrNull()
-                                    if (targetImg != null) {
-                                        val uri = android.net.Uri.fromFile(targetImg).toString()
-                                        if (!covers.contains(uri)) covers.add(uri)
-                                    }
-                                }
-                            } catch (_: Exception) {}
                         }
                     }
                 }
@@ -649,20 +688,20 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 定位正在播放的歌曲（自动切回所属子列表或全部歌曲主列表并滚动定位）
+    // 定位正在播放的歌曲（自动切回所属子列表或全部歌曲主列表并瞬间定位到位）
     LaunchedEffect(locateSongTrigger) {
         if (locateSongTrigger > 0 && currentPlayingSong != null) {
             val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")
             val subIdx = activeSubViewSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             val mainIdx = filteredSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             if (activeSubViewTitle != null && !isGridSubView && subIdx >= 0) {
-                runCatching { subViewListState.animateScrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx) }
             } else if (mainIdx >= 0) {
                 if (activeSubViewTitle != null) {
                     activeSubViewTitle = null
                     delay(80)
                 }
-                var headerCount = 4 // Header + Bento卡片 + 歌单 + 全部歌曲标题栏
+                var headerCount = 3 // 0:Header, 1:Bento卡片, 2:全部歌曲操作栏
                 if (recentAddedSongs.isNotEmpty()) headerCount++
                 if (localFolders.isNotEmpty()) headerCount++
                 runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
@@ -670,7 +709,7 @@ fun LocalLibraryScreen(
                 activeSubViewTitle = lastSubViewTitle
                 activeSubViewSubtitle = lastSubViewSubtitle
                 delay(80)
-                runCatching { subViewListState.animateScrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx) }
             }
         }
     }
@@ -678,8 +717,22 @@ fun LocalLibraryScreen(
     Box(modifier = Modifier.fillMaxSize()) {
         // 主视图：浏览资料库各大板块 (当没有进入二级下钻时展示)
         if (activeSubViewTitle == null) {
-            LazyColumn(
-                state = libraryListState,
+            com.lm.player.core.designsystem.component.PullToRefreshLayout(
+                isRefreshing = isPullRefreshing,
+                onRefresh = {
+                    isPullRefreshing = true
+                    coroutineScope.launch {
+                        runCatching {
+                            onRefreshPlaylists()
+                            onSyncNow()
+                            kotlinx.coroutines.delay(800)
+                        }
+                        isPullRefreshing = false
+                    }
+                }
+            ) {
+                LazyColumn(
+                    state = libraryListState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
@@ -793,9 +846,9 @@ fun LocalLibraryScreen(
                     fun ServerStatusCard(cardModifier: Modifier = Modifier) {
                         LibraryLiquidCard(
                             modifier = cardModifier,
-                            gradientColors = if (isServerOk) listOf(Color(0xFF133624), Color(0xFF0A1F15)) else listOf(Color(0xFF332410), Color(0xFF1C1308)),
-                            glowColor = if (isServerOk) Color(0xFF34C759) else Color(0xFFFF9500),
-                            secondaryGlowColor = if (isServerOk) Color(0xFF30D158) else Color(0xFFFFB340),
+                            gradientColors = if (isServerOk) libPalettes[0].gradientColors else listOf(Color(0xFF332410), Color(0xFF1C1308)),
+                            glowColor = if (isServerOk) libPalettes[0].glowColor else Color(0xFFFF9500),
+                            secondaryGlowColor = if (isServerOk) libPalettes[0].secondaryGlowColor else Color(0xFFFFB340),
                             onClick = {
                                 val active = configuredServers.firstOrNull { it.isCurrentActive } ?: configuredServers.firstOrNull()
                                 if (active != null) onSelectServer(active) else onGoToSettings()
@@ -912,9 +965,9 @@ fun LocalLibraryScreen(
                     fun RecentAlbumCard(cardModifier: Modifier = Modifier) {
                         LibraryLiquidCard(
                             modifier = cardModifier,
-                            gradientColors = listOf(Color(0xFF5A250D), Color(0xFF2E1005)),
-                            glowColor = Color(0xFFFF7A45),
-                            secondaryGlowColor = Color(0xFFFFD200),
+                            gradientColors = libPalettes[1].gradientColors,
+                            glowColor = libPalettes[1].glowColor,
+                            secondaryGlowColor = libPalettes[1].secondaryGlowColor,
                             onClick = {
                                 isFromAllAlbums = false
                                 activeSubViewTitle = "全部专辑"
@@ -1030,8 +1083,9 @@ fun LocalLibraryScreen(
                     fun FavoriteSongsCard(cardModifier: Modifier = Modifier) {
                         LibraryLiquidCard(
                             modifier = cardModifier,
-                            gradientColors = listOf(Color(0xFFDC2626), Color(0xFF7F1D1D)),
-                            glowColor = Color(0xFFFF4D4D),
+                            gradientColors = libPalettes[2].gradientColors,
+                            glowColor = libPalettes[2].glowColor,
+                            secondaryGlowColor = libPalettes[2].secondaryGlowColor,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "我喜欢的音乐"
@@ -1109,9 +1163,10 @@ fun LocalLibraryScreen(
                             subtitle = "${filteredSongs.size} 首资料库曲目",
                             badgeText = if (isTriggeringScan || serverScanStatus?.isScanning == true) "扫描中" else "全库",
                             icon = Icons.Default.MusicNote,
-                            iconColor = Color(0xFF60A5FA),
-                            gradientColors = listOf(Color(0xFF2563EB), Color(0xFF1E3A8A)),
-                            glowColor = Color(0xFF60A5FA),
+                            iconColor = libPalettes[3].iconColor,
+                            gradientColors = libPalettes[3].gradientColors,
+                            glowColor = libPalettes[3].glowColor,
+                            secondaryGlowColor = libPalettes[3].secondaryGlowColor,
                             onClick = {
                                 activeSubViewTitle = "全部歌曲"
                                 activeSubViewSubtitle = "资料库曲目 · 共 ${filteredSongs.size} 首"
@@ -1128,9 +1183,10 @@ fun LocalLibraryScreen(
                             subtitle = "${finalDownloadedSongs.size} 首本机离线",
                             badgeText = "离线",
                             icon = Icons.Default.FileDownload,
-                            iconColor = Color(0xFF34D399),
-                            gradientColors = listOf(Color(0xFF047857), Color(0xFF064E3B)),
-                            glowColor = Color(0xFF34D399),
+                            iconColor = libPalettes[4].iconColor,
+                            gradientColors = libPalettes[4].gradientColors,
+                            glowColor = libPalettes[4].glowColor,
+                            secondaryGlowColor = libPalettes[4].secondaryGlowColor,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "本地下载"
@@ -1579,15 +1635,14 @@ fun LocalLibraryScreen(
                         }
                     }
                 } else {
-                    items(
+                    itemsIndexed(
                         items = filteredSongs,
-                        key = { it.id },
-                        contentType = { "library_song_item" }
-                    ) { song ->
+                        key = { _, song -> song.id },
+                        contentType = { _, _ -> "library_song_item" }
+                    ) { idx, song ->
                         val isSelected = selectedMainSongIds.contains(song.id)
                         Column {
                             if (songSortMode == "source") {
-                                val idx = filteredSongs.indexOf(song)
                                 val prevSource = if (idx > 0) getSongSourceTypeName(filteredSongs[idx - 1]) else null
                                 val currentSource = getSongSourceTypeName(song)
                                 if (prevSource != currentSource) {
@@ -1633,6 +1688,7 @@ fun LocalLibraryScreen(
                 }
             }
         }
+    }
 
         // 二级下钻详情视图 (页面内展示：歌单曲目、歌手曲目、专辑曲目，绝不遮挡底部播放栏)
         if (activeSubViewTitle != null) {

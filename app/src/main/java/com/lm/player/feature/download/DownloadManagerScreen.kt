@@ -35,9 +35,14 @@ import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.DownloadTask
+import com.lm.player.core.model.LemonServerDownloadTaskRecord
 import com.lm.player.core.model.UnifiedSong
+import com.lm.player.core.network.LemonMusicProtocol
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 /**
  * 现代轻奢风格已下载音乐管理中心
@@ -66,12 +71,68 @@ fun DownloadManagerScreen(
 ) {
     val context = LocalContext.current
     val dimensions = LocalAppDimensions.current
-    var selectedTab by remember { mutableIntStateOf(1) } // 0: 正在下载, 1: 已下载完成 (默认)
+    val scope = rememberCoroutineScope()
+    var selectedTab by remember { mutableIntStateOf(if (activeTasks.isNotEmpty()) 0 else 2) } // 0: 本地下载, 1: 服务器下载, 2: 已完成
     var isMultiSelectMode by remember { mutableStateOf(false) }
     val selectedSongIds = remember { mutableStateListOf<String>() }
 
     var isMultiSelectActiveMode by remember { mutableStateOf(false) }
     val selectedActiveTaskIds = remember { mutableStateListOf<String>() }
+
+    // 服务器下载任务列表与状态
+    var serverDownloads by remember { mutableStateOf<List<LemonServerDownloadTaskRecord>>(emptyList()) }
+    var isServerLoading by remember { mutableStateOf(false) }
+    var taskPendingDelete by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
+
+    fun refreshServerDownloads() {
+        isServerLoading = true
+        scope.launch {
+            LemonMusicProtocol.fetchServerDownloadList(context)
+                .onSuccess { list ->
+                    serverDownloads = list.sortedByDescending { it.createdAt }
+                    isServerLoading = false
+                }
+                .onFailure {
+                    isServerLoading = false
+                }
+        }
+    }
+
+    fun deleteServerTask(taskId: String) {
+        scope.launch {
+            LemonMusicProtocol.deleteServerDownloadTask(taskId, context)
+                .onSuccess {
+                    Toast.makeText(context, "已删除服务器下载任务", Toast.LENGTH_SHORT).show()
+                    refreshServerDownloads()
+                }
+                .onFailure {
+                    Toast.makeText(context, "删除失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                }
+        }
+    }
+
+    fun clearCompletedServerTasks() {
+        scope.launch {
+            LemonMusicProtocol.clearCompletedServerDownloads(context)
+                .onSuccess {
+                    Toast.makeText(context, "已清理已完成任务", Toast.LENGTH_SHORT).show()
+                    refreshServerDownloads()
+                }
+                .onFailure {
+                    Toast.makeText(context, "清理失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        refreshServerDownloads()
+    }
+
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == 1) {
+            refreshServerDownloads()
+        }
+    }
 
     // 安卓系统返回键逐层回退：先退出多选状态，否则返回上一级页面
     BackHandler {
@@ -216,8 +277,28 @@ fun DownloadManagerScreen(
                     }
                 }
 
-                // 仅在已下载 Tab 展示批量管理操作
-                if (selectedTab == 1 && completedSongs.isNotEmpty()) {
+                // 服务器下载 Tab 顶部操作 (清空已完成 & 刷新)
+                if (selectedTab == 1) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (serverDownloads.any { it.status == "completed" }) {
+                            TextButton(
+                                onClick = { clearCompletedServerTasks() },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text("清空已完成", color = AppleRed, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        IconButton(
+                            onClick = { refreshServerDownloads() },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = "刷新", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+
+                // 仅在已完成 Tab 展示批量管理操作
+                if (selectedTab == 2 && completedSongs.isNotEmpty()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (isMultiSelectMode) {
                             TextButton(
@@ -268,7 +349,7 @@ fun DownloadManagerScreen(
                 }
             }
 
-            // 2. 分段切换器 (正在下载 vs 已下载完成)
+            // 2. 分段切换器 (本地下载 vs 服务器下载 vs 已完成)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -277,6 +358,7 @@ fun DownloadManagerScreen(
                     .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
                     .padding(3.dp)
             ) {
+                // Tab 0: 本地下载
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -291,13 +373,14 @@ fun DownloadManagerScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "正在下载 (${activeTasks.size})",
-                        fontSize = 13.sp,
+                        text = "本地下载 (${activeTasks.size})",
+                        fontSize = 12.sp,
                         fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Normal,
                         color = if (selectedTab == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
+                // Tab 1: 服务器下载
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -306,6 +389,30 @@ fun DownloadManagerScreen(
                         .background(if (selectedTab == 1) MaterialTheme.colorScheme.surface else Color.Transparent)
                         .clickable {
                             selectedTab = 1
+                            isMultiSelectMode = false
+                            selectedSongIds.clear()
+                            isMultiSelectActiveMode = false
+                            selectedActiveTaskIds.clear()
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "服务器下载 (${serverDownloads.size})",
+                        fontSize = 12.sp,
+                        fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
+                        color = if (selectedTab == 1) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                // Tab 2: 已完成
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(17.dp))
+                        .background(if (selectedTab == 2) MaterialTheme.colorScheme.surface else Color.Transparent)
+                        .clickable {
+                            selectedTab = 2
                             isMultiSelectActiveMode = false
                             selectedActiveTaskIds.clear()
                         },
@@ -313,9 +420,9 @@ fun DownloadManagerScreen(
                 ) {
                     Text(
                         text = "已完成 (${completedSongs.size})",
-                        fontSize = 13.sp,
-                        fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selectedTab == 1) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                        fontSize = 12.sp,
+                        fontWeight = if (selectedTab == 2) FontWeight.Bold else FontWeight.Normal,
+                        color = if (selectedTab == 2) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -429,8 +536,16 @@ fun DownloadManagerScreen(
                         }
                     }
                 }
+            } else if (selectedTab == 1) {
+                // ====== 服务器下载列表 ======
+                ServerDownloadTasksContent(
+                    serverDownloads = serverDownloads,
+                    isLoading = isServerLoading,
+                    onRefresh = { refreshServerDownloads() },
+                    onDeleteTask = { taskPendingDelete = it }
+                )
             } else {
-                // ====== 已下载完成列表 ======
+                // ====== 已下载完成列表 (Tab 2) ======
                 if (completedSongs.isEmpty()) {
                     Box(
                         modifier = Modifier
@@ -724,7 +839,7 @@ fun DownloadManagerScreen(
 
         // 4.2 已下载多选模式下底部浮动批量操作条
         AnimatedVisibility(
-            visible = isMultiSelectMode && selectedTab == 1,
+            visible = isMultiSelectMode && selectedTab == 2,
             enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
             exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
             modifier = Modifier
@@ -974,6 +1089,45 @@ fun DownloadManagerScreen(
                 }
             }
         }
+    }
+
+    if (taskPendingDelete != null) {
+        val task = taskPendingDelete!!
+        AlertDialog(
+            onDismissRequest = { taskPendingDelete = null },
+            title = {
+                Text(
+                    text = "确认删除服务器下载？",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 17.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            },
+            text = {
+                Text(
+                    text = "确定要从服务端删除歌曲「${task.name}」的下载记录吗？如果文件正在下载，下载进程将被立即终止。",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val id = task.id
+                        taskPendingDelete = null
+                        deleteServerTask(id)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                ) {
+                    Text("确认删除", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { taskPendingDelete = null }) {
+                    Text("取消", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        )
     }
 }
 
@@ -1245,5 +1399,229 @@ private fun formatStorageSize(bytes: Long): String {
     } else {
         val mb = bytes.toDouble() / (1024.0 * 1024.0)
         String.format(Locale.getDefault(), "%.1f MB", mb)
+    }
+}
+
+@Composable
+private fun ServerDownloadTasksContent(
+    serverDownloads: List<LemonServerDownloadTaskRecord>,
+    isLoading: Boolean,
+    onRefresh: () -> Unit,
+    onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit
+) {
+    if (isLoading && serverDownloads.isEmpty()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 80.dp),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(color = AppleRed, modifier = Modifier.size(36.dp))
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("正在拉取服务器下载记录...", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
+            }
+        }
+    } else if (serverDownloads.isEmpty()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 80.dp),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    imageVector = Icons.Outlined.CloudDownload,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                    modifier = Modifier.size(56.dp)
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("暂无服务器端下载任务", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = onRefresh,
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("刷新状态", fontSize = 13.sp)
+                }
+            }
+        }
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 60.dp)
+        ) {
+            items(
+                items = serverDownloads,
+                key = { it.id }
+            ) { task ->
+                ServerDownloadTaskRow(
+                    task = task,
+                    onDelete = { onDeleteTask(task) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ServerDownloadTaskRow(
+    task: LemonServerDownloadTaskRecord,
+    onDelete: () -> Unit
+) {
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val borderColor = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.08f)
+
+    val statusText = when (task.status.lowercase()) {
+        "downloading" -> "下载中 ${task.progress}%"
+        "completed" -> "已完成"
+        "waiting" -> "排队中"
+        "error" -> if (task.error.isNotBlank()) "失败: ${task.error}" else "下载失败"
+        "paused" -> "已暂停"
+        "await_confirm" -> "待确认"
+        else -> task.status
+    }
+
+    val statusColor = when (task.status.lowercase()) {
+        "downloading" -> AppleRed
+        "completed" -> Color(0xFF34C759)
+        "waiting" -> Color(0xFFFF9500)
+        "error" -> Color(0xFFFF3B30)
+        "paused" -> Color.Gray
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = BorderStroke(1.dp, borderColor),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 歌曲封面与状态角标
+                Box(modifier = Modifier.size(48.dp)) {
+                    AlbumArtworkImage(
+                        model = task.coverUrl,
+                        seedId = task.id,
+                        targetSize = 160,
+                        modifier = Modifier.size(48.dp),
+                        cornerRadius = 8.dp
+                    )
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.90f),
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(1.dp)
+                            .size(16.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = when (task.status.lowercase()) {
+                                    "completed" -> Icons.Default.CheckCircle
+                                    "downloading" -> Icons.Default.Downloading
+                                    "error" -> Icons.Default.ErrorOutline
+                                    "waiting" -> Icons.Default.HourglassTop
+                                    else -> Icons.Default.CloudDownload
+                                },
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(12.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                // 歌曲信息
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = task.name,
+                        style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "${task.singer}${if (task.album.isNotBlank()) " • ${task.album}" else ""}",
+                        style = TextStyle(fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // 音质标签
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AppleRed.copy(alpha = 0.12f)
+                        ) {
+                            Text(
+                                text = task.quality.uppercase(),
+                                color = AppleRed,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        // 状态标签
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = statusColor.copy(alpha = 0.12f)
+                        ) {
+                            Text(
+                                text = statusText,
+                                color = statusColor,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                        if (task.createdAt > 0L) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            val timeStr = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(task.createdAt))
+                            Text(
+                                text = timeStr,
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+
+                // 删除按钮
+                IconButton(onClick = onDelete) {
+                    Icon(
+                        imageVector = Icons.Outlined.Delete,
+                        contentDescription = "删除任务",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            // 若在下载中，展示进度条
+            if (task.status.lowercase() == "downloading") {
+                Spacer(modifier = Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { (task.progress.coerceIn(0, 100)) / 100f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = AppleRed,
+                    trackColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                )
+            }
+        }
     }
 }

@@ -22,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -128,6 +129,13 @@ fun SettingsScreen(
     var downloadLrcFile by remember {
         mutableStateOf(prefs.getBoolean("download_lrc_file_v2", false))
     }
+    var autoCacheOnFavorite by remember {
+        mutableStateOf(prefs.getBoolean("auto_cache_on_favorite", false) || prefs.getBoolean("auto_cache_to_server_on_favorite", false))
+    }
+    var autoCacheServerQuality by remember {
+        mutableStateOf(AudioQuality.fromKey(prefs.getString("auto_cache_server_quality", "320k") ?: "320k"))
+    }
+    var expandedScriptIds by remember { mutableStateOf(setOf<String>()) }
     var maxConcurrentDownloads by remember(downloadSettings.maxConcurrent) {
         mutableIntStateOf(downloadSettings.maxConcurrent.coerceIn(1, 6))
     }
@@ -650,6 +658,7 @@ fun SettingsScreen(
                                 )
                             } else {
                                 sourceScripts.forEach { script ->
+                                    val isExpanded = expandedScriptIds.contains(script.id)
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
                                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
@@ -657,47 +666,162 @@ fun SettingsScreen(
                                         border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
                                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                                     ) {
-                                        Row(
-                                            modifier = Modifier.padding(12.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                                    if (script.version.isNotBlank()) {
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        Text("v${script.version}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.weight(1f).clickable {
+                                                        expandedScriptIds = if (isExpanded) expandedScriptIds - script.id else expandedScriptIds + script.id
+                                                    },
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                                        contentDescription = if (isExpanded) "折叠平台设置" else "展开平台设置",
+                                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        modifier = Modifier.size(20.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Column {
+                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                            Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                                                            if (script.version.isNotBlank()) {
+                                                                Spacer(modifier = Modifier.width(6.dp))
+                                                                Text("v${script.version}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                            }
+                                                        }
+                                                        if (script.author.isNotBlank()) {
+                                                            Text("作者: ${script.author}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                        }
                                                     }
                                                 }
-                                                if (script.author.isNotBlank()) {
-                                                    Text("作者: ${script.author}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
 
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Switch(
-                                                    checked = script.isActive,
-                                                    onCheckedChange = { enable ->
-                                                        if (activeServer != null) {
-                                                            coroutineScope.launch {
-                                                                val proto = LemonMusicProtocol(
-                                                                    NetworkClientFactory.createOkHttpClient(context),
-                                                                    activeServer.serverUrl,
-                                                                    activeServer.username,
-                                                                    activeServer.tokenOrApiKey
-                                                                )
-                                                                val res = if (enable) proto.activateSource(script.id) else proto.deactivateSource(script.id)
-                                                                if (res.isSuccess) {
-                                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                                    Toast.makeText(context, if (enable) "音源已激活" else "音源已停用", Toast.LENGTH_SHORT).show()
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Switch(
+                                                        checked = script.isActive,
+                                                        onCheckedChange = { enable ->
+                                                            if (activeServer != null) {
+                                                                coroutineScope.launch {
+                                                                    val proto = LemonMusicProtocol(
+                                                                        NetworkClientFactory.createOkHttpClient(context),
+                                                                        activeServer.serverUrl,
+                                                                        activeServer.username,
+                                                                        activeServer.tokenOrApiKey
+                                                                    )
+                                                                    val res = if (enable) proto.activateSource(script.id) else proto.deactivateSource(script.id)
+                                                                    if (res.isSuccess) {
+                                                                        sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                                                        Toast.makeText(context, if (enable) "音源已激活" else "音源已停用", Toast.LENGTH_SHORT).show()
+                                                                    }
                                                                 }
                                                             }
                                                         }
+                                                    )
+                                                    IconButton(onClick = { scriptToDelete = script }, modifier = Modifier.size(28.dp)) {
+                                                        Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed.copy(alpha = 0.8f), modifier = Modifier.size(16.dp))
                                                     }
-                                                )
-                                                IconButton(onClick = { scriptToDelete = script }, modifier = Modifier.size(28.dp)) {
-                                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed.copy(alpha = 0.8f), modifier = Modifier.size(16.dp))
+                                                }
+                                            }
+
+                                            // 折叠菜单：各平台独立解析开关
+                                            AnimatedVisibility(visible = isExpanded) {
+                                                Column(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(top = 8.dp)
+                                                ) {
+                                                    HorizontalDivider(
+                                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                                                        thickness = 0.5.dp,
+                                                        modifier = Modifier.padding(vertical = 6.dp)
+                                                    )
+                                                    Text(
+                                                        text = "平台解析设置 (对接柠檬服务器)",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Medium,
+                                                        color = MaterialTheme.colorScheme.primary
+                                                    )
+                                                    Spacer(modifier = Modifier.height(6.dp))
+
+                                                    val platforms = script.supportedPlatforms.ifEmpty { listOf("kw", "kg", "tx", "wy", "mg") }
+                                                    platforms.forEach { platform ->
+                                                        val platformTitle = when (platform.lowercase()) {
+                                                            "kw" -> "酷我音乐"
+                                                            "kg" -> "酷狗音乐"
+                                                            "tx" -> "QQ音乐"
+                                                            "wy" -> "网易云音乐"
+                                                            "mg" -> "咪咕音乐"
+                                                            "bd" -> "百度音乐"
+                                                            else -> platform.uppercase()
+                                                        }
+                                                        val isPlatformEnabled = platform !in script.disabledPlatforms
+
+                                                        val togglePlatformAction: (Boolean) -> Unit = { enable ->
+                                                            if (activeServer != null) {
+                                                                val oldScripts = sourceScripts
+                                                                sourceScripts = sourceScripts.map { s ->
+                                                                    if (s.id == script.id) {
+                                                                        val nextDisabled = if (enable) s.disabledPlatforms - platform else s.disabledPlatforms + platform
+                                                                        s.copy(disabledPlatforms = nextDisabled.distinct())
+                                                                    } else s
+                                                                }
+                                                                coroutineScope.launch {
+                                                                    val proto = LemonMusicProtocol(
+                                                                        NetworkClientFactory.createOkHttpClient(context),
+                                                                        activeServer.serverUrl,
+                                                                        activeServer.username,
+                                                                        activeServer.tokenOrApiKey
+                                                                    )
+                                                                    val res = proto.updateSourcePlatformStatus(script.id, platform, enable)
+                                                                    if (res.isSuccess) {
+                                                                        Toast.makeText(context, "$platformTitle 解析已${if (enable) "开启" else "取消"}", Toast.LENGTH_SHORT).show()
+                                                                    } else {
+                                                                        sourceScripts = oldScripts
+                                                                        Toast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message ?: "请检查服务端连接"}", Toast.LENGTH_SHORT).show()
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        Row(
+                                                            modifier = Modifier
+                                                                .fillMaxWidth()
+                                                                .padding(vertical = 3.dp, horizontal = 4.dp)
+                                                                .clip(RoundedCornerShape(8.dp))
+                                                                .clickable { togglePlatformAction(!isPlatformEnabled) },
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically
+                                                        ) {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                Surface(
+                                                                    shape = RoundedCornerShape(4.dp),
+                                                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                                                ) {
+                                                                    Text(
+                                                                        text = platform.uppercase(),
+                                                                        fontSize = 10.sp,
+                                                                        fontWeight = FontWeight.Bold,
+                                                                        color = MaterialTheme.colorScheme.primary,
+                                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                                    )
+                                                                }
+                                                                Spacer(modifier = Modifier.width(8.dp))
+                                                                Text(
+                                                                    text = platformTitle,
+                                                                    fontSize = 12.sp,
+                                                                    color = MaterialTheme.colorScheme.onSurface
+                                                                )
+                                                            }
+                                                            Switch(
+                                                                checked = isPlatformEnabled,
+                                                                onCheckedChange = { togglePlatformAction(it) },
+                                                                modifier = Modifier.scale(0.85f)
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1160,6 +1284,48 @@ fun SettingsScreen(
                                     }
                                 }
                             )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "收藏后自动缓存到服务器",
+                                subtitle = "在 App 内点击收藏歌曲后，后台自动将音频提交至服务器下载存储 (默认为关闭状态)",
+                                checked = autoCacheOnFavorite,
+                                onCheckedChange = {
+                                    autoCacheOnFavorite = it
+                                    prefs.edit()
+                                        .putBoolean("auto_cache_on_favorite", it)
+                                        .putBoolean("auto_cache_to_server_on_favorite", it)
+                                        .apply()
+                                    context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
+                                        .putBoolean("auto_cache_to_server_on_favorite", it)
+                                        .apply()
+                                }
+                            )
+
+                            if (autoCacheOnFavorite) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                SettingDropdownRow(
+                                    icon = Icons.Default.CloudDownload,
+                                    title = "收藏缓存音质",
+                                    subtitle = "收藏曲目自动缓存到服务器时优先请求的音质",
+                                    selectedValue = autoCacheServerQuality,
+                                    options = listOf(
+                                        AudioQuality.Q_128K,
+                                        AudioQuality.Q_320K,
+                                        AudioQuality.Q_FLAC,
+                                        AudioQuality.Q_HIRES
+                                    ),
+                                    getLabel = { "${it.label} [${it.badge}]" },
+                                    getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                    onSelect = { q ->
+                                        autoCacheServerQuality = q
+                                        prefs.edit().putString("auto_cache_server_quality", q.key).apply()
+                                        context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
+                                            .putString("auto_cache_server_quality", q.key)
+                                            .apply()
+                                    }
+                                )
+                            }
                         }
                     }
                 }

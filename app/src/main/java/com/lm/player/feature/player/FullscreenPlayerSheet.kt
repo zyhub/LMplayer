@@ -57,6 +57,7 @@ import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.media.AudioSharingManager
 import com.lm.player.core.media.ShareProtocolType
 import com.lm.player.core.model.*
+import java.io.File
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -1732,7 +1733,35 @@ fun AudioSpecsDropdownMenu(
     val qualityTag = if (isLossless && realBitRate >= 1200) "Hi-Res 无损母带" else if (isLossless) "无损品质音频" else if (realBitRate >= 320) "极高品质音频" else "标准音频"
     val sizeText: String = realLocalSizeStr
 
-    val locationText: String = if (isLocal) (song.localFilePath ?: "本地存储") else (song.streamUrl.takeIf { it.isNotBlank() } ?: "在线 NAS 媒体流")
+    val locationText: String = if (isLocal && !song.localFilePath.isNullOrBlank()) {
+        val f = File(song.localFilePath)
+        f.parent ?: song.localFilePath
+    } else {
+        val stream = song.streamUrl
+        var nasPath = ""
+        if (stream.contains("path=")) {
+            try {
+                val uri = android.net.Uri.parse(stream)
+                val pathParam = uri.getQueryParameter("path")
+                if (!pathParam.isNullOrBlank()) {
+                    val decoded = java.net.URLDecoder.decode(pathParam, "UTF-8")
+                    val parentDir = if (decoded.contains("/")) decoded.substringBeforeLast("/") + "/" else decoded
+                    nasPath = parentDir
+                }
+            } catch (_: Exception) {}
+        }
+        if (nasPath.isBlank() && !song.relativeFolderPath.isNullOrBlank()) {
+            val folder = song.relativeFolderPath.trim().trimEnd('/')
+            nasPath = "$folder/"
+        }
+        if (nasPath.isBlank()) {
+            val artist = song.artist.ifBlank { "未知歌手" }
+            val album = song.album.ifBlank { "单曲" }
+            nasPath = "/音乐/$artist/$album/"
+        }
+        if (!nasPath.startsWith("/")) nasPath = "/$nasPath"
+        "NAS: $nasPath"
+    }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     Dialog(
@@ -1783,7 +1812,46 @@ fun AudioSpecsDropdownMenu(
                     else -> "$activeRouteName · NAS 无损推流"
                 }
 
+                val isOnlineSong = song.id.startsWith("lemon_online_") ||
+                    song.serverId == "lemon_online" ||
+                    song.streamUrl.startsWith("lemon_online://") ||
+                    (com.lm.player.core.media.DownloadRequestPlanner.hasRemoteSource(song) && !isLocal)
+
+                val platformKey = when {
+                    song.id.startsWith("lemon_online_") -> song.id.removePrefix("lemon_online_").substringBefore("_")
+                    else -> {
+                        val rawJson = song.rawMetaJson ?: song.relativeFolderPath
+                        if (!rawJson.isNullOrBlank()) {
+                            runCatching {
+                                val obj = org.json.JSONObject(rawJson)
+                                obj.optString("source").ifBlank { obj.optString("platform") }
+                            }.getOrNull().orEmpty()
+                        } else ""
+                    }
+                }.ifBlank { "kw" }
+
+                val platformName = when (platformKey.lowercase()) {
+                    "tx" -> "QQ音乐"
+                    "kw" -> "酷我音乐"
+                    "wy" -> "网易云音乐"
+                    "kg" -> "酷狗音乐"
+                    "mg" -> "咪咕音乐"
+                    "bd" -> "百度音乐"
+                    else -> platformKey.uppercase()
+                }
+
+                val sourceName = runCatching {
+                    val rawJson = song.rawMetaJson ?: song.relativeFolderPath
+                    if (!rawJson.isNullOrBlank()) {
+                        val obj = org.json.JSONObject(rawJson)
+                        obj.optString("sourceName").ifBlank { obj.optString("scriptName") }
+                    } else ""
+                }.getOrNull()?.ifBlank { null } ?: "官方音源"
+
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (isOnlineSong) {
+                        SpecRowItem("解析来源", "$sourceName / ${platformName}解析", isBold = true, valueColor = AppleRed)
+                    }
                     SpecRowItem("音质等级", qualityTag, valueColor = if (isLossless) Color(0xFFD4AF37) else AppleRed)
                     SpecRowItem("编码格式", formatStr, isBold = true)
                     SpecRowItem("音频码率", "${if (song.bitRate > 0) song.bitRate else (if (isLossless) 920 else 320)} kbps")

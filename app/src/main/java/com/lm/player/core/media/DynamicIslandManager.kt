@@ -148,6 +148,7 @@ object DynamicIslandManager {
 
     private var lastNotifiedSongId: String = ""
     private var lastNotifiedPlaying: Boolean? = null
+    private var lastNotifiedFavorite: Boolean? = null
     private var lastNotifiedHasCustomArtwork: Boolean = false
 
     /**
@@ -735,6 +736,11 @@ object DynamicIslandManager {
         val prevPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_PREV, 101)
         val togglePendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_TOGGLE, 102)
         val nextPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_NEXT, 103)
+        val favPendingIntent = buildServiceCommandPendingIntent(context, PlaybackService.CMD_TOGGLE_FAVORITE, 104)
+
+        val isFavorite = currentSong?.isFavorite == true
+        val favIcon = if (isFavorite) R.drawable.ic_favorite_filled else R.drawable.ic_favorite_border
+        val favTitle = if (isFavorite) "已收藏" else "收藏"
 
         val builder = NotificationCompat.Builder(context, PlaybackService.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -770,6 +776,13 @@ object DynamicIslandManager {
                     android.R.drawable.ic_media_next,
                     "下一首",
                     nextPendingIntent
+                ).build()
+            )
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    favIcon,
+                    favTitle,
+                    favPendingIntent
                 ).build()
             )
 
@@ -855,12 +868,14 @@ object DynamicIslandManager {
         val player = exoPlayer ?: runCatching { Media3Factory.getSharedExoPlayer(context) }.getOrNull() ?: return
 
         val songId = PlaybackQueueManager.currentSongFlow.value?.id.orEmpty()
+        val isFavorite = PlaybackQueueManager.currentSongFlow.value?.isFavorite == true
         val isPlaying = player.isPlaying
         val hasCustomArtwork = songId.isNotEmpty() && bitmapCache.get(songId) != null
 
         if (!force &&
             songId == lastNotifiedSongId &&
             isPlaying == lastNotifiedPlaying &&
+            isFavorite == lastNotifiedFavorite &&
             hasCustomArtwork == lastNotifiedHasCustomArtwork
         ) {
             return
@@ -868,6 +883,7 @@ object DynamicIslandManager {
 
         lastNotifiedSongId = songId
         lastNotifiedPlaying = isPlaying
+        lastNotifiedFavorite = isFavorite
         lastNotifiedHasCustomArtwork = hasCustomArtwork
 
         try {

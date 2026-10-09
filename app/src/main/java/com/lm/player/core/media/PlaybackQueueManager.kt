@@ -682,7 +682,16 @@ object PlaybackQueueManager {
         }
     }
 
+    private var lastSkipElapsedRealtime = 0L
+
     fun playNext(context: Context) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSkipElapsedRealtime < 400L) {
+            Log.w(TAG, "playNext debounced: ignore fast repeat skip (${now - lastSkipElapsedRealtime}ms)")
+            return
+        }
+        lastSkipElapsedRealtime = now
+
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
         val list = _playlistFlow.value
@@ -709,6 +718,13 @@ object PlaybackQueueManager {
     }
 
     fun playPrevious(context: Context) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSkipElapsedRealtime < 400L) {
+            Log.w(TAG, "playPrevious debounced: ignore fast repeat skip (${now - lastSkipElapsedRealtime}ms)")
+            return
+        }
+        lastSkipElapsedRealtime = now
+
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
         val list = _playlistFlow.value
@@ -732,6 +748,128 @@ object PlaybackQueueManager {
         Log.i(TAG, "playPrevious: switching to ${prevSong.title}")
         playSong(prevSong, appCtx)
     }
+
+    /**
+     * 收藏状态全链路同步切换：
+     * 1. 立即更新当前播放中歌曲状态与播放列表状态
+     * 2. 刷新通知栏展开态 ♥ 收藏按钮红心图标状态
+     * 3. 异步持久化到 Room 本地数据库及 lemon_favorites 歌单
+     * 4. 同步至远端柠檬音乐服务器收藏列表
+     * 5. 若开启「收藏后自动缓存到服务器」，自动向服务器提交下载任务
+     */
+    fun toggleFavorite(context: Context, song: UnifiedSong? = null) {
+        val appCtx = context.applicationContext
+        val target = song ?: _currentSongFlow.value ?: return
+        val newFav = !target.isFavorite
+        val updated = target.copy(isFavorite = newFav)
+
+        // 1. 即时更新内存 StateFlow
+        if (_currentSongFlow.value?.id == target.id) {
+            _currentSongFlow.value = updated
+        }
+        val currentList = _playlistFlow.value
+        if (currentList.any { it.id == target.id }) {
+            _playlistFlow.value = currentList.map { if (it.id == target.id) updated else it }
+        }
+
+        // 2. 刷新通知栏与灵动岛
+        try {
+            DynamicIslandManager.notifySystemIsland(
+                appCtx,
+                null,
+                Media3Factory.getSharedExoPlayer(appCtx),
+                force = true
+            )
+        } catch (_: Throwable) {}
+
+        // 3. 异步持久化与服务器双向同步
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val db = ZdsDatabase.getInstance(appCtx)
+                val existing = db.songDao().getSongById(target.id)
+                if (existing == null) {
+                    db.songDao().insertSongs(
+                        listOf(
+                            com.lm.player.core.database.entity.SongEntity(
+                                id = updated.id,
+                                title = updated.title.ifBlank { "未知曲目" },
+                                artist = updated.artist.ifBlank { "未知歌手" },
+                                artistId = updated.artistId.ifBlank { "artist_${updated.artist.hashCode()}" },
+                                album = updated.album.ifBlank { "单曲精选" },
+                                albumId = updated.albumId.ifBlank { "album_${updated.album.hashCode()}" },
+                                durationMs = updated.durationMs,
+                                coverUrl = updated.coverUrl,
+                                streamUrl = updated.streamUrl,
+                                serverId = updated.serverId.ifBlank { "local_storage" },
+                                localFilePath = updated.localFilePath,
+                                downloadStatus = updated.downloadStatus,
+                                bitRate = updated.bitRate,
+                                format = updated.format,
+                                isFavorite = newFav,
+                                relativeFolderPath = updated.rawMetaJson ?: updated.relativeFolderPath,
+                                addedTimestamp = System.currentTimeMillis()
+                            )
+                        )
+                    )
+                } else {
+                    db.songDao().updateFavorite(target.id, newFav)
+                }
+                if (newFav) {
+                    db.playlistDao().addSongToPlaylist(
+                        com.lm.player.core.database.entity.PlaylistSongEntity(
+                            playlistId = "lemon_favorites",
+                            songId = target.id
+                        )
+                    )
+                } else {
+                    db.playlistDao().removeSongFromPlaylist("lemon_favorites", target.id)
+                }
+                db.playlistDao().updateSongCount("lemon_favorites")
+
+                // 4. 同步至远端服务器
+                val activeServer = db.serverDao().getActiveServer()
+                    ?: db.serverDao().getAllServers().firstOrNull { it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+                if (activeServer != null) {
+                    val protocol = LemonMusicProtocol(
+                        com.lm.player.core.network.NetworkClientFactory.createOkHttpClient(appCtx),
+                        activeServer.serverUrl,
+                        activeServer.username,
+                        activeServer.tokenOrApiKey
+                    )
+                    protocol.toggleFavoriteSongOnServer(updated, newFav)
+
+                    // 5. 检查「收藏后自动缓存到服务器」设置
+                    val prefs = appCtx.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                    val legacyPrefs = appCtx.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE)
+                    val autoCache = prefs.getBoolean("auto_cache_on_favorite", false) ||
+                        prefs.getBoolean("auto_cache_to_server_on_favorite", false) ||
+                        legacyPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
+                    if (newFav && autoCache) {
+                        val targetServerId = activeServer.id.ifBlank { "lemon_music" }
+                        val updatedServerId = if (target.serverId.isBlank() || target.serverId == "lemon_online" || target.serverId == "default") {
+                            targetServerId
+                        } else {
+                            target.serverId
+                        }
+                        val songWithServer = updated.copy(serverId = updatedServerId)
+                        _currentSongFlow.value = songWithServer
+                        db.songDao().updateServerId(target.id, updatedServerId)
+
+                        val qKey = prefs.getString("auto_cache_server_quality", null)
+                            ?: prefs.getString("default_download_quality", null)
+                            ?: legacyPrefs.getString("default_download_quality", "320k")
+                            ?: "320k"
+                        val targetQuality = com.lm.player.core.model.AudioQuality.fromKey(qKey)
+                        val task = DownloadRequestPlanner.buildServerDownloadTask(songWithServer, targetQuality)
+                        protocol.addServerDownloadTasks(listOf(task))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "toggleFavorite async error", e)
+            }
+        }
+    }
+
 
     fun togglePlay(context: Context) {
         val appCtx = context.applicationContext

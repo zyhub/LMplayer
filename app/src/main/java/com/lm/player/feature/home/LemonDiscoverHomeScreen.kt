@@ -61,6 +61,26 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+data class LiquidCardColorPalette(
+    val gradientColors: List<Color>,
+    val glowColor: Color,
+    val secondaryGlowColor: Color,
+    val iconColor: Color
+)
+
+val ALL_RANDOM_LIQUID_PALETTES: List<LiquidCardColorPalette> = listOf(
+    LiquidCardColorPalette(listOf(Color(0xFF0C3852), Color(0xFF061826)), Color(0xFF00D2FF), Color(0xFF38EF7D), Color(0xFF00D2FF)), // Ocean Cyan
+    LiquidCardColorPalette(listOf(Color(0xFF5A250D), Color(0xFF2E1005)), Color(0xFFFF7A45), Color(0xFFFFD200), Color(0xFFFF9500)), // Sunset Amber
+    LiquidCardColorPalette(listOf(Color(0xFF251A4A), Color(0xFF130D2E)), Color(0xFF8B5CF6), Color(0xFFC084FC), Color(0xFFA78BFA)), // Royal Violet
+    LiquidCardColorPalette(listOf(Color(0xFF4A154B), Color(0xFF250B28)), Color(0xFFE040FB), Color(0xFFFF80AB), Color(0xFFE040FB)), // Cyber Magenta
+    LiquidCardColorPalette(listOf(Color(0xFF0F3E33), Color(0xFF07211C)), Color(0xFF34D399), Color(0xFF10B981), Color(0xFF34D399)), // Emerald Mint
+    LiquidCardColorPalette(listOf(Color(0xFF5C1D24), Color(0xFF2D0B10)), Color(0xFFFF4D4D), Color(0xFFFF758F), Color(0xFFFF5252)), // Ruby Crimson
+    LiquidCardColorPalette(listOf(Color(0xFF1A2A4E), Color(0xFF0E172E)), Color(0xFF3B82F6), Color(0xFF60A5FA), Color(0xFF60A5FA)), // Electric Cobalt
+    LiquidCardColorPalette(listOf(Color(0xFF4A3410), Color(0xFF281B08)), Color(0xFFFFB300), Color(0xFFFFE082), Color(0xFFFFC107)), // Solar Gold
+    LiquidCardColorPalette(listOf(Color(0xFF1F3D3D), Color(0xFF0E1F1F)), Color(0xFF2DD4BF), Color(0xFF5EEAD4), Color(0xFF2DD4BF)), // Aurora Teal
+    LiquidCardColorPalette(listOf(Color(0xFF38153A), Color(0xFF1D091F)), Color(0xFFF43F5E), Color(0xFFFB7185), Color(0xFFF43F5E))  // Rose Coral
+)
+
 /**
  * 柠檬音乐专属：现代轻奢发现主页 (Discover Home)
  * 包含：
@@ -83,7 +103,9 @@ fun LemonDiscoverHomeScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
     onListScrollingChange: (Boolean) -> Unit = {},
+    onScrollPositionChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
@@ -121,6 +143,7 @@ fun LemonDiscoverHomeScreen(
     var newAlbums by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var reloadTrigger by remember { mutableStateOf(0) }
+    var isPullRefreshing by remember { mutableStateOf(false) }
 
     // 官方权威排行榜独立全景下钻层
     var isToplistsOverviewOpen by remember { mutableStateOf(false) }
@@ -208,6 +231,24 @@ fun LemonDiscoverHomeScreen(
     val isAnyScrolling = discoverListState.isScrollInProgress || collectionListState.isScrollInProgress
     LaunchedEffect(isAnyScrolling) {
         onListScrollingChange(isAnyScrolling)
+    }
+
+    val dynamicPalettes = remember { ALL_RANDOM_LIQUID_PALETTES.shuffled().take(5) }
+
+    val isScrolledAway = (activeCollectionTitle != null && (collectionListState.firstVisibleItemIndex > 0 || collectionListState.firstVisibleItemScrollOffset > 0)) ||
+        (activeCollectionTitle == null && (discoverListState.firstVisibleItemIndex > 0 || discoverListState.firstVisibleItemScrollOffset > 0))
+    LaunchedEffect(isScrolledAway) {
+        onScrollPositionChange(isScrolledAway)
+    }
+
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            if (activeCollectionTitle != null) {
+                collectionListState.scrollToItem(0)
+            } else {
+                discoverListState.scrollToItem(0)
+            }
+        }
     }
 
     val isServerOk = configuredServers.any { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
@@ -360,7 +401,7 @@ fun LemonDiscoverHomeScreen(
                     activeCollectionTitle = lastCollectionTitle
                     kotlinx.coroutines.delay(80)
                 }
-                runCatching { collectionListState.animateScrollToItem(colIdx) }
+                runCatching { collectionListState.scrollToItem(colIdx) }
             } else if (newIdx >= 0) {
                 if (activeCollectionTitle != null) {
                     activeCollectionTitle = null
@@ -371,15 +412,29 @@ fun LemonDiscoverHomeScreen(
                 var headerItems = 2 // 顶部 Header + 2大3小卡片矩阵
                 if (recommendPlaylists.isNotEmpty()) headerItems++ // 热门推荐歌单
                 headerItems++ // 新歌首发标题栏与选项卡
-                runCatching { discoverListState.animateScrollToItem(headerItems + newIdx) }
+                runCatching { discoverListState.scrollToItem(headerItems + newIdx) }
             }
         }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (activeCollectionTitle == null && !isToplistsOverviewOpen && !isAlbumsOverviewOpen) {
-            LazyColumn(
-                state = discoverListState,
+            com.lm.player.core.designsystem.component.PullToRefreshLayout(
+                isRefreshing = isPullRefreshing,
+                onRefresh = {
+                    isPullRefreshing = true
+                    coroutineScope.launch {
+                        runCatching {
+                            onSyncNow()
+                            reloadTrigger++
+                            kotlinx.coroutines.delay(800)
+                        }
+                        isPullRefreshing = false
+                    }
+                }
+            ) {
+                LazyColumn(
+                    state = discoverListState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
@@ -576,10 +631,10 @@ fun LemonDiscoverHomeScreen(
                             title = "今日推荐",
                             badgeText = "精选 3首",
                             icon = Icons.Default.AutoAwesome,
-                            iconColor = Color(0xFF00D2FF),
-                            gradientColors = listOf(Color(0xFF0C3852), Color(0xFF061826)),
-                            glowColor = Color(0xFF00D2FF),
-                            secondaryGlowColor = Color(0xFF38EF7D),
+                            iconColor = dynamicPalettes[0].iconColor,
+                            gradientColors = dynamicPalettes[0].gradientColors,
+                            glowColor = dynamicPalettes[0].glowColor,
+                            secondaryGlowColor = dynamicPalettes[0].secondaryGlowColor,
                             onClick = {
                                 todaySongs.firstOrNull()?.let {
                                     playNonRoamingSong(it, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
@@ -665,10 +720,10 @@ fun LemonDiscoverHomeScreen(
                             title = "最新专辑",
                             badgeText = "新碟首发",
                             icon = Icons.Default.Album,
-                            iconColor = Color(0xFFFF9500),
-                            gradientColors = listOf(Color(0xFF5A250D), Color(0xFF2E1005)),
-                            glowColor = Color(0xFFFF7A45),
-                            secondaryGlowColor = Color(0xFFFFD200),
+                            iconColor = dynamicPalettes[1].iconColor,
+                            gradientColors = dynamicPalettes[1].gradientColors,
+                            glowColor = dynamicPalettes[1].glowColor,
+                            secondaryGlowColor = dynamicPalettes[1].secondaryGlowColor,
                             onClick = {
                                 isAlbumsOverviewOpen = true
                             }
@@ -752,10 +807,10 @@ fun LemonDiscoverHomeScreen(
                             title = "权威排行榜",
                             badgeText = "官方热榜",
                             icon = Icons.Default.Leaderboard,
-                            iconColor = Color(0xFFA78BFA),
-                            gradientColors = listOf(Color(0xFF251A4A), Color(0xFF130D2E)),
-                            glowColor = Color(0xFF8B5CF6),
-                            secondaryGlowColor = Color(0xFFC084FC),
+                            iconColor = dynamicPalettes[2].iconColor,
+                            gradientColors = dynamicPalettes[2].gradientColors,
+                            glowColor = dynamicPalettes[2].glowColor,
+                            secondaryGlowColor = dynamicPalettes[2].secondaryGlowColor,
                             onClick = {
                                 isToplistsOverviewOpen = true
                             }
@@ -812,12 +867,12 @@ fun LemonDiscoverHomeScreen(
                                 subtitle = "随心而动 · 智能雷达",
                                 badgeText = "心动",
                                 icon = Icons.Default.Shuffle,
-                                iconColor = Color(0xFFE040FB),
+                                iconColor = dynamicPalettes[3].iconColor,
                                 trailingIcon = Icons.Default.PlayArrow,
                                 isCurrentlyPlaying = isRoamingPlaying && isPlaying && currentPlayingSong != null && roamingSongIds.contains(currentPlayingSong.id),
-                                gradientColors = listOf(Color(0xFF4A154B), Color(0xFF250B28)),
-                                glowColor = Color(0xFFE040FB),
-                                secondaryGlowColor = Color(0xFFFF80AB),
+                                gradientColors = dynamicPalettes[3].gradientColors,
+                                glowColor = dynamicPalettes[3].glowColor,
+                                secondaryGlowColor = dynamicPalettes[3].secondaryGlowColor,
                                 onClick = {
                                     val pool = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }.shuffled()
                                     if (pool.isNotEmpty()) {
@@ -837,11 +892,11 @@ fun LemonDiscoverHomeScreen(
                                 subtitle = "探索全网全新好歌",
                                 badgeText = "刷新",
                                 icon = Icons.Default.Refresh,
-                                iconColor = Color(0xFF34D399),
+                                iconColor = dynamicPalettes[4].iconColor,
                                 trailingIcon = Icons.Default.AutoAwesome,
-                                gradientColors = listOf(Color(0xFF064E3B), Color(0xFF022C22)),
-                                glowColor = Color(0xFF34D399),
-                                secondaryGlowColor = Color(0xFF6EE7B7),
+                                gradientColors = dynamicPalettes[4].gradientColors,
+                                glowColor = dynamicPalettes[4].glowColor,
+                                secondaryGlowColor = dynamicPalettes[4].secondaryGlowColor,
                                 onClick = {
                                     com.lm.player.core.network.LemonMusicProtocol.clearDiscoverCache()
                                     recommendSeed++
@@ -1058,8 +1113,9 @@ fun LemonDiscoverHomeScreen(
                 }
             }
         }
-        }
     }
+}
+}
 
         // 官方权威排行榜全景下钻层 (点击【权威排行榜】大卡时展开，减少主页重复列表)
         if (isToplistsOverviewOpen && activeCollectionTitle == null) {

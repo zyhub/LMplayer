@@ -247,9 +247,7 @@ fun SongListItemRow(
     val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
     val activeTask = activeDownloadTasks.firstOrNull { it.song.id == song.id }
-    val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() &&
-            (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
-    val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
+    val isDownloaded = (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
     val isCurrentPlaying = com.lm.player.core.designsystem.component.isSamePlayingSong(song, currentPlayingSong)
@@ -472,7 +470,9 @@ fun LocalMusicHomeScreen(
     currentPlayingSong: UnifiedSong? = null,
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
+    scrollToTopTrigger: Int = 0,
     onListScrollingChange: (Boolean) -> Unit = {},
+    onScrollPositionChange: (Boolean) -> Unit = {},
     onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
@@ -579,9 +579,20 @@ fun LocalMusicHomeScreen(
                 if (homeDisplayConfig.showRecentlyAdded && effectiveRecentlyAdded.isNotEmpty()) headerOffset++
                 if (homeDisplayConfig.showAlbums && albums.isNotEmpty()) headerOffset++
                 if (homeDisplayConfig.showArtists && artists.isNotEmpty()) headerOffset++
-                listState.animateScrollToItem((headerOffset + songIdx).coerceAtLeast(0))
+                listState.scrollToItem((headerOffset + songIdx).coerceAtLeast(0))
             }
         }
+    }
+
+    LaunchedEffect(scrollToTopTrigger) {
+        if (scrollToTopTrigger > 0) {
+            listState.scrollToItem(0)
+        }
+    }
+
+    val isScrolledAway = listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
+    LaunchedEffect(isScrolledAway) {
+        onScrollPositionChange(isScrolledAway)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {

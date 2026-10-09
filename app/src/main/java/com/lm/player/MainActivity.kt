@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -35,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -393,11 +395,14 @@ class MainActivity : ComponentActivity() {
             // 正在播放歌曲定位悬浮按钮状态（记录歌曲所属列表页面 + 仅在播放中且列表滑动时显示，播放界面不显示）
             var playingListScreen by remember { mutableStateOf(Screen.HOME) }
             var locateSongTrigger by remember { mutableStateOf(0) }
+            var scrollToTopTrigger by remember { mutableStateOf(0) }
+            var isScrolledAwayFromTop by remember { mutableStateOf(false) }
             var isSongListScrolling by remember { mutableStateOf(false) }
             var isLocateButtonVisible by remember { mutableStateOf(false) }
+            var userManualPlayClickCount by rememberSaveable { mutableIntStateOf(0) }
 
-            LaunchedEffect(isSongListScrolling, isPlaying, isFullPlayerVisible, currentScreen, isSearchDialogOpen) {
-                if (!isPlaying || isFullPlayerVisible || isSearchDialogOpen || currentScreen !in listOf(Screen.HOME, Screen.LIBRARY)) {
+            LaunchedEffect(isSongListScrolling, isPlaying, isFullPlayerVisible, currentScreen, isSearchDialogOpen, userManualPlayClickCount) {
+                if (!isPlaying || isFullPlayerVisible || isSearchDialogOpen || currentScreen !in listOf(Screen.HOME, Screen.LIBRARY) || userManualPlayClickCount < 2) {
                     isLocateButtonVisible = false
                 } else if (isSongListScrolling) {
                     isLocateButtonVisible = true
@@ -975,6 +980,7 @@ class MainActivity : ComponentActivity() {
 
             // 核心业务函数：播放指定歌曲 (委托至 PlaybackQueueManager 调度，支持动态上下文队列、断点进度与全局本地优先调用)
             val playSongWithQueueAndPosition: (UnifiedSong, List<UnifiedSong>?, Long) -> Unit = { targetSong, contextQueue, startPositionMs ->
+                userManualPlayClickCount++
                 if (currentScreen == Screen.HOME || currentScreen == Screen.LIBRARY) {
                     playingListScreen = currentScreen
                 }
@@ -1397,7 +1403,18 @@ class MainActivity : ComponentActivity() {
              */
             val handleToggleFavorite: (UnifiedSong) -> Unit = { songToFav ->
                 val newFav = !songToFav.isFavorite
-                val updatedSong = songToFav.copy(isFavorite = newFav)
+                val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
+                    uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
+                val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                val willCacheToServer = newFav && isAutoCache && activeServer != null
+                val targetServerId = activeServer?.id?.ifBlank { "lemon_music" } ?: "lemon_music"
+                val effectiveServerId = when {
+                    willCacheToServer && (songToFav.serverId.isBlank() || songToFav.serverId == "lemon_online" || songToFav.serverId == "default") -> targetServerId
+                    songToFav.serverId.isNotBlank() && songToFav.serverId != "lemon_online" -> songToFav.serverId
+                    else -> "lemon_online"
+                }
+                val updatedSong = songToFav.copy(isFavorite = newFav, serverId = effectiveServerId)
                 songList = if (songList.any { it.id == songToFav.id }) {
                     songList.map { if (it.id == songToFav.id) updatedSong else it }
                 } else {
@@ -1422,12 +1439,6 @@ class MainActivity : ComponentActivity() {
                     try {
                         val existing = database.songDao().getSongById(songToFav.id)
                         if (existing == null) {
-                            val activeSrv = serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull()
-                            val effectiveServerId = when {
-                                songToFav.serverId.isNotBlank() && songToFav.serverId != "lemon_online" -> songToFav.serverId
-                                activeSrv != null -> activeSrv.id
-                                else -> "local_storage"
-                            }
                             database.songDao().insertSongs(
                                 listOf(
                                     SongEntity(
@@ -1440,7 +1451,7 @@ class MainActivity : ComponentActivity() {
                                         durationMs = updatedSong.durationMs,
                                         coverUrl = updatedSong.coverUrl,
                                         streamUrl = updatedSong.streamUrl,
-                                        serverId = effectiveServerId,
+                                        serverId = updatedSong.serverId,
                                         localFilePath = updatedSong.localFilePath,
                                         downloadStatus = updatedSong.downloadStatus,
                                         bitRate = updatedSong.bitRate,
@@ -1453,6 +1464,9 @@ class MainActivity : ComponentActivity() {
                             )
                         } else {
                             database.songDao().updateFavorite(songToFav.id, newFav)
+                            if (willCacheToServer) {
+                                database.songDao().updateServerId(songToFav.id, updatedSong.serverId)
+                            }
                         }
                         if (newFav) {
                             database.playlistDao().addSongToPlaylist(
@@ -1466,8 +1480,6 @@ class MainActivity : ComponentActivity() {
                         }
                         database.playlistDao().updateSongCount("lemon_favorites")
 
-                        val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                            ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                         if (activeServer != null) {
                             val protocol = LemonMusicProtocol(
                                 NetworkClientFactory.createOkHttpClient(this@MainActivity),
@@ -1479,8 +1491,35 @@ class MainActivity : ComponentActivity() {
                             syncServerPlaylists(activeServer)
                             val favs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()
                             if (favs != null) {
+                                val mappedFavs = if (isAutoCache) {
+                                    favs.map { s ->
+                                        if (s.serverId == "lemon_online" || s.serverId.isBlank() || s.serverId == "default") {
+                                            s.copy(serverId = activeServer.id.ifBlank { "lemon_music" })
+                                        } else s
+                                    }
+                                } else favs
                                 withContext(Dispatchers.Main) {
-                                    serverFavoriteSongs = favs
+                                    serverFavoriteSongs = mappedFavs
+                                }
+                            }
+                            // 收藏后自动缓存到服务器
+                            val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
+                                uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
+                            if (newFav && isAutoCache) {
+                                try {
+                                    val qKey = uiPrefs.getString("auto_cache_server_quality", null)
+                                        ?: uiPrefs.getString("default_download_quality", AudioQuality.Q_320K.key)
+                                        ?: AudioQuality.Q_320K.key
+                                    val targetQuality = AudioQuality.fromKey(qKey)
+                                    val serverTask = DownloadRequestPlanner.buildServerDownloadTask(updatedSong, targetQuality)
+                                    val cacheRes = protocol.addServerDownloadTasks(listOf(serverTask))
+                                    withContext(Dispatchers.Main) {
+                                        if (cacheRes.isSuccess) {
+                                            Toast.makeText(this@MainActivity, "已同步提交服务器缓存 [${targetQuality.badge}]", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w("MainActivity", "autoCacheOnFavorite error", e)
                                 }
                             }
                         }
@@ -1926,6 +1965,8 @@ class MainActivity : ComponentActivity() {
                                             currentPlayingSong = currentSong,
                                             isPlaying = isPlaying,
                                             locateSongTrigger = locateSongTrigger,
+                                            scrollToTopTrigger = scrollToTopTrigger,
+                                            onScrollPositionChange = { isScrolledAwayFromTop = it },
                                             onListScrollingChange = { isSongListScrolling = it },
                                             onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                             onDownloadSong = handleDownloadSong,
@@ -2004,6 +2045,8 @@ class MainActivity : ComponentActivity() {
                                             currentPlayingSong = currentSong,
                                             isPlaying = isPlaying,
                                             locateSongTrigger = locateSongTrigger,
+                                            scrollToTopTrigger = scrollToTopTrigger,
+                                            onScrollPositionChange = { isScrolledAwayFromTop = it },
                                             onListScrollingChange = { isSongListScrolling = it },
                                             onSongClick = { song, queue -> playSongWithQueue(song, queue) },
                                             onDownloadSong = handleDownloadSong,
@@ -2124,6 +2167,8 @@ class MainActivity : ComponentActivity() {
                                         currentPlayingSong = currentSong,
                                         isPlaying = isPlaying,
                                         locateSongTrigger = locateSongTrigger,
+                                        scrollToTopTrigger = scrollToTopTrigger,
+                                        onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onListScrollingChange = { isSongListScrolling = it },
                                         onSelectLocalServer = {
                                             activeServerName = "本地模式"
@@ -2583,69 +2628,111 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        // 正在播放歌曲定位悬浮按钮（小圆形背景仅显示图标；消除半透明背景与动画期间阴影穿透重叠问题）
-                        AnimatedVisibility(
-                            visible = isLocateButtonVisible &&
-                                isPlaying &&
-                                currentSong != null &&
-                                !isFullPlayerVisible &&
-                                !isSearchDialogOpen &&
-                                (currentScreen == Screen.HOME || currentScreen == Screen.LIBRARY),
-                            enter = fadeIn(animationSpec = tween(200)) + scaleIn(animationSpec = tween(200), initialScale = 0.85f),
-                            exit = fadeOut(animationSpec = tween(220)) + scaleOut(animationSpec = tween(220), targetScale = 0.85f),
+                        // 右下角浮动操作列：定位当前播放歌曲按钮 + 置顶按钮 (滑动不在顶端时出现，位置在定位歌曲按钮的下面)
+                        Column(
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
                                 .padding(
                                     end = 18.dp,
                                     bottom = innerPadding.calculateBottomPadding() + 14.dp
-                                )
+                                ),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Surface(
-                                onClick = {
-                                    val song = currentSong ?: return@Surface
-                                    val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
-                                    val activeConfig = if (isLocalMode) null else serversList.firstOrNull { it.isCurrentActive }
-                                    val existsInLibrary = songList.any { s ->
-                                        com.lm.player.core.designsystem.component.isSamePlayingSong(s, song) && (
-                                            if (isLocalMode || activeConfig == null) {
-                                                s.downloadStatus == DownloadStatus.DOWNLOADED ||
-                                                s.serverId in listOf("local_storage", "local_folder", "local_saf") ||
-                                                !s.localFilePath.isNullOrBlank()
-                                            } else {
-                                                s.serverId == activeConfig.id ||
-                                                s.serverId == activeConfig.serverUrl ||
-                                                (activeConfig.type == ServerType.LEMON_MUSIC && (s.serverId == "lemon_music" || s.serverId == activeConfig.id))
-                                            }
+                            // 1. 定位当前播放歌曲按钮
+                            AnimatedVisibility(
+                                visible = isLocateButtonVisible &&
+                                    isPlaying &&
+                                    currentSong != null &&
+                                    !isFullPlayerVisible &&
+                                    !isSearchDialogOpen &&
+                                    userManualPlayClickCount >= 2 &&
+                                    (currentScreen == Screen.HOME || currentScreen == Screen.LIBRARY),
+                                enter = fadeIn(animationSpec = tween(200)) + scaleIn(animationSpec = tween(200), initialScale = 0.85f),
+                                exit = fadeOut(animationSpec = tween(220)) + scaleOut(animationSpec = tween(220), targetScale = 0.85f)
+                            ) {
+                                Surface(
+                                    onClick = {
+                                        val song = currentSong ?: return@Surface
+                                        val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                                        val activeConfig = if (isLocalMode) null else serversList.firstOrNull { it.isCurrentActive }
+                                        val existsInLibrary = songList.any { s ->
+                                            com.lm.player.core.designsystem.component.isSamePlayingSong(s, song) && (
+                                                if (isLocalMode || activeConfig == null) {
+                                                    s.downloadStatus == DownloadStatus.DOWNLOADED ||
+                                                    s.serverId in listOf("local_storage", "local_folder", "local_saf") ||
+                                                    !s.localFilePath.isNullOrBlank()
+                                                } else {
+                                                    s.serverId == activeConfig.id ||
+                                                    s.serverId == activeConfig.serverUrl ||
+                                                    (activeConfig.type == ServerType.LEMON_MUSIC && (s.serverId == "lemon_music" || s.serverId == activeConfig.id))
+                                                }
+                                            )
+                                        }
+                                        val targetListScreen = when {
+                                            playingListScreen == Screen.LIBRARY && existsInLibrary -> Screen.LIBRARY
+                                            playingListScreen == Screen.HOME -> Screen.HOME
+                                            existsInLibrary -> Screen.LIBRARY
+                                            else -> playingListScreen
+                                        }
+                                        if (currentScreen != targetListScreen) {
+                                            currentScreen = targetListScreen
+                                        }
+                                        locateSongTrigger++
+                                    },
+                                    modifier = Modifier.size(40.dp),
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    shadowElevation = 5.dp,
+                                    tonalElevation = 0.dp,
+                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.26f))
+                                ) {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.MyLocation,
+                                            contentDescription = "定位当前播放歌曲",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(20.dp)
                                         )
                                     }
-                                    val targetListScreen = when {
-                                        playingListScreen == Screen.LIBRARY && existsInLibrary -> Screen.LIBRARY
-                                        playingListScreen == Screen.HOME -> Screen.HOME
-                                        existsInLibrary -> Screen.LIBRARY
-                                        else -> playingListScreen
-                                    }
-                                    if (currentScreen != targetListScreen) {
-                                        currentScreen = targetListScreen
-                                    }
-                                    locateSongTrigger++
-                                },
-                                modifier = Modifier.size(40.dp),
-                                shape = CircleShape,
-                                color = MaterialTheme.colorScheme.primary,
-                                shadowElevation = 5.dp,
-                                tonalElevation = 0.dp,
-                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.26f))
+                                }
+                            }
+
+                            // 2. 置顶按钮 (滑动不在顶端时出现，位置在定位歌曲按钮的下面)
+                            AnimatedVisibility(
+                                visible = isScrolledAwayFromTop &&
+                                    !isFullPlayerVisible &&
+                                    !isSearchDialogOpen &&
+                                    (currentScreen == Screen.HOME || currentScreen == Screen.LIBRARY),
+                                enter = fadeIn(animationSpec = tween(200)) + scaleIn(animationSpec = tween(200), initialScale = 0.85f),
+                                exit = fadeOut(animationSpec = tween(220)) + scaleOut(animationSpec = tween(220), targetScale = 0.85f)
                             ) {
-                                Box(
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentAlignment = Alignment.Center
+                                val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+                                Surface(
+                                    onClick = {
+                                        scrollToTopTrigger++
+                                    },
+                                    modifier = Modifier.size(40.dp),
+                                    shape = CircleShape,
+                                    color = if (isDark) Color(0xFF2C2C36) else Color.White,
+                                    shadowElevation = 5.dp,
+                                    tonalElevation = 0.dp,
+                                    border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.20f) else Color.Black.copy(alpha = 0.12f))
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.MyLocation,
-                                        contentDescription = "定位当前播放歌曲",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(20.dp)
-                                    )
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.KeyboardArrowUp,
+                                            contentDescription = "返回顶部",
+                                            tint = if (isDark) Color.White else Color(0xFF1E1E26),
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -3004,14 +3091,7 @@ class MainActivity : ComponentActivity() {
         try {
             mediaCommandReceiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
-                    val cmd = intent?.getStringExtra(PlaybackService.EXTRA_COMMAND)
-                    when (cmd) {
-                        PlaybackService.CMD_NEXT -> playNextAction?.invoke()
-                        PlaybackService.CMD_PREV -> playPreviousAction?.invoke()
-                        PlaybackService.CMD_TOGGLE -> togglePlayAction?.invoke()
-                        PlaybackService.CMD_PLAY -> if (exoPlayer?.isPlaying != true) togglePlayAction?.invoke()
-                        PlaybackService.CMD_PAUSE -> if (exoPlayer?.isPlaying == true) togglePlayAction?.invoke()
-                    }
+                    // PlaybackService 是媒体指令执行的唯一真相源，避免广播回路导致二次调用
                 }
             }
             val filter = IntentFilter(PlaybackService.ACTION_MEDIA_COMMAND)
@@ -3074,7 +3154,6 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_NAVIGATE_NEXT,
             KeyEvent.KEYCODE_PAGE_DOWN -> {
                 PlaybackQueueManager.playNext(this@MainActivity)
-                playNextAction?.invoke()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PREVIOUS,
@@ -3086,14 +3165,12 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
             KeyEvent.KEYCODE_PAGE_UP -> {
                 PlaybackQueueManager.playPrevious(this@MainActivity)
-                playPreviousAction?.invoke()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             KeyEvent.KEYCODE_HEADSETHOOK,
             KeyEvent.KEYCODE_BUTTON_START -> {
                 PlaybackQueueManager.togglePlay(this@MainActivity)
-                togglePlayAction?.invoke()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY -> {

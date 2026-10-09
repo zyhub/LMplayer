@@ -71,6 +71,7 @@ class PlaybackService : MediaSessionService() {
         const val CMD_TOGGLE = "CMD_TOGGLE"
         const val CMD_NEXT = "CMD_NEXT"
         const val CMD_PREV = "CMD_PREV"
+        const val CMD_TOGGLE_FAVORITE = "CMD_TOGGLE_FAVORITE"
 
         // 仅在手机端关闭「启用挂后台手机灵动岛」时屏蔽的手机系统通知中心/状态栏胶囊包名（不影响车机桌面与蓝牙播控）
         private val PHONE_SYSTEM_ISLAND_PACKAGES = setOf(
@@ -249,22 +250,18 @@ class PlaybackService : MediaSessionService() {
 
                 override fun seekToNext() {
                     PlaybackQueueManager.playNext(this@PlaybackService)
-                    dispatchBroadcast(CMD_NEXT)
                 }
 
                 override fun seekToNextMediaItem() {
                     PlaybackQueueManager.playNext(this@PlaybackService)
-                    dispatchBroadcast(CMD_NEXT)
                 }
 
                 override fun seekToPrevious() {
                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                    dispatchBroadcast(CMD_PREV)
                 }
 
                 override fun seekToPreviousMediaItem() {
                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                    dispatchBroadcast(CMD_PREV)
                 }
             }
 
@@ -292,6 +289,7 @@ class PlaybackService : MediaSessionService() {
                         .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
                         .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
                         .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
+                        .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
                         .build()
                     val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
                         .add(Player.COMMAND_SEEK_TO_NEXT)
@@ -321,25 +319,23 @@ class PlaybackService : MediaSessionService() {
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
                             PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
                         }
                         CMD_PREV -> {
                             PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
                         }
                         CMD_TOGGLE -> {
                             PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
                         }
                         CMD_PLAY -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PLAY)
                         }
                         CMD_PAUSE -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PAUSE)
+                        }
+                        CMD_TOGGLE_FAVORITE -> {
+                            PlaybackQueueManager.toggleFavorite(this@PlaybackService)
                         }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -362,7 +358,7 @@ class PlaybackService : MediaSessionService() {
                         if (now - lastKeyTimestamp < 250) {
                             return true
                         }
-                        if (keyEvent.action == KeyEvent.ACTION_DOWN || (keyEvent.action == KeyEvent.ACTION_UP && keyEvent.repeatCount == 0)) {
+                        if (keyEvent.action == KeyEvent.ACTION_DOWN) {
                             lastKeyTimestamp = now
                             Log.i(TAG, "Received MediaButton KeyEvent: ${keyEvent.keyCode}, action: ${keyEvent.action}")
                             when (keyEvent.keyCode) {
@@ -375,7 +371,6 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_NEXT,
                                 KeyEvent.KEYCODE_PAGE_DOWN -> {
                                     PlaybackQueueManager.playNext(this@PlaybackService)
-                                    dispatchBroadcast(CMD_NEXT)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PREVIOUS,
@@ -387,27 +382,23 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
                                 KeyEvent.KEYCODE_PAGE_UP -> {
                                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PREV)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                                 KeyEvent.KEYCODE_HEADSETHOOK,
                                 KeyEvent.KEYCODE_BUTTON_START -> {
                                     PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_TOGGLE)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PLAY)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PAUSE,
                                 KeyEvent.KEYCODE_MEDIA_STOP -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PAUSE)
                                     return true
                                 }
                             }
@@ -424,20 +415,14 @@ class PlaybackService : MediaSessionService() {
                 ): Int {
                     when (playerCommand) {
                         Player.COMMAND_SEEK_TO_NEXT,
-                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
                         Player.COMMAND_SEEK_TO_PREVIOUS,
                         Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
+                            // 仅授权命令执行，实际切歌统一由 forwardingPlayer.seekToNext() / seekToPrevious() 执行
                             return SessionResult.RESULT_SUCCESS
                         }
                         Player.COMMAND_PLAY_PAUSE -> {
                             PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
                             return SessionResult.RESULT_SUCCESS
                         }
                     }
@@ -612,6 +597,10 @@ class PlaybackService : MediaSessionService() {
                     val p = Media3Factory.getSharedExoPlayer(this)
                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this)
                     dispatchBroadcast(CMD_PAUSE)
+                }
+                CMD_TOGGLE_FAVORITE -> {
+                    PlaybackQueueManager.toggleFavorite(this)
+                    dispatchBroadcast(CMD_TOGGLE_FAVORITE)
                 }
             }
             startImmediateForeground()
