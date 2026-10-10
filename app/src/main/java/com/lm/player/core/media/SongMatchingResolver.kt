@@ -267,15 +267,34 @@ object SongMatchingResolver {
         if (incomingSongs.isEmpty()) return emptyList()
 
         val validPathMemo = HashMap<String, Boolean>(128)
-        fun isLocalPathValidFast(path: String?, status: DownloadStatus): Boolean {
+        /**
+         * 本地路径有效性判定 —— **分两种语义**，不能混用（P1-5）。
+         *
+         * @param allowTrustStatusOnMain 是否允许「只看 DOWNLOADED 标记、不查磁盘」。
+         *
+         * 背景：本函数会在**主线程**的列表解析路径上被调用，候选集是整个曲库（2000+ 首），
+         * 逐条 File.exists() 是 O(n) 磁盘 stat，会直接卡住列表渲染。因此原有的做法是
+         * 「downloadDir == null 且状态为 DOWNLOADED 时直接返回 true」。
+         *
+         * 但这带来一个真实缺陷：用户在系统文件管理器里删掉音频、或 U 盘/SD 卡被拔出后，
+         * 数据库里仍是 DOWNLOADED + 有效的 localFilePath，UI 继续显示「已下载」，
+         * 点播时却拼出 file:// 交给 ExoPlayer → **播放直接失败且没有任何提示**。
+         *
+         * 因此把选择权交给调用方：
+         *  - 列表展示（主线程、追求流畅）传 true，接受短暂的状态漂移；
+         *  - **播放路由**（决定能不能真的播出来）必须传 false，宁可多一次 stat 也不能误报。
+         */
+        fun isLocalPathValid(path: String?, status: DownloadStatus, allowTrustStatusOnMain: Boolean = true): Boolean {
             if (path.isNullOrBlank()) return false
             if (path.startsWith("content://")) return true
-            // 当处于纯内存列表解析 (downloadDir == null) 且状态已明确标记为 DOWNLOADED 时，避免在主线程重复触发磁盘 stat()
-            if (downloadDir == null && status == DownloadStatus.DOWNLOADED) return true
+            if (allowTrustStatusOnMain && downloadDir == null && status == DownloadStatus.DOWNLOADED) return true
             return validPathMemo.getOrPut(path) {
                 File(path).let { it.exists() && it.length() > 0 }
             }
         }
+        // 兼容旧调用名（列表解析路径）：保留「主线程可信任标记」的快速语义
+        fun isLocalPathValidFast(path: String?, status: DownloadStatus): Boolean =
+            isLocalPathValid(path, status, allowTrustStatusOnMain = true)
 
         // 1. 预构建内存快速哈希索引表（支持同 (normTitle, normArtist) 下按版本/专辑精确区分）
         val cachedById = HashMap<String, UnifiedSong>(allCachedSongs.size)

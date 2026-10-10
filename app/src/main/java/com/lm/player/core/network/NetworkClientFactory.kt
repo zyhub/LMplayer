@@ -45,13 +45,37 @@ object NetworkClientFactory {
     @Volatile
     private var activeAuthToken: String = ""
 
-    fun setActiveAuthToken(token: String) {
+    /**
+     * 允许自动注入 [activeAuthToken] 的目标主机集合（小写，不含端口）。
+     *
+     * **为什么必须绑定主机**：共享 OkHttpClient 的拦截器此前对「任意主机 + 路径以 /api/ 开头
+     * + 无 Authorization 头」的请求一律注入柠檬服务器的 Bearer 令牌。用户同时配置了 NAS、
+     * 第三方音源或其它自建服务时，只要其接口路径以 /api/ 开头，就会收到本机的柠檬服务器令牌
+     * —— 属于凭据外泄。现在只有登录成功过的那台服务器主机才会被注入。
+     */
+    private val authTokenHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    fun setActiveAuthToken(token: String, host: String? = null) {
         if (token.isNotBlank()) {
             activeAuthToken = token.trim()
+            host?.trim()?.takeIf { it.isNotBlank() }?.let {
+                authTokenHosts.add(it.substringBefore(':').lowercase())
+            }
         }
     }
 
     fun getActiveAuthToken(): String = activeAuthToken
+
+    fun clearActiveAuthToken() {
+        activeAuthToken = ""
+        authTokenHosts.clear()
+    }
+
+    /** 该主机是否被授权接收全局令牌（未登记任何主机时一律不注入） */
+    private fun isTokenHostAllowed(host: String): Boolean {
+        if (authTokenHosts.isEmpty()) return false
+        return authTokenHosts.contains(host.lowercase())
+    }
 
     fun createOkHttpClient(context: Context): OkHttpClient {
         return getSharedClient(context)
@@ -66,7 +90,9 @@ object NetworkClientFactory {
         val appContext = context.applicationContext
         val cacheDir = appContext.cacheDir.resolve("okhttp_http_cache")
         val cache = try {
-            okhttp3.Cache(cacheDir, 64L * 1024 * 1024)
+            // HTTP 磁盘缓存 16MB（原 64MB）：音频流接口已强制 FORCE_NETWORK 绕过该缓存，
+            // 其余接口（JSON/图片）收益有限，没必要占 64MB 磁盘配额
+            okhttp3.Cache(cacheDir, 16L * 1024 * 1024)
         } catch (_: Exception) {
             null
         }
@@ -105,11 +131,15 @@ object NetworkClientFactory {
                 reqBuilder.cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
             }
             // 若 URL 中携带 token 参数或访问柠檬服务端 API 且未显式指定 Authorization 请求头，自动补充 Bearer Token
+            // 仅对「已登记令牌的服务器主机」注入，避免把柠檬服务器令牌发给第三方 /api/ 接口
             val tokenParam = request.url.queryParameter("token")
             if (request.header("Authorization").isNullOrBlank()) {
-                if (!tokenParam.isNullOrBlank()) {
+                if (!tokenParam.isNullOrBlank() && isTokenHostAllowed(request.url.host)) {
                     reqBuilder.header("Authorization", "Bearer $tokenParam")
-                } else if (activeAuthToken.isNotBlank() && encodedPath.startsWith("/api/")) {
+                } else if (activeAuthToken.isNotBlank() &&
+                    encodedPath.startsWith("/api/") &&
+                    isTokenHostAllowed(request.url.host)
+                ) {
                     reqBuilder.header("Authorization", "Bearer $activeAuthToken")
                 }
             }

@@ -64,11 +64,11 @@ class PlaybackRouter(
                     else -> null
                 }
 
-                // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（严格校验版本、专辑与时长）
+                // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（定向索引查询，严禁全库扫描）
                 directLocalPath ?: run {
                     val db = ZdsDatabase.getInstance(context)
-                    val allSongs = db.songDao().getAllSongsList()
-                    val matched = allSongs.firstOrNull { s ->
+                    val candidates = db.songDao().findCandidatesForPlayback(song.id, song.title)
+                    val matched = candidates.firstOrNull { s ->
                         val hasFile = !s.localFilePath.isNullOrBlank() && File(s.localFilePath).let { f -> f.exists() && f.length() > 0 }
                         hasFile && (s.id == song.id || SongMatchingResolver.isSongMatch(
                             s.title, s.artist, s.durationMs,

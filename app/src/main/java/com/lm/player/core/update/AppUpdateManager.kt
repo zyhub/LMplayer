@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.7.14"
-    const val CURRENT_VERSION_CODE = 49
+    const val CURRENT_VERSION_NAME = "1.7.23"
+    const val CURRENT_VERSION_CODE = 58
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -209,6 +209,7 @@ object AppUpdateManager {
                 )
             )
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to check update", e)
             Result.failure(e)
         }
@@ -256,22 +257,39 @@ object AppUpdateManager {
                 val buffer = ByteArray(8 * 1024)
                 var bytesRead: Int
                 var totalBytesRead = 0L
+                var lastReportTime = 0L
+                var lastReportProgress = 0f
 
                 while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                     outputStream.write(buffer, 0, bytesRead)
                     totalBytesRead += bytesRead
                     val progress = if (totalLength > 0) totalBytesRead.toFloat() / totalLength else 0f
-                    withContext(Dispatchers.Main) {
-                        onProgress(progress, totalBytesRead, totalLength)
+                    val now = System.currentTimeMillis()
+                    if (now - lastReportTime >= 150L || progress - lastReportProgress >= 0.01f) {
+                        lastReportTime = now
+                        lastReportProgress = progress
+                        withContext(Dispatchers.Main) {
+                            onProgress(progress, totalBytesRead, totalLength)
+                        }
                     }
                 }
                 outputStream.flush()
                 outputStream.close()
                 inputStream.close()
+
+                withContext(Dispatchers.Main) {
+                    onProgress(if (totalLength > 0) 1f else 0f, totalLength.coerceAtLeast(0L), totalLength)
+                }
+            }
+
+            if (apkFile.length() <= 0L) {
+                apkFile.delete()
+                return@withContext Result.failure(IllegalStateException("安装包为空，下载失败"))
             }
 
             Result.success(apkFile)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Download APK failed", e)
             Result.failure(e)
         }
@@ -291,6 +309,7 @@ object AppUpdateManager {
                 val hasInstallPermission = try {
                     context.packageManager.canRequestPackageInstalls()
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "canRequestPackageInstalls error: ${e.message}")
                     true
                 }
@@ -304,6 +323,7 @@ object AppUpdateManager {
                         Toast.makeText(context, "请在设置中开启「允许安装未知应用」权限后重试", Toast.LENGTH_LONG).show()
                         return
                     } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
                         Log.w(TAG, "Failed to launch ACTION_MANAGE_UNKNOWN_APP_SOURCES, fallback to direct install", e)
                     }
                 }
@@ -321,6 +341,7 @@ object AppUpdateManager {
             }
             context.startActivity(installIntent)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to launch package installer", e)
             Toast.makeText(context, "调起安装器失败: ${e.message}", Toast.LENGTH_LONG).show()
         }

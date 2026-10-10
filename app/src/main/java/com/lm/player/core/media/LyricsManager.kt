@@ -836,7 +836,16 @@ object EmbeddedLyricsExtractor {
 object LyricsManager {
 
     private const val TAG = "LyricsManager"
-    private val memoryCache = java.util.concurrent.ConcurrentHashMap<String, LyricResult>()
+    private const val MAX_MEMORY_CACHE = 200
+
+    private val memoryCache: MutableMap<String, LyricResult> =
+        java.util.Collections.synchronizedMap(
+            object : java.util.LinkedHashMap<String, LyricResult>(64, 0.75f, /* accessOrder = */ true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, LyricResult>): Boolean {
+                    return size > MAX_MEMORY_CACHE
+                }
+            }
+        )
 
     fun getCachedLyrics(songId: String): LyricResult? {
         return memoryCache[songId]
@@ -1149,9 +1158,15 @@ object LyricsManager {
                     // 3. Android 原生 MediaMetadataRetriever 补充提取
                     try {
                         val retriever = MediaMetadataRetriever()
-                        retriever.setDataSource(localFile.absolutePath)
-                        val metaLyrics = SmartCharsetDecoder.repairMojibakeIfNeeded(retriever.extractMetadata(1000))
-                        retriever.release()
+                        // release 必须放在 finally：setDataSource / extractMetadata 抛异常时
+                        // 原先的 release() 永不执行，native 解码器与文件描述符随之泄漏。
+                        // 歌词解析是每一首播放曲目都会走的路径，长期使用会耗尽 FD。
+                        val metaLyrics = try {
+                            retriever.setDataSource(localFile.absolutePath)
+                            SmartCharsetDecoder.repairMojibakeIfNeeded(retriever.extractMetadata(1000))
+                        } finally {
+                            try { retriever.release() } catch (_: Exception) {}
+                        }
                         if (metaLyrics.isNotBlank() && !SmartCharsetDecoder.looksSuspiciousOrGarbled(metaLyrics)) {
                             val parsed = LrcParser.parse(metaLyrics)
                             if (parsed.lines.isNotEmpty()) return@withContext parsed
@@ -1159,6 +1174,7 @@ object LyricsManager {
                     } catch (_: Exception) {}
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.d(TAG, "Local file lyrics read error: ${e.message}")
             }
         }
@@ -1191,11 +1207,15 @@ object LyricsManager {
                 val protocol = LemonMusicProtocol(client, effectiveServer.serverUrl, effectiveServer.username, effectiveServer.tokenOrApiKey)
                 protocol.ensureAuthenticated()
                 val lyricRes = protocol.getLyricsForSong(song)
-                if (lyricRes.isSuccess && lyricRes.getOrNull()?.lines?.isNotEmpty() == true) {
-                    return@withContext lyricRes.getOrNull()!!
+                // 用局部变量承接：避免 getOrNull()!! 这种脆弱写法（一次重构就可能变成 NPE），
+                // 同时把「成功但为空」与「失败」两种情况区分清楚
+                val fetched = lyricRes.getOrNull()
+                if (lyricRes.isSuccess && fetched != null && fetched.lines.isNotEmpty()) {
+                    return@withContext fetched
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "Lemon music server lyrics query skipped: ${e.message}")
         }
 
@@ -1256,6 +1276,7 @@ object LyricsManager {
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "Kugou lyric fetch error: ${e.message}")
         }
 
@@ -1316,6 +1337,7 @@ object LyricsManager {
                 } catch (_: Exception) {}
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "LRCLIB fetch error: ${e.message}")
         }
 
@@ -1359,6 +1381,7 @@ object LyricsManager {
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "Netease lyric fetch error: ${e.message}")
         }
 
@@ -1403,6 +1426,7 @@ object LyricsManager {
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "QQ music lyric fetch error: ${e.message}")
         }
 

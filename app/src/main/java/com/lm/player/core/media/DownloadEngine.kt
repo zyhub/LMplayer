@@ -15,6 +15,7 @@ import com.lm.player.core.network.NetworkClientFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -243,8 +244,31 @@ class DownloadEngine(
             .replace(Regex("""[\\/:*?"<>|\r\n\t]"""), "_")
             .replace(Regex("""\s+"""), " ")
             .trim('.', ' ')
+        // 目录穿越防护：整段恰为 ".."（或 "."）时上面的 trim 会把它清空，但形如
+        // "Album/.." 这类组合里内层 ".." 会被保留，而 File(baseDir, "Album/../../x")
+        // 会解析到应用私有目录之外的任意路径。relativeFolderPath 来自柠檬服务端返回的
+        // 文件夹层级或数据库历史值 —— 即服务端可控，必须在此彻底阻断。
+        // 只有「整段恰为 . 或 ..」才是穿越意图，必须丢弃；
+        // 正常名称里出现连续两个点（如 "Live 2024..2025"）不应被误伤 ——
+        // 绝对路径安全由 safeChildFile 的 canonicalFile 前缀校验兜底。
+        if (cleaned == "." || cleaned == "..") return ""
         val truncated = if (cleaned.length > 60) cleaned.substring(0, 60).trimEnd() else cleaned
         return truncated.ifBlank { "未知" }
+    }
+
+    /**
+     * 校验最终落盘路径必须位于允许的下载根目录之内（防目录穿越的兜底闸门）。
+     * 返回 null 表示路径非法，调用方应放弃使用该层级并回退到默认目录。
+     */
+    private fun safeChildFile(baseDir: File, relative: String): File? {
+        return try {
+            val base = baseDir.canonicalFile
+            val target = File(base, relative).canonicalFile
+            val basePath = base.path + File.separator
+            if (target.path == base.path || target.path.startsWith(basePath)) target else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
@@ -281,7 +305,8 @@ class DownloadEngine(
             else -> "Music"
         }
 
-        val parentDir = File(baseDir, subFolder)
+        // 兜底闸门：即使 subFolder 通过了逐段净化，也再校验一次最终规范化路径必须落在 baseDir 之内
+        val parentDir = safeChildFile(baseDir, subFolder) ?: baseDir
         if (!parentDir.exists()) {
             parentDir.mkdirs()
         }
@@ -518,15 +543,40 @@ class DownloadEngine(
                         response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
                     }
 
+                    // 断点续传必须校验服务端实际返回的**起始偏移**，不能只看状态码是不是 206。
+                    // 若服务端/中间代理返回了偏移不一致的 206（或客户端断点文件被外部改动），
+                    // 把新数据直接 append 到本地残片会拼出一个头部正常、中段错乱的文件 ——
+                    // 播放器能解出时长但音频杂音/跳帧，而且魔数检测依然判定为合法 flac/mp3，
+                    // 用户与日志都极难发现。此处在进入读取前先校验并丢弃残片从头下载。
+                    if (response.code == 206 && existingBytes > 0L) {
+                        val contentRange = response.header("Content-Range")
+                        val rangeStart = contentRange
+                            ?.substringAfter("bytes", "")
+                            ?.substringBefore("-")
+                            ?.trim()
+                            ?.toLongOrNull()
+                        if (rangeStart == null || rangeStart != existingBytes) {
+                            Log.w(
+                                TAG,
+                                "断点偏移不匹配 (本地=$existingBytes, 服务端=$contentRange)，丢弃残片重新下载: ${song.title}"
+                            )
+                            response.close()
+                            tempDestFile.delete()
+                            existingBytes = 0L
+                            response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
+                        }
+                    }
+
                     response.use { resp ->
                         if (!resp.isSuccessful) {
                             throw Exception("HTTP 下载失败: ${resp.code}")
                         }
 
-                        val isRangeOk = resp.code == 206
-                        val append = isRangeOk && existingBytes > 0L
                         val body = resp.body ?: throw Exception("响应体为空")
                         val contentTypeHeader = resp.header("Content-Type").orEmpty()
+
+                        val isRangeOk = resp.code == 206
+                        val append = isRangeOk && existingBytes > 0L
                         val totalLength = if (isRangeOk) {
                             existingBytes + body.contentLength()
                         } else {
@@ -544,6 +594,10 @@ class DownloadEngine(
                                 var bytesRead: Int
 
                                 while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    if (!coroutineContext.isActive) {
+                                        Log.i(TAG, "Download task cancelled or paused for ${song.title}")
+                                        break
+                                    }
                                     output.write(buffer, 0, bytesRead)
                                     totalRead += bytesRead
 
@@ -567,6 +621,11 @@ class DownloadEngine(
                                 }
                                 output.flush()
                             }
+                        }
+
+                        if (!coroutineContext.isActive) {
+                            Log.i(TAG, "Download inactive for ${song.title}, aborting post-processing")
+                            return@launch
                         }
 
                         // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
@@ -807,6 +866,7 @@ class DownloadEngine(
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Failed to fetch cover bytes for ${song.title}: ${e.message}")
             }
         }
@@ -831,6 +891,7 @@ class DownloadEngine(
             try {
                 rawLrc = LyricsManager.fetchRawLyrics(song, context)
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Failed to fetch raw lyrics for ${song.title}: ${e.message}")
             }
         }
@@ -842,6 +903,7 @@ class DownloadEngine(
                 lrcFile.writeText(rawLrc!!, Charsets.UTF_8)
                 Log.i(TAG, "Saved companion .lrc: ${lrcFile.absolutePath}")
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Failed to write companion .lrc: ${e.message}")
             }
         }
@@ -861,6 +923,7 @@ class DownloadEngine(
                     Log.i(TAG, "Successfully embedded metadata into ${file.name}")
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.e(TAG, "Failed to embed metadata into ${file.name}", e)
             }
         }

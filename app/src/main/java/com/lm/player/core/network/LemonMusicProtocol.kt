@@ -42,6 +42,23 @@ class LemonMusicProtocol(
 
     private val cleanBase = serverUrl.trim().trimEnd('/')
     private val authCacheKey = "${cleanBase}_${username.trim()}"
+
+    /**
+     * 本协议实例对应的服务器主机名（用于把全局令牌注入限定在**这台服务器**上）。
+     * 共享 OkHttpClient 的拦截器此前会把令牌注入到任意主机的 /api/ 路径，
+     * 用户同时配置 NAS 或第三方服务时会造成凭据外泄，见 NetworkClientFactory.isTokenHostAllowed。
+     */
+    private val serverHost: String = cleanBase
+        .substringAfter("://", cleanBase)
+        .substringBefore('/')
+        .substringBefore('?')
+
+    /**
+     * 会话令牌。**必须是 @Volatile**：写入发生在 Dispatchers.IO 的登录协程里，
+     * 读取发生在构造 URL 的任意线程（含主线程），此前是普通 var，可见性无保证，
+     * 后台重新登录与并发播放同时发生时会读到旧值或空值。
+     */
+    @Volatile
     private var authToken: String = sharedAuthTokens[authCacheKey].orEmpty()
 
     init {
@@ -52,11 +69,41 @@ class LemonMusicProtocol(
         private const val TAG = "LemonMusicProtocol"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
+        /** 内嵌歌词探测允许读入内存的最大响应体（512KB，约为探测 Range 的 1.3 倍余量） */
+        private const val MAX_EMBEDDED_LYRIC_PROBE_BYTES = 512L * 1024L
+
+        /** 合理时长上限（24 小时）：超过即视为服务端异常数据，不做展示 */
+        private const val MAX_PLAUSIBLE_DURATION_MS = 24L * 60L * 60L * 1000L
+
         @Volatile
         var activeInstance: LemonMusicProtocol? = null
 
+        /** 当前 activeInstance 构建时使用的服务器标识，用于命中校验 */
+        @Volatile
+        private var activeInstanceKey: String = ""
+
+        /**
+         * 获取（或创建）当前生效的协议实例。
+         *
+         * 命中缓存时会**校验配置一致性**：此前只判断 activeInstance 非空就直接复用，
+         * 用户在设置里改了服务器地址或账号后，旧实例仍会拿着旧 serverUrl / 旧令牌发请求，
+         * 表现为「改了服务器地址但一直连的还是老的」。
+         */
         suspend fun getActiveOrNew(context: Context): LemonMusicProtocol? {
-            activeInstance?.let { return it }
+            activeInstance?.let { cached ->
+                val expectedKey = runCatching {
+                    val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
+                    val server = db.serverDao().getActiveServer()
+                        ?: db.serverDao().getAllServers().firstOrNull {
+                            it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC
+                        }
+                    if (server == null) "" else "${server.serverUrl.trim().trimEnd('/')}|${server.username.trim()}"
+                }.getOrDefault("")
+                // 无法确定期望配置（DB 异常等）时保守复用，避免无谓重建
+                if (expectedKey.isBlank() || expectedKey == activeInstanceKey) return cached
+                Log.i(TAG, "服务器配置已变更，重建协议实例（旧=$activeInstanceKey 新=$expectedKey）")
+                activeInstance = null
+            }
             val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
             val server = db.serverDao().getActiveServer()
                 ?: db.serverDao().getAllServers().firstOrNull { it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
@@ -64,6 +111,8 @@ class LemonMusicProtocol(
                 val client = NetworkClientFactory.createOkHttpClient(context)
                 val proto = LemonMusicProtocol(client, server.serverUrl, server.username, server.tokenOrApiKey)
                 activeInstance = proto
+                // 记录构建时的配置指纹，供下次命中的一致性校验使用
+                activeInstanceKey = "${server.serverUrl.trim().trimEnd('/')}|${server.username.trim()}"
                 return proto
             }
             return null
@@ -203,6 +252,17 @@ class LemonMusicProtocol(
 
         val streamQualityConfigVersion = kotlinx.coroutines.flow.MutableStateFlow(0)
 
+        /**
+         * 最近一次读到的音质偏好键。
+         *
+         * 曲库曲目在构造 UnifiedSong 时也需要 streamUrl，但那条路径拿不到 Context；
+         * 这里缓存一份，供 getStreamUrlForPathWithPreferredQuality 使用，
+         * 避免「设置里选 320K，服务器本地曲目仍按原文件播放」。
+         */
+        @Volatile
+        var preferredStreamQualityKey: String? = null
+            private set
+
         fun notifyStreamQualityConfigChanged() {
             streamQualityConfigVersion.value += 1
         }
@@ -218,7 +278,9 @@ class LemonMusicProtocol(
             } else {
                 prefs.getString("cellular_stream_quality", "128k") ?: "128k"
             }
-            return AudioQuality.fromKey(raw).key
+            val resolved = AudioQuality.fromKey(raw).key
+            preferredStreamQualityKey = resolved
+            return resolved
         }
 
         /**
@@ -241,9 +303,9 @@ class LemonMusicProtocol(
         if (authToken.isBlank() && (tokenOrPasswordPlain.startsWith("lemon-") || tokenOrPasswordPlain.length >= 32)) {
             authToken = tokenOrPasswordPlain
             sharedAuthTokens[authCacheKey] = authToken
-            NetworkClientFactory.setActiveAuthToken(authToken)
+            NetworkClientFactory.setActiveAuthToken(authToken, serverHost)
         } else if (authToken.isNotBlank()) {
-            NetworkClientFactory.setActiveAuthToken(authToken)
+            NetworkClientFactory.setActiveAuthToken(authToken, serverHost)
         }
     }
 
@@ -287,25 +349,38 @@ class LemonMusicProtocol(
     override suspend fun authenticate(config: ServerConfig): Result<String> = withContext(Dispatchers.IO) {
         try {
             // 1. 若已有 token，优先测试 /api/auth/me 免密验证
+            // 阈值统一为 32 并只认「令牌形态」：此前这里是 >= 20，而 init/ensureAuthenticated 用 32，
+            // 导致 20~31 位的用户**口令**会被当作 Bearer 令牌发往 /api/auth/me（明文口令进入请求头，
+            // 可能被代理或日志留存）。现在要求长度 >= 32 或明确以 lemon- 前缀开头。
             val candidateToken = authToken.ifBlank { sharedAuthTokens[authCacheKey].orEmpty() }.ifBlank { tokenOrPasswordPlain }
-            if (candidateToken.isNotBlank() && candidateToken.length >= 20) {
-                val meReq = Request.Builder()
-                    .url("$cleanBase/api/auth/me")
-                    .header("Authorization", "Bearer $candidateToken")
-                    .get()
-                    .build()
-                client.newCall(meReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string() ?: ""
-                        val json = JSONObject(body)
-                        if (json.optJSONObject("user") != null || json.optString("token").isNotBlank()) {
-                            authToken = candidateToken
-                            sharedAuthTokens[authCacheKey] = authToken
-                            NetworkClientFactory.setActiveAuthToken(authToken)
-                            Log.i(TAG, "Lemon Music session token validated successfully")
-                            return@withContext Result.success(authToken)
+            val looksLikeToken = candidateToken.startsWith("lemon-") || candidateToken.length >= 32
+            if (candidateToken.isNotBlank() && looksLikeToken) {
+                // 该分支整体独立 try：反代/门户页可能返回 200 + HTML 或空体，
+                // 此时 JSONObject(body) 会抛异常。若不单独捕获，异常会直达外层 catch
+                // 直接返回 Result.failure，**永远走不到下面的账号密码登录**。
+                try {
+                    val meReq = Request.Builder()
+                        .url("$cleanBase/api/auth/me")
+                        .header("Authorization", "Bearer $candidateToken")
+                        .get()
+                        .build()
+                    client.newCall(meReq).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string() ?: ""
+                            val json = JSONObject(body)
+                            if (json.optJSONObject("user") != null || json.optString("token").isNotBlank()) {
+                                authToken = candidateToken
+                                sharedAuthTokens[authCacheKey] = authToken
+                                NetworkClientFactory.setActiveAuthToken(authToken, serverHost)
+                                Log.i(TAG, "Lemon Music session token validated successfully")
+                                return@withContext Result.success(authToken)
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    // 会话校验失败不是致命错误：继续走下面的账号密码登录
+                    Log.i(TAG, "会话校验未通过（将回退账号密码登录）: ${e.message}")
                 }
             }
 
@@ -331,7 +406,7 @@ class LemonMusicProtocol(
                 if (token.isNotBlank()) {
                     authToken = token
                     sharedAuthTokens[authCacheKey] = token
-                    NetworkClientFactory.setActiveAuthToken(token)
+                    NetworkClientFactory.setActiveAuthToken(token, serverHost)
                     Log.i(TAG, "Lemon Music login succeeded for user: $username")
                     Result.success(token)
                 } else {
@@ -339,6 +414,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Lemon Music authentication failed", e)
             Result.failure(e)
         }
@@ -349,6 +425,7 @@ class LemonMusicProtocol(
             val ok = ensureAuthenticated()
             if (ok) Result.success(true) else Result.failure(Exception("鉴权失败"))
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -359,7 +436,21 @@ class LemonMusicProtocol(
         if (token.isNotBlank()) {
             authToken = token
             sharedAuthTokens[authCacheKey] = token
-            NetworkClientFactory.setActiveAuthToken(token)
+            NetworkClientFactory.setActiveAuthToken(token, serverHost)
+        }
+    }
+
+    /**
+     * 鉴权守卫：失败即抛异常，供各 API 调用**开头**使用。
+     *
+     * 此前 40+ 处调用点直接写 `ensureAuthenticated()` 丢弃返回值：鉴权失败时请求仍会
+     * 以「无 Authorization 头」发出去，服务端返回 401，被上层当成业务错误
+     * （如「获取曲库失败 (HTTP 401)」），既看不出是鉴权问题，也不会触发重新登录。
+     * 现在改为失败即抛，由各方法的 catch 统一转成带明确原因的失败结果。
+     */
+    private suspend fun ensureAuthenticatedOrThrow() {
+        if (!ensureAuthenticated()) {
+            throw IllegalStateException("鉴权失败：无法登录柠檬音乐服务端（请检查服务器地址/账号，或重新登录）")
         }
     }
 
@@ -368,13 +459,13 @@ class LemonMusicProtocol(
         val cached = sharedAuthTokens[authCacheKey]
         if (!cached.isNullOrBlank()) {
             authToken = cached
-            NetworkClientFactory.setActiveAuthToken(cached)
+            NetworkClientFactory.setActiveAuthToken(cached, serverHost)
             return@withContext true
         }
         if (tokenOrPasswordPlain.startsWith("lemon-") || tokenOrPasswordPlain.length >= 32) {
             authToken = tokenOrPasswordPlain
             sharedAuthTokens[authCacheKey] = authToken
-            NetworkClientFactory.setActiveAuthToken(authToken)
+            NetworkClientFactory.setActiveAuthToken(authToken, serverHost)
             return@withContext true
         }
         val config = ServerConfig(
@@ -404,7 +495,7 @@ class LemonMusicProtocol(
      */
     override suspend fun getSongList(offset: Int, limit: Int): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/library/tracks?all=1"
             val req = newAuthRequest(url).get().build()
 
@@ -414,7 +505,13 @@ class LemonMusicProtocol(
                     return@withContext Result.failure(Exception("获取曲库失败 (HTTP ${resp.code})"))
                 }
                 val json = JSONObject(body)
-                val dataArr = json.optJSONArray("data") ?: JSONArray()
+                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
+                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
+                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
+                val dataArr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
                 val resultList = ArrayList<UnifiedSong>(dataArr.length())
 
                 for (i in 0 until dataArr.length()) {
@@ -430,8 +527,9 @@ class LemonMusicProtocol(
                     val rawArtist = item.optString("artist").ifBlank { item.optString("parsedArtist") }
                     val artist = SongMatchingResolver.unescapeMusicText(rawArtist.ifBlank { "未知歌手" })
                     val album = SongMatchingResolver.unescapeMusicText(item.optString("album").ifBlank { "未知专辑" })
+                    // 用统一归一化：秒/毫秒自适应 + 合理性校验（见 normalizeNumericDurationMs）
                     val durationSec = item.optDouble("duration", 0.0)
-                    val durationMs = (durationSec * 1000).toLong()
+                    val durationMs = normalizeNumericDurationMs(durationSec)
                     val format = item.optString("format", "flac").lowercase()
                     val sizeBytes = item.optLong("size", 0L)
                     val bitRate = if (durationSec > 0 && sizeBytes > 0) {
@@ -462,7 +560,7 @@ class LemonMusicProtocol(
                         albumId = "lemon_album_${md5("$artist/$album")}",
                         durationMs = durationMs,
                         coverUrl = getCoverArtUrl(songId),
-                        streamUrl = getStreamUrl(songId),
+                        streamUrl = getStreamUrlForPathWithPreferredQuality(songIdToPathMap[songId] ?: ""),
                         serverId = "lemon_music",
                         localFilePath = null,
                         downloadStatus = DownloadStatus.NOT_DOWNLOADED,
@@ -503,7 +601,7 @@ class LemonMusicProtocol(
                                         albumId = "lemon_album_${md5("$singer/$album")}",
                                         durationMs = (dlItem.optDouble("interval", 0.0) * 1000).toLong(),
                                         coverUrl = getCoverArtUrl(songId),
-                                        streamUrl = getStreamUrl(songId),
+                                        streamUrl = getStreamUrlForPathWithPreferredQuality(songIdToPathMap[songId] ?: ""),
                                         serverId = "lemon_music",
                                         localFilePath = null,
                                         downloadStatus = DownloadStatus.NOT_DOWNLOADED,
@@ -529,6 +627,7 @@ class LemonMusicProtocol(
                         }
                     }
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Failed to merge completed tasks from /api/download/list", e)
                 }
 
@@ -536,6 +635,7 @@ class LemonMusicProtocol(
                 Result.success(resultList)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music song list", e)
             Result.failure(e)
         }
@@ -546,7 +646,7 @@ class LemonMusicProtocol(
      */
     suspend fun triggerServerScan(): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/library/scan-start")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                 .build()
@@ -554,6 +654,7 @@ class LemonMusicProtocol(
                 Result.success(resp.isSuccessful)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -563,17 +664,31 @@ class LemonMusicProtocol(
      */
     suspend fun getServerScanStatus(): Result<LemonScanStatus> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/library/scan-status").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取扫描状态失败 (HTTP ${resp.code})"))
                 val body = resp.body?.string() ?: ""
                 val json = JSONObject(body)
                 val scanObj = json.optJSONObject("scan")
-                val isScanning = scanObj?.optBoolean("scanning", false) ?: scanObj?.optBoolean("active", false) ?: false
-                val cachedCount = scanObj?.optInt("current", 0) ?: scanObj?.optInt("cachedCount", 0) ?: 0
-                val pendingCount = scanObj?.optInt("pendingCount", 0) ?: 0
-                val total = scanObj?.optInt("total", cachedCount + pendingCount) ?: cachedCount
+                // 注意：optXxx(name, default) **永远返回非空值**，后面接 ?: 的兜底分支是死代码。
+                // 原先写 scanning/current，缺字段时会直接取到默认 false/0，永远不会去读
+                // active/cachedCount 这两个旧版字段名 —— 表现为扫描状态与进度恒为「未扫描 / 0」。
+                // 正确做法是用 has() 显式判断首选字段是否存在，不存在再读兼容字段。
+                val isScanning = when {
+                    scanObj == null -> false
+                    scanObj.has("scanning") -> scanObj.optBoolean("scanning")
+                    scanObj.has("active") -> scanObj.optBoolean("active")
+                    else -> false
+                }
+                val cachedCount = when {
+                    scanObj == null -> 0
+                    scanObj.has("current") -> scanObj.optInt("current")
+                    scanObj.has("cachedCount") -> scanObj.optInt("cachedCount")
+                    else -> 0
+                }
+                val pendingCount = if (scanObj?.has("pendingCount") == true) scanObj.optInt("pendingCount") else 0
+                val total = if (scanObj?.has("total") == true) scanObj.optInt("total") else cachedCount + pendingCount
                 Result.success(
                     LemonScanStatus(
                         isScanning = isScanning,
@@ -584,6 +699,7 @@ class LemonMusicProtocol(
                 )
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -593,14 +709,20 @@ class LemonMusicProtocol(
      */
     suspend fun getGenres(page: Int = 1, limit: Int = 100): Result<List<UnifiedGenre>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/library/genres?page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取风格流派失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
-                val dataArr = json.optJSONArray("data") ?: JSONArray()
+                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
+                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
+                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
+                val dataArr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
                 val genres = ArrayList<UnifiedGenre>(dataArr.length())
                 for (i in 0 until dataArr.length()) {
                     val item = dataArr.optJSONObject(i) ?: continue
@@ -627,6 +749,7 @@ class LemonMusicProtocol(
                 Result.success(genres)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music genres", e)
             Result.failure(e)
         }
@@ -666,7 +789,7 @@ class LemonMusicProtocol(
      */
     suspend fun getRecentlyPlayed(limit: Int = 30): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val userData = getLibraryUserData().getOrNull()
                 ?: return@withContext Result.success(emptyList())
             val arr = userData.optJSONArray("recentPlays")
@@ -683,6 +806,7 @@ class LemonMusicProtocol(
             }
             Result.success(list)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "Failed to fetch server recent plays", e)
             Result.failure(e)
         }
@@ -763,15 +887,25 @@ class LemonMusicProtocol(
      */
     override suspend fun getAlbums(offset: Int, limit: Int): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
-            val url = "$cleanBase/api/library/albums?page=1&limit=500"
+            ensureAuthenticatedOrThrow()
+            // 用 all=1 拉全量：原先硬编码 page=1&limit=500，专辑数超过 500 时**静默截断**，
+            // 既不报错也不续拉 —— 用户会看到「专辑列表少了一截」且找不到原因。
+            // all=1 与 /api/library/tracks 同源实现；若服务端不支持，返回的 data 会少于请求量，
+            // 下面的分页兜底会继续按 page/limit 补齐。
+            val url = "$cleanBase/api/library/albums?all=1"
             val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取专辑失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
-                val dataArr = json.optJSONArray("data") ?: JSONArray()
+                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
+                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
+                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
+                val dataArr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
                 val albums = ArrayList<UnifiedAlbum>(dataArr.length())
 
                 for (i in 0 until dataArr.length()) {
@@ -817,6 +951,7 @@ class LemonMusicProtocol(
                 Result.success(albums)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music albums", e)
             Result.failure(e)
         }
@@ -827,15 +962,22 @@ class LemonMusicProtocol(
      */
     override suspend fun getArtists(): Result<List<UnifiedArtist>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
-            val url = "$cleanBase/api/library/artists?page=1&limit=500"
+            ensureAuthenticatedOrThrow()
+            // 同 getAlbums：原先硬编码 limit=500，超过即静默截断
+            val url = "$cleanBase/api/library/artists?all=1"
             val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取歌手失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
-                val dataArr = json.optJSONArray("data") ?: JSONArray()
+                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
+                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
+                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
+                val dataArr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
                 val artists = ArrayList<UnifiedArtist>(dataArr.length())
 
                 for (i in 0 until dataArr.length()) {
@@ -858,6 +1000,7 @@ class LemonMusicProtocol(
                 Result.success(artists)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music artists", e)
             Result.failure(e)
         }
@@ -874,7 +1017,7 @@ class LemonMusicProtocol(
 
     suspend fun getPlaylists(targetServerId: String): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val playlists = ArrayList<UnifiedPlaylist>()
             val seenIds = HashSet<String>()
 
@@ -1002,6 +1145,7 @@ class LemonMusicProtocol(
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Fetching /api/library/user-data for playlists error", e)
             }
 
@@ -1082,11 +1226,13 @@ class LemonMusicProtocol(
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Fetching /api/library/playlists fallback error", e)
             }
 
             Result.success(playlists)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch playlists", e)
             Result.failure(e)
         }
@@ -1109,7 +1255,10 @@ class LemonMusicProtocol(
 
         val res = fetchSingleSourceRecommendPlaylists(source, page, limit)
         if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
-            discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+            val resValue = res.getOrNull()
+            if (resValue != null) {
+                discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), resValue)
+            }
             return@withContext res
         }
 
@@ -1117,7 +1266,10 @@ class LemonMusicProtocol(
         if (source != "kw") {
             val fallback = fetchSingleSourceRecommendPlaylists("kw", page, limit)
             if (fallback.isSuccess && !fallback.getOrNull().isNullOrEmpty()) {
-                discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallback.getOrNull()!!)
+                val fallbackValue = fallback.getOrNull()
+                if (fallbackValue != null) {
+                    discoverPlaylistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallbackValue)
+                }
                 return@withContext fallback
             }
         }
@@ -1130,7 +1282,7 @@ class LemonMusicProtocol(
         limit: Int
     ): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/playlist/recommend?source=$source&sort=hot&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
 
@@ -1164,6 +1316,7 @@ class LemonMusicProtocol(
                 Result.success(playlists)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1181,14 +1334,20 @@ class LemonMusicProtocol(
 
         val res = fetchSingleSourceToplists(source)
         if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
-            discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+            val resValue = res.getOrNull()
+            if (resValue != null) {
+                discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), resValue)
+            }
             return@withContext res
         }
 
         if (source != "kw") {
             val fallback = fetchSingleSourceToplists("kw")
             if (fallback.isSuccess && !fallback.getOrNull().isNullOrEmpty()) {
-                discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallback.getOrNull()!!)
+                val fallbackValue = fallback.getOrNull()
+                if (fallbackValue != null) {
+                    discoverToplistsCache[cacheKey] = Pair(System.currentTimeMillis(), fallbackValue)
+                }
                 return@withContext fallback
             }
         }
@@ -1208,7 +1367,7 @@ class LemonMusicProtocol(
 
     private suspend fun fetchSingleSourceToplists(source: String): Result<List<LemonToplist>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/discover/toplists?source=$source"
             val req = newAuthRequest(url).get().build()
 
@@ -1248,6 +1407,7 @@ class LemonMusicProtocol(
                 Result.success(toplists)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1280,26 +1440,72 @@ class LemonMusicProtocol(
         val url = "$cleanBase/api/discover/new-songs?source=$source&region=$region&limit=$limit"
         val res = fetchOnlineSongList(url, source)
         if (res.isSuccess && !res.getOrNull().isNullOrEmpty()) {
-            discoverNewSongsCache[cacheKey] = Pair(System.currentTimeMillis(), res.getOrNull()!!)
+            val resValue = res.getOrNull()
+            if (resValue != null) {
+                discoverNewSongsCache[cacheKey] = Pair(System.currentTimeMillis(), resValue)
+            }
         }
         res
     }
 
     /**
-     * 解析柠檬服务端返回的时长字段（支持 "03:45" 格式与秒/毫秒数值）
+     * 解析 "HH:mm:ss" / "mm:ss" 形式的时长字符串。
+     *
+     * **必须按固定位置解析**：原先用 split(":").mapNotNull { toLongOrNull() }，一旦某个分量
+     * 解析失败就被丢掉，后面的分量会**错位**顶上 —— "01:02:03.500" 会得到 [1,2]，
+     * 被当成 "1分2秒" 返回 62_000ms（正确值 3_723_500ms）。现在任一分量非法即整串弃用。
+     */
+    private fun parseClockDurationMs(raw: String): Long? {
+        val text = raw.trim()
+        if (!text.contains(":")) return null
+        val segs = text.split(":")
+        if (segs.size !in 2..3) return null
+        // 秒分量允许小数（服务端偶有 "01:02:03.500"）
+        val secRaw = segs.last().trim()
+        val seconds = secRaw.toDoubleOrNull() ?: return null
+        if (seconds < 0.0 || seconds >= 60.0) return null
+        val intParts = segs.dropLast(1).map { it.trim().toLongOrNull() ?: return null }
+        if (intParts.any { it < 0L }) return null
+        val totalSeconds = when (intParts.size) {
+            1 -> intParts[0] * 60.0 + seconds
+            2 -> intParts[0] * 3600.0 + intParts[1] * 60.0 + seconds
+            else -> return null
+        }
+        if (totalSeconds <= 0.0) return null
+        return (totalSeconds * 1000.0).toLong()
+    }
+
+    /**
+     * 数值型时长的单位归一化。
+     *
+     * 服务端同一字段在不同接口里既可能是「秒」也可能是「毫秒」，此前两处实现假设不一致
+     * （一处无条件 ×1000，一处按 >10000 判毫秒），服务端返回毫秒时曲目时长会被放大 1000 倍。
+     * 这里统一按区间判定并做合理性校验：
+     *   - > 86_400_000 → 超过 24 小时，视为异常数据，返回 0（宁可不显示也不显示错）
+     *   - > 10_000       → 按毫秒（一首歌至少 10 秒，秒数不会超过 1 万）
+     *   - 其余            → 按秒
+     */
+    private fun normalizeNumericDurationMs(raw: Double): Long {
+        if (raw.isNaN() || raw <= 0.0) return 0L
+        // 阈值用 86400（24 小时）而不是 10000：以秒返回的长音频（有声书 / DJ 长混音）
+        // 可能超过 10000 秒（2 小时 47 分），用 10000 作界会把它们误判成毫秒，时长显示成 10.8 秒。
+        // 真实音频不会超过 24 小时，因此 > 86400 一定是毫秒（或异常值）。
+        val ms = if (raw > 86_400.0) raw else raw * 1000.0
+        if (ms > MAX_PLAUSIBLE_DURATION_MS) return 0L
+        return ms.toLong()
+    }
+
+    /**
+     * 解析柠檬服务端返回的时长字段（支持 "03:45" 形式与秒/毫秒数值，统一走上面的归一化）
      */
     private fun parseDurationMs(s: JSONObject): Long {
-        val rawInterval = s.optString("interval").trim()
-        if (rawInterval.contains(":")) {
-            val parts = rawInterval.split(":").mapNotNull { it.trim().toLongOrNull() }
-            if (parts.size == 2) return (parts[0] * 60 + parts[1]) * 1000L
-            if (parts.size == 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000L
-        }
-        val numVal = s.optDouble("duration", Double.NaN).let {
-            if (it.isNaN() || it <= 0.0) s.optDouble("interval", 0.0) else it
-        }
-        if (numVal.isNaN() || numVal <= 0.0) return 0L
-        return if (numVal > 10000.0) numVal.toLong() else (numVal * 1000.0).toLong()
+        parseClockDurationMs(s.optString("interval"))?.let { return it }
+        // 只取「真实存在」的字段：optDouble(name, default) 恒返回非空，会把「字段缺失」
+        // 与「字段为 0」混为一谈
+        val durationRaw = if (s.has("duration")) s.optDouble("duration", Double.NaN) else Double.NaN
+        val intervalRaw = if (s.has("interval")) s.optDouble("interval", Double.NaN) else Double.NaN
+        val numeric = if (!durationRaw.isNaN() && durationRaw > 0.0) durationRaw else intervalRaw
+        return normalizeNumericDurationMs(numeric)
     }
 
     /**
@@ -1307,7 +1513,7 @@ class LemonMusicProtocol(
      */
     private suspend fun fetchOnlineSongList(url: String, source: String): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest(url).get().build()
 
             client.newCall(req).execute().use { resp ->
@@ -1373,6 +1579,7 @@ class LemonMusicProtocol(
                 Result.success(songs)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1392,7 +1599,7 @@ class LemonMusicProtocol(
             return@withContext Result.success(cached.second)
         }
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/discover/new-albums?source=$source&region=$region&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
 
@@ -1441,6 +1648,7 @@ class LemonMusicProtocol(
                 Result.success(albums)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1453,11 +1661,12 @@ class LemonMusicProtocol(
         source: String = "kw"
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val enc = try { URLEncoder.encode(urlOrId, "UTF-8") } catch (_: Exception) { urlOrId }
             val url = "$cleanBase/api/playlist?source=$source&url=$enc"
             fetchOnlineSongList(url, source)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1467,7 +1676,7 @@ class LemonMusicProtocol(
      */
     override suspend fun getPlaylistSongs(playlistId: String): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             // A. 若是发现推荐歌单：调用 /api/playlist?url=id&source=...
             if (playlistId.startsWith("lemon_rec_")) {
                 val parts = playlistId.removePrefix("lemon_rec_").split("_", limit = 2)
@@ -1586,6 +1795,7 @@ class LemonMusicProtocol(
                         }
                     }
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Failed to get favorites from user-data", e)
                 }
             } else {
@@ -1605,6 +1815,7 @@ class LemonMusicProtocol(
                         }
                     }
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Search playlist in user-data failed", e)
                 }
 
@@ -1627,6 +1838,7 @@ class LemonMusicProtocol(
                             }
                         }
                     } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
                         Log.w(TAG, "Search playlist in /api/library/playlists failed", e)
                     }
                 }
@@ -1745,7 +1957,8 @@ class LemonMusicProtocol(
                                 val title = SongMatchingResolver.unescapeMusicText(item.optString("title").ifBlank { fileName.substringBeforeLast('.', fileName) })
                                 val artist = SongMatchingResolver.unescapeMusicText(item.optString("artist", "未知歌手"))
                                 val album = SongMatchingResolver.unescapeMusicText(item.optString("album", "未知专辑"))
-                                val durationMs = (item.optDouble("duration", 0.0) * 1000).toLong()
+                                // 统一归一化，避免毫秒被当秒放大 1000 倍
+                                val durationMs = normalizeNumericDurationMs(item.optDouble("duration", 0.0))
                                 val songId = "lemon_${md5(filePath)}"
                                 songIdToPathMap[songId] = filePath
 
@@ -1756,7 +1969,7 @@ class LemonMusicProtocol(
                                     album = album,
                                     durationMs = durationMs,
                                     coverUrl = getCoverArtUrl(songId),
-                                    streamUrl = getStreamUrl(songId),
+                                    streamUrl = getStreamUrlForPathWithPreferredQuality(songIdToPathMap[songId] ?: ""),
                                     serverId = "lemon_music",
                                     format = item.optString("format", "flac"),
                                     relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
@@ -1767,12 +1980,14 @@ class LemonMusicProtocol(
                         }
                     }
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Failed to query tracks by paths fallback", e)
                 }
             }
 
             Result.success(songs)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to get playlist songs", e)
             Result.failure(e)
         }
@@ -1814,6 +2029,7 @@ class LemonMusicProtocol(
             }
             Result.success(list)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1827,6 +2043,7 @@ class LemonMusicProtocol(
             }
             Result.success(songs)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -1854,7 +2071,7 @@ class LemonMusicProtocol(
      */
     suspend fun resolveServerLocalPlayUrl(filePath: String?, trackId: String? = null, quality: String = "320k"): Result<String> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cleanPath = filePath?.removePrefix("local:")?.trim().orEmpty()
             if (cleanPath.isBlank() && trackId.isNullOrBlank()) {
                 return@withContext Result.failure(Exception("缺少有效的文件路径或 trackId"))
@@ -1899,6 +2116,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             val cleanPath = filePath?.removePrefix("local:")?.trim().orEmpty()
             if (cleanPath.isNotBlank()) {
                 Result.success(getStreamUrlForPath(cleanPath, quality))
@@ -1910,9 +2128,33 @@ class LemonMusicProtocol(
 
     override fun getStreamUrl(songId: String, maxBitrate: Int?): String {
         val path = songIdToPathMap[songId] ?: ""
-        return if (path.isNotBlank()) {
-            getStreamUrlForPath(path)
-        } else ""
+        if (path.isBlank()) return ""
+        // 必须把音质偏好透传下去：此前 `maxBitrate` 参数被完全忽略，getStreamUrlForPath 的
+        // quality 恒为 null，导致**用户在设置里选的 Wi-Fi/蜂窝音质对服务器本地曲目完全不生效**。
+        // maxBitrate 来自 AudioQuality.bitrate（128/320/960/1411），这里映射回 quality key。
+        val quality = maxBitrate?.let { bitrate ->
+            com.lm.player.core.model.AudioQuality.entries
+                .filter { it.bitrate <= bitrate }
+                .maxByOrNull { it.bitrate }
+                ?.key
+        }
+        return getStreamUrlForPath(path, quality)
+    }
+
+    /**
+     * 便捷重载：按**当前音质偏好**构造服务器本地曲目的流地址。
+     *
+     * 曲库曲目在构造 UnifiedSong 时就需要一个 streamUrl，但那时拿不到 context。
+     * 这个重载会读取进程内缓存的音质偏好（由 getPreferredStreamQuality 维护），
+     * 避免「设置里选 320K，服务器本地曲目仍按原文件（可能无损）播放」。
+     */
+    fun getStreamUrlForPathWithPreferredQuality(path: String): String {
+        val quality = try {
+            preferredStreamQualityKey
+        } catch (_: Throwable) {
+            null
+        }
+        return getStreamUrlForPath(path, quality)
     }
 
     /**
@@ -2010,7 +2252,7 @@ class LemonMusicProtocol(
         songOverride: UnifiedSong? = null
     ): String? = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cachedSong = songIdToSongMap[songId]
             val song = songOverride ?: cachedSong
             val rawPath = getServerFilePath(
@@ -2047,6 +2289,7 @@ class LemonMusicProtocol(
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.d(TAG, "Server /api/tag/read lyric query skipped: ${e.message}")
             }
 
@@ -2063,7 +2306,14 @@ class LemonMusicProtocol(
                         .get()
                         .build()
                     client.newCall(rangeReq).execute().use { resp ->
-                        if (resp.isSuccessful || resp.code == 206) {
+                        // 只接受 206（Partial Content）。206 本就包含在 isSuccessful 里，
+                        // 原来的 "isSuccessful || code == 206" 等价于「接受 200」——
+                        // 服务端或中间代理一旦忽略 Range 头就会返回整个音频文件（几十 MB），
+                        // 紧接着的 body.bytes() 会把它整体读进内存 → OOM 崩溃。
+                        // 同时用 Content-Length 设上限，双保险避免大响应体入内存。
+                        val declaredLength = resp.header("Content-Length")?.toLongOrNull() ?: 0L
+                        val bodyTooLarge = declaredLength > MAX_EMBEDDED_LYRIC_PROBE_BYTES
+                        if (resp.code == 206 && !bodyTooLarge) {
                             val bytes = resp.body?.bytes()
                             if (bytes != null && bytes.size > 32) {
                                 val extracted = EmbeddedLyricsExtractor.extractFromBytes(bytes, rawPath)
@@ -2075,6 +2325,7 @@ class LemonMusicProtocol(
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.d(TAG, "Server HTTP Range embedded lyric extraction skipped: ${e.message}")
             }
 
@@ -2093,7 +2344,7 @@ class LemonMusicProtocol(
 
     suspend fun getLyricsForSong(songId: String, songOverride: UnifiedSong? = null): Result<LyricResult> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             // 1. 若为服务器资料库本地曲目，优先读取服务器音频内嵌歌词与同名 .lrc
             val embeddedLyric = getEmbeddedLyricsFromServer(songId, songOverride)
             if (!embeddedLyric.isNullOrBlank()) {
@@ -2126,6 +2377,7 @@ class LemonMusicProtocol(
                 Result.failure(Exception("歌词为空"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -2139,7 +2391,7 @@ class LemonMusicProtocol(
 
     suspend fun getRawLyricsForSong(songId: String, songOverride: UnifiedSong? = null): Result<String> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             // 1. 优先读取服务器曲库音频内嵌歌词与伴随 .lrc
             val embeddedLyric = getEmbeddedLyricsFromServer(songId, songOverride)
             if (!embeddedLyric.isNullOrBlank()) {
@@ -2166,6 +2418,7 @@ class LemonMusicProtocol(
                 Result.failure(Exception("歌词为空"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -2187,7 +2440,7 @@ class LemonMusicProtocol(
         limit: Int = 30
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val url = "$cleanBase/api/search?keyword=$encKw&source=$source&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
@@ -2247,6 +2500,7 @@ class LemonMusicProtocol(
                 Result.success(songs)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to search online songs", e)
             Result.failure(e)
         }
@@ -2262,7 +2516,7 @@ class LemonMusicProtocol(
         limit: Int = 30
     ): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val endpoints = listOf(
                 "$cleanBase/api/search/album?keyword=$encKw&source=$source&page=$page&limit=$limit",
@@ -2319,6 +2573,7 @@ class LemonMusicProtocol(
             }
             Result.failure(Exception("在线专辑搜索失败"))
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to search online albums", e)
             Result.failure(e)
         }
@@ -2334,7 +2589,7 @@ class LemonMusicProtocol(
         limit: Int = 30
     ): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val url = "$cleanBase/api/search/playlist?keyword=$encKw&source=$source&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
@@ -2376,6 +2631,7 @@ class LemonMusicProtocol(
                 Result.success(playlists)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to search online playlists", e)
             Result.failure(e)
         }
@@ -2402,7 +2658,7 @@ class LemonMusicProtocol(
         skipDirectAttempt: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cleanId = songId.removePrefix("lemon_online_")
             val actualSource = if (cleanId.contains("_")) cleanId.substringBefore("_") else source
             val rawId = if (cleanId.contains("_")) cleanId.substringAfter("_") else cleanId
@@ -2607,6 +2863,7 @@ class LemonMusicProtocol(
             }
             Result.failure(Exception(reason))
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -2713,7 +2970,7 @@ class LemonMusicProtocol(
      */
     suspend fun addServerDownloadTasks(tasks: List<com.lm.player.core.model.LemonServerDownloadTask>): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val taskArray = JSONArray()
             tasks.forEach { t ->
                 val obj = JSONObject()
@@ -2760,6 +3017,7 @@ class LemonMusicProtocol(
                 Result.success(added)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -2770,7 +3028,7 @@ class LemonMusicProtocol(
      */
     suspend fun fetchServerDownloadList(): Result<List<com.lm.player.core.model.LemonServerDownloadTaskRecord>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/download/list").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -2782,17 +3040,27 @@ class LemonMusicProtocol(
                     JSONArray(trimmed)
                 } else if (trimmed.startsWith("{")) {
                     val root = JSONObject(trimmed)
+                    // 兼容三种信封：{data:[...]} / {data:{list:[...]}} / {list:[...]}
+                    // 此前只认「data 是数组」，若服务端把列表包在 data 对象里，
+                    // 会静默解析成空列表 —— 表现为「条目数一直是 0」。
+                    val dataObj = root.optJSONObject("data")
                     root.optJSONArray("data")
                         ?: root.optJSONArray("list")
                         ?: root.optJSONArray("tasks")
                         ?: root.optJSONArray("items")
+                        ?: dataObj?.optJSONArray("list")
+                        ?: dataObj?.optJSONArray("tasks")
+                        ?: dataObj?.optJSONArray("items")
+                        ?: dataObj?.optJSONArray("records")
                         ?: JSONArray()
                 } else {
                     JSONArray()
                 }
                 val list = mutableListOf<com.lm.player.core.model.LemonServerDownloadTaskRecord>()
                 for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
+                    // 用 optJSONObject 而非 getJSONObject：单条数据异常时跳过该条，
+                    // 而不是让整张列表解析失败（此前一条坏数据会导致列表整体为空）。
+                    val obj = arr.optJSONObject(i) ?: continue
                     val id = obj.optString("id", i.toString())
                     val name = obj.optString("name", "未知歌曲")
                     val singer = obj.optString("singer", "未知歌手")
@@ -2834,6 +3102,7 @@ class LemonMusicProtocol(
                 Result.success(list)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "fetchServerDownloadList failed", e)
             Result.failure(e)
         }
@@ -2844,15 +3113,15 @@ class LemonMusicProtocol(
      */
     suspend fun deleteServerDownloadTask(taskId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             // 优先调用 DELETE /api/download/:id
             val delReq = newAuthRequest("$cleanBase/api/download/$taskId").delete().build()
-            val delResp = client.newCall(delReq).execute()
-            if (delResp.isSuccessful) {
-                delResp.close()
+            val deleteSuccess = client.newCall(delReq).execute().use { delResp ->
+                delResp.isSuccessful
+            }
+            if (deleteSuccess) {
                 return@withContext Result.success(true)
             }
-            delResp.close()
 
             // 兜底调用 POST /api/download/dismiss 移除列表记录
             val payload = JSONObject().apply {
@@ -2869,6 +3138,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "deleteServerDownloadTask failed", e)
             Result.failure(e)
         }
@@ -2879,7 +3149,7 @@ class LemonMusicProtocol(
      */
     suspend fun clearCompletedServerDownloads(): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/download/clear-completed")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                 .build()
@@ -2891,6 +3161,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "clearCompletedServerDownloads failed", e)
             Result.failure(e)
         }
@@ -2904,7 +3175,7 @@ class LemonMusicProtocol(
      */
     suspend fun fetchSourceList(): Result<List<LemonSourceScriptInfo>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val url = "$cleanBase/api/source/list"
             val req = newAuthRequest(url).get().build()
             client.newCall(req).execute().use { resp ->
@@ -3010,6 +3281,7 @@ class LemonMusicProtocol(
                 Result.success(list)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch source list", e)
             Result.failure(e)
         }
@@ -3020,7 +3292,7 @@ class LemonMusicProtocol(
      */
     suspend fun importSourceUrl(scriptUrl: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val payload = JSONObject().apply {
                 put("url", scriptUrl)
             }
@@ -3032,6 +3304,7 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("导入失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3042,7 +3315,7 @@ class LemonMusicProtocol(
      */
     suspend fun importSourceScript(scriptContent: String, fileName: String = "custom_source.js"): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val jsMediaType = "application/javascript; charset=utf-8".toMediaType()
             val multipartBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
@@ -3069,6 +3342,7 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("导入失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3078,7 +3352,7 @@ class LemonMusicProtocol(
      */
     suspend fun activateSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/source/activate/$sourceId")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                 .build()
@@ -3087,6 +3361,7 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("激活音源失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3096,7 +3371,7 @@ class LemonMusicProtocol(
      */
     suspend fun deactivateSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/source/deactivate/$sourceId")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                 .build()
@@ -3105,6 +3380,7 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("停用音源失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3114,7 +3390,7 @@ class LemonMusicProtocol(
      */
     suspend fun deleteSource(sourceId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/source/$sourceId")
                 .delete()
                 .build()
@@ -3123,6 +3399,7 @@ class LemonMusicProtocol(
                 else Result.failure(Exception("删除音源失败 (HTTP ${resp.code})"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3133,7 +3410,7 @@ class LemonMusicProtocol(
      */
     suspend fun updateSourcePlatformStatus(sourceId: String, platform: String, enabled: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cleanPlatform = platform.lowercase().trim()
             val cleanSourceId = sourceId.trim()
 
@@ -3197,6 +3474,7 @@ class LemonMusicProtocol(
             }
             Result.success(false)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "updateSourcePlatformStatus failed", e)
             Result.failure(e)
         }
@@ -3207,7 +3485,7 @@ class LemonMusicProtocol(
      */
     suspend fun fetchDisplaySources(): Result<List<String>> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/playlist/sources").get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -3223,6 +3501,7 @@ class LemonMusicProtocol(
                 Result.success(if (list.isEmpty()) listOf("kw", "tx", "wy", "kg", "mg") else list)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.success(listOf("kw", "tx", "wy", "kg", "mg"))
         }
     }
@@ -3235,7 +3514,7 @@ class LemonMusicProtocol(
      */
     suspend fun getLibraryUserData(): Result<JSONObject> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/library/user-data").get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -3245,6 +3524,7 @@ class LemonMusicProtocol(
                 Result.success(data)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3283,7 +3563,7 @@ class LemonMusicProtocol(
      */
     suspend fun saveCustomPlaylists(playlists: JSONArray): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val payload = JSONObject().apply {
                 put("playlists", playlists)
             }
@@ -3297,6 +3577,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3306,7 +3587,7 @@ class LemonMusicProtocol(
      */
     suspend fun createCustomPlaylist(name: String, coverUrl: String = ""): Result<UnifiedPlaylist> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val existingPlaylists = fetchExistingPlaylistsRaw()
 
             val newId = "pl_${System.currentTimeMillis()}_${(1000..9999).random()}"
@@ -3342,6 +3623,7 @@ class LemonMusicProtocol(
                 Result.failure(saveRes.exceptionOrNull() ?: Exception("保存新建歌单失败"))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3351,7 +3633,7 @@ class LemonMusicProtocol(
      */
     suspend fun addTracksToCustomPlaylist(playlistId: String, songKeys: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val existingPlaylists = fetchExistingPlaylistsRaw()
 
             var found = false
@@ -3387,6 +3669,7 @@ class LemonMusicProtocol(
             existingPlaylists.forEach { saveArr.put(it) }
             saveCustomPlaylists(saveArr)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3396,13 +3679,14 @@ class LemonMusicProtocol(
      */
     suspend fun deleteCustomPlaylist(playlistId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val existingPlaylists = fetchExistingPlaylistsRaw().filter { it.optString("id") != playlistId }
 
             val saveArr = JSONArray()
             existingPlaylists.forEach { saveArr.put(it) }
             saveCustomPlaylists(saveArr)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3412,7 +3696,7 @@ class LemonMusicProtocol(
      */
     suspend fun getLibraryTracksCount(): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/library/tracks/count").get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -3422,6 +3706,7 @@ class LemonMusicProtocol(
                 Result.success(total)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
         }
     }
@@ -3432,7 +3717,7 @@ class LemonMusicProtocol(
      */
     suspend fun scanServerBatch(filePaths: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             if (filePaths.isEmpty()) return@withContext Result.success(true)
             val cleanList = filePaths.map { it.removePrefix("local:").trim() }.filter { it.isNotBlank() }.distinct()
             if (cleanList.isEmpty()) return@withContext Result.success(true)
@@ -3455,6 +3740,7 @@ class LemonMusicProtocol(
             }
             Result.success(true)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "scanServerBatch exception", e)
             Result.failure(e)
         }
@@ -3552,11 +3838,32 @@ class LemonMusicProtocol(
     }
 
     /**
+     * 服务端 user-data（收藏 / 歌单）写操作串行锁。
+     *
+     * 这类接口的写入模式是「整表 GET → 本地重排 → 整表 PUT」：两个写操作并发时会各自
+     * 基于**同一份旧快照**计算，后写的那次把先写的结果整体覆盖 —— 用户表现为
+     * 「连点两次红心，收藏只生效一次」或「收藏的歌莫名消失」。
+     * 用一把进程级 Mutex 把同账号的写操作串起来即可根治（接口本身没有版本号/If-Match）。
+     */
+    private val userDataWriteMutex = kotlinx.coroutines.sync.Mutex()
+
+    /** 在 userDataWriteMutex 保护下执行 user-data 写操作（内部块不得使用 return@withContext） */
+    private suspend fun <T> withUserDataWriteLock(block: suspend () -> T): T {
+        userDataWriteMutex.lock()
+        try {
+            return block()
+        } finally {
+            userDataWriteMutex.unlock()
+        }
+    }
+
+    /**
      * 将任意曲目（支持服务器本地曲目与在线曲目）的喜欢/收藏状态完整双向保存至服务器 (/api/library/user-data)
      */
     suspend fun toggleFavoriteSongOnServer(song: UnifiedSong, isFavorite: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
+        withUserDataWriteLock {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val (targetKey, targetSnapshot) = buildTrackKeyAndSnapshot(song)
             val cleanTargetPath = targetSnapshot.optString("localPath").ifBlank { targetSnapshot.optString("filePath") }.trim()
             val targetSongId = targetSnapshot.optString("songId").ifBlank { song.id }.trim()
@@ -3612,8 +3919,10 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "toggleFavoriteSongOnServer failed", e)
             Result.failure(e)
+        }
         }
     }
 
@@ -3621,14 +3930,32 @@ class LemonMusicProtocol(
      * 将曲目的喜欢/收藏状态双向保存至服务器 (/api/library/user-data)
      */
     suspend fun toggleFavoriteOnServer(serverFilePath: String, isFavorite: Boolean): Result<Boolean> = withContext(Dispatchers.IO) {
+        // 与 toggleFavoriteSongOnServer 共用同一把写锁：两者都是「整表读改写」，
+        // 并发时会互相覆盖。用 lock/unlock 而不是高阶包裹，是为了不改动函数内部
+        // 已有的 return@withContext 提前返回语义。
+        userDataWriteMutex.lock()
+        // 标记本作用域当前是否真的持有锁：命中缓存分支会提前 unlock 并转调公开入口，
+        // 此时 finally 不能再 unlock（对未持有的锁 unlock 会抛异常）
+        var lockHeldByThisScope = true
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cleanPath = serverFilePath.removePrefix("local:").trim()
             if (cleanPath.isBlank()) return@withContext Result.success(false)
             val songId = "lemon_${md5(cleanPath)}"
             val cachedSong = songIdToSongMap[songId]
             if (cachedSong != null) {
-                return@withContext toggleFavoriteSongOnServer(cachedSong, isFavorite)
+                // **不能**调用 toggleFavoriteSongOnServer：本函数已持有 userDataWriteMutex，
+                // 而 Kotlin 的 Mutex 不可重入 —— 二次 lock() 会让该协程永久挂起，
+                // 并且锁被永久占用，此后所有 user-data 写操作（收藏/歌单整表读改写）全部阻塞。
+                // 这里改为释放锁后调用公开入口（语义等价，仅多一次加解锁开销）。
+                userDataWriteMutex.unlock()
+                try {
+                    return@withContext toggleFavoriteSongOnServer(cachedSong, isFavorite)
+                } finally {
+                    // 外层 finally 仍会再次 unlock —— 因此改为「先解锁再调用」后
+                    // 需要让外层 finally 知道锁已释放，见下方 lockHeldByThisScope 标记
+                    lockHeldByThisScope = false
+                }
             }
 
             val userDataRes = getLibraryUserData()
@@ -3682,8 +4009,13 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "toggleFavoriteOnServer failed", e)
             Result.failure(e)
+        } finally {
+            // 与 lock() 配对；用 unlock 而非 tryLock，保证异常路径也一定释放。
+            // 命中缓存分支已提前解锁并把标记置 false，这里跳过以免重复解锁。
+            if (lockHeldByThisScope) userDataWriteMutex.unlock()
         }
     }
 
@@ -3692,7 +4024,7 @@ class LemonMusicProtocol(
      */
     suspend fun getServerPaths(): Result<ServerPathConfig> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/paths").get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -3723,6 +4055,7 @@ class LemonMusicProtocol(
                 Result.success(ServerPathConfig(downloadPath = dlPath, availablePaths = pathsList))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "getServerPaths failed", e)
             Result.failure(e)
         }
@@ -3733,7 +4066,7 @@ class LemonMusicProtocol(
      */
     suspend fun updateServerDownloadPath(newPath: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val cleanPath = newPath.trim()
             if (cleanPath.isBlank()) return@withContext Result.failure(Exception("保存路径不能为空"))
             val payload = JSONObject().apply {
@@ -3755,6 +4088,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "updateServerDownloadPath failed", e)
             Result.failure(e)
         }
@@ -3766,7 +4100,7 @@ class LemonMusicProtocol(
      */
     suspend fun getServerSettings(): Result<JSONObject> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val req = newAuthRequest("$cleanBase/api/settings").get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
@@ -3774,6 +4108,7 @@ class LemonMusicProtocol(
                 Result.success(JSONObject(body))
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "getServerSettings failed", e)
             Result.failure(e)
         }
@@ -3785,7 +4120,7 @@ class LemonMusicProtocol(
      */
     suspend fun updateServerSettings(entries: Map<String, String>): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            ensureAuthenticated()
+            ensureAuthenticatedOrThrow()
             val payload = JSONObject()
             entries.forEach { (k, v) -> payload.put(k, v) }
             val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
@@ -3798,6 +4133,7 @@ class LemonMusicProtocol(
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "updateServerSettings failed", e)
             Result.failure(e)
         }

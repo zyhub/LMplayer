@@ -877,6 +877,29 @@ fun NowPlayingWaveIndicator(
     modifier: Modifier = Modifier,
     color: Color = AppleRed
 ) {
+    // 后台时不必继续跑动画：rememberInfiniteTransition 一旦创建就会持续逐帧驱动，
+    // 此前它**无条件创建**且不看 isPlaying —— 暂停播放或应用退到后台后仍有 4 条
+    // 无限动画在跑（420/360/480/390ms 各一条），纯属耗电。
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    var isAppResumed by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> isAppResumed = true
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE,
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> isAppResumed = false
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val shouldAnimate = isPlaying && isAppResumed
+    if (!shouldAnimate) {
+        // 静止态：直接画固定高度，不创建任何动画
+        StaticWaveIndicator(color = color, modifier = modifier)
+        return
+    }
     val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition(label = "now_playing_wave")
     val bar1 by infiniteTransition.animateFloat(
         initialValue = 0.25f,
@@ -915,8 +938,18 @@ fun NowPlayingWaveIndicator(
         label = "bar4"
     )
 
-    val heights = if (isPlaying) listOf(bar1, bar2, bar3, bar4) else listOf(0.35f, 0.65f, 0.45f, 0.30f)
+    val heights = listOf(bar1, bar2, bar3, bar4)
+    WaveBars(heights = heights, color = color, modifier = modifier)
+}
 
+/** 静止态音波（未播放或应用在后台）：直接画固定高度，不创建任何无限动画 */
+@Composable
+private fun StaticWaveIndicator(color: Color, modifier: Modifier = Modifier) {
+    WaveBars(heights = listOf(0.35f, 0.65f, 0.45f, 0.30f), color = color, modifier = modifier)
+}
+
+@Composable
+private fun WaveBars(heights: List<Float>, color: Color, modifier: Modifier = Modifier) {
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = color.copy(alpha = 0.12f),

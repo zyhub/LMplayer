@@ -50,7 +50,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.whenStarted
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -59,6 +61,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
+import androidx.room.invalidationTrackerFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import androidx.compose.ui.platform.LocalDensity
 import com.lm.player.core.designsystem.theme.AppThemeMode
 import com.lm.player.core.designsystem.theme.AppleRed
@@ -115,10 +120,47 @@ class MainActivity : ComponentActivity() {
     private var togglePlayAction: (() -> Unit)? = null
     private var mediaCommandReceiver: BroadcastReceiver? = null
 
+    /**
+     * 磁盘探测专用线程池：用于 onPlayerError 里的「整库文件存在性」筛查。
+     *
+     * 该类回调**不是挂起函数**，无法使用 withContext；用单线程池既能把 O(n) 磁盘 stat
+     * 移出调用线程，又保证探测串行、不会并发打满 IO。线程池为 Activity 级复用，
+     * 不在每次播放错误时新建（否则会持续泄漏线程）。
+     */
+    private val diskProbeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "player-error-disk-probe").apply { isDaemon = true }
+    }
+
     // 运行时权限申请器 (兼容 Android 6.0 ~ Android 14+)
+    // 结果必须被处理：此前回调是空的（{ _ -> }），用户点「拒绝」后没有任何说明，
+    // 表现为「本地音乐扫不到、还没有任何提示」—— 这正是权限问题长期无人察觉的原因。
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ -> }
+    ) { result ->
+        val denied = result.filterValues { granted -> !granted }.keys
+        if (denied.isEmpty()) return@registerForActivityResult
+        val readable = denied.joinToString("、") { permission ->
+            when {
+                permission.endsWith("READ_MEDIA_AUDIO") -> "读取本地音乐"
+                permission.endsWith("READ_EXTERNAL_STORAGE") -> "读取存储"
+                permission.endsWith("POST_NOTIFICATIONS") -> "发送通知"
+                else -> permission.substringAfterLast('.')
+            }
+        }
+        val permanentlyDenied = denied.any { permission ->
+            !shouldShowRequestPermissionRationale(permission)
+        }
+        val tip = buildString {
+            append("以下权限被拒绝：")
+            append(readable)
+            append("。")
+            if (denied.any { it.endsWith("READ_MEDIA_AUDIO") || it.endsWith("READ_EXTERNAL_STORAGE") }) {
+                append("本地音乐扫描将无法工作，可在系统设置中开启「音乐和音频」权限后重试。")
+            }
+            if (permanentlyDenied) append("（系统已不再弹窗，需前往系统设置手动开启）")
+        }
+        android.widget.Toast.makeText(this, tip, android.widget.Toast.LENGTH_LONG).show()
+    }
 
     private var onChooseDownloadFolderResult: ((android.net.Uri) -> Unit)? = null
     private val chooseDownloadDirectoryLauncher = registerForActivityResult(
@@ -209,6 +251,9 @@ class MainActivity : ComponentActivity() {
             var enableBottomBarAnimation by remember {
                 mutableStateOf(uiPrefs.getBoolean("enable_bottom_bar_anim", true))
             }
+            var dynamicCardEffects by remember {
+                mutableStateOf(uiPrefs.getBoolean("dynamic_card_effects", true))
+            }
 
             // 启动自动播放与在线容灾配置
             val autoPlayPrefs = remember { getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE) }
@@ -258,7 +303,15 @@ class MainActivity : ComponentActivity() {
             }
 
             // UI 状态机与页面历史回退栈 (支持安卓系统返回键逐层回退直至首页双击退出)
-            var currentScreen by remember { mutableStateOf(Screen.HOME) }
+            // 进程被系统回收后重建时要回到用户原来所在的页面，而不是永远弹回首页。
+            // Screen 是枚举，用 Saver 把它当作字符串存取，读写都是同一个状态对象，
+            // 因此 `currentScreen = xxx` 这类赋值点无需改动。
+            var currentScreen by rememberSaveable(
+                stateSaver = androidx.compose.runtime.saveable.Saver(
+                    save = { it.name },
+                    restore = { name -> try { Screen.valueOf(name) } catch (_: Exception) { Screen.HOME } }
+                )
+            ) { mutableStateOf(Screen.HOME) }
             val screenBackStack = remember { mutableStateListOf<Screen>() }
             var favoritesRefreshTrigger by remember { mutableStateOf(0) }
             val refreshServerFavorites: () -> Unit = { favoritesRefreshTrigger++ }
@@ -286,7 +339,7 @@ class MainActivity : ComponentActivity() {
             var activeServerName by remember { mutableStateOf("本地 · 已下载") }
             var activeServerId by remember { mutableStateOf("") }
             var serversList by remember { mutableStateOf<List<ServerConfig>>(emptyList()) }
-            var isSearchDialogOpen by remember { mutableStateOf(false) }
+            var isSearchDialogOpen by rememberSaveable { mutableStateOf(false) }
             
             // 首页展示自定义配置 (从 SharedPreferences 持久化恢复)
             var homeDisplayConfig by remember {
@@ -326,7 +379,14 @@ class MainActivity : ComponentActivity() {
             // 不再用「曲库前 N 首」冒充 —— 那正是资料库「最近播放」卡片歌曲不对的根因
             val recentlyPlayedSongs by PlaybackQueueManager.recentPlayedSongsFlow.collectAsState()
 
-            val allDownloads by database.downloadDao().getAllDownloadsFlow().collectAsState(initial = emptyList())
+            // 必须用 remember 固定 Flow 实例：collectAsState 的 key 就是 Flow 本身，
+            // 若在组合体内直接调用 DAO 方法，每次重组都会拿到新的冷流实例 →
+            // produceState 反复取消/重启收集、重复发 SQL、反复重建 Room 失效观察者。
+            // 这里同时加 distinctUntilChanged 抑制同值发射。
+            val allDownloadsFlow = remember(database) {
+                database.downloadDao().getAllDownloadsFlow().distinctUntilChanged()
+            }
+            val allDownloads by allDownloadsFlow.collectAsState(initial = emptyList())
             val completedDownloadedSongs by produceState(
                 initialValue = emptyList<UnifiedSong>(),
                 key1 = songList,
@@ -389,7 +449,7 @@ class MainActivity : ComponentActivity() {
             val currentQueue by PlaybackQueueManager.playlistFlow.collectAsState()
 
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
-            var isFullPlayerVisible by remember { mutableStateOf(false) }
+            var isFullPlayerVisible by rememberSaveable { mutableStateOf(false) }
             var isLyricsMode by remember { mutableStateOf(false) }
 
             // 正在播放歌曲定位悬浮按钮状态（记录歌曲所属列表页面 + 仅在播放中且列表滑动时显示，播放界面不显示）
@@ -803,7 +863,12 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(Unit) {
-                database.songDao().getAllSongsFlow().collect { songEntities ->
+                // 不再直接用 Room 的 getAllSongsFlow()（SELECT * 一次返回全表，
+                // 大曲库下 CursorWindow 2MB 放不下会抛 IllegalStateException 闪退），
+                // 改为 Room 官方 invalidationTrackerFlow 监听 songs 表变化 + 分页读取聚合
+                database.invalidationTrackerFlow("songs")
+                    .map { database.songDao().getAllSongsList() }
+                    .collect { songEntities ->
                     val (mappedSongs, recAdded) = withContext(Dispatchers.IO) {
                         val downloadsMap = try {
                             database.downloadDao().getAllDownloadsList().associateBy { it.songId }
@@ -1729,29 +1794,57 @@ class MainActivity : ComponentActivity() {
                         val targetSong = currentSong
                         val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
                         if (targetSong != null) {
+                            // 本地回退与音质降级必须**严格串行**：若本地匹配在后台异步进行、
+                            // 主流程继续往下走，命中本地文件时就会「先 playSong(降质在线) 再
+                            // playSong(本地)」双重起播（互相 cancel + 两条矛盾 Toast + 浪费一级降级档位）。
+                            // 注意：不能用「异步完成后置标记」来短路 —— 那时代码早已走完降级分支。
+                            // **纠正一个错误前提**：Media3Factory 构建 ExoPlayer 时未 setLooper，
+                            // 因此 applicationLooper = 主 Looper，Player.Listener 回调运行在**主线程**。
+                            // 所以「放到 IO 线程并等它返回」在这里等于**冻结主线程**，不能这么做。
+                            // 正确做法见下方 diskProbeExecutor 的异步查 + 主线程复核。
                             if (autoFallbackToLocal) {
                                 // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
-                                val matchedLocalSong = (songList + completedDownloadedSongs).firstOrNull {
-                                    val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                                    hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
-                                        it.title, it.artist, it.durationMs,
-                                        targetSong.title, targetSong.artist, targetSong.durationMs,
-                                        it.album, targetSong.album
-                                    ))
-                                }
-                                if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
-                                    Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
-                                    val localSong = targetSong.copy(
-                                        localFilePath = matchedLocalSong.localFilePath,
-                                        streamUrl = matchedLocalSong.localFilePath ?: "",
-                                        downloadStatus = DownloadStatus.DOWNLOADED
-                                    )
-                                    PlaybackQueueManager.playSong(
-                                        targetSong = localSong,
-                                        context = this@MainActivity,
-                                        startPositionMs = resumePos
-                                    )
-                                    return
+                                //   **必须在 IO 线程做**：候选集是整个曲库，逐条 File.exists() 是 O(n) 磁盘
+                                //   stat。onPlayerError 运行在 ExoPlayer 主线程，若在此同步遍历，
+                                //   大曲库 + 在线断流时会在主线程打出成百上千次 stat，直接掉帧甚至 ANR。
+                                //   这里改为「异步查 + 查到再续播」，不阻塞播放器回调。
+                                val fallbackCandidates = songList + completedDownloadedSongs
+                                // 非阻塞：整库 stat 丢给 diskProbeExecutor，查完再回主线程复核。
+                                // 原实现用 .get(3s) 会**冻结主线程最多 3 秒**（在线流反复断流时反复冻结），
+                                // 且超时后 Future 不取消，单线程池会堆积不可中断的整库扫描。
+                                @Suppress("UNCHECKED_CAST")
+                                val probe = java.util.concurrent.CompletableFuture.supplyAsync({
+                                    fallbackCandidates.firstOrNull {
+                                        val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                                        hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                                            it.title, it.artist, it.durationMs,
+                                            targetSong.title, targetSong.artist, targetSong.durationMs,
+                                            it.album, targetSong.album
+                                        ))
+                                    }
+                                }, diskProbeExecutor)
+                                probe.thenAccept { matchedLocalSong ->
+                                    // 回到主线程复核并续播
+                                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                        // 复核「用户是否已经切歌」：整库磁盘 stat 可能耗时数百毫秒，
+                                        // 这期间用户完全可能点了别的歌；不复核就会把上一首的本地文件
+                                        // 重新 playSong 回来（表现为「自己跳回上一首」）。
+                                        if (currentSong?.id != targetSong.id) {
+                                            Log.i("MainActivity", "本地回退跳过：用户已切歌")
+                                        } else if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
+                                            Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
+                                            val localSong = targetSong.copy(
+                                                localFilePath = matchedLocalSong.localFilePath,
+                                                streamUrl = matchedLocalSong.localFilePath ?: "",
+                                                downloadStatus = DownloadStatus.DOWNLOADED
+                                            )
+                                            PlaybackQueueManager.playSong(
+                                                targetSong = localSong,
+                                                context = this@MainActivity,
+                                                startPositionMs = resumePos
+                                            )
+                                        }
+                                    }
                                 }
                             }
 
@@ -1824,14 +1917,21 @@ class MainActivity : ComponentActivity() {
                                 awaitPointerEventScope {
                                     val edgeThreshold = 44.dp.toPx()
                                     while (true) {
-                                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                        // 必须用 PointerEventPass.Main 而不是 Initial：
+                                        // Initial 阶段父节点**先于**子节点收到事件，drag.isConsumed 恒为 false，
+                                        // 因此无法判断这次拖动是否已被进度条 / 横向列表等子组件认领 ——
+                                        // 表现为「在屏幕左缘按住播放进度条向右拖」会误触发返回。
+                                        // Main 阶段子节点先收到并消费，父节点据此可以正确让行。
+                                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Main)
                                         if (down.position.x <= edgeThreshold) {
                                             var totalDx = 0f
                                             var totalDy = 0f
                                             var triggered = false
                                             while (true) {
-                                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                val event = awaitPointerEvent(PointerEventPass.Main)
                                                 val drag = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                // 已被子组件认领（进度条拖动 / 列表滚动）→ 立即让行
+                                                if (drag.isConsumed) break
                                                 totalDx += (drag.position.x - drag.previousPosition.x)
                                                 totalDy += (drag.position.y - drag.previousPosition.y)
 
@@ -1857,7 +1957,16 @@ class MainActivity : ComponentActivity() {
 
                         // 「我喜欢的音乐」以柠檬服务器收藏为准：
                         // 每次访问资料库 (currentScreen == Screen.LIBRARY) 或触发 favoritesRefreshTrigger 时及时刷新
-                        LaunchedEffect(activeLemonServerForSearch?.id, activeLemonServerForSearch?.tokenOrApiKey, favoritesRefreshTrigger, currentScreen == Screen.LIBRARY) {
+                        // key 用「当前页面」与「服务器身份」本身，而不是布尔表达式：
+                        // 表达式作 key 时，任何一次同步导致 serversList 变成新实例都会让
+                        // activeLemonServerForSearch 变化，从而重复拉取整份服务器收藏；
+                        // 且布尔值无法区分「从 HOME 进 LIBRARY」与「从 MINE 进 LIBRARY」。
+                        LaunchedEffect(
+                            activeLemonServerForSearch?.id,
+                            activeLemonServerForSearch?.tokenOrApiKey,
+                            favoritesRefreshTrigger,
+                            currentScreen
+                        ) {
                             val srv = activeLemonServerForSearch ?: return@LaunchedEffect
                             val fetched = withContext(Dispatchers.IO) {
                                 try {
@@ -1959,6 +2068,7 @@ class MainActivity : ComponentActivity() {
                                                 onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                             },
                                             blurAlpha = blurAlpha,
+                                            dynamicCardEffects = dynamicCardEffects,
                                             allCachedSongs = songList,
                                             activeDownloadTasks = activeDownloadTasks,
                                             activeDownloadCount = activeDownloadTasks.size,
@@ -2164,6 +2274,7 @@ class MainActivity : ComponentActivity() {
                                         currentServerName = activeServerName,
                                         configuredServers = serversList,
                                         blurAlpha = blurAlpha,
+                                        dynamicCardEffects = dynamicCardEffects,
                                         currentPlayingSong = currentSong,
                                         isPlaying = isPlaying,
                                         locateSongTrigger = locateSongTrigger,
@@ -2510,6 +2621,11 @@ class MainActivity : ComponentActivity() {
                                         onEnableBottomBarAnimationChange = { isEnabled ->
                                             enableBottomBarAnimation = isEnabled
                                             uiPrefs.edit().putBoolean("enable_bottom_bar_anim", isEnabled).apply()
+                                        },
+                                        dynamicCardEffects = dynamicCardEffects,
+                                        onDynamicCardEffectsChange = { isEnabled ->
+                                            dynamicCardEffects = isEnabled
+                                            uiPrefs.edit().putBoolean("dynamic_card_effects", isEnabled).apply()
                                         },
                                         autoPlayOnStartup = autoPlayOnStartup,
                                         onAutoPlayOnStartupChange = { isAuto ->
@@ -2939,8 +3055,16 @@ class MainActivity : ComponentActivity() {
                             var localTotalDurationMs by remember { mutableStateOf(exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L) }
                             var prebufferedSongId by remember { mutableStateOf("") }
 
-                            LaunchedEffect(isPlaying, song.id) {
-                                while (isActive && isPlaying) {
+                            // 进度轮询：必须带生命周期门控，否则退到后台仍每 400ms 读一次播放器并写 State。
+                            // 同时**不再把 isPlaying 作为循环条件**：暂停状态下用户拖动进度条或外部 seek
+                            // 之后进度条必须跟着更新，此前会因为 isPlaying == false 而永远停在旧位置。
+                            LaunchedEffect(song.id, isFullPlayerVisible) {
+                                if (!isFullPlayerVisible) return@LaunchedEffect
+                                // 生命周期门控：Activity 进入 STARTED 才开始轮询，退到后台自动挂起。
+                                // 用 lifecycle.whenStarted 而非 repeatOnLifecycle —— 后者需要
+                                // lifecycle-runtime-compose 依赖，本项目未引入（避免为一个轮询加依赖）。
+                                lifecycle.whenStarted {
+                                    while (isActive) {
                                     val pos = exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
                                     localProgressMs = pos
                                     val dur = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
@@ -2961,6 +3085,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                     delay(400)
+                                    }
                                 }
                             }
 
@@ -2978,9 +3103,7 @@ class MainActivity : ComponentActivity() {
                                 isLyricsMode = isLyricsMode,
                                 isShuffle = isShuffle,
                                 isRepeat = isRepeat,
-                                playbackSpeed = playbackSpeed,
                                 allPlaylists = playlistsList,
-                                activeDownloadTasks = activeDownloadTasks,
                                 isServerConnected = (serversList.any { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }),
                                 onTogglePlayPause = togglePlayPause,
                                 onNext = playNext,
@@ -2997,11 +3120,6 @@ class MainActivity : ComponentActivity() {
                                 onToggleFavorite = { handleToggleFavorite(song) },
                                 onToggleShuffle = { PlaybackQueueManager.setShuffle(!isShuffle) },
                                 onToggleRepeat = { PlaybackQueueManager.setRepeat(!isRepeat) },
-                                onChangePlaybackSpeed = { speed ->
-                                    playbackSpeed = speed
-                                    uiPrefs.edit().putFloat("playback_speed", speed).apply()
-                                    exoPlayer?.playbackParameters = androidx.media3.common.PlaybackParameters(speed)
-                                },
                                 onDownloadSong = handleDownloadSong,
                                 onDownloadSongWithOptions = handleDownloadWithOptions,
                                 onAddToPlaylist = handleAddToPlaylist,
@@ -3074,7 +3192,7 @@ class MainActivity : ComponentActivity() {
         isUserExplicitExit = true
         try {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
             // 进程马上就要被销毁，异步写盘的最近播放足迹有丢失风险，这里强制同步落盘
             PlaybackQueueManager.flushRecentPlayed(this)
             exoPlayer?.stop()
@@ -3105,7 +3223,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private var lastActivityKeyTimestamp = 0L
+    /**
+     * 按键级防抖时间戳。
+     *
+     * 此前用**单个全局时间戳**，250ms 窗口内任何两颗不同的按键都会互相压制：
+     * 用户快速按「下一首」后紧接着按「上一首」或音量键时会被静默吞掉。
+     * 改为按 keyCode 分别记录，保持每颗按键自身的防抖、去掉按键之间的干扰。
+     */
+    private val lastKeyTimestampByCode = HashMap<Int, Long>()
 
     // 针对车载中控硬件方向盘按键与蓝牙多功能键的硬件按键分发 (支持全量车机键值与防抖，严禁拦截系统返回键 KEYCODE_BACK)
     private fun isMediaOrVolumeKey(keyCode: Int): Boolean {
@@ -3142,8 +3267,8 @@ class MainActivity : ComponentActivity() {
     private fun handleMediaKeyEvent(keyCode: Int): Boolean {
         if (!isMediaOrVolumeKey(keyCode)) return false
         val now = System.currentTimeMillis()
-        if (now - lastActivityKeyTimestamp < 250) return true
-        lastActivityKeyTimestamp = now
+        if (now - (lastKeyTimestampByCode[keyCode] ?: 0L) < 250) return true
+        lastKeyTimestampByCode[keyCode] = now
         when (keyCode) {
             KeyEvent.KEYCODE_MEDIA_NEXT,
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
@@ -3237,13 +3362,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         super.onPause()
     }
 
     override fun onStop() {
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         if (!isChangingConfigurations && !isUserExplicitExit) {
             DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = true)
         }
@@ -3259,9 +3384,23 @@ class MainActivity : ComponentActivity() {
         return super.onKeyUp(keyCode, event)
     }
 
+    /** 已在 ACTION_DOWN 上处理过、正在等待配对 UP 的媒体键（见 dispatchKeyEvent） */
+    private val pendingMediaDownKeyCodes = HashSet<Int>()
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            if (handleMediaKeyEvent(event.keyCode)) return true
+        // DOWN 与配对的 UP 必须**成对**吞掉。
+        // 此前只拦 DOWN，未被消费的 ACTION_UP 会继续下发到 MediaSession，由 Media3 默认处理
+        // 再执行一次「下一首 / 上一首」—— 蓝牙、方向盘、遥控器按一下媒体键就切两首歌。
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                if (handleMediaKeyEvent(event.keyCode)) {
+                    pendingMediaDownKeyCodes.add(event.keyCode)
+                    return true
+                }
+            }
+            KeyEvent.ACTION_UP -> {
+                if (pendingMediaDownKeyCodes.remove(event.keyCode)) return true
+            }
         }
         return super.dispatchKeyEvent(event)
     }
@@ -3274,13 +3413,17 @@ class MainActivity : ComponentActivity() {
         try {
             val permissions = mutableListOf<String>()
 
+            // 本地音频读取权限：Android 13 (API 33) 起 READ_EXTERNAL_STORAGE 对媒体文件完全失效，
+            // 必须改用按类型划分的 READ_MEDIA_AUDIO，否则 MediaStore 查询返回空游标、
+            // File.exists() 对外置存储一律 false —— 表现为「一键扫描 / 导入文件夹」全部 0 首。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+                }
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     permissions.add(Manifest.permission.POST_NOTIFICATIONS)
                 }
-            }
-
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
+            } else {
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                     permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
                 }
@@ -3301,7 +3444,7 @@ class MainActivity : ComponentActivity() {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+        PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         val stopPlaybackOnExit = try {
             getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE).getBoolean("stop_playback_on_exit", true)
         } catch (_: Exception) { true }

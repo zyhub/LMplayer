@@ -12,8 +12,8 @@ android {
         applicationId = "com.lm.player"
         minSdk = 23
         targetSdk = 34
-        versionCode = 52
-        versionName = "1.7.17"
+        versionCode = 58
+        versionName = "1.7.23"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -35,7 +35,7 @@ android {
             isShrinkResources = true
             signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
+                getDefaultProguardFile("proguard-android.txt"),
                 "proguard-rules.pro"
             )
         }

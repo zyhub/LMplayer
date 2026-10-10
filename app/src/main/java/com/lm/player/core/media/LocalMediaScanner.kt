@@ -16,6 +16,24 @@ import java.io.File
 
 object LocalMediaScanner {
 
+    /**
+     * 解析需要扫描的 MediaStore 音频卷 URI 列表。
+     *
+     * Android 10 (API 29) 起支持多外部卷：getExternalVolumeNames 会返回
+     * "external_primary" 以及 "1234-5678" 这类 SD 卡 / U 盘卷标识。
+     * 老系统（API < 29）没有该 API，回退到 EXTERNAL_CONTENT_URI。
+     */
+    private fun resolveAudioContentUris(context: Context): List<Uri> {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
+            return listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+        }
+        return runCatching {
+            MediaStore.getExternalVolumeNames(context)
+                .map { volume -> MediaStore.Audio.Media.getContentUri(volume) }
+                .ifEmpty { listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) }
+        }.getOrElse { listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) }
+    }
+
     private const val TAG = "LocalMediaScanner"
     private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd")
 
@@ -39,8 +57,12 @@ object LocalMediaScanner {
             val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} >= 10000"
             val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
 
+            // 遍历**全部外部卷**（内置存储 + SD 卡 + U 盘/移动硬盘）：此前只查
+            // MediaStore.Audio.Media.EXTERNAL_CONTENT_URI，在 Android 10+ 分区存储下该 URI
+            // 只覆盖 primary 卷，电视盒子/车机接的 U 盘与移动硬盘会被整体漏扫。
+            for (scanUri in resolveAudioContentUris(context)) {
             context.contentResolver.query(
-                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                scanUri,
                 projection,
                 selection,
                 null,
@@ -57,56 +79,71 @@ object LocalMediaScanner {
                 val entities = mutableListOf<SongEntity>()
                 val retriever = MediaMetadataRetriever()
 
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idCol)
-                    val title = cursor.getString(titleCol) ?: "未知歌曲"
-                    val artist = cursor.getString(artistCol) ?: "未知艺术家"
-                    val album = cursor.getString(albumCol) ?: "未知专辑"
-                    val albumId = cursor.getLong(albumIdCol)
-                    val durationMs = cursor.getLong(durationCol)
-                    val path = cursor.getString(dataCol) ?: ""
-
-                    if (path.isNotBlank() && File(path).exists()) {
-                        val file = File(path)
-                        val ext = file.extension.lowercase().ifBlank { "mp3" }
-                        val songId = "local_media_${id}"
-
-                        // 提取并持久化内嵌高清专辑封面 (优先从音频文件 ID3/FLAC tag 中提取，次选 MediaStore)
-                        var coverUrl = extractAndCacheArtwork(context, path, songId, retriever)
-                        if (coverUrl.isBlank() && albumId > 0) {
-                            val albumArtUri = ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), albumId)
-                            coverUrl = albumArtUri.toString()
+                // 长循环中复用同一个 MediaMetadataRetriever 会让 native 侧状态累积；
+                // 每处理 200 个文件重建一次，兼顾性能与稳定性。
+                var scannedSinceRetrieverReset = 0
+                var metadataRetriever = retriever
+                try {
+                    while (cursor.moveToNext()) {
+                        if (scannedSinceRetrieverReset >= 200) {
+                            runCatching { metadataRetriever.release() }
+                            metadataRetriever = MediaMetadataRetriever()
+                            scannedSinceRetrieverReset = 0
                         }
+                        scannedSinceRetrieverReset++
+                        val id = cursor.getLong(idCol)
+                        val title = cursor.getString(titleCol) ?: "未知歌曲"
+                        val artist = cursor.getString(artistCol) ?: "未知艺术家"
+                        val album = cursor.getString(albumCol) ?: "未知专辑"
+                        val albumId = cursor.getLong(albumIdCol)
+                        val durationMs = cursor.getLong(durationCol)
+                        val path = cursor.getString(dataCol) ?: ""
 
-                        entities.add(
-                            SongEntity(
-                                id = songId,
-                                title = title,
-                                artist = if (artist.contains("<unknown>", ignoreCase = true)) "本地艺术家" else artist,
-                                artistId = "local_artist_${artist.hashCode()}",
-                                album = if (album.contains("<unknown>", ignoreCase = true)) "本地专辑" else album,
-                                albumId = "local_album_${album.hashCode()}",
-                                durationMs = durationMs,
-                                coverUrl = coverUrl,
-                                streamUrl = path,
-                                serverId = "local_storage",
-                                localFilePath = path,
-                                downloadStatus = DownloadStatus.DOWNLOADED,
-                                bitRate = 320,
-                                format = ext,
-                                isFavorite = false
+                        if (path.isNotBlank() && File(path).exists()) {
+                            val file = File(path)
+                            val ext = file.extension.lowercase().ifBlank { "mp3" }
+                            val songId = "local_media_${id}"
+
+                            // 提取并持久化内嵌高清专辑封面 (优先从音频文件 ID3/FLAC tag 中提取，次选 MediaStore)
+                            var coverUrl = extractAndCacheArtwork(context, path, songId, metadataRetriever)
+                            if (coverUrl.isBlank() && albumId > 0) {
+                                val albumArtUri = ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), albumId)
+                                coverUrl = albumArtUri.toString()
+                            }
+
+                            entities.add(
+                                SongEntity(
+                                    id = songId,
+                                    title = title,
+                                    artist = if (artist.contains("<unknown>", ignoreCase = true)) "本地艺术家" else artist,
+                                    artistId = "local_artist_${artist.hashCode()}",
+                                    album = if (album.contains("<unknown>", ignoreCase = true)) "本地专辑" else album,
+                                    albumId = "local_album_${album.hashCode()}",
+                                    durationMs = durationMs,
+                                    coverUrl = coverUrl,
+                                    streamUrl = path,
+                                    serverId = "local_storage",
+                                    localFilePath = path,
+                                    downloadStatus = DownloadStatus.DOWNLOADED,
+                                    bitRate = 320,
+                                    format = ext,
+                                    isFavorite = false
+                                )
                             )
-                        )
-                        count++
+                            count++
+                        }
                     }
+                } finally {
+                    // 释放当前实际使用的实例（循环中可能已重建过多次），确保异常时也能无条件释放
+                    runCatching { metadataRetriever.release() }
                 }
-                try { retriever.release() } catch (_: Exception) {}
 
                 if (entities.isNotEmpty()) {
                     database.songDao().insertSongs(entities)
                     matchAndMergeLocalWithServer(database)
                 }
             }
+            }   // end for (scanUri in resolveAudioContentUris)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to scan system media store", e)
         }
@@ -181,7 +218,7 @@ object LocalMediaScanner {
                     Log.w(TAG, "Error parsing file ${file.name}: ${e.message}")
                 }
             }
-            try { retriever.release() } catch (_: Exception) {}
+            runCatching { retriever.release() }   // release 必须无条件执行：中途抛异常时原先会跳过，导致 native 解码器与 FD 泄漏
 
             if (entities.isNotEmpty()) {
                 database.songDao().insertSongs(entities)
@@ -388,7 +425,7 @@ object LocalMediaScanner {
         } catch (e: Exception) {
             Log.e(TAG, "Error in discoverLocalAudioFilesGrouped", e)
         } finally {
-            try { retriever.release() } catch (_: Exception) {}
+            runCatching { retriever.release() }   // release 必须无条件执行：中途抛异常时原先会跳过，导致 native 解码器与 FD 泄漏
         }
         groupedMap
     }
@@ -502,7 +539,7 @@ object LocalMediaScanner {
             }
 
             traverseDoc(docFile)
-            try { retriever.release() } catch (_: Exception) {}
+            runCatching { retriever.release() }   // release 必须无条件执行：中途抛异常时原先会跳过，导致 native 解码器与 FD 泄漏
 
             if (entities.isNotEmpty()) {
                 database.songDao().insertSongs(entities)

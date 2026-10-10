@@ -1,6 +1,7 @@
 package com.lm.player.core.media
 
 import android.content.Context
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -24,6 +25,8 @@ import java.io.File
 @OptIn(UnstableApi::class)
 object Media3Factory {
 
+    private const val TAG = "Media3Factory"
+
     @Volatile
     private var simpleCacheInstance: SimpleCache? = null
 
@@ -37,8 +40,22 @@ object Media3Factory {
             if (!cacheDir.exists()) {
                 cacheDir.mkdirs()
             }
-            // 2GB 最大磁盘 LRU 缓存，超出时自动淘汰最早未命中的音轨缓存切片
-            val evictor = LeastRecentlyUsedCacheEvictor(2L * 1024 * 1024 * 1024)
+            // 流媒体缓存上限：**按可用空间动态取值**，上限 300MB。
+            // 此前硬编码 2GB —— 而 cacheDir 下还有图片缓存与 OkHttp 缓存，三者合计可达 2.3GB，
+            // 电视盒子/车机内置存储常为 8~16GB，会显著挤占空间；Android 只在存储告急时才回收
+            // 缓存目录且不保证。行业常规（ExoPlayer 官方示例）为 50~200MB。
+            val cacheBudgetBytes = run {
+                val capBytes = 300L * 1024 * 1024
+                try {
+                    val stat = android.os.StatFs(cacheDir.absolutePath)
+                    // 取「上限」与「可用空间的 1/10」中的较小值，最低保留 64MB 保证基本缓冲能力
+                    val dynamic = (stat.availableBytes / 10).coerceAtLeast(64L * 1024 * 1024)
+                    minOf(capBytes, dynamic)
+                } catch (_: Exception) {
+                    capBytes
+                }
+            }
+            val evictor = LeastRecentlyUsedCacheEvictor(cacheBudgetBytes)
             val databaseProvider = StandaloneDatabaseProvider(context.applicationContext)
             simpleCacheInstance = SimpleCache(cacheDir, evictor, databaseProvider)
         }
@@ -92,6 +109,30 @@ object Media3Factory {
             } else {
                 upstreamFactory.createDataSource()
             }
+        }
+    }
+
+    /**
+     * 释放进程级共享播放器。
+     *
+     * **为什么必须有这个方法**：sharedExoPlayer 是进程级静态字段，此前全工程没有任何一处调用
+     * release()。播放器一旦 build 过就会一直持有：
+     * - setWakeMode(C.WAKE_MODE_NETWORK) 带来的 PARTIAL_WAKE_LOCK + WifiLock（用户暂停后依然持有）；
+     * - 音频解码器、AudioTrack 与 OkHttp 连接；
+     * - PlaybackQueueManager 注册的 Player.Listener（通过弱引用守卫可自动失效，见该类 ensurePlayerListener）。
+     * 结果是从最近任务划掉应用后，进程仍可能存活数分钟到数十分钟，期间设备无法进入深度睡眠。
+     *
+     * 只在「用户明确要求彻底停止播放」的路径上调用；调用后下次 getSharedExoPlayer 会重建实例。
+     */
+    @Synchronized
+    fun releaseSharedPlayer() {
+        val player = sharedExoPlayer ?: return
+        sharedExoPlayer = null
+        try {
+            player.release()
+            Log.i(TAG, "Shared ExoPlayer released")
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to release shared ExoPlayer", e)
         }
     }
 
@@ -158,16 +199,26 @@ object Media3Factory {
      * 清理流媒体缓存
      */
     fun clearStreamCache(context: Context) {
+        // 注意：本函数**不会**释放播放器或删除缓存目录。
         try {
-            simpleCacheInstance?.let { cache ->
+
+            // 关键点：DataSource 工厂在**构建播放器时**捕获了 SimpleCache 实例。
+            // 因此不能「一边使用、一边 release 并删除目录」——SimpleCache 内部的 released
+            // 断言会抛 IllegalStateException，内存索引与磁盘分片也会不一致。
+            //
+            // 但同样不能靠「先 releaseSharedPlayer()」来解决：那会让**正在播放的曲目直接中断**，
+            // 用户点一下「清理试听缓存」音乐就哑了，必须手动恢复 —— 为一个清理动作付这个代价是不可接受的。
+            //
+            // 正确做法：**不释放、不删目录**，只逐 key 清掉缓存内容。这样
+            //   ① 播放器的 DataSource 引用依旧有效，播放完全不受影响；
+            //   ② 磁盘上的分片文件被逐个删除，空间照常释放；
+            //   ③ SimpleCache 的索引与磁盘始终一致，不会抛异常。
+            // SimpleCache 自身的 LRU 上限（按可用空间动态取值，上限 300MB）负责后续回收。
+            val cache = simpleCacheInstance
+            if (cache != null) {
                 for (key in cache.keys.toSet()) {
                     try { cache.removeResource(key) } catch (_: Exception) {}
                 }
-            }
-            val cacheDir = File(context.applicationContext.cacheDir, "media3_lru_stream_cache")
-            if (cacheDir.exists()) {
-                cacheDir.deleteRecursively()
-                cacheDir.mkdirs()
             }
         } catch (_: Exception) {}
     }

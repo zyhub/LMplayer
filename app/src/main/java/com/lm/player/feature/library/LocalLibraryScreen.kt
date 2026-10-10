@@ -5,6 +5,7 @@ import android.widget.Toast
 import java.io.File
 import androidx.activity.compose.BackHandler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -19,7 +20,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -81,6 +85,19 @@ import kotlinx.coroutines.launch
  * 6. 全部歌曲高保真流 (带格式/音质标签、收藏、下载弹窗、多维排序、多选/全选下载)
  * 7. 页面内无缝下钻视图 (歌单/歌手/专辑/流派详情，不遮挡底部悬浮播放栏)
  */
+/**
+ * 资料库主列表（LocalLibraryScreen 的 LazyColumn）各板块的**固定下标**。
+ *
+ * 必须与实际 item 顺序保持一致；一旦上方布局增删板块，请同步更新这里。
+ * 抽成常量是为了避免此前「魔法数字 3 漏算了无条件存在的歌单区」导致的定位偏移缺陷。
+ */
+private const val LOCAL_LIBRARY_SECTION_HEADER_INDEX = 0
+private const val LOCAL_LIBRARY_SECTION_BENTO_INDEX = 1
+private const val LOCAL_LIBRARY_SECTION_PLAYLISTS_INDEX = 2
+private const val LOCAL_LIBRARY_SECTION_RECENT_INDEX = 3
+private const val LOCAL_LIBRARY_SECTION_FOLDERS_INDEX = 4
+private const val LOCAL_LIBRARY_SECTION_ALL_SONGS_HEADER_INDEX = 5
+
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
@@ -124,6 +141,7 @@ fun LocalLibraryScreen(
     currentServerName: String = "本地模式",
     configuredServers: List<ServerConfig> = emptyList(),
     blurAlpha: Float = 0.85f,
+    dynamicCardEffects: Boolean = true,
     onSelectLocalServer: () -> Unit = {},
     onSelectServer: (ServerConfig) -> Unit = {},
     onSyncNow: () -> Unit = {},
@@ -145,6 +163,22 @@ fun LocalLibraryScreen(
     // 每次打开资料库随机选取5组不同光影配色，确保5张卡片视觉各异
     val libPalettes = remember { ALL_RANDOM_LIQUID_PALETTES.shuffled().take(5) }
 
+    // 监听前后台生命周期，退到后台或锁屏时暂停光斑帧时钟驱动，降低功耗
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    var isAppResumed by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                isAppResumed = true
+            } else if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                isAppResumed = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val isLiquidAnimated = dynamicCardEffects && isAppResumed
+
     // 排序模式
     // 程序启动默认按「加入时间」：在线模式 = 服务器文件的 mtime（服务器「最近添加」先后），
     // 本地模式 = 本地下载完成时间。与 TV 车机版保持一致，"刚入库的排在前面"才是资料库第一直觉。
@@ -154,6 +188,7 @@ fun LocalLibraryScreen(
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
     var activeSubViewSubtitle by remember { mutableStateOf<String>("") }
+    var activePlaylistId by remember { mutableStateOf<String?>(null) }
     var lastSubViewTitle by remember { mutableStateOf<String?>(null) }
     var lastSubViewSubtitle by remember { mutableStateOf<String>("") }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
@@ -254,11 +289,29 @@ fun LocalLibraryScreen(
     }
 
     // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 兜底聚合
-    val finalDownloadedSongs = remember(allSongs, downloadedSongs) {
-        if (downloadedSongs.isNotEmpty()) {
-            downloadedSongs
-        } else {
-            allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || !it.localFilePath.isNullOrBlank() }
+    // 增加物理本地文件存在性校验，避免 NAS 远程路径被误归入本地离线。
+    //
+    // **必须在 IO 线程做**：候选集是整个曲库（自述 2000+ 首），逐条 File.exists() 是 O(n) 磁盘 stat。
+    // 原先放在 remember 中执行 —— 即组合期在主线程打满磁盘调用，曲库越大首帧越卡；
+    // 而且 remember 的 key 是整个 List，每次重组都要对上千条做 O(n) 深比较。
+    // 现在改为 produceState + Dispatchers.IO，并先用 id 列表做轻量 key 以降低重组开销。
+    val downloadedSongsKey = remember(downloadedSongs) { downloadedSongs.joinToString(",") { it.id } }
+    val allSongsKey = remember(allSongs) { allSongs.size }
+    val finalDownloadedSongs by produceState(
+        initialValue = downloadedSongs,
+        key1 = allSongsKey,
+        key2 = downloadedSongsKey
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val validLocal = { s: UnifiedSong ->
+                val path = s.localFilePath
+                !path.isNullOrBlank() && (path.startsWith("content://") || java.io.File(path).exists())
+            }
+            if (downloadedSongs.isNotEmpty()) {
+                downloadedSongs.filter(validLocal)
+            } else {
+                allSongs.filter { (it.downloadStatus == DownloadStatus.DOWNLOADED || !it.localFilePath.isNullOrBlank()) && validLocal(it) }
+            }
         }
     }
     var isDownloadManagementMode by remember { mutableStateOf(false) }
@@ -416,6 +469,8 @@ fun LocalLibraryScreen(
             }
             val diskFolderCoverCache = HashMap<String, String?>()
 
+            // 需要网络补齐封面的云端歌单（循环内只收集，循环后并发拉取，避免 N 次串行往返）
+            val pendingCoverFetches = ArrayList<Pair<UnifiedPlaylist, MutableList<String>>>()
             for (pl in sortedPlaylists) {
                 val covers = ArrayList<String>()
 
@@ -499,18 +554,13 @@ fun LocalLibraryScreen(
                     }
                 }
 
-                // 6. 如果是云端歌单且仍不足 4 首，可轻量异步拉取一次歌单歌曲
+                // 6. 如果是云端歌单且仍不足 4 首，拉取一次歌单歌曲
+                //    注意：这里必须是 suspend 调用且**不能**在主线程。
+                //    整个 produceState 已在 Dispatchers.IO 内执行，因此串行 N 个歌单的代价可接受；
+                //    但为缩短首次呈现时间，把「需要网络补齐封面」的歌单收集起来，最后并发执行。
+                //    （原先每个歌单顺序 await 一次网络请求，20 个歌单 = 20 次串行往返。）
                 if (covers.size < 4 && pl.isOnline && onFetchPlaylistSongs != null) {
-                    try {
-                        val fetched = onFetchPlaylistSongs(pl.id, true)
-                        for (s in fetched) {
-                            if (covers.size >= 4) break
-                            val c = s.coverUrl
-                            if (!c.isNullOrBlank() && !covers.contains(c)) {
-                                covers.add(c)
-                            }
-                        }
-                    } catch (_: Exception) {}
+                    pendingCoverFetches.add(pl to covers)
                 }
 
                 // 7. 回退 fallbackCoverUrl
@@ -518,8 +568,41 @@ fun LocalLibraryScreen(
                     covers.add(pl.coverUrl)
                 }
 
-                if (covers.isNotEmpty()) {
+                // 先不写入 map：需要联网补齐的歌单要等并发请求回来后再统一落表
+                if (covers.isNotEmpty() && !pendingCoverFetches.any { it.first.id == pl.id }) {
                     map[pl.id] = covers.take(4)
+                }
+            }
+            // 并发补齐封面：每个歌单一次网络请求，彼此独立，用 async 并行发出。
+            // 原先在循环内逐个歌单 await 一次网络请求（N 个歌单 = N 次串行往返），
+            // 且每次都要等上一次超时。改为并发后整体耗时约等于最慢的那一个。
+            if (pendingCoverFetches.isNotEmpty()) {
+                val deferred = pendingCoverFetches.map { (pl, covers) ->
+                    async {
+                        try {
+                            val fetched = onFetchPlaylistSongs?.invoke(pl.id, true).orEmpty()
+                            for (song in fetched) {
+                                if (covers.size >= 4) break
+                                val c = song.coverUrl
+                                if (!c.isNullOrBlank() && !covers.contains(c)) covers.add(c)
+                            }
+                        } catch (_: Exception) {
+                            // 单个歌单失败不影响其它歌单，封面拿不到就沿用已有回退
+                        }
+                    }
+                }
+                deferred.forEach {
+                    try {
+                        it.await()
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e   // 与全工程约定一致：取消必须重抛，不能被 runCatching 吞掉
+                    } catch (_: Exception) {
+                        // 单个歌单封面拉取失败不影响其它歌单
+                    }
+                }
+                // 统一落表：必须在 await 之后读取 covers，否则并发补齐的封面会被丢掉
+                for ((pl, covers) in pendingCoverFetches) {
+                    if (covers.isNotEmpty()) map[pl.id] = covers.take(4)
                 }
             }
             map
@@ -559,6 +642,7 @@ fun LocalLibraryScreen(
             isFromAllAlbums = false
         } else {
             activeSubViewTitle = null
+            activePlaylistId = null
             isFromAllPlaylists = false
             isFromAllFolders = false
             isFromAllArtists = false
@@ -701,7 +785,17 @@ fun LocalLibraryScreen(
                     activeSubViewTitle = null
                     delay(80)
                 }
-                var headerCount = 3 // 0:Header, 1:Bento卡片, 2:全部歌曲操作栏
+                // 必须与上方 LazyColumn 的 **实际 item 顺序**一一对应，任何一处新增/删除板块
+                // 都要同步改这里，否则「定位正在播放歌曲」会滚到错误位置。
+                // 实测顺序（见 LOCAL_LIBRARY_SECTION_* 常量与各 item 前的注释）：
+                //   0 头部标题栏      —— 始终存在
+                //   1 Bento 核心卡片  —— 始终存在（key = "lib_top_bento_cards"）
+                //   2 自建与云端歌单  —— **始终存在**（原先漏算，导致定位永远偏一行）
+                //   3 最近添加        —— 条件：recentAddedSongs 非空
+                //   4 本地文件夹      —— 条件：localFolders 非空
+                //   5 全部歌曲标题栏  —— 始终存在
+                //   6+ 歌曲列表
+                var headerCount = LOCAL_LIBRARY_SECTION_ALL_SONGS_HEADER_INDEX
                 if (recentAddedSongs.isNotEmpty()) headerCount++
                 if (localFolders.isNotEmpty()) headerCount++
                 runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
@@ -849,6 +943,7 @@ fun LocalLibraryScreen(
                             gradientColors = if (isServerOk) libPalettes[0].gradientColors else listOf(Color(0xFF332410), Color(0xFF1C1308)),
                             glowColor = if (isServerOk) libPalettes[0].glowColor else Color(0xFFFF9500),
                             secondaryGlowColor = if (isServerOk) libPalettes[0].secondaryGlowColor else Color(0xFFFFB340),
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 val active = configuredServers.firstOrNull { it.isCurrentActive } ?: configuredServers.firstOrNull()
                                 if (active != null) onSelectServer(active) else onGoToSettings()
@@ -968,6 +1063,7 @@ fun LocalLibraryScreen(
                             gradientColors = libPalettes[1].gradientColors,
                             glowColor = libPalettes[1].glowColor,
                             secondaryGlowColor = libPalettes[1].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isFromAllAlbums = false
                                 activeSubViewTitle = "全部专辑"
@@ -1086,6 +1182,7 @@ fun LocalLibraryScreen(
                             gradientColors = libPalettes[2].gradientColors,
                             glowColor = libPalettes[2].glowColor,
                             secondaryGlowColor = libPalettes[2].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "我喜欢的音乐"
@@ -1167,6 +1264,7 @@ fun LocalLibraryScreen(
                             gradientColors = libPalettes[3].gradientColors,
                             glowColor = libPalettes[3].glowColor,
                             secondaryGlowColor = libPalettes[3].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 activeSubViewTitle = "全部歌曲"
                                 activeSubViewSubtitle = "资料库曲目 · 共 ${filteredSongs.size} 首"
@@ -1187,6 +1285,7 @@ fun LocalLibraryScreen(
                             gradientColors = libPalettes[4].gradientColors,
                             glowColor = libPalettes[4].glowColor,
                             secondaryGlowColor = libPalettes[4].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "本地下载"
@@ -1209,6 +1308,7 @@ fun LocalLibraryScreen(
                             iconColor = Color(0xFFA78BFA),
                             gradientColors = listOf(Color(0xFF6D28D9), Color(0xFF4C1D95)),
                             glowColor = Color(0xFFA78BFA),
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "最近播放"
@@ -1231,6 +1331,7 @@ fun LocalLibraryScreen(
                             iconColor = Color(0xFFFBBF24),
                             gradientColors = listOf(Color(0xFFD97706), Color(0xFF78350F)),
                             glowColor = Color(0xFFFBBF24),
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isFromAllArtists = false
                                 activeSubViewTitle = "全部歌手"
@@ -1372,12 +1473,23 @@ fun LocalLibraryScreen(
                                     onClick = {
                                         isFromAllPlaylists = false
                                         activeSubViewTitle = pl.name
+                                        activePlaylistId = pl.id
                                         activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
                                         if (onFetchPlaylistSongs != null) {
                                             isLoadingSubView = true
                                             coroutineScope.launch {
-                                                activeSubViewSongs = onFetchPlaylistSongs(pl.id, pl.isOnline)
-                                                isLoadingSubView = false
+                                                // 必须 try/finally 复位 loading：回调抛异常（网络抖动、DB 异常）时
+                                                // 若不复位，isLoadingSubView 会永远为 true → 页面停在永久转圈，
+                                                // 用户只能杀进程重开。
+                                                try {
+                                                    activeSubViewSongs = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (_: Exception) {
+                                                    activeSubViewSongs = emptyList()
+                                                } finally {
+                                                    isLoadingSubView = false
+                                                }
                                             }
                                         } else {
                                             activeSubViewSongs = allSongs.filter { it.album == pl.name }
@@ -1782,6 +1894,30 @@ fun LocalLibraryScreen(
                                 }
                             }
                         }
+                    } else if (activePlaylistId != null) {
+                        var showDeleteConfirm by remember { mutableStateOf(false) }
+                        IconButton(onClick = { showDeleteConfirm = true }) {
+                            Icon(Icons.Default.DeleteOutline, contentDescription = "删除歌单", tint = Color(0xFFFF3B30))
+                        }
+                        if (showDeleteConfirm) {
+                            AlertDialog(
+                                onDismissRequest = { showDeleteConfirm = false },
+                                title = { Text("删除歌单") },
+                                text = { Text("确定要删除歌单「$activeSubViewTitle」吗？此操作无法撤销。") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        showDeleteConfirm = false
+                                        val plId = activePlaylistId
+                                        activePlaylistId = null
+                                        activeSubViewTitle = null
+                                        if (plId != null) onDeletePlaylist(plId)
+                                    }) { Text("删除", color = Color(0xFFFF3B30)) }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
+                                }
+                            )
+                        }
                     }
                 }
 
@@ -1966,6 +2102,7 @@ fun LocalLibraryScreen(
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = pl.name
+                                    activePlaylistId = pl.id
                                     activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
                                     if (onFetchPlaylistSongs != null) {
                                         isLoadingSubView = true
@@ -2797,11 +2934,27 @@ private fun RecentAddedSongCard(
     }
 }
 
+@Composable
+private fun rememberLiquidPhase(enabled: Boolean, durationMillis: Int = 8000): State<Float> {
+    if (!enabled) return remember { mutableFloatStateOf(0f) }
+    val infiniteTransition = rememberInfiniteTransition(label = "lib_liquid_phase")
+    return infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = durationMillis, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+}
+
 /**
- * 绘制有机非规则变形液态光斑 Path
- * 通过 8 点谐波多极波动生成平滑变幻的阿米巴流体波形，告别僵硬圆形旋转
+ * 绘制有机非规则变形液态光斑 Path（复用预分配 Path 与 FloatArray 缓冲，零堆内存分配）
  */
-private fun buildOrganicLiquidPath(
+private fun updateOrganicLiquidPath(
+    path: Path,
+    ptsBuffer: FloatArray,
     cx: Float,
     cy: Float,
     baseRadius: Float,
@@ -2809,40 +2962,39 @@ private fun buildOrganicLiquidPath(
     h1: Float = 1.0f,
     h2: Float = 2.0f,
     h3: Float = 3.0f
-): Path {
-    val path = Path()
+) {
+    path.reset()
     val pointsCount = 8
     val step = (2.0 * Math.PI / pointsCount).toFloat()
-    val pts = ArrayList<Offset>(pointsCount)
 
     for (i in 0 until pointsCount) {
         val angle = i * step
-        // phaseRad 乘数均为整数 (1, -1, 2)，保证 phaseRad 在 0 与 2π 时值与一阶导数完全恒等，实现无缝连贯循环
         val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
                    0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
                    0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
         val r = baseRadius * (1f + wave)
-        val px = cx + r * kotlin.math.cos(angle)
-        val py = cy + r * kotlin.math.sin(angle)
-        pts.add(Offset(px, py))
+        ptsBuffer[i * 2] = cx + r * kotlin.math.cos(angle)
+        ptsBuffer[i * 2 + 1] = cy + r * kotlin.math.sin(angle)
     }
 
-    if (pts.isNotEmpty()) {
-        val firstMid = Offset((pts[0].x + pts[1].x) / 2f, (pts[0].y + pts[1].y) / 2f)
-        path.moveTo(firstMid.x, firstMid.y)
-        for (i in 0 until pointsCount) {
-            val pNext = pts[(i + 1) % pointsCount]
-            val pAfterNext = pts[(i + 2) % pointsCount]
-            val mid = Offset((pNext.x + pAfterNext.x) / 2f, (pNext.y + pAfterNext.y) / 2f)
-            path.quadraticBezierTo(pNext.x, pNext.y, mid.x, mid.y)
-        }
-        path.close()
+    val firstMidX = (ptsBuffer[0] + ptsBuffer[2]) / 2f
+    val firstMidY = (ptsBuffer[1] + ptsBuffer[3]) / 2f
+    path.moveTo(firstMidX, firstMidY)
+
+    for (i in 0 until pointsCount) {
+        val nextIdx = ((i + 1) % pointsCount) * 2
+        val afterNextIdx = ((i + 2) % pointsCount) * 2
+        val nextX = ptsBuffer[nextIdx]
+        val nextY = ptsBuffer[nextIdx + 1]
+        val midX = (nextX + ptsBuffer[afterNextIdx]) / 2f
+        val midY = (nextY + ptsBuffer[afterNextIdx + 1]) / 2f
+        path.quadraticBezierTo(nextX, nextY, midX, midY)
     }
-    return path
+    path.close()
 }
 
 /**
- * 资料库液态光影流动大卡/正方卡 (非规则阿米巴流体变形光斑 + 渐变边框动画，连贯无缝循环)
+ * 资料库液态光影流动大卡/正方卡 (仅在 Draw 阶段自绘光影与边框，彻底阻断 Compose 重组开销)
  */
 @Composable
 private fun LibraryLiquidCard(
@@ -2851,42 +3003,19 @@ private fun LibraryLiquidCard(
     glowColor: Color,
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(18.dp),
+    isAnimated: Boolean = true,
     onClick: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "lib_liquid_light")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 8000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-
-    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
-    val rad2 = rad1 + Math.PI.toFloat()
-
-    val cosP = kotlin.math.cos(rad1)
-    val sinP = kotlin.math.sin(rad1)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 8000)
+    val path1 = remember { Path() }
+    val path2 = remember { Path() }
+    val ptsBuffer = remember { FloatArray(16) }
+    val cornerRadius = 18.dp
 
     Surface(
         shape = shape,
         color = Color.Transparent,
-        border = BorderStroke(
-            width = 1.dp,
-            brush = Brush.linearGradient(
-                colors = listOf(
-                    glowColor.copy(alpha = 0.85f),
-                    Color.White.copy(alpha = 0.45f),
-                    glowColor.copy(alpha = 0.20f),
-                    glowColor.copy(alpha = 0.85f)
-                ),
-                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
-                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
-            )
-        ),
         shadowElevation = 4.dp,
         modifier = modifier
             .clip(shape)
@@ -2895,42 +3024,85 @@ private fun LibraryLiquidCard(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.linearGradient(gradientColors))
                 .drawBehind {
-                    val w = size.width
-                    val h = size.height
+                    drawRect(Brush.linearGradient(gradientColors))
 
-                    val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
-                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
-                    val path1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.60f, rad1)
-                    drawPath(
-                        path = path1,
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                glowColor.copy(alpha = 0.62f),
-                                glowColor.copy(alpha = 0.22f),
-                                Color.Transparent
-                            ),
-                            center = Offset(cx1, cy1),
-                            radius = size.maxDimension * 0.75f
-                        )
-                    )
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val rad2 = rad1 + Math.PI.toFloat()
+                        val w = size.width
+                        val h = size.height
 
-                    val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
-                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
-                    val path2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
-                    drawPath(
-                        path = path2,
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                secondaryGlowColor.copy(alpha = 0.42f),
-                                secondaryGlowColor.copy(alpha = 0.12f),
-                                Color.Transparent
-                            ),
-                            center = Offset(cx2, cy2),
-                            radius = size.maxDimension * 0.60f
+                        val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
+                        val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
+                        updateOrganicLiquidPath(path1, ptsBuffer, cx1, cy1, size.maxDimension * 0.60f, rad1)
+                        drawPath(
+                            path = path1,
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.62f),
+                                    glowColor.copy(alpha = 0.22f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(cx1, cy1),
+                                radius = size.maxDimension * 0.75f
+                            )
                         )
-                    )
+
+                        val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
+                        val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
+                        updateOrganicLiquidPath(path2, ptsBuffer, cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
+                        drawPath(
+                            path = path2,
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    secondaryGlowColor.copy(alpha = 0.42f),
+                                    secondaryGlowColor.copy(alpha = 0.12f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(cx2, cy2),
+                                radius = size.maxDimension * 0.60f
+                            )
+                        )
+                    }
+                }
+                .drawWithContent {
+                    drawContent()
+                    val strokeWidth = 1.dp.toPx()
+                    val cr = cornerRadius.toPx()
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val cosP = kotlin.math.cos(rad1)
+                        val sinP = kotlin.math.sin(rad1)
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.85f),
+                                    Color.White.copy(alpha = 0.45f),
+                                    glowColor.copy(alpha = 0.20f),
+                                    glowColor.copy(alpha = 0.85f)
+                                ),
+                                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    } else {
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.50f),
+                                    Color.White.copy(alpha = 0.25f),
+                                    glowColor.copy(alpha = 0.35f)
+                                )
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    }
                 }
         ) {
             Column(
@@ -2961,41 +3133,18 @@ private fun LibraryLiquidSmallCard(
     glowColor: Color,
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(16.dp),
+    isAnimated: Boolean = true,
     onClick: () -> Unit
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "lib_small_liquid")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 7500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-
-    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
-    val rad2 = rad1 + Math.PI.toFloat()
-
-    val cosP = kotlin.math.cos(rad1)
-    val sinP = kotlin.math.sin(rad1)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 7500)
+    val path1 = remember { Path() }
+    val path2 = remember { Path() }
+    val ptsBuffer = remember { FloatArray(16) }
+    val cornerRadius = 16.dp
 
     Surface(
         shape = shape,
         color = Color.Transparent,
-        border = BorderStroke(
-            width = 1.dp,
-            brush = Brush.linearGradient(
-                colors = listOf(
-                    glowColor.copy(alpha = 0.85f),
-                    Color.White.copy(alpha = 0.45f),
-                    glowColor.copy(alpha = 0.20f),
-                    glowColor.copy(alpha = 0.85f)
-                ),
-                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
-                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
-            )
-        ),
         shadowElevation = 3.dp,
         modifier = modifier
             .clip(shape)
@@ -3004,34 +3153,77 @@ private fun LibraryLiquidSmallCard(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.linearGradient(colors = gradientColors))
                 .drawBehind {
-                    val w = size.width
-                    val h = size.height
+                    drawRect(Brush.linearGradient(colors = gradientColors))
 
-                    val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
-                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
-                    val p1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.55f, rad1)
-                    drawPath(
-                        path = p1,
-                        brush = Brush.radialGradient(
-                            colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
-                            center = Offset(cx1, cy1),
-                            radius = size.maxDimension * 0.70f
-                        )
-                    )
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val rad2 = rad1 + Math.PI.toFloat()
+                        val w = size.width
+                        val h = size.height
 
-                    val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
-                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
-                    val p2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
-                    drawPath(
-                        path = p2,
-                        brush = Brush.radialGradient(
-                            colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
-                            center = Offset(cx2, cy2),
-                            radius = size.maxDimension * 0.55f
+                        val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
+                        val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
+                        updateOrganicLiquidPath(path1, ptsBuffer, cx1, cy1, size.maxDimension * 0.55f, rad1)
+                        drawPath(
+                            path = path1,
+                            brush = Brush.radialGradient(
+                                colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
+                                center = Offset(cx1, cy1),
+                                radius = size.maxDimension * 0.70f
+                            )
                         )
-                    )
+
+                        val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
+                        val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
+                        updateOrganicLiquidPath(path2, ptsBuffer, cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
+                        drawPath(
+                            path = path2,
+                            brush = Brush.radialGradient(
+                                colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
+                                center = Offset(cx2, cy2),
+                                radius = size.maxDimension * 0.55f
+                            )
+                        )
+                    }
+                }
+                .drawWithContent {
+                    drawContent()
+                    val strokeWidth = 1.dp.toPx()
+                    val cr = cornerRadius.toPx()
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val cosP = kotlin.math.cos(rad1)
+                        val sinP = kotlin.math.sin(rad1)
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.85f),
+                                    Color.White.copy(alpha = 0.45f),
+                                    glowColor.copy(alpha = 0.20f),
+                                    glowColor.copy(alpha = 0.85f)
+                                ),
+                                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    } else {
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.50f),
+                                    Color.White.copy(alpha = 0.25f),
+                                    glowColor.copy(alpha = 0.35f)
+                                )
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    }
                 }
         ) {
             Row(

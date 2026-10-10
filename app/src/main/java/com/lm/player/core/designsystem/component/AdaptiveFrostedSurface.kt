@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.designsystem.component
+package com.lm.player.core.designsystem.component
 
 import android.os.Build
 import androidx.compose.foundation.background
@@ -30,13 +30,16 @@ fun AdaptiveFrostedSurface(
     val apiLevel = Build.VERSION.SDK_INT
 
     if (apiLevel >= Build.VERSION_CODES.S && !isLowRam) {
-        // Tier 1: 现代高端机型原生 RenderEffect 实时 GPU 模糊
+        // Tier 1: 现代高端机型原生 RenderEffect 实时 GPU 模糊 (背景独立虚化，子视图内容保持清晰锐利)
         Box(
-            modifier = modifier
-                .clip(shape)
-                .background(backgroundColor.copy(alpha = 0.70f))
-                .blur(radius = blurRadius)
+            modifier = modifier.clip(shape)
         ) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(backgroundColor.copy(alpha = 0.70f))
+                    .blur(radius = blurRadius)
+            )
             content()
         }
     } else {

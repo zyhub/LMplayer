@@ -56,6 +56,47 @@ object AudioMetadataEmbedder {
     }
 
     // =========================================================================
+    // 0. 原子替换：任何一步失败都必须保证「至少还有一个完好的音频文件」
+    // =========================================================================
+
+    /**
+     * 用 [tempFile] 的内容替换 [original]，并保证失败时不会两边都丢。
+     *
+     * 原先的写法是 `if (file.delete()) return tempFile.renameTo(file)`，而外层 finally 无条件
+     * 删除 tempFile：一旦原文件删成功而 renameTo 失败 (目标仍被播放器/MediaMetadataRetriever
+     * 占用、跨卷、I/O 报错)，原文件与临时文件同时消失 —— 用户下载的歌曲会被永久删除。
+     *
+     * 这里改为「新内容先改名到备份 → 再删原文件 → 最后改回原名」，
+     * 删原文件失败时回滚备份、原文件毫发无损。
+     */
+    private fun safeReplace(original: File, tempFile: File): Boolean {
+        if (!tempFile.exists() || tempFile.length() <= 0L) return false
+        val backup = File(original.parentFile, original.name + ".lmnew")
+        return try {
+            try { backup.delete() } catch (_: Exception) {}
+            // 1) 新内容先落到同目录备份名；此步失败时原文件尚未被动过
+            if (!tempFile.renameTo(backup)) return false
+            if (!backup.exists() || backup.length() <= 0L) return false
+            // 2) 删除原文件；删不掉说明仍被占用，回滚备份并保持原状
+            if (original.exists() && !original.delete()) {
+                backup.delete()
+                return false
+            }
+            // 3) 备份改回原名；极端情况下改不回去就直接复制内容，避免只剩一个 .lmnew
+            if (backup.renameTo(original)) {
+                true
+            } else {
+                backup.copyTo(original, overwrite = true)
+                backup.delete()
+                original.exists() && original.length() > 0L
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "safeReplace failed for ${original.name}: ${e.message}", e)
+            false
+        }
+    }
+
+    // =========================================================================
     // 1. MP3 ID3v2.3 规范写入 (兼容所有车载车机、Windows/Mac/iOS/Android播放器)
     // =========================================================================
 
@@ -171,11 +212,9 @@ object AudioMetadataEmbedder {
                 }
             }
 
-            // 原子替换
-            if (tempFile.exists() && tempFile.length() > 0) {
-                if (file.delete()) {
-                    return tempFile.renameTo(file)
-                }
+            // 原子替换 (任何一步失败都保留原文件，不会出现两个文件同时消失)
+            if (safeReplace(file, tempFile)) {
+                return true
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error embedding MP3 ID3: ${e.message}", e)
@@ -322,11 +361,9 @@ object AudioMetadataEmbedder {
                 }
             }
 
-            // 原子替换
-            if (tempFile.exists() && tempFile.length() > 0) {
-                if (file.delete()) {
-                    return tempFile.renameTo(file)
-                }
+            // 原子替换 (任何一步失败都保留原文件，不会出现两个文件同时消失)
+            if (safeReplace(file, tempFile)) {
+                return true
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error embedding FLAC metadata: ${e.message}", e)
@@ -492,11 +529,9 @@ object AudioMetadataEmbedder {
                 }
             }
 
-            // 原子替换
-            if (tempFile.exists() && tempFile.length() > 0) {
-                if (file.delete()) {
-                    return tempFile.renameTo(file)
-                }
+            // 原子替换 (任何一步失败都保留原文件，不会出现两个文件同时消失)
+            if (safeReplace(file, tempFile)) {
+                return true
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error embedding M4A metadata: ${e.message}", e)

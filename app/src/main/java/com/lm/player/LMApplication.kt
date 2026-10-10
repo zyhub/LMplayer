@@ -54,16 +54,25 @@ class LMApplication : Application(), ImageLoaderFactory {
             }
         })
 
-        // 2. 异步在后台线程加载 Conscrypt 安全提供商与 Media3 缓存，0ms 阻塞冷启动主线程
+        // 2. 异步在后台线程加载 Conscrypt 安全提供商、Media3 缓存与 Room 数据库，0ms 阻塞冷启动主线程
         CoroutineScope(Dispatchers.IO).launch {
             NetworkClientFactory.installSecurityProvider()
-            val streamCacheEnabled = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE).getBoolean("stream_cache_enabled", true)
+
+            // 键名统一为 stream_cache_enabled_v2：此前 Application 读 stream_cache_enabled
+            // 而 Media3Factory 读 stream_cache_enabled_v2，两个键互不同步，
+            // 该布尔值会被两处竞争改写（P3-4）。
+            val prefs = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+            val streamCacheEnabled = prefs.getBoolean("stream_cache_enabled_v2", false)
             com.lm.player.core.media.Media3Factory.setCacheEnabled(streamCacheEnabled)
             com.lm.player.core.media.Media3Factory.prewarm(this@LMApplication)
+
+            // Room 首次 open 要建库/校验 schema，是在磁盘上做实事的操作。
+            // 放在主线程会直接拖慢冷启动首帧（与上面的注释目标相矛盾），此处挪进 IO 协程。
+            // 单例本身是 @Volatile + synchronized 的，主线程后续取用拿到的是同一实例。
+            ZdsDatabase.getInstance(this@LMApplication)
         }
 
-        // 3. 预初始化全局 Room 数据库单例与后台灵动岛引擎
-        ZdsDatabase.getInstance(this)
+        // 3. 后台灵动岛引擎初始化（纯内存状态读取，无磁盘 IO）
         DynamicIslandManager.ensureInitialized(this)
     }
 
@@ -92,7 +101,9 @@ class LMApplication : Application(), ImageLoaderFactory {
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDir.resolve("image_cache"))
-                    .maxSizeBytes(256L * 1024 * 1024)
+                    // 图片磁盘缓存 96MB（原 256MB）：与流媒体缓存、OkHttp 缓存合计
+                    // 不应把 cacheDir 撑到 GB 级；Coil 内存缓存已能覆盖绝大多数滚动场景
+                    .maxSizeBytes(96L * 1024 * 1024)
                     .build()
             }
             .bitmapConfig(Bitmap.Config.RGB_565)

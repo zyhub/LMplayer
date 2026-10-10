@@ -247,7 +247,14 @@ fun SongListItemRow(
     val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
     val activeTask = activeDownloadTasks.firstOrNull { it.song.id == song.id }
-    val isDownloaded = (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
+    // 磁盘存在性判定必须 remember：列表行每次重组都会执行这一行，
+    // 而 File.exists() 是真实的磁盘 stat —— 滚动时每行每帧一次 stat 是掉帧的直接来源。
+    // key 用路径本身，路径不变就不重复 stat。
+    val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+        val path = song.localFilePath
+        !path.isNullOrBlank() && (path.startsWith("content://") || java.io.File(path).exists())
+    }
+    val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
     val isCurrentPlaying = com.lm.player.core.designsystem.component.isSamePlayingSong(song, currentPlayingSong)
@@ -380,9 +387,8 @@ fun SongListItemRow(
 
         Spacer(modifier = Modifier.width(6.dp))
 
-        val hasLocal = (song.downloadStatus == DownloadStatus.DOWNLOADED) ||
-                (!song.localFilePath.isNullOrBlank()) ||
-                (song.serverId in listOf("local_storage", "local_folder", "local_saf"))
+        // hasLocal 必须基于物理本地文件真实存在，避免 NAS 服务器曲库路径被误判为本地已有
+        val hasLocal = hasPhysicalLocal || (song.serverId in listOf("local_storage", "local_folder", "local_saf"))
         val hasServer = (song.serverId == "lemon_music" ||
                 (isServerConnected && song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")))
 
@@ -929,9 +935,13 @@ private fun RecentlyAddedSongCard(
     onClick: () -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
-    val isDownloaded = !song.localFilePath.isNullOrBlank() &&
-            (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists()) &&
-            (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
+    // 同 SongListItemRow：磁盘 stat 必须 remember，否则每次重组都打一次磁盘
+    val isDownloaded = remember(song.id, song.localFilePath, song.downloadStatus) {
+        val path = song.localFilePath
+        !path.isNullOrBlank() &&
+            (path.startsWith("content://") || java.io.File(path).exists()) &&
+            (song.downloadStatus == DownloadStatus.DOWNLOADED || !path.isNullOrBlank())
+    }
 
     Column(
         modifier = Modifier

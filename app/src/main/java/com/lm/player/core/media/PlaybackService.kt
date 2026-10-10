@@ -49,6 +49,7 @@ class PlaybackService : MediaSessionService() {
 
     private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSession? = null
+    private var playerNotificationListener: Player.Listener? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // 车载导航混音压音 (Ducking) 与通话焦点恢复管理
@@ -57,6 +58,18 @@ class PlaybackService : MediaSessionService() {
     private var isAudioFocusRegistered = false
     private var pausedByPhoneCall = false
     private var duckRestoreJob: Job? = null
+
+    /**
+     * 压音（Ducking）前用户实际设置的音量。
+     * 恢复时必须还原到它，而不是硬写 1.0f —— 否则用户在系统侧把媒体音量调低后，
+     * 一次导航播报就会把播放器音量顶回满值，多次播报叠加后音量状态彻底错乱。
+     * 负值表示「当前没有处于压音状态」。
+     */
+    private var volumeBeforeDuck = -1f
+
+    /** 前台服务状态是否曾成功建立（用于失败时的可观测与告警，见 startImmediateForeground） */
+    @Volatile
+    private var foregroundEstablished = false
 
     companion object {
         private const val TAG = "PlaybackService"
@@ -79,7 +92,7 @@ class PlaybackService : MediaSessionService() {
             "com.miui.notification",
             "com.vivo.systemuiplugin",
             "com.oplus.systemui",
-            "com.huawei.systemserver"
+            "com.huawei.android.launcher"
         )
 
         @Volatile
@@ -128,9 +141,17 @@ class PlaybackService : MediaSessionService() {
                 BackgroundIslandOverlayController.destroy()
                 val player = Media3Factory.getSharedExoPlayer(context)
                 val currentPos = player.currentPosition.takeIf { it > 0L }
-                PlaybackQueueManager.savePlaybackState(context, positionMs = currentPos, commitSync = true)
+                PlaybackQueueManager.savePlaybackState(context, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
                 player.stop()
                 player.clearMediaItems()
+                // 释放进程级共享播放器：否则 setWakeMode(C.WAKE_MODE_NETWORK) 的
+                // PARTIAL_WAKE_LOCK + WifiLock 会随静态单例一直持有到进程结束，
+                // 用户「彻底退出」后设备仍然无法进入深度睡眠（息屏待机耗电）。
+                // 释放是安全的：下次 getSharedExoPlayer 会重建实例，
+                // PlaybackQueueManager 的监听器守卫（弱引用）会自动在新实例上重挂。
+                // 注意：本函数在 companion object 内，访问不到实例字段 exoPlayer ——
+                // 服务实例侧会在 onDestroy/ACTION_STOP_SERVICE 分支自行清空引用。
+                Media3Factory.releaseSharedPlayer()
                 val stopIntent = Intent(context, PlaybackService::class.java).apply {
                     action = ACTION_STOP_SERVICE
                 }
@@ -150,7 +171,9 @@ class PlaybackService : MediaSessionService() {
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
                 duckRestoreJob?.cancel()
                 if (AudioSharingManager.activeCastDevice.value == null) {
-                    player.volume = 1.0f
+                    // 还原到压音前的用户音量，而不是硬置 1.0f
+                    player.volume = if (volumeBeforeDuck >= 0f) volumeBeforeDuck else 1.0f
+                    volumeBeforeDuck = -1f
                 }
                 if (pausedByPhoneCall) {
                     pausedByPhoneCall = false
@@ -161,6 +184,7 @@ class PlaybackService : MediaSessionService() {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 // 车机高德/百度导航播报、倒车雷达提示音：平滑压低音乐音量至 25%，绝不暂停播放
                 if (AudioSharingManager.activeCastDevice.value == null && player.isPlaying) {
+                    if (volumeBeforeDuck < 0f) volumeBeforeDuck = player.volume
                     player.volume = 0.25f
                     scheduleDuckAutoRestore(player, delayMs = 6000L)
                 }
@@ -182,6 +206,7 @@ class PlaybackService : MediaSessionService() {
                 } else {
                     // 车机导航/车载语音助手/雷达强抢焦点：采用压音混音策略保活，防止车机后台音乐被永久掐断
                     if (AudioSharingManager.activeCastDevice.value == null && player.isPlaying) {
+                        if (volumeBeforeDuck < 0f) volumeBeforeDuck = player.volume
                         player.volume = 0.25f
                         scheduleDuckAutoRestore(player, delayMs = 4500L)
                     }
@@ -199,7 +224,9 @@ class PlaybackService : MediaSessionService() {
                     mode == AudioManager.MODE_IN_COMMUNICATION ||
                     mode == AudioManager.MODE_RINGTONE
             if (!inCall && AudioSharingManager.activeCastDevice.value == null) {
-                player.volume = 1.0f
+                // 还原到压音前的用户音量（见 volumeBeforeDuck 注释），而不是硬置满值
+                player.volume = if (volumeBeforeDuck >= 0f) volumeBeforeDuck else 1.0f
+                volumeBeforeDuck = -1f
             }
         }
     }
@@ -210,6 +237,14 @@ class PlaybackService : MediaSessionService() {
         activeInstance = this
         try {
             createNotificationChannel()
+
+            // 0. **必须最先建立前台状态**：本服务由 startForegroundService 拉起，系统要求 5 秒内
+            //    调用 startForeground，否则抛 ForegroundServiceDidNotStartInTimeException 崩溃。
+            //    此前该调用位于本 try 块末尾，一旦 ExoPlayer / MediaSession / 通知构建任一步抛异常，
+            //    被外层 catch(Throwable) 吞掉后 startForeground 永不执行 → 服务以「无前台状态」存活
+            //    数秒后被系统杀掉，用户侧表现为「点播放没反应 / 播几秒就停」。
+            //    此处 mediaSession / exoPlayer 仍为 null，buildNotification 会走无 Session 兜底通知。
+            startImmediateForeground()
 
             // 1. 获取全局单例 ExoPlayer 并确保后台播放队列监听器已挂载
             val rawPlayer = Media3Factory.getSharedExoPlayer(this)
@@ -248,20 +283,42 @@ class PlaybackService : MediaSessionService() {
                     }
                 }
 
+                // 按动作分桶：next / prev 各自一份时间戳。
+                // 此前两处共用一个 lastSeekTimestamp，300ms 内「下一首 → 上一首」的后一颗
+                // 会被静默丢弃（与 MainActivity 里已修掉的跨键共享时间戳是同一类缺陷）。
+                private var lastNextTimestamp = 0L
+                private var lastPrevTimestamp = 0L
+
                 override fun seekToNext() {
+                    val now = System.currentTimeMillis()
+                    if (now - lastNextTimestamp < 300L) return
+                    lastNextTimestamp = now
                     PlaybackQueueManager.playNext(this@PlaybackService)
                 }
 
                 override fun seekToNextMediaItem() {
-                    PlaybackQueueManager.playNext(this@PlaybackService)
+                    seekToNext()
                 }
 
                 override fun seekToPrevious() {
+                    val now = System.currentTimeMillis()
+                    if (now - lastPrevTimestamp < 300L) return
+                    lastPrevTimestamp = now
                     PlaybackQueueManager.playPrevious(this@PlaybackService)
                 }
 
                 override fun seekToPreviousMediaItem() {
-                    PlaybackQueueManager.playPrevious(this@PlaybackService)
+                    seekToPrevious()
+                }
+
+                override fun play() {
+                    val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                    if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
+                }
+
+                override fun pause() {
+                    val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                    if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
                 }
             }
 
@@ -417,12 +474,9 @@ class PlaybackService : MediaSessionService() {
                         Player.COMMAND_SEEK_TO_NEXT,
                         Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
                         Player.COMMAND_SEEK_TO_PREVIOUS,
-                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
-                            // 仅授权命令执行，实际切歌统一由 forwardingPlayer.seekToNext() / seekToPrevious() 执行
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
                         Player.COMMAND_PLAY_PAUSE -> {
-                            PlaybackQueueManager.togglePlay(this@PlaybackService)
+                            // 仅授权命令执行，实际播放播控与防抖切歌统一由 forwardingPlayer 代理执行，消除重复触发
                             return SessionResult.RESULT_SUCCESS
                         }
                     }
@@ -446,7 +500,7 @@ class PlaybackService : MediaSessionService() {
             startImmediateForeground()
 
             // 6. 监听播放状态与曲目切换，平滑同步系统原生媒体通知、音频焦点与悬浮胶囊
-            rawPlayer.addListener(object : Player.Listener {
+            val notificationListener = object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     if (isPlaying) {
                         registerCarSmartAudioFocus()
@@ -462,7 +516,9 @@ class PlaybackService : MediaSessionService() {
                     updateForegroundNotification(rawPlayer.isPlaying)
                     BackgroundIslandOverlayController.refreshVisibilityAndState(this@PlaybackService)
                 }
-            })
+            }
+            playerNotificationListener = notificationListener
+            rawPlayer.addListener(notificationListener)
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to initialize PlaybackService", e)
         }
@@ -557,7 +613,7 @@ class PlaybackService : MediaSessionService() {
                 BackgroundIslandOverlayController.destroy()
                 abandonCarSmartAudioFocus()
                 val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-                PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+                PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -578,29 +634,23 @@ class PlaybackService : MediaSessionService() {
             when (cmd) {
                 CMD_NEXT -> {
                     PlaybackQueueManager.playNext(this)
-                    dispatchBroadcast(CMD_NEXT)
                 }
                 CMD_PREV -> {
                     PlaybackQueueManager.playPrevious(this)
-                    dispatchBroadcast(CMD_PREV)
                 }
                 CMD_TOGGLE -> {
                     PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_TOGGLE)
                 }
                 CMD_PLAY -> {
                     val p = Media3Factory.getSharedExoPlayer(this)
                     if (!p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PLAY)
                 }
                 CMD_PAUSE -> {
                     val p = Media3Factory.getSharedExoPlayer(this)
                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PAUSE)
                 }
                 CMD_TOGGLE_FAVORITE -> {
                     PlaybackQueueManager.toggleFavorite(this)
-                    dispatchBroadcast(CMD_TOGGLE_FAVORITE)
                 }
             }
             startImmediateForeground()
@@ -620,7 +670,7 @@ class PlaybackService : MediaSessionService() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         try {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         } catch (_: Throwable) {}
         val stopPlaybackOnExit = try {
             getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
@@ -630,6 +680,9 @@ class PlaybackService : MediaSessionService() {
             try {
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
+                // 用户设置「划掉任务时停止播放」= 明确要求结束播放，此时释放共享播放器，
+                // 让 WakeLock / WifiLock / 解码器随单例一起归还系统，而不是悬挂到进程结束。
+                Media3Factory.releaseSharedPlayer()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             } catch (_: Throwable) {}
@@ -671,16 +724,80 @@ class PlaybackService : MediaSessionService() {
 
     private fun startImmediateForeground() {
         if (isExplicitStopping) return
+        val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            0
+        }
+        // 第一优先：绑定 MediaSession 的完整媒体通知（灵动岛 / 系统媒体卡片依赖它）
         try {
             val notification = buildNotification()
-            val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-            } else {
-                0
-            }
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, foregroundServiceType)
+            foregroundEstablished = true
+            return
         } catch (e: Throwable) {
-            Log.e(TAG, "Error starting foreground service", e)
+            Log.e(TAG, "Error starting foreground service with media notification", e)
+        }
+        // 第二优先：最小化降级通知。厂商 ROM 限制、通知渠道被关闭、MediaStyle 构建失败时，
+        // 若直接放弃 startForeground，服务会在约 5 秒后被系统以启动超时杀掉（用户侧看到
+        // 「点播放没反应」且日志里只有一行警告）。这里用一个纯文本通知保证前台状态一定能建立。
+        try {
+            val fallback = buildFallbackNotification()
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, fallback, foregroundServiceType)
+            foregroundEstablished = true
+            Log.w(TAG, "Foreground started with fallback notification (media style unavailable)")
+        } catch (e: Throwable) {
+            Log.e(TAG, "FATAL: failed to establish foreground service state", e)
+            if (!foregroundEstablished) {
+                // 两路通知都失败：把可诊断信息落盘（无 adb 场景下的唯一线索），
+                // 并按注释承诺**真正停掉自己** —— 否则服务会以无前台状态存活数秒，
+                // 再被系统以启动超时杀掉，留下一条更难排查的崩溃。
+                reportForegroundFailure(e)
+                if (!isExplicitStopping) {
+                    runCatching { stopSelf() }
+                }
+            }
+        }
+    }
+
+    /**
+     * 最小化兜底通知：不含 MediaStyle，不依赖 MediaSession，只保证前台服务状态成立。
+     * 媒体控制能力此时由系统媒体卡片（MediaSession）暂时代替。
+     */
+    @Suppress("DEPRECATION")
+    private fun buildFallbackNotification(): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
+        }
+        builder.setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("正在准备播放…")
+            .setOngoing(true)
+            .setShowWhen(false)
+        val pendingFlags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        builder.setContentIntent(
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_SINGLE_TOP },
+                pendingFlags
+            )
+        )
+        return builder.build()
+    }
+
+    /** 把前台服务启动失败写入 filesDir/playback_foreground_error.txt，便于无 adb 场景排查 */
+    private fun reportForegroundFailure(e: Throwable) {
+        runCatching {
+            val f = java.io.File(filesDir, "playback_foreground_error.txt")
+            f.writeText(
+                "time=" + System.currentTimeMillis() +
+                    "\nsdk=" + Build.VERSION.SDK_INT +
+                    "\nmodel=" + Build.MANUFACTURER + " " + Build.MODEL +
+                    "\n" + Log.getStackTraceString(e)
+            )
         }
     }
 
@@ -705,13 +822,20 @@ class PlaybackService : MediaSessionService() {
         if (!isExplicitStopping) {
             // 保存当前进度，供下次进入时续播（不再自唤醒拉起后台服务）
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
-            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
+            PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         }
         try {
             duckRestoreJob?.cancel()
             BackgroundIslandOverlayController.destroy()
             abandonCarSmartAudioFocus()
             DynamicIslandManager.bindMediaSession(null)
+            try {
+                playerNotificationListener?.let { listener ->
+                    exoPlayer?.removeListener(listener)
+                }
+            } catch (_: Throwable) {
+            }
+            playerNotificationListener = null
             serviceScope.cancel()
             mediaSession?.run {
                 release()

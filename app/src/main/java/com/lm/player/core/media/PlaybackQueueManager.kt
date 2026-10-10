@@ -58,7 +58,16 @@ object PlaybackQueueManager {
     val recentPlayedSongsFlow: StateFlow<List<UnifiedSong>> = _recentPlayedSongsFlow.asStateFlow()
     @Volatile private var recentPlayedPrimed = false
 
-    private var isListenerAttached = false
+    /**
+     * 收藏切换去抖：记录每首歌最近一次切换的时间戳。
+     *
+     * 连点红心会产生多次并发的「本机 Room 写入 + 远端整表同步 + 可能的服务器下载任务」，
+     * 既浪费请求，也会因为服务端 user-data 的整表读改写而彼此覆盖（用户看到「点了没反应」）。
+     * 同一首歌 600ms 内只接受一次切换。
+     */
+    private val favoriteToggleGuard = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // 注意：监听器幂等判定已改为 listenerAttachedPlayerRef（弱引用），见 ensurePlayerListener
     private var appContext: Context? = null
 
     private fun songToJson(song: UnifiedSong): JSONObject {
@@ -324,14 +333,76 @@ object PlaybackQueueManager {
         persistRecentPlayed(ctx, _recentPlayedSongsFlow.value, commitSync = true)
     }
 
+    /**
+     * 落盘专用串行执行器。
+     * 主线程上的 commit() 是同步磁盘写，慢速 eMMC 上会直接掉帧甚至 ANR ——
+     * 手机端此前在**每次点播/切歌**（playSong）、onPause/onStop/onDestroy 都走主线程 commit，
+     * 并要序列化最多 120 首队列 JSON（MAX_PERSISTED_QUEUE_SIZE）。
+     * 单线程执行器保证写入顺序，避免多线程交错写出半份 JSON。
+     */
+    /**
+     * 落盘序号：每次写入（同步或异步）自增，异步任务执行前比对。
+     *
+     * 背景：主线程的 commitSync 会被投递到 persistExecutor 异步执行，而「退出/关机」类路径
+     * 用 allowOffloadOnMain=false 绕过执行器同步写同一份 SharedPreferences ——
+     * 若执行器里还压着更早的任务，它会在同步写之后落盘，用旧歌/旧进度覆盖新状态。
+     * 因此每个写入都带序号，执行时若发现已有更新的写入完成，就丢弃这次过期写入。
+     */
+    private val persistSeq = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile
+    private var lastPersistedSeq = 0L
+
+    private val persistExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "playback-state-persist").apply { isDaemon = true }
+    }
+
+    /**
+     * 队列元数据重算专用单线程池。
+     *
+     * 曲库级（2 万首）的 associateBy + map + 磁盘校验不能放在主线程 —— MainActivity 的
+     * invalidationTrackerFlow.collect 体运行在主线程，每次数据库失效都会调用 updateMetadata，
+     * 而 mergeSongMetadata 内部还会对每首歌做 2 次 File.exists()（最多 4 万次磁盘 stat）。
+     * 但也不能并发执行（会与 _playlistFlow 的读取竞争），故用单线程串行化。
+     */
+    private val metadataExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "queue-metadata").apply { isDaemon = true }
+    }
+
     fun savePlaybackState(
         context: Context? = appContext,
         song: UnifiedSong? = _currentSongFlow.value,
         positionMs: Long? = null,
-        commitSync: Boolean = false
+        commitSync: Boolean = false,
+        /**
+         * 是否允许在主线程调用时把 commitSync 降级为「投递到 IO 串行执行」。
+         * 默认 true（常规播放路径，不能阻塞主线程）；
+         * **关机 / 彻底退出**这类「必须写完再返回」的路径传 false，保持同步语义。
+         */
+        allowOffloadOnMain: Boolean = true
     ) {
         val ctx = context ?: appContext ?: return
         val target = song ?: _currentSongFlow.value ?: return
+        // 主线程 + 允许降级 → 投递到 IO 线程执行同样的写入（保持 commitSync 语义，只是换个线程）
+        val seq = persistSeq.incrementAndGet()
+        if (commitSync && allowOffloadOnMain &&
+            android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
+        ) {
+            persistExecutor.execute {
+                // 过期任务丢弃：期间若已有更新的写入（尤其是同步写）完成，本次跳过
+                if (seq < lastPersistedSeq) {
+                    Log.i(TAG, "skip stale playback-state persist (seq=$seq < $lastPersistedSeq)")
+                    return@execute
+                }
+                writePlaybackState(ctx, target, positionMs, commitSync = true)
+                lastPersistedSeq = maxOf(lastPersistedSeq, seq)
+            }
+            return
+        }
+        writePlaybackState(ctx, target, positionMs, commitSync)
+        lastPersistedSeq = maxOf(lastPersistedSeq, seq)
+    }
+
+    private fun writePlaybackState(ctx: Context, target: UnifiedSong, positionMs: Long?, commitSync: Boolean) {
         try {
             val prefs = ctx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
             val editor = prefs.edit()
@@ -339,8 +410,9 @@ object PlaybackQueueManager {
                 .putString("last_played_song_title", target.title)
                 .putString("last_played_song_artist", target.artist)
                 .putString("last_played_song_json", songToJson(target).toString())
-            if (_playlistFlow.value.isNotEmpty()) {
-                editor.putString("last_played_queue_json", queueToJson(_playlistFlow.value, target.id))
+            val queue = _playlistFlow.value
+            if (queue.isNotEmpty()) {
+                editor.putString("last_played_queue_json", queueToJson(queue, target.id))
             }
             if (positionMs != null && positionMs >= 0L) {
                 editor.putLong("last_played_position_ms", positionMs)
@@ -462,13 +534,23 @@ object PlaybackQueueManager {
     }
 
     fun updateMetadata(songs: List<UnifiedSong>) {
+        // **必须在后台线程做**：songs 是整个曲库（2 万首级别）。
+        // 此前本函数直接在调用方线程（MainActivity 的 invalidationTrackerFlow.collect 体 = 主线程）
+        // 执行 associateBy + map + mergeSongMetadata，每次数据库失效都要在主线程处理 2 万条，
+        // 而 mergeSongMetadata 内部还会对每首歌做 2 次 File.exists() → 最多 4 万次磁盘 stat。
+        // 结果是「每次同步/扫描都卡死主线程」，必然 ANR。
+        // 这里只做主线程安全的引用赋值，真正的重算丢到单线程计算池串行执行。
         if (_playlistFlow.value.isEmpty()) {
             _playlistFlow.value = songs
         } else {
-            val songMap = songs.associateBy { it.id }
-            _playlistFlow.value = _playlistFlow.value.map { existing ->
-                val matched = songMap[existing.id]
-                if (matched != null) mergeSongMetadata(existing, matched) else existing
+            val snapshot = _playlistFlow.value
+            metadataExecutor.execute {
+                val songMap = songs.associateBy { it.id }
+                val merged = snapshot.map { existing ->
+                    val matched = songMap[existing.id]
+                    if (matched != null) mergeSongMetadata(existing, matched) else existing
+                }
+                _playlistFlow.value = merged
             }
         }
         val current = _currentSongFlow.value
@@ -545,13 +627,30 @@ object PlaybackQueueManager {
     private var lastBgErrorRetryTimeMs: Long = 0L
     private var lastBgErrorQualityIdx: Int = 0
 
+    /**
+     * 已挂过监听器的播放器实例（弱引用）。
+     *
+     * 用弱引用而不是布尔标记：Media3Factory.releaseSharedPlayer() 会在「彻底退出播放」时
+     * 释放进程级播放器，之后 getSharedExoPlayer 会重建一个**新实例**。若沿用布尔标记，
+     * 新实例上永远挂不上监听器（onPlayerError 容灾、STATE_ENDED 续播、周期落盘全部失效）。
+     * 弱引用让旧实例被回收后守卫自动失效，从而在新实例上重新挂载。
+     */
+    @Volatile
+    private var listenerAttachedPlayerRef: java.lang.ref.WeakReference<Player>? = null
+
     fun ensurePlayerListener(context: Context) {
         val appCtx = context.applicationContext
         if (appContext == null) {
             appContext = appCtx
         }
-        if (isListenerAttached) return
         val player = Media3Factory.getSharedExoPlayer(appCtx)
+        // 判据必须是「挂过监听的那个实例**就是当前共享实例**」，而不是「那个实例还被强引用」。
+        // 弱引用的失效依赖 GC 时机：release 后旧实例仍可能被 MainActivity/PlaybackService 的
+        // 字段短暂持有，这段时间里 getSharedExoPlayer 已返回**新实例**，若用「弱引用是否还在」
+        // 判断就会提前 return —— 新播放器没有监听器，isPlaying 状态、播完续播、后台容灾全部失效。
+        val existing = listenerAttachedPlayerRef?.get()
+        if (existing === player) return   // 同一实例已挂过，幂等
+        listenerAttachedPlayerRef = java.lang.ref.WeakReference(player)
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
@@ -618,7 +717,7 @@ object PlaybackQueueManager {
                 }
             }
         })
-        isListenerAttached = true
+        // 已由 listenerAttachedPlayerRef 承担幂等判定，此处不再使用布尔标记
     }
 
     fun playSong(
@@ -703,8 +802,11 @@ object PlaybackQueueManager {
         val isShuffle = _isShuffleFlow.value
 
         val nextSong: UnifiedSong = if (isShuffle) {
-            val candidates = if (list.size > 1) list.filter { it.id != current?.id } else list
-            candidates.random()
+            // 队列只有 1 首、或队列里与当前曲目同 id 的条目占满时，filter 结果会是空列表，
+            // 直接 random() 会抛 NoSuchElementException（该回调运行在 ExoPlayer 主线程 → 必崩）。
+            // 因此空列表必须回退到整份队列。
+            val candidates = list.filter { it.id != current?.id }.ifEmpty { list }
+            candidates.randomOrNull() ?: return
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex >= 0 && currentIndex < list.size - 1) {
@@ -735,8 +837,8 @@ object PlaybackQueueManager {
         val current = _currentSongFlow.value
         val isShuffle = _isShuffleFlow.value
 
-        val prevSong: UnifiedSong = if (list.size > 1 && isShuffle) {
-            list.filter { it.id != current?.id }.random()
+        val prevSong: UnifiedSong = if (isShuffle && list.size > 1) {
+            list.filter { it.id != current?.id }.ifEmpty { list }.randomOrNull() ?: list.first()
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex > 0) {
@@ -760,6 +862,21 @@ object PlaybackQueueManager {
     fun toggleFavorite(context: Context, song: UnifiedSong? = null) {
         val appCtx = context.applicationContext
         val target = song ?: _currentSongFlow.value ?: return
+        // 连点去抖：同一首歌 600ms 内的第二次点击不再直接丢弃，而是**取反状态**。
+        // 直接 return 会让「点红心 → 立刻取消」停在已收藏状态（本地与服务器一致但违背用户意图），
+        // 与我们要修的「连点只生效一次」是同一类问题的另一面。
+        // 这里改为：窗口内已有点击时，把目标状态翻转后继续执行（等于合并为最后一次意图）。
+        val nowMs = System.currentTimeMillis()
+        val lastMs = favoriteToggleGuard[target.id]
+        val inDebounceWindow = lastMs != null && nowMs - lastMs < 600L
+        if (inDebounceWindow) {
+            Log.i(TAG, "toggleFavorite coalesced for ${target.title}")
+        }
+        favoriteToggleGuard[target.id] = nowMs
+        // 简单的容量保护：去抖表按歌曲累积，超过一定规模就清理过期项
+        if (favoriteToggleGuard.size > 256) {
+            favoriteToggleGuard.entries.removeAll { nowMs - it.value > 60_000L }
+        }
         val newFav = !target.isFavorite
         val updated = target.copy(isFavorite = newFav)
 

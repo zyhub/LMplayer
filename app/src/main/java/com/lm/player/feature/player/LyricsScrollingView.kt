@@ -74,6 +74,8 @@ fun LyricsScrollingView(
 
     val activeColor = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
     val inactiveColor = if (isDark) lyricTheme.inactiveColorDark else lyricTheme.inactiveColorLight
+    val karaokeBaseColor = lyricTheme.getKaraokeBaseColor(isDark)
+    val karaokeOverlayColor = lyricTheme.getKaraokeOverlayColor(isDark)
 
     if (cleanLyrics.isEmpty()) {
         Box(
@@ -112,9 +114,10 @@ fun LyricsScrollingView(
         lastTickUptime = android.os.SystemClock.uptimeMillis()
     }
 
+    val isPlaying by com.lm.player.core.media.PlaybackQueueManager.isPlayingFlow.collectAsState()
     var frameTick by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isKaraokeEnabled) {
-        if (isKaraokeEnabled) {
+    LaunchedEffect(isKaraokeEnabled, isPlaying) {
+        if (isKaraokeEnabled && isPlaying) {
             while (true) {
                 withFrameMillis { frameTick = it }
             }
@@ -199,7 +202,7 @@ fun LyricsScrollingView(
                                     fontSize = currentSize,
                                     fontWeight = fontWeight,
                                     fontFamily = lyricFontFamily,
-                                    color = inactiveColor,
+                                    color = karaokeBaseColor,
                                     lineHeight = currentLineHeight
                                 )
                             )
@@ -226,7 +229,7 @@ fun LyricsScrollingView(
                                         fontSize = currentSize,
                                         fontWeight = fontWeight,
                                         fontFamily = lyricFontFamily,
-                                        color = activeColor,
+                                        color = karaokeOverlayColor,
                                         lineHeight = currentLineHeight
                                     )
                                 )

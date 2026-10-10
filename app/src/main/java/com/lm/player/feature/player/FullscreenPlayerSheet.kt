@@ -81,9 +81,7 @@ fun FullscreenPlayerSheet(
     isLyricsMode: Boolean,
     isShuffle: Boolean,
     isRepeat: Boolean,
-    playbackSpeed: Float = 1.0f,
     allPlaylists: List<UnifiedPlaylist> = emptyList(),
-    activeDownloadTasks: List<DownloadTask> = emptyList(),
     isServerConnected: Boolean = true,
     onTogglePlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -94,7 +92,6 @@ fun FullscreenPlayerSheet(
     onToggleFavorite: () -> Unit,
     onToggleShuffle: () -> Unit,
     onToggleRepeat: () -> Unit,
-    onChangePlaybackSpeed: (Float) -> Unit = {},
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
@@ -114,10 +111,15 @@ fun FullscreenPlayerSheet(
     }
 
     // 若当前处于 DLNA / AirPlay 无线投射状态，切歌时自动将新曲目同步推送至远端接收器
-    LaunchedEffect(song.id) {
-        val targetDevice = activeCastDevice
-        if (targetDevice != null) {
+    // key 必须包含 activeCastDevice?.id：此前只有 song.id，导致**播放中途才连上投屏设备时**
+    // 不会补推当前曲目（用户看到「连上了但没声音」）；同时 castSongToDevice 需要 try/catch，
+    // 否则投屏失败会抛异常影响该组合作用域的协程。
+    LaunchedEffect(song.id, activeCastDevice?.id) {
+        val targetDevice = activeCastDevice ?: return@LaunchedEffect
+        try {
             AudioSharingManager.castSongToDevice(context, targetDevice, song, 0L)
+        } catch (e: Exception) {
+            android.util.Log.w("FullscreenPlayerSheet", "castSongToDevice failed", e)
         }
     }
 
@@ -155,6 +157,73 @@ fun FullscreenPlayerSheet(
     var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
     var activeTimerMinutes by remember { mutableStateOf(0) }
     var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
+
+    // ===== 睡眠定时关闭：真正生效的实现 =====
+    // 与 TV 端同源问题：此前只有 activeTimerMinutes 一个 remember 状态 + 一句 Toast，
+    // 全工程没有任何消费者，用户设置后永远不会生效。现在用到期时间戳 + 协程真倒计时。
+    var sleepTimerEndsAtMs by remember { mutableStateOf(0L) }
+    var sleepTimerRemainingSec by remember { mutableStateOf(0L) }
+    var sleepTimerRevision by remember { mutableStateOf(0) }
+    // 「播完当前曲」(-1 档) 单独标记，否则会被当成「已到期」立即停止
+    var sleepTimerStopAfterCurrent by remember { mutableStateOf(false) }
+    // 「播完当前曲」在**设置那一刻**正在播的曲目 id。
+    // 关键：不能用 sleepTimerStopAfterCurrent 本身作为 LaunchedEffect 的 key ——
+    // applySleepTimer(-1) 把它置 true 会立刻重启该 effect，脚本当即判定「本曲已播完」，
+    // 表现为「一选播完当前曲就马上停播」。改为记录当时曲目、只在 song.id 变化时才结算。
+    var sleepTimerArmedSongId by remember { mutableStateOf("") }
+
+    LaunchedEffect(sleepTimerRevision, sleepTimerEndsAtMs) {
+        if (sleepTimerEndsAtMs <= 0L) {
+            sleepTimerRemainingSec = 0L
+            return@LaunchedEffect
+        }
+        while (true) {
+            val remain = sleepTimerEndsAtMs - System.currentTimeMillis()
+            if (remain <= 0L) break
+            sleepTimerRemainingSec = (remain + 999L) / 1000L
+            kotlinx.coroutines.delay(1000L)
+        }
+        sleepTimerRemainingSec = 0L
+        sleepTimerEndsAtMs = 0L
+        activeTimerMinutes = 0
+        if (isPlaying) {
+            onTogglePlayPause()
+        }
+        Toast.makeText(context, "睡眠定时已到，已停止播放", Toast.LENGTH_SHORT).show()
+    }
+
+    // 「播完当前曲」的落地：只有「设置时正在播的那首歌」真的换了，才算播完。
+    // key 里**不能**包含 sleepTimerStopAfterCurrent 本身，否则设置动作会立刻触发结算，
+    // 表现为「一选播完当前曲就马上停播」。
+    LaunchedEffect(song.id) {
+        if (sleepTimerStopAfterCurrent && sleepTimerArmedSongId.isNotBlank() && song.id != sleepTimerArmedSongId) {
+            sleepTimerStopAfterCurrent = false
+            sleepTimerArmedSongId = ""
+            activeTimerMinutes = 0
+            sleepTimerRemainingSec = 0L
+            // 到点时如果用户已手动暂停，不要再反转成播放
+            if (isPlaying) {
+                onTogglePlayPause()
+            }
+            Toast.makeText(context, "当前曲目已播完，已停止播放", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 统一的定时器设置入口：min > 0 为分钟数；min == -1 为「播完当前曲」；min == 0 为取消 */
+    fun applySleepTimer(min: Int) {
+        activeTimerMinutes = min
+        sleepTimerStopAfterCurrent = min == -1
+        // 记录「设置那一刻正在播的曲目」：只有它被换掉才算播完
+        sleepTimerArmedSongId = if (min == -1) song.id else ""
+        sleepTimerEndsAtMs = if (min > 0) System.currentTimeMillis() + min * 60_000L else 0L
+        sleepTimerRemainingSec = 0L
+        sleepTimerRevision++
+        when {
+            min > 0 -> Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
+            min == -1 -> Toast.makeText(context, "已设置：播完当前曲目后停止", Toast.LENGTH_SHORT).show()
+            else -> Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
+        }
+    }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     // 歌词偏好设置 (字号大小、时间快慢偏置、6 套主题预设)
@@ -429,8 +498,13 @@ fun FullscreenPlayerSheet(
                                 }
 
                                 // 缓存与下载
-                                val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
-                                    (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                                // 播放页在播放期间会因进度刷新持续重组，这里的磁盘 stat 必须 remember，
+                                // 否则播放中会在主线程不断做 File.exists()（U-4）。同时去掉 !! 脆弱写法。
+                                val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+                                    val path = song.localFilePath
+                                    !path.isNullOrBlank() && (path.startsWith("content://") ||
+                                        runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                                }
                                 Box {
                                     Box(
                                         modifier = Modifier
@@ -488,8 +562,10 @@ fun FullscreenPlayerSheet(
                                     targetSize = 480,
                                     modifier = Modifier
                                         .size(dynamicCoverSize)
-                                        .clip(RoundedCornerShape(coverCorner))
-                                        .shadow(12.dp, RoundedCornerShape(coverCorner)),
+                                        // Modifier 顺序：shadow 必须在 clip **之前**，否则阴影会被裁掉
+                                        // （横屏封面阴影此前完全不生效；竖屏写法本就是 .size().shadow()）
+                                        .shadow(12.dp, RoundedCornerShape(coverCorner))
+                                        .clip(RoundedCornerShape(coverCorner)),
                                     cornerRadius = coverCorner
                                 )
 
@@ -738,14 +814,8 @@ fun FullscreenPlayerSheet(
                                         expanded = showSleepTimerPanel,
                                         onDismissRequest = { showSleepTimerPanel = false },
                                         activeTimerMinutes = activeTimerMinutes,
-                                        onSelectTimer = { min ->
-                                            activeTimerMinutes = min
-                                            if (min > 0) {
-                                                Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
+                                        remainingSeconds = sleepTimerRemainingSec,
+                                        onSelectTimer = { min -> applySleepTimer(min) }
                                     )
                                 }
 
@@ -1297,8 +1367,13 @@ fun FullscreenPlayerSheet(
                         }
 
                         // 下载与缓存选择按钮 (支持本地/服务器/双端同步选择)
-                        val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
-                            (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                        // 播放页在播放期间会因进度刷新持续重组，这里的磁盘 stat 必须 remember，
+                        // 否则播放中会在主线程不断做 File.exists()（U-4）。同时去掉 !! 脆弱写法。
+                        val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+                            val path = song.localFilePath
+                            !path.isNullOrBlank() && (path.startsWith("content://") ||
+                                runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                        }
                         Box {
                             Box(
                                 modifier = Modifier
@@ -1491,14 +1566,8 @@ fun FullscreenPlayerSheet(
                             expanded = showSleepTimerPanel,
                             onDismissRequest = { showSleepTimerPanel = false },
                             activeTimerMinutes = activeTimerMinutes,
-                            onSelectTimer = { min ->
-                                activeTimerMinutes = min
-                                if (min > 0) {
-                                    Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
-                                }
-                            }
+                            remainingSeconds = sleepTimerRemainingSec,
+                            onSelectTimer = { min -> applySleepTimer(min) }
                         )
                     }
 
@@ -1646,6 +1715,8 @@ fun SleepTimerDropdownMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
     activeTimerMinutes: Int,
+    /** 剩余秒数：由宿主每秒更新，用于展示真实倒计时（0 表示未设置或已到期） */
+    remainingSeconds: Long = 0L,
     onSelectTimer: (Int) -> Unit
 ) {
     DropdownMenu(
@@ -1654,7 +1725,15 @@ fun SleepTimerDropdownMenu(
         modifier = Modifier.widthIn(min = 220.dp, max = 280.dp)
     ) {
         Text(
-            text = if (activeTimerMinutes > 0) "已设置：${activeTimerMinutes}分钟后停止" else "睡眠定时关闭",
+            text = if (activeTimerMinutes > 0 && remainingSeconds > 0L) {
+                val m = remainingSeconds / 60
+                val s = remainingSeconds % 60
+                "将在 %d:%02d 后停止播放".format(java.util.Locale.US, m, s)
+            } else if (activeTimerMinutes > 0) {
+                "已设置：${activeTimerMinutes}分钟后停止"
+            } else {
+                "睡眠定时关闭"
+            },
             style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant),
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )

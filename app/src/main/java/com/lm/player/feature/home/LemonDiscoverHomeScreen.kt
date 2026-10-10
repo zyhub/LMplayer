@@ -11,7 +11,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -97,6 +100,7 @@ fun LemonDiscoverHomeScreen(
     currentSource: OnlineMusicSource,
     onSourceChange: (OnlineMusicSource) -> Unit,
     blurAlpha: Float = 0.85f,
+    dynamicCardEffects: Boolean = true,
     allCachedSongs: List<UnifiedSong> = emptyList(),
     activeDownloadTasks: List<DownloadTask> = emptyList(),
     activeDownloadCount: Int = 0,
@@ -136,6 +140,22 @@ fun LemonDiscoverHomeScreen(
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = blurAlpha)
     val borderColor = if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.10f)
     val coroutineScope = rememberCoroutineScope()
+
+    // 监听前后台生命周期，退到后台或锁屏时暂停光斑帧时钟驱动，降低功耗
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    var isAppResumed by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                isAppResumed = true
+            } else if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                isAppResumed = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val isLiquidAnimated = dynamicCardEffects && isAppResumed
 
     var recommendPlaylists by remember { mutableStateOf<List<UnifiedPlaylist>>(emptyList()) }
     var toplists by remember { mutableStateOf<List<LemonToplist>>(emptyList()) }
@@ -635,6 +655,7 @@ fun LemonDiscoverHomeScreen(
                             gradientColors = dynamicPalettes[0].gradientColors,
                             glowColor = dynamicPalettes[0].glowColor,
                             secondaryGlowColor = dynamicPalettes[0].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 todaySongs.firstOrNull()?.let {
                                     playNonRoamingSong(it, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
@@ -724,6 +745,7 @@ fun LemonDiscoverHomeScreen(
                             gradientColors = dynamicPalettes[1].gradientColors,
                             glowColor = dynamicPalettes[1].glowColor,
                             secondaryGlowColor = dynamicPalettes[1].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isAlbumsOverviewOpen = true
                             }
@@ -811,6 +833,7 @@ fun LemonDiscoverHomeScreen(
                             gradientColors = dynamicPalettes[2].gradientColors,
                             glowColor = dynamicPalettes[2].glowColor,
                             secondaryGlowColor = dynamicPalettes[2].secondaryGlowColor,
+                            isAnimated = isLiquidAnimated,
                             onClick = {
                                 isToplistsOverviewOpen = true
                             }
@@ -873,6 +896,7 @@ fun LemonDiscoverHomeScreen(
                                 gradientColors = dynamicPalettes[3].gradientColors,
                                 glowColor = dynamicPalettes[3].glowColor,
                                 secondaryGlowColor = dynamicPalettes[3].secondaryGlowColor,
+                                isAnimated = isLiquidAnimated,
                                 onClick = {
                                     val pool = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }.shuffled()
                                     if (pool.isNotEmpty()) {
@@ -897,6 +921,7 @@ fun LemonDiscoverHomeScreen(
                                 gradientColors = dynamicPalettes[4].gradientColors,
                                 glowColor = dynamicPalettes[4].glowColor,
                                 secondaryGlowColor = dynamicPalettes[4].secondaryGlowColor,
+                                isAnimated = isLiquidAnimated,
                                 onClick = {
                                     com.lm.player.core.network.LemonMusicProtocol.clearDiscoverCache()
                                     recommendSeed++
@@ -956,9 +981,16 @@ fun LemonDiscoverHomeScreen(
                                         isLoadingCollection = true
                                         val plId = playlist.id
                                         coroutineScope.launch {
-                                            activeCollectionSongs = onFetchCollectionSongs(plId, currentSource)
-                                            isLoadingCollection = false
-                                        }
+                                                try {
+                                                    activeCollectionSongs = onFetchCollectionSongs(plId, currentSource)
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (_: Exception) {
+                                                    activeCollectionSongs = emptyList()
+                                                } finally {
+                                                    isLoadingCollection = false
+                                                }
+                                            }
                                     }
                                 )
                             }
@@ -1181,9 +1213,16 @@ fun LemonDiscoverHomeScreen(
                                 isLoadingCollection = true
                                 val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
                                 coroutineScope.launch {
-                                    activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
-                                    isLoadingCollection = false
-                                }
+                                                try {
+                                                    activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (_: Exception) {
+                                                    activeCollectionSongs = emptyList()
+                                                } finally {
+                                                    isLoadingCollection = false
+                                                }
+                                            }
                             }
                         )
                     }
@@ -1266,9 +1305,16 @@ fun LemonDiscoverHomeScreen(
                                     selectedCollectionSongIds = emptySet()
                                     isLoadingCollection = true
                                     coroutineScope.launch {
-                                        activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
-                                        isLoadingCollection = false
-                                    }
+                                                try {
+                                                    activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (_: Exception) {
+                                                    activeCollectionSongs = emptyList()
+                                                } finally {
+                                                    isLoadingCollection = false
+                                                }
+                                            }
                                 }
                             )
                         }
@@ -1746,11 +1792,27 @@ fun OnlineSourceDropdownMenu(
     }
 }
 
+@Composable
+private fun rememberLiquidPhase(enabled: Boolean, durationMillis: Int = 8000): State<Float> {
+    if (!enabled) return remember { mutableFloatStateOf(0f) }
+    val infiniteTransition = rememberInfiniteTransition(label = "liquid_phase")
+    return infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = durationMillis, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+}
+
 /**
- * 绘制有机非规则变形液态光斑 Path
- * 采用谐波正整倍数角频率波动，保证在 [0, 2π] 周期内首尾连续闭合无缝循环，告别突变卡顿
+ * 绘制有机非规则变形液态光斑 Path（复用预分配 Path 与 FloatArray 缓冲，零堆内存分配）
  */
-private fun buildOrganicLiquidPath(
+private fun updateOrganicLiquidPath(
+    path: Path,
+    ptsBuffer: FloatArray,
     cx: Float,
     cy: Float,
     baseRadius: Float,
@@ -1758,40 +1820,39 @@ private fun buildOrganicLiquidPath(
     h1: Float = 1.0f,
     h2: Float = 2.0f,
     h3: Float = 3.0f
-): Path {
-    val path = Path()
+) {
+    path.reset()
     val pointsCount = 8
     val step = (2.0 * Math.PI / pointsCount).toFloat()
-    val pts = ArrayList<Offset>(pointsCount)
 
     for (i in 0 until pointsCount) {
         val angle = i * step
-        // phaseRad 乘数均为整数 (1, -1, 2)，保证 phaseRad 在 0 与 2π 时值与一阶导数完全恒等，实现完美无缝连贯循环
         val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
                    0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
                    0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
         val r = baseRadius * (1f + wave)
-        val px = cx + r * kotlin.math.cos(angle)
-        val py = cy + r * kotlin.math.sin(angle)
-        pts.add(Offset(px, py))
+        ptsBuffer[i * 2] = cx + r * kotlin.math.cos(angle)
+        ptsBuffer[i * 2 + 1] = cy + r * kotlin.math.sin(angle)
     }
 
-    if (pts.isNotEmpty()) {
-        val firstMid = Offset((pts[0].x + pts[1].x) / 2f, (pts[0].y + pts[1].y) / 2f)
-        path.moveTo(firstMid.x, firstMid.y)
-        for (i in 0 until pointsCount) {
-            val pNext = pts[(i + 1) % pointsCount]
-            val pAfterNext = pts[(i + 2) % pointsCount]
-            val mid = Offset((pNext.x + pAfterNext.x) / 2f, (pNext.y + pAfterNext.y) / 2f)
-            path.quadraticBezierTo(pNext.x, pNext.y, mid.x, mid.y)
-        }
-        path.close()
+    val firstMidX = (ptsBuffer[0] + ptsBuffer[2]) / 2f
+    val firstMidY = (ptsBuffer[1] + ptsBuffer[3]) / 2f
+    path.moveTo(firstMidX, firstMidY)
+
+    for (i in 0 until pointsCount) {
+        val nextIdx = ((i + 1) % pointsCount) * 2
+        val afterNextIdx = ((i + 2) % pointsCount) * 2
+        val nextX = ptsBuffer[nextIdx]
+        val nextY = ptsBuffer[nextIdx + 1]
+        val midX = (nextX + ptsBuffer[afterNextIdx]) / 2f
+        val midY = (nextY + ptsBuffer[afterNextIdx + 1]) / 2f
+        path.quadraticBezierTo(nextX, nextY, midX, midY)
     }
-    return path
+    path.close()
 }
 
 /**
- * 发现页动态液态光影大卡/正方卡 (非规则阿米巴流体变形光斑 + 渐变边框动画，无限连贯循环)
+ * 发现页动态液态光影大卡/正方卡 (仅在 Draw 阶段自绘光影与边框，彻底阻断 Compose 重组开销)
  */
 @Composable
 private fun DiscoverLiquidCard(
@@ -1804,42 +1865,19 @@ private fun DiscoverLiquidCard(
     glowColor: Color,
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(18.dp),
+    isAnimated: Boolean = true,
     onClick: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "discover_liquid_light")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 8000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-
-    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
-    val rad2 = rad1 + Math.PI.toFloat()
-
-    val cosP = kotlin.math.cos(rad1)
-    val sinP = kotlin.math.sin(rad1)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 8000)
+    val path1 = remember { Path() }
+    val path2 = remember { Path() }
+    val ptsBuffer = remember { FloatArray(16) }
+    val cornerRadius = 18.dp
 
     Surface(
         shape = shape,
         color = Color.Transparent,
-        border = BorderStroke(
-            width = 1.dp,
-            brush = Brush.linearGradient(
-                colors = listOf(
-                    glowColor.copy(alpha = 0.85f),
-                    Color.White.copy(alpha = 0.45f),
-                    glowColor.copy(alpha = 0.20f),
-                    glowColor.copy(alpha = 0.85f)
-                ),
-                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
-                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
-            )
-        ),
         shadowElevation = 4.dp,
         modifier = modifier
             .clip(shape)
@@ -1848,44 +1886,87 @@ private fun DiscoverLiquidCard(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.linearGradient(colors = gradientColors))
                 .drawBehind {
-                    val w = size.width
-                    val h = size.height
+                    drawRect(Brush.linearGradient(colors = gradientColors))
 
-                    // 1. 第一主液态流光核（谐波化整连贯连续流动）
-                    val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
-                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
-                    val path1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.60f, rad1)
-                    drawPath(
-                        path = path1,
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                glowColor.copy(alpha = 0.62f),
-                                glowColor.copy(alpha = 0.22f),
-                                Color.Transparent
-                            ),
-                            center = Offset(cx1, cy1),
-                            radius = size.maxDimension * 0.75f
-                        )
-                    )
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val rad2 = rad1 + Math.PI.toFloat()
+                        val w = size.width
+                        val h = size.height
 
-                    // 2. 第二辅液态对流核（相位偏移 π 逆向循环流动）
-                    val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
-                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
-                    val path2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
-                    drawPath(
-                        path = path2,
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                secondaryGlowColor.copy(alpha = 0.42f),
-                                secondaryGlowColor.copy(alpha = 0.12f),
-                                Color.Transparent
-                            ),
-                            center = Offset(cx2, cy2),
-                            radius = size.maxDimension * 0.60f
+                        // 1. 第一主液态流光核
+                        val cx1 = w * (0.50f + 0.22f * kotlin.math.sin(rad1) + 0.08f * kotlin.math.cos(2f * rad1))
+                        val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1) + 0.06f * kotlin.math.sin(2f * rad1))
+                        updateOrganicLiquidPath(path1, ptsBuffer, cx1, cy1, size.maxDimension * 0.60f, rad1)
+                        drawPath(
+                            path = path1,
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.62f),
+                                    glowColor.copy(alpha = 0.22f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(cx1, cy1),
+                                radius = size.maxDimension * 0.75f
+                            )
                         )
-                    )
+
+                        // 2. 第二辅液态对流核
+                        val cx2 = w * (0.50f - 0.20f * kotlin.math.cos(rad2) + 0.07f * kotlin.math.sin(2f * rad2))
+                        val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2) - 0.06f * kotlin.math.cos(2f * rad2))
+                        updateOrganicLiquidPath(path2, ptsBuffer, cx2, cy2, size.maxDimension * 0.45f, rad2, 1.2f, 2.0f, 1.5f)
+                        drawPath(
+                            path = path2,
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    secondaryGlowColor.copy(alpha = 0.42f),
+                                    secondaryGlowColor.copy(alpha = 0.12f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(cx2, cy2),
+                                radius = size.maxDimension * 0.60f
+                            )
+                        )
+                    }
+                }
+                .drawWithContent {
+                    drawContent()
+                    val strokeWidth = 1.dp.toPx()
+                    val cr = cornerRadius.toPx()
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val cosP = kotlin.math.cos(rad1)
+                        val sinP = kotlin.math.sin(rad1)
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.85f),
+                                    Color.White.copy(alpha = 0.45f),
+                                    glowColor.copy(alpha = 0.20f),
+                                    glowColor.copy(alpha = 0.85f)
+                                ),
+                                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    } else {
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.50f),
+                                    Color.White.copy(alpha = 0.25f),
+                                    glowColor.copy(alpha = 0.35f)
+                                )
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    }
                 }
         ) {
             Column(
@@ -1958,41 +2039,18 @@ private fun DiscoverLiquidSmallCard(
     glowColor: Color,
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(16.dp),
+    isAnimated: Boolean = true,
     onClick: () -> Unit
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "small_liquid_light")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 7500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-
-    val rad1 = Math.toRadians(phase.toDouble()).toFloat()
-    val rad2 = rad1 + Math.PI.toFloat()
-
-    val cosP = kotlin.math.cos(rad1)
-    val sinP = kotlin.math.sin(rad1)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 7500)
+    val path1 = remember { Path() }
+    val path2 = remember { Path() }
+    val ptsBuffer = remember { FloatArray(16) }
+    val cornerRadius = 16.dp
 
     Surface(
         shape = shape,
         color = Color.Transparent,
-        border = BorderStroke(
-            width = 1.dp,
-            brush = Brush.linearGradient(
-                colors = listOf(
-                    glowColor.copy(alpha = 0.85f),
-                    Color.White.copy(alpha = 0.45f),
-                    glowColor.copy(alpha = 0.20f),
-                    glowColor.copy(alpha = 0.85f)
-                ),
-                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
-                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
-            )
-        ),
         shadowElevation = 3.dp,
         modifier = modifier
             .clip(shape)
@@ -2001,34 +2059,77 @@ private fun DiscoverLiquidSmallCard(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.linearGradient(colors = gradientColors))
                 .drawBehind {
-                    val w = size.width
-                    val h = size.height
+                    drawRect(Brush.linearGradient(colors = gradientColors))
 
-                    val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
-                    val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
-                    val p1 = buildOrganicLiquidPath(cx1, cy1, size.maxDimension * 0.55f, rad1)
-                    drawPath(
-                        path = p1,
-                        brush = Brush.radialGradient(
-                            colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
-                            center = Offset(cx1, cy1),
-                            radius = size.maxDimension * 0.70f
-                        )
-                    )
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val rad2 = rad1 + Math.PI.toFloat()
+                        val w = size.width
+                        val h = size.height
 
-                    val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
-                    val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
-                    val p2 = buildOrganicLiquidPath(cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
-                    drawPath(
-                        path = p2,
-                        brush = Brush.radialGradient(
-                            colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
-                            center = Offset(cx2, cy2),
-                            radius = size.maxDimension * 0.55f
+                        val cx1 = w * (0.50f + 0.24f * kotlin.math.sin(rad1))
+                        val cy1 = h * (0.50f + 0.20f * kotlin.math.cos(rad1))
+                        updateOrganicLiquidPath(path1, ptsBuffer, cx1, cy1, size.maxDimension * 0.55f, rad1)
+                        drawPath(
+                            path = path1,
+                            brush = Brush.radialGradient(
+                                colors = listOf(glowColor.copy(alpha = 0.58f), glowColor.copy(alpha = 0.20f), Color.Transparent),
+                                center = Offset(cx1, cy1),
+                                radius = size.maxDimension * 0.70f
+                            )
                         )
-                    )
+
+                        val cx2 = w * (0.50f - 0.22f * kotlin.math.cos(rad2))
+                        val cy2 = h * (0.50f + 0.18f * kotlin.math.sin(rad2))
+                        updateOrganicLiquidPath(path2, ptsBuffer, cx2, cy2, size.maxDimension * 0.42f, rad2, 1.2f, 2.0f, 1.5f)
+                        drawPath(
+                            path = path2,
+                            brush = Brush.radialGradient(
+                                colors = listOf(secondaryGlowColor.copy(alpha = 0.40f), Color.Transparent),
+                                center = Offset(cx2, cy2),
+                                radius = size.maxDimension * 0.55f
+                            )
+                        )
+                    }
+                }
+                .drawWithContent {
+                    drawContent()
+                    val strokeWidth = 1.dp.toPx()
+                    val cr = cornerRadius.toPx()
+                    if (isAnimated) {
+                        val phase = phaseState.value
+                        val rad1 = Math.toRadians(phase.toDouble()).toFloat()
+                        val cosP = kotlin.math.cos(rad1)
+                        val sinP = kotlin.math.sin(rad1)
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.85f),
+                                    Color.White.copy(alpha = 0.45f),
+                                    glowColor.copy(alpha = 0.20f),
+                                    glowColor.copy(alpha = 0.85f)
+                                ),
+                                start = Offset((0.5f + 0.5f * cosP) * 300f, (0.5f + 0.5f * sinP) * 300f),
+                                end = Offset((0.5f - 0.5f * cosP) * 300f, (0.5f - 0.5f * sinP) * 300f)
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    } else {
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    glowColor.copy(alpha = 0.50f),
+                                    Color.White.copy(alpha = 0.25f),
+                                    glowColor.copy(alpha = 0.35f)
+                                )
+                            ),
+                            cornerRadius = CornerRadius(cr, cr),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    }
                 }
         ) {
             Row(

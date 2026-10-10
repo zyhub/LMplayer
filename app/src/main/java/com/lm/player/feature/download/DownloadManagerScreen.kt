@@ -82,6 +82,8 @@ fun DownloadManagerScreen(
     // 服务器下载任务列表与状态
     var serverDownloads by remember { mutableStateOf<List<LemonServerDownloadTaskRecord>>(emptyList()) }
     var isServerLoading by remember { mutableStateOf(false) }
+    /** 服务器下载列表的错误信息（null 表示无错误），用于把「静默空白」变成可读提示 */
+    var serverDownloadError by remember { mutableStateOf<String?>(null) }
     var taskPendingDelete by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
 
     fun refreshServerDownloads() {
@@ -91,9 +93,18 @@ fun DownloadManagerScreen(
                 .onSuccess { list ->
                     serverDownloads = list.sortedByDescending { it.createdAt }
                     isServerLoading = false
+                    serverDownloadError = null
                 }
-                .onFailure {
+                .onFailure { e ->
+                    // 此前失败被静默吞掉：列表空着、没有加载态、也没有任何提示，
+                    // 用户只能看到「服务器下载 (0)」，无法判断是服务端确实没有记录、
+                    // 还是请求失败、还是根本没连上服务器。这里把失败暴露出来。
                     isServerLoading = false
+                    serverDownloadError = e.message ?: "未知错误"
+                    android.util.Log.w("DownloadManagerScreen", "拉取服务器下载列表失败", e)
+                    if (e.message?.contains("未连接") == true) {
+                        Toast.makeText(context, "未连接柠檬音乐服务端，无法获取服务器下载列表", Toast.LENGTH_LONG).show()
+                    }
                 }
         }
     }
@@ -541,6 +552,7 @@ fun DownloadManagerScreen(
                 ServerDownloadTasksContent(
                     serverDownloads = serverDownloads,
                     isLoading = isServerLoading,
+                    errorMessage = serverDownloadError,
                     onRefresh = { refreshServerDownloads() },
                     onDeleteTask = { taskPendingDelete = it }
                 )
@@ -993,9 +1005,9 @@ fun DownloadManagerScreen(
                         Column {
                             Text(song.title, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Spacer(modifier = Modifier.height(2.dp))
-                            Text(song.artist, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(song.artist, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Spacer(modifier = Modifier.height(2.dp))
-                            Text(if (song.album.isNotBlank()) song.album else "单曲", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(if (song.album.isNotBlank()) song.album else "单曲", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
 
@@ -1406,6 +1418,8 @@ private fun formatStorageSize(bytes: Long): String {
 private fun ServerDownloadTasksContent(
     serverDownloads: List<LemonServerDownloadTaskRecord>,
     isLoading: Boolean,
+    /** 拉取失败时的错误信息；null 表示「确实没有记录」而不是「请求失败」 */
+    errorMessage: String?,
     onRefresh: () -> Unit,
     onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit
 ) {
@@ -1437,7 +1451,24 @@ private fun ServerDownloadTasksContent(
                     modifier = Modifier.size(56.dp)
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-                Text("暂无服务器端下载任务", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+                // 关键：区分「服务端确实没有记录」与「请求失败」。
+                // 此前两种情况都显示「暂无服务器端下载任务」，用户无法判断该去服务端查、
+                // 还是该检查网络/服务端连接 —— 这正是「条目数一直不对」难以定位的原因。
+                if (errorMessage != null) {
+                    Text(
+                        text = "获取失败：$errorMessage",
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "请检查服务端连接与登录状态后重试",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp
+                    )
+                } else {
+                    Text("暂无服务器端下载任务", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+                }
                 Spacer(modifier = Modifier.height(12.dp))
                 OutlinedButton(
                     onClick = onRefresh,

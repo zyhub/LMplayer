@@ -110,7 +110,9 @@ object DynamicIslandManager {
     private val bitmapCache = LruCache<String, Bitmap>(24)
     private val accentColorCache = LruCache<String, Int>(36)
     private val artworkBytesCache = LruCache<String, ByteArray>(24)
+    @Volatile
     private var fallbackCoverBitmap: Bitmap? = null
+    private val fallbackLock = Any()
 
     // 持久持有当前活跃的 MediaSession 与 MediaNotification.Provider.Callback，严防无 Session 覆盖导致下岛
     @Volatile
@@ -141,6 +143,7 @@ object DynamicIslandManager {
     private val _currentLineProgressFlow = MutableStateFlow(1f)
     val currentLineProgressFlow: StateFlow<Float> = _currentLineProgressFlow.asStateFlow()
 
+    @Volatile
     private var isInitialized = false
     private var backgroundLyricsJob: Job? = null
     private var activeLyricsSongId: String = ""
@@ -187,9 +190,22 @@ object DynamicIslandManager {
         activeMediaSession = session
     }
 
+    private val initLock = Any()
+
     fun ensureInitialized(context: Context) {
         val appCtx = context.applicationContext
+        // 双重检查锁：Application、MainActivity、PlaybackService、悬浮层控制器都会调用本方法，
+        // 此前 isInitialized 是普通 Boolean 且无任何同步 —— 并发调用会重复读取偏好、
+        // 并重复启动 startBackgroundLyricsEngine（该函数内部虽有 isActive 守卫，
+        // 但两次调用之间存在竞态窗口）。
         if (isInitialized) return
+        synchronized(initLock) {
+            if (isInitialized) return
+            ensureInitializedLocked(appCtx)
+        }
+    }
+
+    private fun ensureInitializedLocked(appCtx: Context) {
         val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _systemIslandEnabledFlow.value = prefs.getBoolean(KEY_SYSTEM_ISLAND_ENABLED, true)
         val defaultMode = if (isHuaweiOrHarmonyOS()) IslandDisplayMode.SMART else IslandDisplayMode.SYSTEM_ONLY
@@ -585,7 +601,16 @@ object DynamicIslandManager {
      * 生成高颜值 Apple Red 渐变兜底封面 Bitmap，防止无封面歌曲在灵动岛上呈现空白
      */
     fun getOrCreateFallbackBitmap(): Bitmap {
+        // 双重检查锁：通知构建线程、灵动岛渲染线程、后台封面预热协程都可能同时判定为 null，
+        // 各建一份 256×256 ARGB_8888（约 256KB）并互相覆盖，随后同一张 Bitmap 被多个线程持有。
         fallbackCoverBitmap?.let { return it }
+        synchronized(fallbackLock) {
+            fallbackCoverBitmap?.let { return it }
+            return createFallbackBitmapLocked()
+        }
+    }
+
+    private fun createFallbackBitmapLocked(): Bitmap {
         val size = 256
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)

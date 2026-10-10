@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.database
+package com.lm.player.core.database
 
 import android.content.Context
 import androidx.room.Database
@@ -43,7 +43,13 @@ abstract class ZdsDatabase : RoomDatabase() {
                     "zds_player.db"
                 )
                     .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-                    .fallbackToDestructiveMigration()
+                    // 只允许「降级」时清库（用户装了旧版本，结构不兼容，无法安全降级）。
+                    // 升级绝不清库：此前用 fallbackToDestructiveMigration() 意味着只要下次发版把
+                    // version 从 4 改成 5，用户的 songs / downloads / playlists / servers 会被
+                    // 整体 DROP 重建 —— 本地曲库索引、已下载记录、自建歌单、服务器地址与令牌
+                    // 全部丢失，而磁盘上音频文件会变成永不识别的孤儿文件。
+                    // 新增字段时请务必补 Migration(N, N+1) 并在此处 addMigrations(...)。
+                    .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                 INSTANCE = instance
                 instance

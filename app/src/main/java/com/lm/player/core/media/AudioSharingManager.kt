@@ -292,7 +292,8 @@ object AudioSharingManager {
             }
             context.startActivity(btIntent)
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             false
         }
     }
@@ -307,7 +308,8 @@ object AudioSharingManager {
             }
             context.startActivity(castIntent)
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             launchSystemMediaOutputSwitcher(context)
         }
     }
@@ -371,6 +373,7 @@ object AudioSharingManager {
                     publishDevice(device)
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "LAN discovery warning: ${e.message}")
             } finally {
                 activeNsdListeners.forEach { listener ->
@@ -458,7 +461,8 @@ object AudioSharingManager {
             } else {
                 DatagramSocket()
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             DatagramSocket()
         }
 
@@ -511,7 +515,8 @@ object AudioSharingManager {
                         }
                         parseJobs.add(job)
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     // 单次超时继续监听
                 }
             }
@@ -621,6 +626,7 @@ object AudioSharingManager {
                 )
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.d(TAG, "Failed to parse UPnP XML from $locationUrl: ${e.message}")
             null
         }
@@ -809,6 +815,7 @@ object AudioSharingManager {
                 }
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "castSongToDevice error", e)
             Result.failure(e)
         }
@@ -873,7 +880,7 @@ object AudioSharingManager {
                     .url("http://${current.host}:${current.port}/stop")
                     .post("".toRequestBody(null))
                     .build()
-                client.newCall(req).execute().close()
+                client.newCall(req).execute().use { it.body?.string() }
             }
         }
     }
@@ -1182,7 +1189,7 @@ object AudioSharingManager {
             .header("SOAPAction", "\"urn:schemas-upnp-org:service:AVTransport:1#Pause\"")
             .post(pauseSoap.toRequestBody("text/xml; charset=utf-8".toMediaType()))
             .build()
-        client.newCall(req).execute().close()
+        client.newCall(req).execute().use { it.body?.string() }
     }
 
     private fun sendDlnaSeek(context: Context, device: LanShareDevice, positionMs: Long) {
@@ -1209,7 +1216,7 @@ object AudioSharingManager {
             .header("SOAPAction", "\"urn:schemas-upnp-org:service:AVTransport:1#Seek\"")
             .post(seekSoap.toRequestBody("text/xml; charset=utf-8".toMediaType()))
             .build()
-        client.newCall(req).execute().close()
+        client.newCall(req).execute().use { it.body?.string() }
     }
 
     private fun sendDlnaStop(context: Context, device: LanShareDevice) {
@@ -1232,7 +1239,7 @@ object AudioSharingManager {
             .header("SOAPAction", "\"urn:schemas-upnp-org:service:AVTransport:1#Stop\"")
             .post(stopSoap.toRequestBody("text/xml; charset=utf-8".toMediaType()))
             .build()
-        client.newCall(req).execute().close()
+        client.newCall(req).execute().use { it.body?.string() }
     }
 
     /**
@@ -1253,7 +1260,8 @@ object AudioSharingManager {
                 .post(bodyText.toRequestBody("text/parameters".toMediaType()))
                 .build()
             client.newCall(req).execute().use { it.isSuccessful }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             false
         }
     }
@@ -1280,7 +1288,8 @@ object AudioSharingManager {
                 while (!server.isClosed) {
                     val clientSocket = try {
                         server.accept()
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
                         break
                     }
                     launch(Dispatchers.IO) {
@@ -1290,6 +1299,7 @@ object AudioSharingManager {
             }
             httpServerPort
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to start local LAN HTTP media server", e)
             0
         }
@@ -1438,6 +1448,7 @@ object AudioSharingManager {
         val afd = try {
             cr.openAssetFileDescriptor(uri, "r")
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to open afd for $uriStr", e)
             null
         }

@@ -92,27 +92,34 @@ class BootCompletedReceiver : BroadcastReceiver() {
         if (!autoLaunch) return
 
         val appContext = context.applicationContext
+        val pendingResult = goAsync()
         Handler(Looper.getMainLooper()).postDelayed({
             try {
-                val serviceIntent = Intent(appContext, PlaybackService::class.java)
-                ContextCompat.startForegroundService(appContext, serviceIntent)
-            } catch (e: Exception) {
-                Log.w(TAG, "Start PlaybackService on boot failed", e)
-            }
-
-            try {
-                val activityIntent = Intent(appContext, MainActivity::class.java).apply {
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                            Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    )
-                    putExtra("from_boot_completed", true)
+                try {
+                    val serviceIntent = Intent(appContext, PlaybackService::class.java)
+                    ContextCompat.startForegroundService(appContext, serviceIntent)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Start PlaybackService on boot failed", e)
                 }
-                appContext.startActivity(activityIntent)
-                Log.i(TAG, "Launched MainActivity on system boot completed")
-            } catch (e: Exception) {
-                Log.e(TAG, "Launch MainActivity on boot failed", e)
+
+                try {
+                    val activityIntent = Intent(appContext, MainActivity::class.java).apply {
+                        addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+                        putExtra("from_boot_completed", true)
+                    }
+                    appContext.startActivity(activityIntent)
+                    Log.i(TAG, "Launched MainActivity on system boot completed")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Launch MainActivity on boot failed", e)
+                }
+            } finally {
+                try {
+                    pendingResult.finish()
+                } catch (_: Throwable) {}
             }
         }, 1500L)
     }

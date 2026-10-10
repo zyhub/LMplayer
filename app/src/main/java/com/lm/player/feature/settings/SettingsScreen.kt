@@ -73,6 +73,8 @@ fun SettingsScreen(
     currentScaleMode: UiScaleMode,
     blurAlpha: Float,
     enableBottomBarAnimation: Boolean,
+    dynamicCardEffects: Boolean = true,
+    onDynamicCardEffectsChange: (Boolean) -> Unit = {},
     autoPlayOnStartup: Boolean = true,
     autoFallbackToLocal: Boolean = true,
     autoLaunchOnBoot: Boolean = false,
@@ -150,8 +152,10 @@ fun SettingsScreen(
     var streamCacheEnabled by remember {
         mutableStateOf(prefs.getBoolean("stream_cache_enabled_v2", false))
     }
+    // 默认值必须与 PlaybackService.onTaskRemoved 的读取默认值保持一致（true），
+    // 否则「从未设置过」的用户会看到开关是关的、但实际行为是划掉任务就停播。
     var stopPlaybackOnExit by remember {
-        mutableStateOf(prefs.getBoolean("stop_playback_on_exit", false))
+        mutableStateOf(prefs.getBoolean("stop_playback_on_exit", true))
     }
 
     // 弹窗状态
@@ -385,14 +389,23 @@ fun SettingsScreen(
                                         onClick = {
                                             isTestingConnection = true
                                             coroutineScope.launch {
-                                                val client = NetworkClientFactory.createOkHttpClient(context)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                val res = proto.testConnection()
-                                                isTestingConnection = false
-                                                if (res.isSuccess) {
-                                                    Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
-                                                } else {
-                                                    Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                                // try/finally 复位状态：抛异常时 isTestingConnection 会永久为 true，
+                                                // 「测试连接」按钮从此永久禁用并一直显示「测试中...」。
+                                                try {
+                                                    val client = NetworkClientFactory.createOkHttpClient(context)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    val res = proto.testConnection()
+                                                    if (res.isSuccess) {
+                                                        Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (e: Exception) {
+                                                    Toast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
+                                                } finally {
+                                                    isTestingConnection = false
                                                 }
                                             }
                                         },
@@ -612,14 +625,22 @@ fun SettingsScreen(
                                             if (activeServer?.type == ServerType.LEMON_MUSIC) {
                                                 isLoadingScripts = true
                                                 coroutineScope.launch {
-                                                    val proto = LemonMusicProtocol(
-                                                        NetworkClientFactory.createOkHttpClient(context),
-                                                        activeServer.serverUrl,
-                                                        activeServer.username,
-                                                        activeServer.tokenOrApiKey
-                                                    )
-                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                    isLoadingScripts = false
+                                                    // try/finally 复位：异常时否则永久转圈（脚本列表一直显示加载中）
+                                                    try {
+                                                        val proto = LemonMusicProtocol(
+                                                            NetworkClientFactory.createOkHttpClient(context),
+                                                            activeServer.serverUrl,
+                                                            activeServer.username,
+                                                            activeServer.tokenOrApiKey
+                                                        )
+                                                        sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                                        throw e
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(context, "音源脚本加载失败: ${e.message}", Toast.LENGTH_LONG).show()
+                                                    } finally {
+                                                        isLoadingScripts = false
+                                                    }
                                                 }
                                             } else {
                                                 Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
@@ -1000,27 +1021,38 @@ fun SettingsScreen(
                                         if (!isScanningLocalAndServer) {
                                             isScanningLocalAndServer = true
                                             coroutineScope.launch {
-                                                withContext(Dispatchers.Main) {
-                                                    Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
-                                                }
-                                                var totalScanned = 0
-                                                // 1. 扫描配置目录
-                                                for (path in localMusicPaths) {
-                                                    if (java.io.File(path).exists()) {
-                                                        totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                                // try/finally 复位：扫描任意一环抛异常（无权限、目录不可读、DB 异常）时
+                                                // isScanningLocalAndServer 会永久为 true，按钮 enable=false 后再也无法扫描。
+                                                try {
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
                                                     }
-                                                }
-                                                // 2. 扫描系统媒体库
-                                                totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
+                                                    var totalScanned = 0
+                                                    // 1. 扫描配置目录
+                                                    for (path in localMusicPaths) {
+                                                        if (java.io.File(path).exists()) {
+                                                            totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                                        }
+                                                    }
+                                                    // 2. 扫描系统媒体库
+                                                    totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
 
-                                                // 3. 与服务器曲库智能比对与真实性校验
-                                                val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
-                                                val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
-                                                LocalMediaScanner.matchAndMergeLocalWithServer(database)
+                                                    // 3. 与服务器曲库智能比对与真实性校验
+                                                    val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                                    val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                    LocalMediaScanner.matchAndMergeLocalWithServer(database)
 
-                                                withContext(Dispatchers.Main) {
-                                                    Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
-                                                    onLocalScanCompleted()
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
+                                                        onLocalScanCompleted()
+                                                    }
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (e: Exception) {
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "本地扫描失败: ${e.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                                } finally {
                                                     isScanningLocalAndServer = false
                                                 }
                                             }
@@ -1345,7 +1377,7 @@ fun SettingsScreen(
                                 getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
                                 onSelect = { q ->
                                     wifiStreamQuality = q
-                                    prefs.edit().putString("wifi_stream_quality", q.key).commit()
+                                    prefs.edit().putString("wifi_stream_quality", q.key).apply()
                                     onStreamQualityChanged()
                                 }
                             )
@@ -1363,7 +1395,7 @@ fun SettingsScreen(
                                 getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
                                 onSelect = { q ->
                                     cellularStreamQuality = q
-                                    prefs.edit().putString("cellular_stream_quality", q.key).commit()
+                                    prefs.edit().putString("cellular_stream_quality", q.key).apply()
                                     onStreamQualityChanged()
                                 }
                             )
@@ -1419,10 +1451,11 @@ fun SettingsScreen(
                     }
 
                     item {
-                        var stopPlaybackOnExit by remember {
-                            mutableStateOf(prefs.getBoolean("stop_playback_on_exit", true))
-                        }
-
+                        // 注意：这里曾用 remember 重复声明了一份 stopPlaybackOnExit，把外层状态**遮蔽**成
+                        // 死代码；更糟的是两处默认值相反（内层 true、外层 false），而
+                        // PlaybackService.onTaskRemoved 读同一键时用的默认值是 true ——
+                        // 同一个偏好项在不同卡片里读写的是不同变量，开关表现随机。
+                        // 现已删除内层声明，统一使用文件顶部的 hoisted 状态（默认值与 Service 契约一致）。
                         SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
                             SettingSwitchRow(
                                 title = "安卓系统启动后自动启动软件",
@@ -1698,6 +1731,14 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
+                                title = "首页与资料库动态光影特效",
+                                subtitle = if (dynamicCardEffects) "已开启液态光斑流动动效；退到后台或锁屏时自动暂停以省电" else "已关闭动态光影：使用零开销静态渐变与高光边框，彻底降低 CPU 占用与发热",
+                                checked = dynamicCardEffects,
+                                onCheckedChange = onDynamicCardEffectsChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
                                 title = "退出应用时停止播放",
                                 subtitle = "默认关闭（退至后台/桌面时继续放歌）。开启后，双击返回键退出应用或划掉后台任务时将彻底停止放歌并释放播放服务",
                                 checked = stopPlaybackOnExit,
@@ -1747,10 +1788,18 @@ fun SettingsScreen(
                         showPurgeConfirmDialog = false
                         isPurgingLegacyData = true
                         coroutineScope.launch {
-                            val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database)
-                            isPurgingLegacyData = false
-                            onLocalScanCompleted()
-                            Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
+                            // try/finally 复位：异常时否则按钮永久处于「清理中」禁用态
+                            try {
+                                val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database)
+                                onLocalScanCompleted()
+                                Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "资料库清理失败: ${e.message}", Toast.LENGTH_LONG).show()
+                            } finally {
+                                isPurgingLegacyData = false
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AppleRed)

@@ -22,6 +22,14 @@
     <!-- 在线应用自更新与安装器调起权限 (Android 8.0+) -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!--
+        Android 13 (API 33) 起 READ_EXTERNAL_STORAGE 对媒体文件**完全失效**，必须改用
+        按类型划分的 READ_MEDIA_AUDIO。缺这条会导致 Android 13/14 手机上
+        「一键全盘扫描」「导入本地文件夹」「U 盘扫描」全部返回 0 首（MediaStore 查询
+        返回空游标、File.exists() 对外置存储一律 false）—— 装了却扫不到本地音乐。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
     <!-- 存储权限适配 (API 23~32) -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
@@ -33,7 +41,7 @@
 
     <application
         android:name=".LMApplication"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -73,6 +81,7 @@
         <!-- 安卓系统开机自动启动软件广播接收器 -->
         <receiver
             android:name=".core.media.BootCompletedReceiver"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED"
             android:enabled="true"
             android:exported="true"
             android:directBootAware="true">
