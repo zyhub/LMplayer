@@ -109,6 +109,16 @@ object NetworkClientFactory {
             .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
+            // **整个请求的总时长上限**（含连接、写入、服务端处理与读取）。
+            //
+            // connect/read/write 三个超时都是「单次 IO 操作」的语义，不是「请求总时长」：
+            // 只要服务端持续慢速吐数据，readTimeout 就永远不会触发，请求可以拖到几分钟甚至更久。
+            // 下载收尾阶段会同步拉取【封面图】与【歌词】，这两次请求此前没有任何总时长约束 ——
+            // 一旦对方响应缓慢，下载进度条就会在 100% 停留很久（用户反复反馈的现象之一）。
+            //
+            // 300 秒足以覆盖整库同步这类大响应（readTimeout 仍是 60 秒，
+            // 正常情况下单次读取不会超时），只用来兜住「长时间挂死」的极端情况。
+            .callTimeout(300, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
 
         if (cache != null) {
