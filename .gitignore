@@ -15,3 +15,7 @@ captures
 *.log
 app.tgz
 icon_downloaded.png
+
+# 调试截图（排查时临时产生，勿提交）
+/_dbg_*.png
+/screenshot_*.png

@@ -651,9 +651,26 @@ class DownloadEngine(
                         bitRate = if (finalExt in listOf("flac", "wav")) song.bitRate.coerceAtLeast(960) else song.bitRate
                     )
 
-                    // 4. 后置元数据处理：拉取高清封面、原始同步歌词、生成伴随 .lrc 以及音频内嵌 ID3/FLAC/M4A 标签
-                    val localCoverPath = postProcessDownloadedFile(actualDestFile, finalSong)
-                    val effectiveCover = if (!localCoverPath.isNullOrBlank() && finalSong.coverUrl.isBlank()) localCoverPath else finalSong.coverUrl
+                    // ===== 收尾顺序是本文件最容易踩坑的地方，务必看清以下分工 =====
+                    //
+                    // 曾经的写法是「先把封面/歌词全部处理完，再写库 + 移除任务」，导致了一个
+                    // 被用户反复反馈的现象：**进度条卡在 100% 很久才变成已完成**。
+                    //
+                    // 根因：进度条由 `totalRead / totalLength` 计算，读完最后一个字节就显示 100%；
+                    // 而进度条什么时候消失、任务什么时候变「已完成」，取决于 `removeTask` + 写库，
+                    // 它们被排在 postProcessDownloadedFile 之后。而 postProcessDownloadedFile 里有
+                    // **两次同步网络请求**（拉取封面图 + 拉取歌词），即使失败也会各自走完超时，
+                    // 于是「100% → 已完成」之间凭空插入了几十秒的纯等待。
+                    // 这也解释了用户观察到的另一个现象：暂停后恢复会立刻完成 ——
+                    // 恢复时字节已完整，跳过了下载循环，收尾网络请求也往往已缓存/变快。
+                    //
+                    // 现在的分工：
+                    //   1) 快速取一次本地封面（仅本地文件读取，无网络）—— 只为让列表立即有封面；
+                    //   2) **立刻**写库 + removeTask，让进度条马上消失、状态变「已完成」；
+                    //   3) 元数据内嵌（封面下载、歌词拉取、ID3/FLAC 标签写入）放到后台继续，
+                    //      用 NonCancellable 保证即使用户此时暂停/取消也不会写出半截标签。
+                    val quickCover = postProcessLocalCoverOnly(actualDestFile)
+                    val effectiveCover = if (!quickCover.isNullOrBlank() && finalSong.coverUrl.isBlank()) quickCover else finalSong.coverUrl
 
                     // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表
                     val completedEntity = initialEntity.copy(
@@ -669,7 +686,7 @@ class DownloadEngine(
                     saveOrUpdateSongEntity(finalSong.copy(coverUrl = effectiveCover), actualDestFile.absolutePath)
                     removeTask(song.id)
                     urlResolverMap.remove(song.id)
-                    Log.i(TAG, "Song ${song.title} downloaded and tagged successfully to ${actualDestFile.absolutePath}")
+                    Log.i(TAG, "Song ${song.title} downloaded to ${actualDestFile.absolutePath}（元数据将在后台继续内嵌）")
 
                     withContext(Dispatchers.Main) {
                         // 如实告知**实际**拿到的音质：音源缺目标音质时会逐级降级
@@ -680,6 +697,22 @@ class DownloadEngine(
                             "「${song.title}」已完成离线下载 [实际音质: $actualQuality]",
                             Toast.LENGTH_SHORT
                         ).show()
+                    }
+
+                    // 6. 后台补全元数据（封面下载、歌词拉取、标签内嵌）—— 不阻塞「已完成」状态。
+                    //    NonCancellable：标签写入是文件级写操作，中途被打断会留下损坏的音频头。
+                    try {
+                        val localCoverPath = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                            postProcessDownloadedFile(actualDestFile, finalSong)
+                        }
+                        // 封面文件（cover.jpg）此时已落盘，列表下次刷新时会自然带上；
+                        // 不再为此额外写库 —— 下载结果本身已经是 DOWNLOADED 且路径正确，
+                        // 多一次写库只会多一次 songs 表失效通知（触发整库重算）。
+                        Log.i(TAG, "Song ${song.title} 元数据内嵌完成（封面=${localCoverPath ?: "无"}）")
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        // 元数据失败不影响下载结果：音频已完整落盘、库记录已是 DOWNLOADED
+                        Log.w(TAG, "元数据内嵌失败（不影响已下载文件）: ${song.title}", e)
                     }
 
                 } catch (e: Exception) {
@@ -834,6 +867,21 @@ class DownloadEngine(
      * 5. 若开启 download_embed_cover 或 download_embed_lyric：调用 AudioMetadataEmbedder 写入 ID3v2.3/FLAC/M4A 标签；
      * 6. 返回可能落盘的本地封面路径。
      */
+    /**
+     * **只做本地封面探测**（无任何网络请求），用于下载完成瞬间先给列表一个封面。
+     *
+     * 抽出来的原因见调用点的长注释：真正的元数据内嵌含同步网络请求，
+     * 绝不能挡在「写库 + 移除任务」之前，否则进度条会在 100% 停留很久。
+     *
+     * @return 本地专辑目录下 cover.jpg 的绝对路径；不存在则 null
+     */
+    private fun postProcessLocalCoverOnly(file: File): String? = try {
+        val coverJpg = file.parentFile?.let { File(it, "cover.jpg") }
+        if (coverJpg != null && coverJpg.exists() && coverJpg.length() > 0L) coverJpg.absolutePath else null
+    } catch (_: Exception) {
+        null
+    }
+
     suspend fun postProcessDownloadedFile(
         file: File,
         song: UnifiedSong
