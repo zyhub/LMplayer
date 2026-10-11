@@ -499,6 +499,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) { true }
 
                 if (stopPlaybackOnExit) {
+                    // 开关开启：返回键 = 退出入口。首次提示，2 秒内再按则彻底退出并停播。
                     val now = System.currentTimeMillis()
                     if (now - lastBackPressTime < 2000) {
                         exitAppCompletely()
@@ -506,18 +507,15 @@ class MainActivity : ComponentActivity() {
                         lastBackPressTime = now
                         Toast.makeText(this@MainActivity, "再按一次彻底退出程序并停止播放", Toast.LENGTH_SHORT).show()
                     }
-                } else if (isPlaying) {
-                    // 正在播放音乐时按返回键：平滑退至后台桌面/导航页面，播放交由前台播放服务按常规策略维持
+                } else {
+                    // 开关关闭：返回键 = 退到后台，**与当前是否在播放无关**。
+                    //
+                    // 此前这里分成 `else if (isPlaying)` 与 `else` 两支：播放中按返回退后台，
+                    // 暂停中按返回却会退出并停播 —— 同一个设置下，用户按同样的键得到相反结果，
+                    // 且「暂停时反而更容易退出停播」完全违背直觉。现在统一为退后台，
+                    // 后台保活场景只会变多、不会变少（不会让任何原本继续播放的场景变成停播）。
                     DynamicIslandManager.onAppBackgroundStateChanged(this@MainActivity, inBackground = true)
                     moveTaskToBack(true)
-                } else {
-                    val now = System.currentTimeMillis()
-                    if (now - lastBackPressTime < 2000) {
-                        exitAppCompletely()
-                    } else {
-                        lastBackPressTime = now
-                        Toast.makeText(this@MainActivity, "再按一次彻底退出程序（播放中按返回键将转入后台保活播放）", Toast.LENGTH_SHORT).show()
-                    }
                 }
             }
 
@@ -3445,11 +3443,15 @@ class MainActivity : ComponentActivity() {
         }
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
         PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
-        val stopPlaybackOnExit = try {
-            getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE).getBoolean("stop_playback_on_exit", true)
-        } catch (_: Exception) { true }
-        if (isUserExplicitExit || (stopPlaybackOnExit && isFinishing)) {
-            // 仅在用户主动选择彻底退出软件或开启了「退出应用时停止播放」且界面退出时停止播放器与后台服务
+        // 只有当用户**明确要求退出**时才停播。
+        //
+        // 此前这里还带了一个 `|| (stopPlaybackOnExit && isFinishing)` 分支，问题有三：
+        //  1) 与 exitAppCompletely() 的停播逻辑完全重复（那条路径已置 isUserExplicitExit=true）；
+        //  2) isFinishing 在系统回收 / 「不保留活动」等场景同样为 true，会**误停**正在后台播放的音乐；
+        //  3) 「划掉最近任务」的真实停播入口是 PlaybackService.onTaskRemoved（它自己读该开关），
+        //     不归 onDestroy 管 —— 两处都读同一开关只会让行为难以推理。
+        // 因此这里只看 isUserExplicitExit 这一个真值来源。
+        if (isUserExplicitExit) {
             try {
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()

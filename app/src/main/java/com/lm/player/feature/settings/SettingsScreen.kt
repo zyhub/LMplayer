@@ -1483,7 +1483,12 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
                                 title = "退出应用时停止播放",
-                                subtitle = "双击返回键退出或从最近任务卡片划掉应用时停止音乐播放并释放后台服务",
+                                // 副标题必须准确描述「控制什么、不影响什么」：
+                                // 此前两处同名开关共享同一 prefs key，且第二处副标题写「默认关闭」，
+                                // 与实际默认值 true 相反，用户会误以为「退到后台就停播」——而锁屏与按 Home
+                                // 走的是 Activity onStop，根本不读这个开关。这里把边界一次说清。
+                                subtitle = "关闭后：按返回键退至桌面，播放交由后台服务维持（锁屏同样不受影响）。" +
+                                    "开启后：双击返回键或从最近任务划掉应用时，彻底停止播放并释放后台服务",
                                 checked = stopPlaybackOnExit,
                                 onCheckedChange = { checked ->
                                     stopPlaybackOnExit = checked
@@ -1737,16 +1742,7 @@ fun SettingsScreen(
                                 onCheckedChange = onDynamicCardEffectsChange
                             )
 
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingSwitchRow(
-                                title = "退出应用时停止播放",
-                                subtitle = "默认关闭（退至后台/桌面时继续放歌）。开启后，双击返回键退出应用或划掉后台任务时将彻底停止放歌并释放播放服务",
-                                checked = stopPlaybackOnExit,
-                                onCheckedChange = { enabled ->
-                                    stopPlaybackOnExit = enabled
-                                    prefs.edit().putBoolean("stop_playback_on_exit", enabled).apply()
-                                }
-                            )
+
                         }
                     }
 
@@ -1760,7 +1756,7 @@ fun SettingsScreen(
                         ) {
                             Icon(Icons.Default.PowerSettingsNew, contentDescription = null, tint = MaterialTheme.colorScheme.error)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("彻底退出应用并停止后台服务", color = MaterialTheme.colorScheme.error, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
+                            Text("彻底退出应用并停止后台服务（无论上方开关如何设置都会停播）", color = MaterialTheme.colorScheme.error, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
