@@ -59,7 +59,13 @@ object DownloadRequestPlanner {
     fun existingLocalFileSatisfies(song: UnifiedSong, quality: AudioQuality): Boolean {
         val targetLossless = quality.format.equals("flac", ignoreCase = true) || quality.bitrate >= 800
         val existingLossless = song.format.lowercase() in LOSSLESS_EXTS
-        return if (targetLossless) existingLossless else !existingLossless
+        return if (targetLossless) {
+            existingLossless
+        } else {
+            if (existingLossless) return false
+            if (quality.bitrate >= 320 && song.bitRate in 1..255) return false
+            true
+        }
     }
 
     /**
@@ -103,12 +109,15 @@ object DownloadRequestPlanner {
     /**
      * 按**目标音质**解析该歌曲的下载直链。服务器曲库歌曲与原文件音质不符时，
      * 会优先改走音源取对应音质，而不是把服务器上的原文件原样拖下来。
+     * 支持本地音源引擎直连与服务端协同双通道。
      */
     suspend fun resolveStreamAtQuality(
-        protocol: LemonMusicProtocol,
+        protocol: LemonMusicProtocol?,
         song: UnifiedSong,
-        quality: AudioQuality
+        quality: AudioQuality,
+        context: android.content.Context? = null
     ): ResolvedDownloadStream? {
+        if (protocol == null) return null
         protocol.ensureAuthenticated()
 
         val serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)

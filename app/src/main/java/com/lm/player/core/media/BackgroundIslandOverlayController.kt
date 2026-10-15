@@ -551,6 +551,19 @@ object BackgroundIslandOverlayController {
         private var cachedCoverShader: BitmapShader? = null
         private val shaderMatrix = Matrix()
 
+        private var cachedAuraShader: RadialGradient? = null
+        private var cachedAuraCx = 0f
+        private var cachedAuraCy = 0f
+        private var cachedAuraR = 0f
+        private var cachedAuraColor = 0
+
+        private var cachedBorderShader: LinearGradient? = null
+        private var cachedBorderL = 0f
+        private var cachedBorderT = 0f
+        private var cachedBorderR = 0f
+        private var cachedBorderB = 0f
+        private var cachedBorderColor = 0
+
         // 酷狗概念版封面动态流光主色（默认荧光青 #00E5FF）
         private var accentColor: Int = Color.parseColor("#FF00E5FF")
         private var isPlaying: Boolean = false
@@ -950,28 +963,45 @@ object BackgroundIslandOverlayController {
                 Color.green(accentColor),
                 Color.blue(accentColor)
             )
-            auraPaint.shader = RadialGradient(
-                auraCenterX,
-                auraCenterY,
-                auraRadius,
-                intArrayOf(auraColorWithAlpha, Color.TRANSPARENT),
-                floatArrayOf(0f, 1f),
-                Shader.TileMode.CLAMP
-            )
+            if (cachedAuraShader == null || cachedAuraCx != auraCenterX || cachedAuraCy != auraCenterY ||
+                cachedAuraR != auraRadius || cachedAuraColor != auraColorWithAlpha) {
+                cachedAuraCx = auraCenterX
+                cachedAuraCy = auraCenterY
+                cachedAuraR = auraRadius
+                cachedAuraColor = auraColorWithAlpha
+                cachedAuraShader = RadialGradient(
+                    auraCenterX,
+                    auraCenterY,
+                    auraRadius,
+                    intArrayOf(auraColorWithAlpha, Color.TRANSPARENT),
+                    floatArrayOf(0f, 1f),
+                    Shader.TileMode.CLAMP
+                )
+            }
+            auraPaint.shader = cachedAuraShader
             canvas.drawRoundRect(bgRect, cornerRadius, cornerRadius, auraPaint)
 
             // 3. 绘制概念流光金属描边（随音乐播放状态律动发光）
             val activeStrokeColor = if (isPlaying) accentColor else Color.parseColor("#FF383C4E")
-            borderPaint.shader = LinearGradient(
-                bgRect.left, bgRect.top, bgRect.right, bgRect.bottom,
-                intArrayOf(
-                    activeStrokeColor,
-                    Color.parseColor("#FF282B3A"),
-                    activeStrokeColor
-                ),
-                floatArrayOf(0f, 0.55f, 1f),
-                Shader.TileMode.CLAMP
-            )
+            if (cachedBorderShader == null || cachedBorderL != bgRect.left || cachedBorderT != bgRect.top ||
+                cachedBorderR != bgRect.right || cachedBorderB != bgRect.bottom || cachedBorderColor != activeStrokeColor) {
+                cachedBorderL = bgRect.left
+                cachedBorderT = bgRect.top
+                cachedBorderR = bgRect.right
+                cachedBorderB = bgRect.bottom
+                cachedBorderColor = activeStrokeColor
+                cachedBorderShader = LinearGradient(
+                    bgRect.left, bgRect.top, bgRect.right, bgRect.bottom,
+                    intArrayOf(
+                        activeStrokeColor,
+                        Color.parseColor("#FF282B3A"),
+                        activeStrokeColor
+                    ),
+                    floatArrayOf(0f, 0.55f, 1f),
+                    Shader.TileMode.CLAMP
+                )
+            }
+            borderPaint.shader = cachedBorderShader
             borderPaint.alpha = if (isDraggingWindowPosition) 255 else 215
             borderPaint.strokeWidth = if (isDraggingWindowPosition) dp(1.8f) else dp(1.1f)
             canvas.drawRoundRect(bgRect, cornerRadius, cornerRadius, borderPaint)
@@ -1607,42 +1637,8 @@ object BackgroundIslandOverlayController {
             val song = currentSong ?: return
             val updated = song.copy(isFavorite = !song.isFavorite)
             currentSong = updated
-            PlaybackQueueManager.updateCurrentSong(updated)
             invalidate()
-            ioScope.launch {
-                try {
-                    val dao = ZdsDatabase.getInstance(context).songDao()
-                    // updateFavorite 只是 UPDATE ... WHERE id，对尚未入库的歌曲影响 0 行，
-                    // 收藏会静默丢失；先补一行再改标记
-                    if (dao.getSongById(song.id) == null) {
-                        dao.insertSongs(
-                            listOf(
-                                com.lm.player.core.database.entity.SongEntity(
-                                    id = updated.id,
-                                    title = updated.title.ifBlank { "未知曲目" },
-                                    artist = updated.artist.ifBlank { "未知歌手" },
-                                    artistId = updated.artistId.ifBlank { "artist_${updated.artist.hashCode()}" },
-                                    album = updated.album.ifBlank { "单曲精选" },
-                                    albumId = updated.albumId.ifBlank { "album_${updated.album.hashCode()}" },
-                                    durationMs = updated.durationMs,
-                                    coverUrl = updated.coverUrl,
-                                    streamUrl = updated.streamUrl,
-                                    serverId = updated.serverId.ifBlank { "local_storage" },
-                                    localFilePath = updated.localFilePath,
-                                    downloadStatus = updated.downloadStatus,
-                                    bitRate = updated.bitRate,
-                                    format = updated.format,
-                                    isFavorite = updated.isFavorite,
-                                    relativeFolderPath = updated.rawMetaJson ?: updated.relativeFolderPath,
-                                    addedTimestamp = System.currentTimeMillis()
-                                )
-                            )
-                        )
-                    } else {
-                        dao.updateFavorite(song.id, updated.isFavorite)
-                    }
-                } catch (_: Exception) {}
-            }
+            PlaybackQueueManager.toggleFavorite(context, song)
         }
 
         private fun openMainApp() {

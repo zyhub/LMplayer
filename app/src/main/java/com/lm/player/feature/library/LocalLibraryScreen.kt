@@ -34,6 +34,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import com.lm.player.feature.home.ALL_RANDOM_LIQUID_PALETTES
+import com.lm.player.core.designsystem.component.rememberLiquidPhase
+import com.lm.player.core.designsystem.component.updateOrganicLiquidPath
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -307,11 +309,28 @@ fun LocalLibraryScreen(
                 val path = s.localFilePath
                 !path.isNullOrBlank() && (path.startsWith("content://") || java.io.File(path).exists())
             }
-            if (downloadedSongs.isNotEmpty()) {
+            val rawList = if (downloadedSongs.isNotEmpty()) {
                 downloadedSongs.filter(validLocal)
             } else {
                 allSongs.filter { (it.downloadStatus == DownloadStatus.DOWNLOADED || !it.localFilePath.isNullOrBlank()) && validLocal(it) }
             }
+            // 按物理文件路径 + 歌曲 ID 双重去重（若同一文件同时存在服务器曲目与 local_storage 临时记录，优先保留服务器曲目）
+            val byPath = LinkedHashMap<String, UnifiedSong>(rawList.size)
+            for (song in rawList) {
+                val key = song.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { it.isNotBlank() }
+                    ?: "id:${song.id}"
+                val existing = byPath[key]
+                if (existing == null) {
+                    byPath[key] = song
+                } else {
+                    val existingIsLocalOnly = existing.serverId in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                    val incomingIsServer = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                    if (existingIsLocalOnly && incomingIsServer) {
+                        byPath[key] = song
+                    }
+                }
+            }
+            byPath.values.distinctBy { it.id }
         }
     }
     var isDownloadManagementMode by remember { mutableStateOf(false) }
@@ -329,7 +348,7 @@ fun LocalLibraryScreen(
     // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源。
     // 优先用宿主注入的服务器收藏口径，只有宿主拿不到时才退回本地 isFavorite 标记。
     val favSongs = remember(allSongs, favoriteSongs) {
-        if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }
+        (if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }).distinctBy { it.id }
     }
 
     // 我喜欢的音乐下钻视图联动刷新。
@@ -370,26 +389,43 @@ fun LocalLibraryScreen(
     // 服务器专辑 id 与曲目 albumId 同源 (lemon_album_${md5("$artist/$name")})，可直接做最近添加排序。
     val albums = remember(allSongs, serverAlbums) {
         if (serverAlbums.isNotEmpty()) {
-            // 服务器专辑接口若没给出封面（既无代表曲目路径也无外链封面），
-            // 用本地曲库里同专辑歌曲的封面兜底，避免专辑卡片全是占位图。
+            // 服务器专辑接口若没给出封面或歌曲数量，用曲库里同专辑歌曲兜底补齐
             val coverByAlbumId = HashMap<String, String>(allSongs.size)
             val coverByAlbumTitle = HashMap<String, String>(allSongs.size)
+            val countByAlbumId = HashMap<String, Int>(allSongs.size)
+            val countByAlbumTitle = HashMap<String, Int>(allSongs.size)
             for (song in allSongs) {
-                if (song.coverUrl.isBlank()) continue
-                if (song.albumId.isNotBlank() && !coverByAlbumId.containsKey(song.albumId)) {
-                    coverByAlbumId[song.albumId] = song.coverUrl
+                if (song.albumId.isNotBlank()) {
+                    countByAlbumId[song.albumId] = (countByAlbumId[song.albumId] ?: 0) + 1
+                    if (song.coverUrl.isNotBlank() && !coverByAlbumId.containsKey(song.albumId)) {
+                        coverByAlbumId[song.albumId] = song.coverUrl
+                    }
                 }
-                val titleKey = song.album.ifBlank { "单曲精选" }
-                if (!coverByAlbumTitle.containsKey(titleKey)) {
+                val titleKey = song.album.ifBlank { "未知专辑" }
+                countByAlbumTitle[titleKey] = (countByAlbumTitle[titleKey] ?: 0) + 1
+                val singleKey = song.album.ifBlank { "单曲精选" }
+                if (singleKey != titleKey) {
+                    countByAlbumTitle[singleKey] = (countByAlbumTitle[singleKey] ?: 0) + 1
+                }
+                if (song.coverUrl.isNotBlank() && !coverByAlbumTitle.containsKey(titleKey)) {
                     coverByAlbumTitle[titleKey] = song.coverUrl
                 }
             }
             serverAlbums.map { album ->
-                if (album.coverUrl.isNotBlank()) {
+                val resolvedCover = if (album.coverUrl.isNotBlank()) {
+                    album.coverUrl
+                } else {
+                    coverByAlbumId[album.id] ?: coverByAlbumTitle[album.title] ?: ""
+                }
+                val resolvedCount = maxOf(
+                    album.songCount,
+                    countByAlbumId[album.id] ?: 0,
+                    countByAlbumTitle[album.title] ?: 0
+                )
+                if (resolvedCover == album.coverUrl && resolvedCount == album.songCount) {
                     album
                 } else {
-                    val fallback = coverByAlbumId[album.id] ?: coverByAlbumTitle[album.title] ?: ""
-                    if (fallback.isBlank()) album else album.copy(coverUrl = fallback)
+                    album.copy(coverUrl = resolvedCover, songCount = resolvedCount)
                 }
             }
         } else {
@@ -441,9 +477,10 @@ fun LocalLibraryScreen(
     val localPlaylistCovers by produceState<Map<String, List<String>>>(
         initialValue = emptyMap(),
         key1 = sortedPlaylists,
-        key2 = allSongs.size
+        key2 = allSongs.size,
+        key3 = "${activeServerConfig?.id}_${currentServerName}"
     ) {
-        value = withContext(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
             val map = HashMap<String, List<String>>()
             
@@ -469,6 +506,10 @@ fun LocalLibraryScreen(
             }
             val diskFolderCoverCache = HashMap<String, String?>()
 
+            fun isUsableCover(url: String?): Boolean {
+                return !url.isNullOrBlank() && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(url)
+            }
+
             // 需要网络补齐封面的云端歌单（循环内只收集，循环后并发拉取，避免 N 次串行往返）
             val pendingCoverFetches = ArrayList<Pair<UnifiedPlaylist, MutableList<String>>>()
             for (pl in sortedPlaylists) {
@@ -477,7 +518,7 @@ fun LocalLibraryScreen(
                 // 1. 如果已有 previewCovers，先放入
                 if (pl.previewCovers.isNotEmpty()) {
                     for (c in pl.previewCovers) {
-                        if (c.isNotBlank() && !covers.contains(c) && covers.size < 4) {
+                        if (isUsableCover(c) && !covers.contains(c) && covers.size < 4) {
                             covers.add(c)
                         }
                     }
@@ -487,7 +528,7 @@ fun LocalLibraryScreen(
                 if (covers.size < 4 && pl.coverUrl.contains("|")) {
                     for (c in pl.coverUrl.split("|")) {
                         val tc = c.trim()
-                        if (tc.isNotBlank() && !covers.contains(tc) && covers.size < 4) {
+                        if (isUsableCover(tc) && !covers.contains(tc) && covers.size < 4) {
                             covers.add(tc)
                         }
                     }
@@ -497,7 +538,7 @@ fun LocalLibraryScreen(
                 if (covers.size < 4) {
                     val dbCovers = db.playlistDao().getPlaylistCoverUrls(pl.id)
                     for (c in dbCovers) {
-                        if (c.isNotBlank() && !covers.contains(c) && covers.size < 4) {
+                        if (isUsableCover(c) && !covers.contains(c) && covers.size < 4) {
                             covers.add(c)
                         }
                     }
@@ -509,11 +550,11 @@ fun LocalLibraryScreen(
                     for (s in plSongs) {
                         if (covers.size >= 4) break
                         var c = s.coverUrl
-                        if (c.isNullOrBlank()) {
+                        if (!isUsableCover(c)) {
                             val matched = songById[s.id] ?: (if (!s.localFilePath.isNullOrBlank()) songByPath[s.localFilePath!!] else null)
                             c = matched?.coverUrl ?: ""
                         }
-                        if (c.isNullOrBlank() && !s.localFilePath.isNullOrBlank()) {
+                        if (!isUsableCover(c) && !s.localFilePath.isNullOrBlank()) {
                             val parentPath = s.localFilePath!!.replace('\\', '/').substringBeforeLast('/', "")
                             if (parentPath.isNotBlank()) {
                                 val diskCover = diskFolderCoverCache.getOrPut(parentPath) {
@@ -535,8 +576,8 @@ fun LocalLibraryScreen(
                                 if (!diskCover.isNullOrBlank()) c = diskCover
                             }
                         }
-                        if (!c.isNullOrBlank() && !covers.contains(c)) {
-                            covers.add(c)
+                        if (isUsableCover(c) && !covers.contains(c)) {
+                            covers.add(c!!)
                         }
                     }
                 }
@@ -548,43 +589,53 @@ fun LocalLibraryScreen(
                     for (s in matchedFromAll) {
                         if (covers.size >= 4) break
                         val c = s.coverUrl
-                        if (!c.isNullOrBlank() && !covers.contains(c)) {
+                        if (isUsableCover(c) && !covers.contains(c)) {
                             covers.add(c)
                         }
                     }
                 }
 
-                // 6. 如果是云端歌单且仍不足 4 首，拉取一次歌单歌曲
-                //    注意：这里必须是 suspend 调用且**不能**在主线程。
-                //    整个 produceState 已在 Dispatchers.IO 内执行，因此串行 N 个歌单的代价可接受；
-                //    但为缩短首次呈现时间，把「需要网络补齐封面」的歌单收集起来，最后并发执行。
-                //    （原先每个歌单顺序 await 一次网络请求，20 个歌单 = 20 次串行往返。）
-                if (covers.size < 4 && pl.isOnline && onFetchPlaylistSongs != null) {
+                // 6. 如果是云端歌单且仍不足 4 首（或含有尚未核验 hasPicture 的 /api/tag/cover 链接），拉取一次歌单歌曲核验并补齐真实封面
+                val targetCoverCount = minOf(4, pl.songCount.coerceAtLeast(1))
+                if (pl.isOnline && onFetchPlaylistSongs != null && (covers.size < targetCoverCount || covers.any { it.contains("/api/tag/cover") })) {
                     pendingCoverFetches.add(pl to covers)
                 }
 
                 // 7. 回退 fallbackCoverUrl
-                if (covers.isEmpty() && pl.coverUrl.isNotBlank() && !pl.coverUrl.contains("|")) {
+                if (covers.isEmpty() && isUsableCover(pl.coverUrl) && !pl.coverUrl.contains("|")) {
                     covers.add(pl.coverUrl)
                 }
 
-                // 先不写入 map：需要联网补齐的歌单要等并发请求回来后再统一落表
-                if (covers.isNotEmpty() && !pendingCoverFetches.any { it.first.id == pl.id }) {
+                if (covers.isNotEmpty()) {
                     map[pl.id] = covers.take(4)
                 }
             }
+            // 先立即发布一轮已有封面，避免等待网络补齐期间卡片空白
+            value = HashMap(map)
+
             // 并发补齐封面：每个歌单一次网络请求，彼此独立，用 async 并行发出。
-            // 原先在循环内逐个歌单 await 一次网络请求（N 个歌单 = N 次串行往返），
-            // 且每次都要等上一次超时。改为并发后整体耗时约等于最慢的那一个。
             if (pendingCoverFetches.isNotEmpty()) {
                 val deferred = pendingCoverFetches.map { (pl, covers) ->
                     async {
                         try {
                             val fetched = onFetchPlaylistSongs?.invoke(pl.id, true).orEmpty()
+                            val orderedCovers = ArrayList<String>(4)
                             for (song in fetched) {
-                                if (covers.size >= 4) break
+                                if (orderedCovers.size >= 4) break
                                 val c = song.coverUrl
-                                if (!c.isNullOrBlank() && !covers.contains(c)) covers.add(c)
+                                if (isUsableCover(c) && !orderedCovers.contains(c)) {
+                                    orderedCovers.add(c)
+                                }
+                            }
+                            for (c in covers) {
+                                if (orderedCovers.size >= 4) break
+                                if (isUsableCover(c) && !orderedCovers.contains(c)) {
+                                    orderedCovers.add(c)
+                                }
+                            }
+                            if (orderedCovers.isNotEmpty()) {
+                                covers.clear()
+                                covers.addAll(orderedCovers)
                             }
                         } catch (_: Exception) {
                             // 单个歌单失败不影响其它歌单，封面拿不到就沿用已有回退
@@ -600,17 +651,23 @@ fun LocalLibraryScreen(
                         // 单个歌单封面拉取失败不影响其它歌单
                     }
                 }
-                // 统一落表：必须在 await 之后读取 covers，否则并发补齐的封面会被丢掉
                 for ((pl, covers) in pendingCoverFetches) {
                     if (covers.isNotEmpty()) map[pl.id] = covers.take(4)
                 }
+                value = HashMap(map)
             }
-            map
         }
     }
 
-    // 自动同步服务器歌单 (进入资料库或服务器配置就绪时自动拉取)
-    LaunchedEffect(activeServerConfig?.id) {
+    // 切换本地曲库与在线服务器时：自动复位旧下钻视图状态并刷新歌单数据，防止跨模式数据残留与状态冲突
+    LaunchedEffect(activeServerConfig?.id, currentServerName) {
+        activeSubViewTitle = null
+        activePlaylistId = null
+        activeSubViewSongs = emptyList()
+        isMainSongsMultiSelect = false
+        selectedMainSongIds = emptySet()
+        isSubViewMultiSelect = false
+        selectedSubViewSongIds = emptySet()
         if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
             onRefreshPlaylists()
         }
@@ -792,10 +849,9 @@ fun LocalLibraryScreen(
                 //   1 Bento 核心卡片  —— 始终存在（key = "lib_top_bento_cards"）
                 //   2 自建与云端歌单  —— **始终存在**（原先漏算，导致定位永远偏一行）
                 //   3 最近添加        —— 条件：recentAddedSongs 非空
-                //   4 本地文件夹      —— 条件：localFolders 非空
-                //   5 全部歌曲标题栏  —— 始终存在
-                //   6+ 歌曲列表
-                var headerCount = LOCAL_LIBRARY_SECTION_ALL_SONGS_HEADER_INDEX
+                // 基础固定项目共 4 项（头部标题栏、Bento核心卡片、自建与云端歌单、全部歌曲标题栏）
+                // 动态项目：最近添加、本地文件夹
+                var headerCount = 4
                 if (recentAddedSongs.isNotEmpty()) headerCount++
                 if (localFolders.isNotEmpty()) headerCount++
                 runCatching { libraryListState.animateScrollToItem(headerCount + mainIdx) }
@@ -934,7 +990,7 @@ fun LocalLibraryScreen(
 
                 // ==================== 1.5 核心入口流光卡片 (动态液态光影设计) ====================
                 item(key = "lib_top_bento_cards") {
-                    val topAlbum = albums.firstOrNull()
+                    val topAlbum = recentAddedAlbums.firstOrNull() ?: albums.firstOrNull()
 
                     @Composable
                     fun ServerStatusCard(cardModifier: Modifier = Modifier) {
@@ -1105,7 +1161,7 @@ fun LocalLibraryScreen(
                                 }
                             }
 
-                            // 中间封面与专辑信息
+                            // 中间封面与专辑信息（展示专辑名称、歌手及专辑下歌曲数量）
                             if (topAlbum != null) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -1128,11 +1184,23 @@ fun LocalLibraryScreen(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                         Text(
-                                            text = topAlbum.artist,
+                                            text = "${topAlbum.artist} · ${topAlbum.songCount} 首",
                                             fontSize = 10.sp,
-                                            color = Color.White.copy(alpha = 0.75f),
+                                            color = Color.White.copy(alpha = 0.80f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = Color.White.copy(alpha = 0.18f)
+                                    ) {
+                                        Text(
+                                            text = "${topAlbum.songCount} 首",
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.White,
+                                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
                                         )
                                     }
                                 }
@@ -1482,7 +1550,9 @@ fun LocalLibraryScreen(
                                                 // 若不复位，isLoadingSubView 会永远为 true → 页面停在永久转圈，
                                                 // 用户只能杀进程重开。
                                                 try {
-                                                    activeSubViewSongs = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                                    val fetched = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                                    activeSubViewSongs = fetched
+                                                    activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${maxOf(pl.songCount, fetched.size)} 首"
                                                 } catch (e: kotlinx.coroutines.CancellationException) {
                                                     throw e
                                                 } catch (_: Exception) {
@@ -1749,7 +1819,7 @@ fun LocalLibraryScreen(
                 } else {
                     itemsIndexed(
                         items = filteredSongs,
-                        key = { _, song -> song.id },
+                        key = { idx, song -> "${song.id}_$idx" },
                         contentType = { _, _ -> "library_song_item" }
                     ) { idx, song ->
                         val isSelected = selectedMainSongIds.contains(song.id)
@@ -2107,8 +2177,17 @@ fun LocalLibraryScreen(
                                     if (onFetchPlaylistSongs != null) {
                                         isLoadingSubView = true
                                         coroutineScope.launch {
-                                            activeSubViewSongs = onFetchPlaylistSongs(pl.id, pl.isOnline)
-                                            isLoadingSubView = false
+                                            try {
+                                                val fetched = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                                activeSubViewSongs = fetched
+                                                activeSubViewSubtitle = "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${maxOf(pl.songCount, fetched.size)} 首"
+                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                throw e
+                                            } catch (_: Exception) {
+                                                activeSubViewSongs = emptyList()
+                                            } finally {
+                                                isLoadingSubView = false
+                                            }
                                         }
                                     } else {
                                         activeSubViewSongs = allSongs.filter { it.album == pl.name }
@@ -2223,16 +2302,20 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        items(albums, key = { it.id }) { album ->
+                        items(recentAddedAlbums.ifEmpty { albums }, key = { it.id }) { album ->
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(14.dp))
                                     .clickable {
-                                        val albumSongs = allSongs.filter { it.album == album.title }
+                                        val albumSongs = allSongs.filter {
+                                            it.album == album.title ||
+                                            (album.id.isNotBlank() && it.albumId == album.id) ||
+                                            (album.title in listOf("未知专辑", "单曲精选") && it.album.isBlank())
+                                        }
                                         isFromAllAlbums = true
                                         activeSubViewTitle = album.title
-                                        activeSubViewSubtitle = "${album.artist} · 共 ${albumSongs.size} 首"
+                                        activeSubViewSubtitle = "${album.artist} · 共 ${maxOf(album.songCount, albumSongs.size)} 首"
                                         activeSubViewSongs = albumSongs
                                     }
                             ) {
@@ -2291,11 +2374,11 @@ fun LocalLibraryScreen(
                         ),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(
+                        itemsIndexed(
                             items = activeSubViewSongs,
-                            key = { it.id },
-                            contentType = { "subview_song_row" }
-                        ) { song ->
+                            key = { idx, song -> "${song.id}_$idx" },
+                            contentType = { _, _ -> "subview_song_row" }
+                        ) { _, song ->
                             if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
                                 val isSelected = song.id in selectedDownloadSongIds
                                 Surface(
@@ -2932,65 +3015,6 @@ private fun RecentAddedSongCard(
             overflow = TextOverflow.Ellipsis
         )
     }
-}
-
-@Composable
-private fun rememberLiquidPhase(enabled: Boolean, durationMillis: Int = 8000): State<Float> {
-    if (!enabled) return remember { mutableFloatStateOf(0f) }
-    val infiniteTransition = rememberInfiniteTransition(label = "lib_liquid_phase")
-    return infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = durationMillis, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-}
-
-/**
- * 绘制有机非规则变形液态光斑 Path（复用预分配 Path 与 FloatArray 缓冲，零堆内存分配）
- */
-private fun updateOrganicLiquidPath(
-    path: Path,
-    ptsBuffer: FloatArray,
-    cx: Float,
-    cy: Float,
-    baseRadius: Float,
-    phaseRad: Float,
-    h1: Float = 1.0f,
-    h2: Float = 2.0f,
-    h3: Float = 3.0f
-) {
-    path.reset()
-    val pointsCount = 8
-    val step = (2.0 * Math.PI / pointsCount).toFloat()
-
-    for (i in 0 until pointsCount) {
-        val angle = i * step
-        val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
-                   0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
-                   0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
-        val r = baseRadius * (1f + wave)
-        ptsBuffer[i * 2] = cx + r * kotlin.math.cos(angle)
-        ptsBuffer[i * 2 + 1] = cy + r * kotlin.math.sin(angle)
-    }
-
-    val firstMidX = (ptsBuffer[0] + ptsBuffer[2]) / 2f
-    val firstMidY = (ptsBuffer[1] + ptsBuffer[3]) / 2f
-    path.moveTo(firstMidX, firstMidY)
-
-    for (i in 0 until pointsCount) {
-        val nextIdx = ((i + 1) % pointsCount) * 2
-        val afterNextIdx = ((i + 2) % pointsCount) * 2
-        val nextX = ptsBuffer[nextIdx]
-        val nextY = ptsBuffer[nextIdx + 1]
-        val midX = (nextX + ptsBuffer[afterNextIdx]) / 2f
-        val midY = (nextY + ptsBuffer[afterNextIdx + 1]) / 2f
-        path.quadraticBezierTo(nextX, nextY, midX, midY)
-    }
-    path.close()
 }
 
 /**

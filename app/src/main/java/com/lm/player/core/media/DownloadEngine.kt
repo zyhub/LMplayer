@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -320,7 +321,13 @@ class DownloadEngine(
             song.format.contains("aac", ignoreCase = true) -> "aac"
             else -> "mp3"
         }
-        return File(parentDir, "$safeTitle.$ext")
+        val isArtistUnknown = song.artist.isBlank() || song.artist.contains("未知")
+        val fileName = if (isArtistUnknown && subFolder == "Music") {
+            "${safeTitle}_${song.id.takeLast(6)}.$ext"
+        } else {
+            "$safeTitle.$ext"
+        }
+        return File(parentDir, fileName)
     }
 
     private suspend fun saveOrUpdateSongEntity(song: UnifiedSong, localFilePath: String) {
@@ -338,8 +345,35 @@ class DownloadEngine(
             }
         }
 
-        val existing = songDao.getSongById(song.id)
-        if (existing != null) {
+        val existingByPath = songDao.getSongByLocalPath(localFilePath)
+        val existingById = songDao.getSongById(song.id)
+        val isSongServerLinked = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+        val isExistingPathServerLinked = existingByPath != null && existingByPath.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+
+        // 若数据库中已有另一条不同 ID 的记录指向同一物理文件：
+        // 优先保留已关联服务器的曲目记录，清理冗余的本地/在线临时 ID 记录，防止已下载列表重复出现两条相同歌曲
+        if (existingByPath != null && existingByPath.id != song.id) {
+            if (isExistingPathServerLinked && !isSongServerLinked) {
+                songDao.updateDownloadStatusSpecsAndTimestamp(
+                    songId = existingByPath.id,
+                    status = DownloadStatus.DOWNLOADED,
+                    localPath = localFilePath,
+                    format = detectedExt,
+                    bitRate = computedBitRate,
+                    timestamp = System.currentTimeMillis()
+                )
+                if (existingById != null) {
+                    songDao.deleteSongById(song.id)
+                }
+                downloadDao.deleteDownload(song.id)
+                return
+            } else {
+                songDao.deleteSongById(existingByPath.id)
+                downloadDao.deleteDownload(existingByPath.id)
+            }
+        }
+
+        if (existingById != null) {
             songDao.updateDownloadStatusSpecsAndTimestamp(
                 songId = song.id,
                 status = DownloadStatus.DOWNLOADED,
@@ -369,7 +403,8 @@ class DownloadEngine(
                 format = detectedExt,
                 isFavorite = song.isFavorite,
                 relativeFolderPath = safeRelativePath,
-                addedTimestamp = System.currentTimeMillis()
+                addedTimestamp = System.currentTimeMillis(),
+                rawMetaJson = song.rawMetaJson
             )
             songDao.insertSongs(listOf(newEntity))
         }
@@ -423,7 +458,7 @@ class DownloadEngine(
             // 1. 防重复下载检测与核对：仅当目标同名**同音质档次**的物理文件已存在且非空时才跳过下载
             val record = downloadDao.getDownloadRecord(song.id)
             val requestedLossless = song.format.equals("flac", ignoreCase = true) || song.bitRate >= 800
-            fun isExistingFileCompatible(path: String?): Boolean {
+            suspend fun isExistingFileCompatible(path: String?): Boolean {
                 if (path.isNullOrBlank()) return false
                 val f = File(path)
                 if (!f.exists() || f.length() <= 0L || f.name.endsWith(".download")) return false
@@ -431,9 +466,14 @@ class DownloadEngine(
                 return if (requestedLossless) {
                     realExt in LOSSLESS_AUDIO_EXTS
                 } else {
-                    // 以前这里对任何有损请求都无条件放行 → 本地已有 FLAC 时选 320K 会被判为
-                    // "已下载完成"直接跳过，用户永远拿不到 320K。现在要求已有文件也必须是有损的。
-                    realExt !in LOSSLESS_AUDIO_EXTS
+                    if (realExt in LOSSLESS_AUDIO_EXTS) return false
+                    if (song.bitRate >= 320) {
+                        val existingBitRate = songDao.getSongByLocalPath(f.absolutePath)?.bitRate
+                            ?: record?.let { if (it.localFilePath == f.absolutePath) song.bitRate else 0 }
+                            ?: 0
+                        if (existingBitRate in 1..255) return false
+                    }
+                    true
                 }
             }
 
@@ -447,10 +487,24 @@ class DownloadEngine(
                     isRecordDownloaded -> record!!.localFilePath!!
                     else -> song.localFilePath!!
                 }
+                val canonicalOwner = songDao.getSongByLocalPath(validPath)
+                val targetRecordSongId = if (canonicalOwner != null && canonicalOwner.id != song.id &&
+                    canonicalOwner.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                ) {
+                    canonicalOwner.id
+                } else {
+                    song.id
+                }
+                downloadDao.deleteDownloadByLocalPath(validPath)
                 saveOrUpdateSongEntity(song, validPath)
+                val platformInitial = if (song.id.startsWith("lemon_online_")) {
+                    song.id.removePrefix("lemon_online_").substringBefore("_")
+                } else "kw"
+                val rawMetaInitial = song.rawMetaJson ?: song.relativeFolderPath
+                val isServerSongInitial = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
                 downloadDao.insertOrUpdate(
                     DownloadEntity(
-                        songId = song.id,
+                        songId = targetRecordSongId,
                         title = song.title,
                         artist = song.artist,
                         coverUrl = song.coverUrl,
@@ -459,7 +513,12 @@ class DownloadEngine(
                         status = DownloadStatus.DOWNLOADED,
                         bytesDownloaded = File(validPath).length(),
                         totalBytes = File(validPath).length(),
-                        completedTimestamp = System.currentTimeMillis()
+                        completedTimestamp = System.currentTimeMillis(),
+                        sourcePlatform = platformInitial,
+                        platformSongId = song.id.removePrefix("lemon_online_${platformInitial}_"),
+                        chosenQuality = if (song.bitRate >= 800) "flac" else if (song.bitRate >= 320) "320k" else "128k",
+                        rawMetaJson = rawMetaInitial,
+                        serverPushStatus = if (isServerSongInitial) 0 else 1
                     )
                 )
                 removeTask(song.id)
@@ -475,6 +534,11 @@ class DownloadEngine(
             }
 
             // 2. 初始化下载任务与数据库状态 (队列排队状态)
+            val platform = if (song.id.startsWith("lemon_online_")) {
+                song.id.removePrefix("lemon_online_").substringBefore("_")
+            } else "kw"
+            val rawMeta = song.rawMetaJson ?: song.relativeFolderPath
+            val isServerSong = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
             val initialEntity = DownloadEntity(
                 songId = song.id,
                 title = song.title,
@@ -484,7 +548,12 @@ class DownloadEngine(
                 remoteUrl = song.streamUrl,
                 status = DownloadStatus.DOWNLOADING,
                 bytesDownloaded = 0L,
-                totalBytes = 0L
+                totalBytes = 0L,
+                sourcePlatform = platform,
+                platformSongId = song.id.removePrefix("lemon_online_${platform}_"),
+                chosenQuality = if (song.bitRate >= 800) "flac" else if (song.bitRate >= 320) "320k" else "128k",
+                rawMetaJson = rawMeta,
+                serverPushStatus = if (isServerSong) 0 else 1
             )
             downloadDao.insertOrUpdate(initialEntity)
             
@@ -527,8 +596,8 @@ class DownloadEngine(
                     fun buildDownloadRequest(rangeStart: Long): Request {
                         val rb = Request.Builder()
                             .url(effectiveStreamUrl)
-                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                            .header("Accept", "*/*")
+                        val cdnHeaders = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(effectiveStreamUrl)
+                        cdnHeaders.forEach { (k, v) -> rb.header(k, v) }
                         if (rangeStart > 0L) {
                             rb.header("Range", "bytes=$rangeStart-")
                         }
@@ -672,8 +741,21 @@ class DownloadEngine(
                     val quickCover = postProcessLocalCoverOnly(actualDestFile)
                     val effectiveCover = if (!quickCover.isNullOrBlank() && finalSong.coverUrl.isBlank()) quickCover else finalSong.coverUrl
 
-                    // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表
+                    // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表（先清理同一物理路径的冗余旧记录）
+                    val canonicalOwner = songDao.getSongByLocalPath(actualDestFile.absolutePath)
+                    val targetRecordSongId = if (canonicalOwner != null && canonicalOwner.id != song.id &&
+                        canonicalOwner.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                    ) {
+                        canonicalOwner.id
+                    } else {
+                        song.id
+                    }
+                    downloadDao.deleteDownloadByLocalPath(actualDestFile.absolutePath)
+                    if (targetRecordSongId != song.id) {
+                        downloadDao.deleteDownload(song.id)
+                    }
                     val completedEntity = initialEntity.copy(
+                        songId = targetRecordSongId,
                         status = DownloadStatus.DOWNLOADED,
                         coverUrl = effectiveCover,
                         localFilePath = actualDestFile.absolutePath,
@@ -1138,14 +1220,10 @@ class DownloadEngine(
     }
 
     private fun updateTask(task: DownloadTask) {
-        val map = _activeTasksMap.value.toMutableMap()
-        map[task.song.id] = task
-        _activeTasksMap.value = map
+        _activeTasksMap.update { it + (task.song.id to task) }
     }
 
     private fun removeTask(songId: String) {
-        val map = _activeTasksMap.value.toMutableMap()
-        map.remove(songId)
-        _activeTasksMap.value = map
+        _activeTasksMap.update { it - songId }
     }
 }

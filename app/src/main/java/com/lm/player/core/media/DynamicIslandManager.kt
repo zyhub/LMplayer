@@ -295,7 +295,11 @@ object DynamicIslandManager {
                 val needOverlayLyrics = shouldUseOverlayIsland() &&
                         (_isAppInBackgroundFlow.value || playing)
                 if (song != null && player != null && needOverlayLyrics) {
-                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    val offsetMs = runCatching {
+                        appContext.getSharedPreferences("zds_lyrics_prefs", Context.MODE_PRIVATE)
+                            .getLong("lyrics_offset_ms", 0L)
+                    }.getOrDefault(0L)
+                    val pos = (player.currentPosition + offsetMs).coerceAtLeast(0L)
                     val lines = activeLyricResult.lines.ifEmpty {
                         LyricsManager.getCachedLyrics(song.id)?.lines.orEmpty()
                     }

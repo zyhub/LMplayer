@@ -255,9 +255,20 @@ object AudioMetadataEmbedder {
 
     private fun isFlacFile(file: File): Boolean {
         return try {
-            RandomAccessFile(file, "r").use {
+            RandomAccessFile(file, "r").use { raf ->
+                var startOffset = 0L
+                val header = ByteArray(10)
+                if (raf.read(header) < 4) return false
+                if (header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() && header[2] == '3'.code.toByte()) {
+                    val id3Size = ((header[6].toInt() and 0x7F) shl 21) or
+                            ((header[7].toInt() and 0x7F) shl 14) or
+                            ((header[8].toInt() and 0x7F) shl 7) or
+                            (header[9].toInt() and 0x7F)
+                    startOffset = 10L + id3Size
+                }
+                raf.seek(startOffset)
                 val magic = ByteArray(4)
-                it.readFully(magic)
+                if (raf.read(magic) < 4) return false
                 magic[0] == 'f'.code.toByte() && magic[1] == 'L'.code.toByte() &&
                         magic[2] == 'a'.code.toByte() && magic[3] == 'C'.code.toByte()
             }
@@ -277,6 +288,21 @@ object AudioMetadataEmbedder {
         val tempFile = File(file.parentFile, "${file.name}.flac_tmp")
         try {
             RandomAccessFile(file, "r").use { raf ->
+                var startOffset = 0L
+                val header = ByteArray(10)
+                if (raf.read(header) < 4) return false
+                var hasId3 = false
+                var id3TotalLen = 0L
+                if (header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() && header[2] == '3'.code.toByte()) {
+                    val id3Size = ((header[6].toInt() and 0x7F) shl 21) or
+                            ((header[7].toInt() and 0x7F) shl 14) or
+                            ((header[8].toInt() and 0x7F) shl 7) or
+                            (header[9].toInt() and 0x7F)
+                    startOffset = 10L + id3Size
+                    hasId3 = true
+                    id3TotalLen = startOffset
+                }
+                raf.seek(startOffset)
                 val magic = ByteArray(4)
                 raf.readFully(magic)
                 if (String(magic, Charsets.US_ASCII) != "fLaC") {
@@ -336,6 +362,12 @@ object AudioMetadataEmbedder {
 
                 // 5. 写入临时文件
                 FileOutputStream(tempFile).use { fos ->
+                    if (hasId3 && id3TotalLen > 0L) {
+                        raf.seek(0)
+                        val id3Buf = ByteArray(id3TotalLen.toInt())
+                        raf.readFully(id3Buf)
+                        fos.write(id3Buf)
+                    }
                     fos.write(magic) // "fLaC"
 
                     for (i in newBlocks.indices) {
@@ -491,16 +523,16 @@ object AudioMetadataEmbedder {
                 val moovBytes = ByteArray(moovSize.toInt())
                 raf.readFully(moovBytes)
 
-                // 构建新的 ilst 树
-                val updatedMoovBytes = updateMoovWithMetadata(moovBytes, title, artist, album, coverBytes, lyrics)
-                val deltaSize = updatedMoovBytes.size - moovSize
-
-                // 若 moov 排在 mdat 之前，且 moov 大小发生变化，需要调整 stco / co64 块偏移
-                val finalMoovBytes = if (mdatOffset > moovOffset && deltaSize != 0L) {
-                    adjustChunkOffsets(updatedMoovBytes, deltaSize)
-                } else {
-                    updatedMoovBytes
-                }
+                // 构建新的 ilst 树并在纯净 strippedMoov 上调整 stco / co64 块偏移 (若 moov 排在 mdat 之前)
+                val finalMoovBytes = updateMoovWithMetadata(
+                    moovBytes = moovBytes,
+                    title = title,
+                    artist = artist,
+                    album = album,
+                    coverBytes = coverBytes,
+                    lyrics = lyrics,
+                    needAdjustChunkOffsets = (mdatOffset > moovOffset)
+                )
 
                 // 写入临时文件
                 FileOutputStream(tempFile).use { fos ->
@@ -547,7 +579,8 @@ object AudioMetadataEmbedder {
         artist: String,
         album: String,
         coverBytes: ByteArray?,
-        lyrics: String?
+        lyrics: String?,
+        needAdjustChunkOffsets: Boolean = false
     ): ByteArray {
         val ilstBos = ByteArrayOutputStream()
         if (title.isNotBlank()) writeMp4TextAtom(ilstBos, "©nam", title)
@@ -594,12 +627,21 @@ object AudioMetadataEmbedder {
             write(metaAtom)
         }.toByteArray()
 
-        // 移除 moov 中原有的 udta 原子（若有），并追加新 udta
+        // 移除 moov 中原有的 udta 原子（若有）
         val strippedMoov = removeAtom(moovBytes, "udta")
+        val finalMoovSize = strippedMoov.size + udtaAtom.size
+        val deltaSize = finalMoovSize.toLong() - moovBytes.size.toLong()
+
+        // 关键安全重构：在纯净的 strippedMoov（不含新封面图片与歌词）上执行块偏移调整，杜绝误匹配图片二进制中的 "stco" 字节
+        val adjustedStrippedMoov = if (needAdjustChunkOffsets && deltaSize != 0L) {
+            adjustChunkOffsets(strippedMoov, deltaSize)
+        } else {
+            strippedMoov
+        }
+
         val finalMoov = ByteArrayOutputStream().apply {
-            val totalMoovSize = strippedMoov.size + udtaAtom.size
-            writeBigEndianInt(this, totalMoovSize)
-            write(strippedMoov, 4, strippedMoov.size - 4)
+            writeBigEndianInt(this, finalMoovSize)
+            write(adjustedStrippedMoov, 4, adjustedStrippedMoov.size - 4)
             write(udtaAtom)
         }.toByteArray()
 
@@ -611,13 +653,20 @@ object AudioMetadataEmbedder {
         var offset = 8 // skip parent size & type
         bos.write(parentBytes, 0, 8)
         while (offset < parentBytes.size - 8) {
-            val atomSize = ByteBuffer.wrap(parentBytes, offset, 4).int
+            val rawSize = ByteBuffer.wrap(parentBytes, offset, 4).int.toLong() and 0xFFFFFFFFL
             val atomType = String(parentBytes, offset + 4, 4, Charsets.US_ASCII)
-            if (atomSize <= 0 || offset + atomSize > parentBytes.size) break
-            if (atomType != targetType) {
-                bos.write(parentBytes, offset, atomSize)
+            var actualAtomSize = rawSize
+            if (rawSize == 1L) {
+                if (offset + 16 > parentBytes.size) break
+                actualAtomSize = ByteBuffer.wrap(parentBytes, offset + 8, 8).long
+            } else if (rawSize == 0L) {
+                actualAtomSize = (parentBytes.size - offset).toLong()
             }
-            offset += atomSize
+            if (actualAtomSize <= 0 || offset + actualAtomSize > parentBytes.size) break
+            if (atomType != targetType) {
+                bos.write(parentBytes, offset, actualAtomSize.toInt())
+            }
+            offset += actualAtomSize.toInt()
         }
         return bos.toByteArray()
     }
@@ -666,9 +715,12 @@ object AudioMetadataEmbedder {
 
     private fun adjustChunkOffsets(moovBytes: ByteArray, delta: Long): ByteArray {
         val copy = moovBytes.copyOf()
-        val target = "stco".toByteArray(Charsets.US_ASCII)
-        for (i in 0 until copy.size - target.size - 8) {
-            if (copy[i] == target[0] && copy[i + 1] == target[1] && copy[i + 2] == target[2] && copy[i + 3] == target[3]) {
+        val stco = "stco".toByteArray(Charsets.US_ASCII)
+        val co64 = "co64".toByteArray(Charsets.US_ASCII)
+
+        // 1. 调整 32 位 stco
+        for (i in 0 until copy.size - stco.size - 8) {
+            if (copy[i] == stco[0] && copy[i + 1] == stco[1] && copy[i + 2] == stco[2] && copy[i + 3] == stco[3]) {
                 val countOffset = i + 8
                 if (countOffset + 4 <= copy.size) {
                     val entryCount = ByteBuffer.wrap(copy, countOffset, 4).int
@@ -682,6 +734,26 @@ object AudioMetadataEmbedder {
                         copy[curPos + 2] = ((newOffset shr 8) and 0xFF).toByte()
                         copy[curPos + 3] = (newOffset and 0xFF).toByte()
                         curPos += 4
+                    }
+                }
+            }
+        }
+
+        // 2. 调整 64 位 co64
+        for (i in 0 until copy.size - co64.size - 8) {
+            if (copy[i] == co64[0] && copy[i + 1] == co64[1] && copy[i + 2] == co64[2] && copy[i + 3] == co64[3]) {
+                val countOffset = i + 8
+                if (countOffset + 4 <= copy.size) {
+                    val entryCount = ByteBuffer.wrap(copy, countOffset, 4).int
+                    var curPos = countOffset + 4
+                    for (c in 0 until entryCount) {
+                        if (curPos + 8 > copy.size) break
+                        val oldOffset = ByteBuffer.wrap(copy, curPos, 8).long
+                        val newOffset = oldOffset + delta
+                        val bb = ByteBuffer.allocate(8).putLong(newOffset)
+                        val newBytes = bb.array()
+                        System.arraycopy(newBytes, 0, copy, curPos, 8)
+                        curPos += 8
                     }
                 }
             }

@@ -47,11 +47,16 @@ import com.lm.player.core.model.UnifiedArtist
 import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
 
+private val realFormatCache = androidx.collection.LruCache<String, Triple<String, Int, String>>(512)
+
 /**
  * 精准解析本地已下载文件的真实封装格式 (支持魔数头 fLaC 校验)、真实码率与真实物理文件大小
  */
 fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String> {
     val localPath = song.localFilePath
+    val cacheKey = if (!localPath.isNullOrBlank()) "$localPath:${song.bitRate}:${song.format}" else "${song.id}:${song.bitRate}:${song.format}"
+    realFormatCache.get(cacheKey)?.let { return it }
+
     val localFile = if (!localPath.isNullOrBlank() && !localPath.startsWith("content://")) {
         try {
             java.io.File(localPath).takeIf { it.exists() && it.length() > 0L }
@@ -95,7 +100,9 @@ fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String
         "%.1f MB".format(java.util.Locale.US, estMb)
     }
 
-    return Triple(detectedExt, realBitRate, sizeStr)
+    val result = Triple(detectedExt, realBitRate, sizeStr)
+    realFormatCache.put(cacheKey, result)
+    return result
 }
 
 /**
@@ -327,6 +334,9 @@ fun SongListItemRow(
                 val (realFormatStr, realBitRate, realSizeStr) = remember(song.id, song.localFilePath, song.format, song.bitRate) {
                     resolveRealLocalFormatAndSize(song)
                 }
+                val downloadedSpecs = remember(song.id, song.localFilePath, song.format, song.bitRate) {
+                    formatDownloadedSongSpecs(song)
+                }
                 val isLosslessLocal = realFormatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
                 // 已下载到本地的歌曲：括号内显示真实文件具体音质与大小，下方显示完整技术参数
                 Text(
@@ -355,7 +365,7 @@ fun SongListItemRow(
                     }
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = formatDownloadedSongSpecs(song),
+                        text = downloadedSpecs,
                         fontSize = dimensions.badgeSize,
                         color = Color(0xFF34C759),
                         maxLines = 1,

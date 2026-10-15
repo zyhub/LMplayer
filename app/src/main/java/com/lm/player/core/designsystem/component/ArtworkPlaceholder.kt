@@ -11,7 +11,10 @@ import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +46,43 @@ fun getGradientForId(id: String): List<Color> {
     return AppleGradients[index]
 }
 
+private fun normalizeMusicCoverUrl(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    var url = raw.trim()
+    if (url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
+    if (com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(url)) return null
+    if (url.startsWith("//")) {
+        url = "https:$url"
+    }
+    if (url.contains("{size}")) {
+        url = url.replace("{size}", "400")
+    }
+    if (url.contains("kuwo.cn/star/albumcover/120/")) {
+        url = url.replace("kuwo.cn/star/albumcover/120/", "kuwo.cn/star/albumcover/500/")
+    }
+    return url
+}
+
+private fun buildMusicImageRequest(
+    context: android.content.Context,
+    rawUrl: String?,
+    width: Int,
+    height: Int = width
+): ImageRequest? {
+    val cleanUrl = normalizeMusicCoverUrl(rawUrl) ?: return null
+    val builder = ImageRequest.Builder(context)
+        .data(cleanUrl)
+        .size(width, height)
+        .crossfade(false)
+    if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
+        val headers = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(cleanUrl)
+        for ((k, v) in headers) {
+            builder.addHeader(k, v)
+        }
+    }
+    return builder.build()
+}
+
 /**
  * 高性能专辑/歌曲封面组件 (限制解码尺寸杜绝车机内存溢出与 GC 卡顿)
  */
@@ -56,13 +96,8 @@ fun AlbumArtworkImage(
     seedId: String = "",
     targetSize: Int = 160 // 默认按列表高保真 160px 解码，大幅减少 75% 显存
 ) {
-    val cleanModel = remember(model) {
-        if (model.isNullOrBlank()) null
-        else {
-            val trimmed = model.trim()
-            if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
-        }
-    }
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
     val gradientColors = remember(seedId, cleanModel) {
         getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "seed"))
     }
@@ -75,17 +110,14 @@ fun AlbumArtworkImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!cleanModel.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank() && !loadFailed) {
             AsyncImage(
                 model = remember(cleanModel, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(cleanModel)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = contentScale,
+                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -106,8 +138,10 @@ fun PlaylistArtworkImage(
     seedId: String = "",
     targetSize: Int = 160
 ) {
-    val gradientColors = remember(title, seedId, model) {
-        getGradientForId(if (title.isNotBlank()) title else if (seedId.isNotBlank()) seedId else (model ?: "playlist"))
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
+    val gradientColors = remember(title, seedId, cleanModel) {
+        getGradientForId(if (title.isNotBlank()) title else if (seedId.isNotBlank()) seedId else (cleanModel ?: "playlist"))
     }
     val context = LocalContext.current
 
@@ -117,17 +151,14 @@ fun PlaylistArtworkImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!model.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank() && !loadFailed) {
             AsyncImage(
-                model = remember(model, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(model)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                model = remember(cleanModel, targetSize) {
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
+                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -151,8 +182,10 @@ fun ArtistAvatarImage(
     seedId: String = "",
     targetSize: Int = 160
 ) {
-    val gradientColors = remember(seedId, model) {
-        getGradientForId(if (seedId.isNotBlank()) seedId else (model ?: "artist"))
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
+    val gradientColors = remember(seedId, cleanModel) {
+        getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "artist"))
     }
     val context = LocalContext.current
 
@@ -162,17 +195,14 @@ fun ArtistAvatarImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!model.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank() && !loadFailed) {
             AsyncImage(
-                model = remember(model, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(model)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                model = remember(cleanModel, targetSize) {
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
+                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -196,7 +226,13 @@ fun MosaicArtworkCollage(
     cornerRadius: Dp = 12.dp,
     seedId: String = ""
 ) {
-    val validCovers = remember(coverUrls) { coverUrls.filter { it.isNotBlank() }.take(4) }
+    var failedUrls by remember(coverUrls) { mutableStateOf(emptySet<String>()) }
+    val validCovers = remember(coverUrls, failedUrls) {
+        coverUrls.mapNotNull { normalizeMusicCoverUrl(it) }
+            .filter { it !in failedUrls }
+            .distinct()
+            .take(4)
+    }
     val gradientColors = remember(seedId) { getGradientForId(seedId) }
     val context = LocalContext.current
 
@@ -216,80 +252,67 @@ fun MosaicArtworkCollage(
                 )
             }
             1 -> {
+                val c0 = validCovers[0]
                 AsyncImage(
-                    model = remember(validCovers[0]) {
-                        ImageRequest.Builder(context)
-                            .data(validCovers[0])
-                            .size(200, 200)
-                            .crossfade(false)
-                            .build()
+                    model = remember(c0) {
+                        buildMusicImageRequest(context, c0, 200, 200)
                     },
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
+                    onError = { failedUrls = failedUrls + c0 },
                     modifier = Modifier.fillMaxSize()
                 )
             }
             else -> {
+                val c0 = validCovers[0]
+                val c1 = validCovers.getOrElse(1) { c0 }
+                val c2 = validCovers.getOrElse(2) { c0 }
+                val c3 = validCovers.getOrElse(3) { c1 }
                 Column(modifier = Modifier.fillMaxSize()) {
                     Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                             AsyncImage(
-                                model = remember(validCovers[0]) {
-                                    ImageRequest.Builder(context)
-                                        .data(validCovers[0])
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                model = remember(c0) {
+                                    buildMusicImageRequest(context, c0, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c0 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c1 = validCovers.getOrElse(1) { validCovers[0] }
                             AsyncImage(
                                 model = remember(c1) {
-                                    ImageRequest.Builder(context)
-                                        .data(c1)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c1, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c1 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                     }
                     Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c2 = validCovers.getOrElse(2) { validCovers[0] }
                             AsyncImage(
                                 model = remember(c2) {
-                                    ImageRequest.Builder(context)
-                                        .data(c2)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c2, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c2 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c3 = validCovers.getOrElse(3) { validCovers.getOrElse(1) { validCovers[0] } }
                             AsyncImage(
                                 model = remember(c3) {
-                                    ImageRequest.Builder(context)
-                                        .data(c3)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c3, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c3 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }

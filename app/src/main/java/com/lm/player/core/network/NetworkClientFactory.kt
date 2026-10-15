@@ -59,6 +59,7 @@ object NetworkClientFactory {
         if (token.isNotBlank()) {
             activeAuthToken = token.trim()
             host?.trim()?.takeIf { it.isNotBlank() }?.let {
+                authTokenHosts.clear()
                 authTokenHosts.add(it.substringBefore(':').lowercase())
             }
         }
@@ -136,6 +137,16 @@ object NetworkClientFactory {
                 )
             }
             val encodedPath = request.url.encodedPath
+            // 自动为第三方音乐平台 CDN 音频直链补齐防盗链 Referer / Origin 头
+            val cdnPlatform = MusicCdnHeaders.guessSourceFromUrl(request.url.toString())
+            if (cdnPlatform.isNotBlank() && request.header("Referer").isNullOrBlank()) {
+                val cdnHeaders = MusicCdnHeaders.buildHeaders(cdnPlatform)
+                cdnHeaders.forEach { (k, v) ->
+                    if (request.header(k).isNullOrBlank()) {
+                        reqBuilder.header(k, v)
+                    }
+                }
+            }
             // 音频流式接口绕过 OkHttp 磁盘缓存（交由 Media3 SimpleCache 统一管理），避免 206 Range 截断冲突
             if (encodedPath.contains("/api/play/")) {
                 reqBuilder.cacheControl(okhttp3.CacheControl.FORCE_NETWORK)

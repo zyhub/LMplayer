@@ -594,18 +594,6 @@ class PlaybackService : MediaSessionService() {
         } catch (_: Throwable) {}
     }
 
-    private fun dispatchBroadcast(command: String) {
-        try {
-            val intent = Intent(ACTION_MEDIA_COMMAND).apply {
-                putExtra(EXTRA_COMMAND, command)
-                setPackage(packageName)
-            }
-            sendBroadcast(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send media command broadcast: $command", e)
-        }
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_SERVICE) {
             isExplicitStopping = true

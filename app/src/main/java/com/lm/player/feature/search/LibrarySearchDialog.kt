@@ -39,6 +39,7 @@ import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.feature.home.SongListItemRow
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -86,6 +87,7 @@ fun LibrarySearchDialog(
     var drillDownSubtitle by remember { mutableStateOf<String?>(null) }
     var drillDownSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingDrillDown by remember { mutableStateOf(false) }
+    var drillDownJob by remember { mutableStateOf<Job?>(null) }
 
     BackHandler {
         if (drillDownTitle != null) {
@@ -417,6 +419,7 @@ fun LibrarySearchDialog(
                                     isServerConnected = isServerConnected,
                                     currentPlayingSong = currentPlayingSong,
                                     isPlaying = isPlaying,
+                                    activeDownloadTasks = activeDownloadTasks,
                                     onClick = { onSongClick(song, resolvedDrillDownSongs) },
                                     onDownloadClick = { songForDownloadChoice = song },
                                     onDownloadWithOptions = { s, target, quality ->
@@ -507,6 +510,7 @@ fun LibrarySearchDialog(
                                                 isServerConnected = isServerConnected,
                                                 currentPlayingSong = currentPlayingSong,
                                                 isPlaying = isPlaying,
+                                                activeDownloadTasks = activeDownloadTasks,
                                                 onClick = { onSongClick(song, localSongResults) },
                                                 onDownloadClick = { songForDownloadChoice = song },
                                                 onDownloadWithOptions = { s, target, quality ->
@@ -536,6 +540,7 @@ fun LibrarySearchDialog(
                                                 isServerConnected = isServerConnected,
                                                 currentPlayingSong = currentPlayingSong,
                                                 isPlaying = isPlaying,
+                                                activeDownloadTasks = activeDownloadTasks,
                                                 onClick = { onSongClick(song, resolvedOnlineSongs) },
                                                 onDownloadClick = { songForDownloadChoice = song },
                                                 onDownloadWithOptions = { s, target, quality ->
@@ -624,8 +629,8 @@ fun LibrarySearchDialog(
                                                     drillDownSubtitle = album.artist
                                                     isLoadingDrillDown = true
                                                     drillDownSongs = emptyList()
-                                                    kotlinx.coroutines.MainScope().let { _ -> }
-                                                    coroutineScope.launch {
+                                                    drillDownJob?.cancel()
+                                                    drillDownJob = coroutineScope.launch {
                                                         try {
                                                             drillDownSongs = onFetchCollectionSongs?.invoke(album.id).orEmpty()
                                                         } catch (_: Exception) {
@@ -676,7 +681,8 @@ fun LibrarySearchDialog(
                                                     drillDownSubtitle = "${pl.songCount} 首歌曲"
                                                     isLoadingDrillDown = true
                                                     drillDownSongs = emptyList()
-                                                    coroutineScope.launch {
+                                                    drillDownJob?.cancel()
+                                                    drillDownJob = coroutineScope.launch {
                                                         try {
                                                             drillDownSongs = onFetchCollectionSongs?.invoke(pl.id).orEmpty()
                                                         } catch (_: Exception) {
@@ -712,7 +718,8 @@ fun LibrarySearchDialog(
                                                     drillDownSubtitle = if (pl.songCount > 0) "${pl.songCount} 首歌曲" else selectedSource.displayName
                                                     isLoadingDrillDown = true
                                                     drillDownSongs = emptyList()
-                                                    coroutineScope.launch {
+                                                    drillDownJob?.cancel()
+                                                    drillDownJob = coroutineScope.launch {
                                                         try {
                                                             drillDownSongs = onFetchCollectionSongs?.invoke(pl.id).orEmpty()
                                                         } catch (_: Exception) {

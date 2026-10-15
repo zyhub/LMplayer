@@ -50,6 +50,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
+import com.lm.player.core.designsystem.component.rememberLiquidPhase
+import com.lm.player.core.designsystem.component.updateOrganicLiquidPath
 import com.lm.player.core.designsystem.component.BatchDownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
@@ -59,6 +61,7 @@ import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -211,6 +214,7 @@ fun LemonDiscoverHomeScreen(
     var activeCollectionCover by remember { mutableStateOf("") }
     var activeCollectionSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingCollection by remember { mutableStateOf(false) }
+    var collectionLoadJob by remember { mutableStateOf<Job?>(null) }
 
     // 安卓系统返回键逐级回退：多选状态 -> 歌单/榜单/专辑详情抽屉 -> 榜单/专辑全景 -> 首页
     val hasActiveSubView = isCollectionMultiSelect || activeCollectionTitle != null || isNewSongsMultiSelect || isToplistsOverviewOpen || isAlbumsOverviewOpen
@@ -311,39 +315,56 @@ fun LemonDiscoverHomeScreen(
         }
     }
 
+    // 切换本地曲库与在线服务器时重置下钻详情视图并刷新发现页数据
+    var previousServerModeKey by remember { mutableStateOf("${serverName}_$isServerOk") }
+
     // 动态拉取发现页内容：分块独立异步加载与流式渐进呈现，大幅提速首页载入
-    LaunchedEffect(currentSource, reloadTrigger) {
-        if (recommendPlaylists.isEmpty() && toplists.isEmpty() && newSongs.isEmpty() && newAlbums.isEmpty()) {
+    LaunchedEffect(currentSource, reloadTrigger, serverName, isServerOk) {
+        val currentServerModeKey = "${serverName}_$isServerOk"
+        val isModeChanged = currentServerModeKey != previousServerModeKey
+        if (isModeChanged) {
+            previousServerModeKey = currentServerModeKey
+            activeCollectionTitle = null
+        }
+        if (isModeChanged || (recommendPlaylists.isEmpty() && toplists.isEmpty() && newSongs.isEmpty() && newAlbums.isEmpty())) {
             isLoading = true
         }
         coroutineScope {
             launch {
                 val pl = runCatching { onFetchDiscoverPlaylists(currentSource) }.getOrDefault(emptyList())
                 if (pl.isNotEmpty()) {
-                    recommendPlaylists = if (reloadTrigger > 0) pl.shuffled() else pl
+                    recommendPlaylists = if (reloadTrigger > 0 && !isModeChanged) pl.shuffled() else pl
                     isLoading = false
+                } else if (isModeChanged) {
+                    recommendPlaylists = emptyList()
                 }
             }
             launch {
                 val tl = runCatching { onFetchDiscoverToplists(currentSource) }.getOrDefault(emptyList())
                 if (tl.isNotEmpty()) {
-                    toplists = if (reloadTrigger > 0) tl.shuffled() else tl
+                    toplists = if (reloadTrigger > 0 && !isModeChanged) tl.shuffled() else tl
                     isLoading = false
+                } else if (isModeChanged) {
+                    toplists = emptyList()
                 }
             }
             launch {
                 val ns = runCatching { onFetchDiscoverNewSongs(currentSource) }.getOrDefault(emptyList())
                 if (ns.isNotEmpty()) {
-                    newSongs = if (reloadTrigger > 0) ns.shuffled() else ns
+                    newSongs = if (reloadTrigger > 0 && !isModeChanged) ns.shuffled() else ns
                     isLoading = false
+                } else if (isModeChanged) {
+                    newSongs = emptyList()
                 }
             }
             if (onFetchDiscoverNewAlbums != null) {
                 launch {
                     val na = runCatching { onFetchDiscoverNewAlbums(currentSource) }.getOrDefault(emptyList())
                     if (na.isNotEmpty()) {
-                        newAlbums = if (reloadTrigger > 0) na.shuffled() else na
+                        newAlbums = if (reloadTrigger > 0 && !isModeChanged) na.shuffled() else na
                         isLoading = false
+                    } else if (isModeChanged) {
+                        newAlbums = emptyList()
                     }
                 }
             }
@@ -371,7 +392,7 @@ fun LemonDiscoverHomeScreen(
         }
     }
 
-    // 最新专辑最少 3 张专辑池计算（换一批时通过 recommendSeed 偏移轮转，保证展示至少 3 张精选专辑）
+    // 最新专辑最少 3 张专辑池计算（换一批时通过 recommendSeed 偏移轮转，展示真实新碟专辑）
     val todayAlbums = remember(newAlbums, allCachedSongs, recommendSeed) {
         val pool = if (newAlbums.isNotEmpty()) {
             newAlbums
@@ -390,24 +411,11 @@ fun LemonDiscoverHomeScreen(
                 }
         }
         if (pool.isEmpty()) {
-            listOf(
-                UnifiedAlbum(id = "album_def_1", title = "流行新碟速递", artist = "群星新单", coverUrl = "", songCount = 10),
-                UnifiedAlbum(id = "album_def_2", title = "热播原声精选", artist = "原声音轨", coverUrl = "", songCount = 8),
-                UnifiedAlbum(id = "album_def_3", title = "风向潮流首发", artist = "新碟典藏", coverUrl = "", songCount = 12)
-            )
+            emptyList()
         } else {
             val offset = (recommendSeed * 3) % pool.size
             val rotated = pool.drop(offset) + pool.take(offset)
-            if (rotated.size < 3) {
-                val fallback = listOf(
-                    UnifiedAlbum(id = "album_def_1", title = "流行新碟速递", artist = "群星新单", coverUrl = "", songCount = 10),
-                    UnifiedAlbum(id = "album_def_2", title = "热播原声精选", artist = "原声音轨", coverUrl = "", songCount = 8),
-                    UnifiedAlbum(id = "album_def_3", title = "风向潮流首发", artist = "新碟典藏", coverUrl = "", songCount = 12)
-                )
-                (rotated + fallback).distinctBy { it.title }.take(3)
-            } else {
-                rotated.take(3)
-            }
+            rotated.take(3)
         }
     }
 
@@ -761,7 +769,28 @@ fun LemonDiscoverHomeScreen(
                                                 .fillMaxWidth()
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .clickable {
-                                                    isAlbumsOverviewOpen = true
+                                                    if (album.id.startsWith("lemon_discover_album_")) {
+                                                        activeCollectionTitle = album.title
+                                                        lastCollectionTitle = album.title
+                                                        activeCollectionCover = album.coverUrl
+                                                        isCollectionMultiSelect = false
+                                                        selectedCollectionSongIds = emptySet()
+                                                        isLoadingCollection = true
+                                                        collectionLoadJob?.cancel()
+                                                        collectionLoadJob = coroutineScope.launch {
+                                                            try {
+                                                                activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
+                                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                                throw e
+                                                            } catch (_: Exception) {
+                                                                activeCollectionSongs = emptyList()
+                                                            } finally {
+                                                                isLoadingCollection = false
+                                                            }
+                                                        }
+                                                    } else {
+                                                        isAlbumsOverviewOpen = true
+                                                    }
                                                 }
                                                 .padding(vertical = 2.dp, horizontal = 2.dp),
                                             verticalAlignment = Alignment.CenterVertically,
@@ -783,7 +812,10 @@ fun LemonDiscoverHomeScreen(
                                                     overflow = TextOverflow.Ellipsis
                                                 )
                                                 Text(
-                                                    text = album.artist.ifBlank { "最新专辑" },
+                                                    text = buildString {
+                                                        append(album.artist.ifBlank { "最新专辑" })
+                                                        if (album.songCount > 0) append(" · ${album.songCount} 首")
+                                                    },
                                                     fontSize = 9.sp,
                                                     color = Color.White.copy(alpha = 0.75f),
                                                     maxLines = 1,
@@ -827,7 +859,7 @@ fun LemonDiscoverHomeScreen(
                                 .weight(1f)
                                 .fillMaxHeight(),
                             title = "权威排行榜",
-                            badgeText = "官方热榜",
+                            badgeText = if (toplists.isNotEmpty()) "${toplists.size} 个榜单" else "官方热榜",
                             icon = Icons.Default.Leaderboard,
                             iconColor = dynamicPalettes[2].iconColor,
                             gradientColors = dynamicPalettes[2].gradientColors,
@@ -838,39 +870,93 @@ fun LemonDiscoverHomeScreen(
                                 isToplistsOverviewOpen = true
                             }
                         ) {
-                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                Text(
-                                    text = topRank?.name ?: "热歌榜 · 飙升榜",
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "各大音乐官方风向标 · 共 ${toplists.size} 个榜单",
-                                    fontSize = 10.sp,
-                                    color = Color.White.copy(alpha = 0.75f),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "点击浏览全榜",
-                                    fontSize = 10.sp,
-                                    color = Color.White.copy(alpha = 0.70f)
-                                )
-                                Icon(
-                                    imageVector = Icons.Default.ChevronRight,
-                                    contentDescription = null,
-                                    tint = Color.White.copy(alpha = 0.85f),
-                                    modifier = Modifier.size(16.dp)
-                                )
+                            if (toplists.isNotEmpty()) {
+                                val rankOffset = if (toplists.size > 2) (recommendSeed * 2) % toplists.size else 0
+                                val rotatedRanks = (toplists.drop(rankOffset) + toplists.take(rankOffset)).take(2)
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    rotatedRanks.forEach { rankItem ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    activeCollectionTitle = rankItem.name
+                                                    lastCollectionTitle = rankItem.name
+                                                    activeCollectionCover = rankItem.coverUrl
+                                                    isCollectionMultiSelect = false
+                                                    selectedCollectionSongIds = emptySet()
+                                                    isLoadingCollection = true
+                                                    val tlId = "lemon_toplist_${rankItem.source}_${rankItem.id}"
+                                                    collectionLoadJob?.cancel()
+                                                    collectionLoadJob = coroutineScope.launch {
+                                                        try {
+                                                            activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
+                                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                                            throw e
+                                                        } catch (_: Exception) {
+                                                            activeCollectionSongs = emptyList()
+                                                        } finally {
+                                                            isLoadingCollection = false
+                                                        }
+                                                    }
+                                                }
+                                                .padding(vertical = 2.dp, horizontal = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            AlbumArtworkImage(
+                                                model = rankItem.coverUrl,
+                                                seedId = "toplist_${rankItem.source}_${rankItem.id}",
+                                                modifier = Modifier.size(28.dp),
+                                                cornerRadius = 6.dp
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = rankItem.name,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = rankItem.updateFrequency.ifBlank { "${currentSource.displayName}官方榜" },
+                                                    fontSize = 9.sp,
+                                                    color = Color.White.copy(alpha = 0.75f),
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            Icon(
+                                                imageVector = Icons.Default.ChevronRight,
+                                                contentDescription = null,
+                                                tint = Color.White.copy(alpha = 0.80f),
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Text(
+                                        text = topRank?.name ?: "热歌榜 · 飙升榜",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "各大音乐官方风向标 · 点击浏览全榜",
+                                        fontSize = 10.sp,
+                                        color = Color.White.copy(alpha = 0.75f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
 
@@ -980,7 +1066,8 @@ fun LemonDiscoverHomeScreen(
                                         selectedCollectionSongIds = emptySet()
                                         isLoadingCollection = true
                                         val plId = playlist.id
-                                        coroutineScope.launch {
+                                        collectionLoadJob?.cancel()
+                                        collectionLoadJob = coroutineScope.launch {
                                                 try {
                                                     activeCollectionSongs = onFetchCollectionSongs(plId, currentSource)
                                                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1212,7 +1299,8 @@ fun LemonDiscoverHomeScreen(
                                 selectedCollectionSongIds = emptySet()
                                 isLoadingCollection = true
                                 val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
-                                coroutineScope.launch {
+                                collectionLoadJob?.cancel()
+                                collectionLoadJob = coroutineScope.launch {
                                                 try {
                                                     activeCollectionSongs = onFetchCollectionSongs(tlId, currentSource)
                                                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1304,7 +1392,8 @@ fun LemonDiscoverHomeScreen(
                                     isCollectionMultiSelect = false
                                     selectedCollectionSongIds = emptySet()
                                     isLoadingCollection = true
-                                    coroutineScope.launch {
+                                    collectionLoadJob?.cancel()
+                                    collectionLoadJob = coroutineScope.launch {
                                                 try {
                                                     activeCollectionSongs = onFetchCollectionSongs(album.id, currentSource)
                                                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1677,7 +1766,10 @@ private fun DiscoverAlbumCard(
         )
         Spacer(modifier = Modifier.height(2.dp))
         Text(
-            text = album.artist.ifBlank { "最新专辑" },
+            text = buildString {
+                append(album.artist.ifBlank { "最新专辑" })
+                if (album.songCount > 0) append(" · ${album.songCount} 首")
+            },
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
@@ -1790,65 +1882,6 @@ fun OnlineSourceDropdownMenu(
             )
         }
     }
-}
-
-@Composable
-private fun rememberLiquidPhase(enabled: Boolean, durationMillis: Int = 8000): State<Float> {
-    if (!enabled) return remember { mutableFloatStateOf(0f) }
-    val infiniteTransition = rememberInfiniteTransition(label = "liquid_phase")
-    return infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = durationMillis, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "phase"
-    )
-}
-
-/**
- * 绘制有机非规则变形液态光斑 Path（复用预分配 Path 与 FloatArray 缓冲，零堆内存分配）
- */
-private fun updateOrganicLiquidPath(
-    path: Path,
-    ptsBuffer: FloatArray,
-    cx: Float,
-    cy: Float,
-    baseRadius: Float,
-    phaseRad: Float,
-    h1: Float = 1.0f,
-    h2: Float = 2.0f,
-    h3: Float = 3.0f
-) {
-    path.reset()
-    val pointsCount = 8
-    val step = (2.0 * Math.PI / pointsCount).toFloat()
-
-    for (i in 0 until pointsCount) {
-        val angle = i * step
-        val wave = 0.28f * kotlin.math.sin(h1 * angle + phaseRad) +
-                   0.18f * kotlin.math.cos(h2 * angle - phaseRad) +
-                   0.12f * kotlin.math.sin(h3 * angle + 2f * phaseRad)
-        val r = baseRadius * (1f + wave)
-        ptsBuffer[i * 2] = cx + r * kotlin.math.cos(angle)
-        ptsBuffer[i * 2 + 1] = cy + r * kotlin.math.sin(angle)
-    }
-
-    val firstMidX = (ptsBuffer[0] + ptsBuffer[2]) / 2f
-    val firstMidY = (ptsBuffer[1] + ptsBuffer[3]) / 2f
-    path.moveTo(firstMidX, firstMidY)
-
-    for (i in 0 until pointsCount) {
-        val nextIdx = ((i + 1) % pointsCount) * 2
-        val afterNextIdx = ((i + 2) % pointsCount) * 2
-        val nextX = ptsBuffer[nextIdx]
-        val nextY = ptsBuffer[nextIdx + 1]
-        val midX = (nextX + ptsBuffer[afterNextIdx]) / 2f
-        val midY = (nextY + ptsBuffer[afterNextIdx + 1]) / 2f
-        path.quadraticBezierTo(nextX, nextY, midX, midY)
-    }
-    path.close()
 }
 
 /**

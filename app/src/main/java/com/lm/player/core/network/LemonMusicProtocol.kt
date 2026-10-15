@@ -102,7 +102,7 @@ class LemonMusicProtocol(
                 // 无法确定期望配置（DB 异常等）时保守复用，避免无谓重建
                 if (expectedKey.isBlank() || expectedKey == activeInstanceKey) return cached
                 Log.i(TAG, "服务器配置已变更，重建协议实例（旧=$activeInstanceKey 新=$expectedKey）")
-                activeInstance = null
+                clearStaticCaches()
             }
             val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
             val server = db.serverDao().getActiveServer()
@@ -149,6 +149,35 @@ class LemonMusicProtocol(
         private val songIdToPathMap = ConcurrentHashMap<String, String>()
         private val songIdToTrackIdMap = ConcurrentHashMap<String, String>()
         private val songIdToSongMap = ConcurrentHashMap<String, UnifiedSong>()
+        // 记录服务器本地曲目是否包含内嵌封面 (来自 /api/library/tracks 或 /api/library/tracks/by-paths 的 hasPicture 字段)
+        private val songIdHasEmbeddedCoverMap = ConcurrentHashMap<String, Boolean>()
+        // 缓存已通过在线搜索或快照补齐的真实封面 URL，避免无内嵌封面的本地曲目重复请求或回退到 404 的 /api/tag/cover
+        private val songIdResolvedCoverMap = ConcurrentHashMap<String, String>()
+
+        fun registerResolvedCover(songId: String, coverUrl: String) {
+            val clean = coverUrl.trim()
+            if (songId.isBlank() || clean.isBlank() || clean.contains("/api/tag/cover")) return
+            songIdResolvedCoverMap[songId] = clean
+            songIdToSongMap[songId]?.let { existing ->
+                if (existing.coverUrl.isBlank() || existing.coverUrl.contains("/api/tag/cover")) {
+                    songIdToSongMap[songId] = existing.copy(coverUrl = clean)
+                }
+            }
+        }
+
+        fun getResolvedCover(songId: String): String? = songIdResolvedCoverMap[songId]?.takeIf { it.isNotBlank() }
+
+        /**
+         * 判断给定的封面链接是否属于「已知无内嵌封面的服务器本地曲目 (/api/tag/cover 必返 404)」
+         */
+        fun isKnownMissingEmbeddedCoverUrl(url: String?): Boolean {
+            if (url.isNullOrBlank()) return true
+            if (!url.contains("/api/tag/cover")) return false
+            val path = getServerFilePath("", coverUrl = url)?.removePrefix("local:")?.trim().orEmpty()
+            if (path.isBlank()) return false
+            val songId = "lemon_${md5(path)}"
+            return songIdHasEmbeddedCoverMap[songId] == false
+        }
 
         // 发现页短期内存快取 (缓存 5 分钟，显著提速主页切换与展示)
         private val discoverPlaylistsCache = ConcurrentHashMap<String, Pair<Long, List<UnifiedPlaylist>>>()
@@ -162,6 +191,21 @@ class LemonMusicProtocol(
             discoverToplistsCache.clear()
             discoverNewSongsCache.clear()
             discoverNewAlbumsCache.clear()
+        }
+
+        fun clearStaticCaches() {
+            songIdToPathMap.clear()
+            songIdToTrackIdMap.clear()
+            songIdToSongMap.clear()
+            songIdHasEmbeddedCoverMap.clear()
+            songIdResolvedCoverMap.clear()
+            discoverPlaylistsCache.clear()
+            discoverToplistsCache.clear()
+            discoverNewSongsCache.clear()
+            discoverNewAlbumsCache.clear()
+            sharedAuthTokens.clear()
+            activeInstance = null
+            activeInstanceKey = ""
         }
 
         private val HEX_CHARS = "0123456789abcdef".toCharArray()
@@ -547,6 +591,8 @@ class LemonMusicProtocol(
                     }
 
                     val songId = "lemon_${md5(filePath)}"
+                    val hasPic = if (item.has("hasPicture")) item.optBoolean("hasPicture", false) else true
+                    songIdHasEmbeddedCoverMap[songId] = hasPic
                     songIdToPathMap[songId] = filePath
                     if (trackId.isNotBlank()) {
                         songIdToTrackIdMap[songId] = trackId
@@ -559,7 +605,7 @@ class LemonMusicProtocol(
                         album = album,
                         albumId = "lemon_album_${md5("$artist/$album")}",
                         durationMs = durationMs,
-                        coverUrl = getCoverArtUrl(songId),
+                        coverUrl = resolveCoverArtUrlForLocalPath(filePath),
                         streamUrl = getStreamUrlForPathWithPreferredQuality(songIdToPathMap[songId] ?: ""),
                         serverId = "lemon_music",
                         localFilePath = null,
@@ -812,43 +858,112 @@ class LemonMusicProtocol(
         }
     }
 
+    private fun extractTrackCoverFromJson(obj: JSONObject): String {
+        var sPic = obj.optString("picUrl")
+            .ifBlank { obj.optString("img") }
+            .ifBlank { obj.optString("cover") }
+            .ifBlank { obj.optString("pic") }
+            .ifBlank { obj.optString("coverUrl") }
+            .ifBlank { obj.optString("albumPic") }
+            .ifBlank { obj.optString("albumpic") }
+            .ifBlank { obj.optString("pic_url") }
+            .ifBlank { obj.optString("album_pic") }
+            .ifBlank { obj.optString("hts_img") }
+            .ifBlank { obj.optString("web_albumpic_short") }
+        if (sPic.isBlank()) {
+            val albumMid = obj.optString("albumMid").ifBlank { obj.optString("albummid") }
+            if (albumMid.isNotBlank()) {
+                sPic = "https://y.gtimg.cn/music/photo_new/T002R500x500M000${albumMid}.jpg"
+            }
+        }
+        return normalizeImageUrl(sPic, cleanBase)
+    }
+
+    private fun extractOnlineSongIdFromJson(obj: JSONObject, fallbackKey: String = "", title: String = "", artist: String = ""): String {
+        var rawId = obj.optString("songId")
+            .ifBlank { obj.optString("id") }
+            .ifBlank { obj.optString("rid").removePrefix("MUSIC_") }
+            .ifBlank { obj.optString("musicrid").removePrefix("MUSIC_") }
+            .ifBlank { obj.optString("songmid") }
+            .ifBlank { obj.optString("hash") }
+            .ifBlank { obj.optString("copyrightId") }
+        if (rawId.isBlank()) {
+            val k = obj.optString("key").ifBlank { fallbackKey }.trim()
+            if (k.isNotBlank() && !k.startsWith("local:")) {
+                rawId = if (k.contains(":")) k.substringAfter(":").trim() else k
+            }
+        }
+        if (rawId.isBlank() && (title.isNotBlank() || artist.isNotBlank())) {
+            rawId = md5("${title.trim()}|${artist.trim()}").take(16)
+        }
+        return rawId
+    }
+
     /**
      * 将 /api/library/user-data 中的单条曲目记录 (favorites / recentPlays 通用结构) 映射为 UnifiedSong。
      * 同时兼容「服务端本地文件路径」与「全网在线音源」两种记录形态，无法识别时返回 null。
      */
     private fun parseUserDataTrack(item: Any?): UnifiedSong? {
+        if (item is String) {
+            val trimmed = item.trim()
+            if (trimmed.isBlank()) return null
+            if (trimmed.startsWith("local:") || trimmed.startsWith("/") || trimmed.contains("\\")) {
+                val cleanPath = trimmed.removePrefix("local:").trim()
+                if (cleanPath.isBlank()) return null
+                val songId = "lemon_${md5(cleanPath)}"
+                songIdToSongMap[songId]?.let { return it }
+                val fileName = cleanPath.replace('\\', '/').substringAfterLast('/')
+                return UnifiedSong(
+                    id = songId,
+                    title = fileName.substringBeforeLast('.', fileName),
+                    artist = "未知歌手",
+                    artistId = "artist_unknown",
+                    album = "未知专辑",
+                    albumId = "album_unknown",
+                    durationMs = 0L,
+                    coverUrl = resolveCoverArtUrlForLocalPath(cleanPath),
+                    streamUrl = getStreamUrlForPath(cleanPath),
+                    serverId = "lemon_music",
+                    localFilePath = null,
+                    downloadStatus = DownloadStatus.NOT_DOWNLOADED,
+                    bitRate = 320,
+                    format = cleanPath.substringAfterLast('.', "flac").lowercase(),
+                    isFavorite = false
+                )
+            }
+            return null
+        }
         val obj = item as? JSONObject ?: return null
         val sName = SongMatchingResolver.unescapeMusicText(obj.optString("name").ifBlank { obj.optString("title") })
         val sSinger = SongMatchingResolver.unescapeMusicText(obj.optString("singer").ifBlank { obj.optString("artist", "未知歌手") })
         val sAlbum = SongMatchingResolver.unescapeMusicText(obj.optString("album", "未知专辑"))
         val sLocalPath = obj.optString("localPath").ifBlank { obj.optString("filePath") }
-        val sSource = obj.optString("source").ifBlank { obj.optString("platform") }
-        val sSongId = obj.optString("songId").ifBlank { obj.optString("id") }
-        val durMs = (obj.optDouble("interval", obj.optDouble("duration", 0.0)) * 1000).toLong()
         val key = obj.optString("key")
-        var sPic = obj.optString("picUrl").ifBlank { obj.optString("img") }
-        if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
-            sPic = "$cleanBase$sPic"
+        val sSource = obj.optString("source").ifBlank { obj.optString("platform") }.ifBlank {
+            if (key.contains(":") && !key.startsWith("local:")) key.substringBefore(":") else ""
         }
+        val durMs = normalizeNumericDurationMs(obj.optDouble("interval", obj.optDouble("duration", 0.0)))
+        val sPic = extractTrackCoverFromJson(obj)
 
         if (sLocalPath.isNotBlank() || key.startsWith("local:")) {
             val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else key.removePrefix("local:")).trim()
             if (cleanPath.isBlank()) return null
             val songId = "lemon_${md5(cleanPath)}"
+            val cached = songIdToSongMap[songId]
             return UnifiedSong(
                 id = songId,
-                title = sName.ifBlank { cleanPath.substringAfterLast('/').substringBeforeLast('.') },
-                artist = sSinger,
+                title = sName.ifBlank { cached?.title ?: cleanPath.replace('\\', '/').substringAfterLast('/').substringBeforeLast('.') },
+                artist = if (sSinger != "未知歌手" || cached == null) sSinger else cached.artist,
                 artistId = "artist_${sSinger.hashCode()}",
-                album = sAlbum,
+                album = if (sAlbum != "未知专辑" || cached == null) sAlbum else cached.album,
                 albumId = "album_${sAlbum.hashCode()}",
-                durationMs = durMs,
-                coverUrl = if (sPic.isNotBlank()) sPic else getCoverArtUrlForPath(cleanPath),
+                durationMs = if (durMs > 0L) durMs else (cached?.durationMs ?: 0L),
+                coverUrl = resolveCoverArtUrlForLocalPath(cleanPath, sPic),
                 streamUrl = getStreamUrlForPath(cleanPath),
                 serverId = "lemon_music",
-                localFilePath = null,
-                downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                bitRate = 320,
+                localFilePath = cached?.localFilePath,
+                downloadStatus = cached?.downloadStatus ?: DownloadStatus.NOT_DOWNLOADED,
+                bitRate = cached?.bitRate ?: 320,
                 format = cleanPath.substringAfterLast('.', "flac").lowercase(),
                 isFavorite = false,
                 relativeFolderPath = extractRelativeFolderPath(cleanPath, sSinger, sAlbum)
@@ -857,9 +972,10 @@ class LemonMusicProtocol(
 
         if (sSource.isNotBlank() && sSource != "local") {
             val platform = sSource.ifBlank { "kw" }
-            val rawId = sSongId.ifBlank { key }
+            val rawId = extractOnlineSongIdFromJson(obj, key, sName, sSinger)
             if (rawId.isBlank()) return null
-            val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_$rawId"
+            val onlineId = if (rawId.startsWith("lemon_online_")) rawId else "lemon_online_${platform}_$rawId"
+            val streamId = rawId.removePrefix("lemon_online_${platform}_")
             return UnifiedSong(
                 id = onlineId,
                 title = sName.ifBlank { "在线曲目" },
@@ -869,7 +985,7 @@ class LemonMusicProtocol(
                 albumId = "album_${sAlbum.hashCode()}",
                 durationMs = durMs,
                 coverUrl = sPic,
-                streamUrl = "lemon_online://$platform/$rawId",
+                streamUrl = "lemon_online://$platform/$streamId",
                 serverId = "lemon_online",
                 localFilePath = null,
                 downloadStatus = DownloadStatus.NOT_DOWNLOADED,
@@ -888,68 +1004,108 @@ class LemonMusicProtocol(
     override suspend fun getAlbums(offset: Int, limit: Int): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
-            // 用 all=1 拉全量：原先硬编码 page=1&limit=500，专辑数超过 500 时**静默截断**，
-            // 既不报错也不续拉 —— 用户会看到「专辑列表少了一截」且找不到原因。
-            // all=1 与 /api/library/tracks 同源实现；若服务端不支持，返回的 data 会少于请求量，
-            // 下面的分页兜底会继续按 page/limit 补齐。
-            val url = "$cleanBase/api/library/albums?all=1"
-            val req = newAuthRequest(url).get().build()
+            // 服务端 /api/library/albums 不支持 all=1（会回退为默认 page=1, limit=48 只返回 48 张专辑），
+            // 因此按 page + limit 分页循环拉取直至拿齐 total 全量专辑。
+            val pageSize = if (limit > 0) limit.coerceAtLeast(200) else 500
+            val albums = ArrayList<UnifiedAlbum>()
+            val seenUniqueKeys = HashSet<String>()
+            val seenIds = HashSet<String>()
+            var page = 1
+            var expectedTotal = -1
 
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取专辑失败 (HTTP ${resp.code})"))
-                val json = JSONObject(body)
-                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
-                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
-                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
-                val dataArr = json.optJSONArray("data")
-                    ?: json.optJSONObject("data")?.optJSONArray("list")
-                    ?: json.optJSONArray("list")
-                    ?: JSONArray()
-                val albums = ArrayList<UnifiedAlbum>(dataArr.length())
+            while (page <= 100) {
+                val url = "$cleanBase/api/library/albums?page=$page&limit=$pageSize"
+                val req = newAuthRequest(url).get().build()
 
-                for (i in 0 until dataArr.length()) {
-                    val item = dataArr.optJSONObject(i) ?: continue
-                    val name = item.optString("name").ifBlank { item.optString("album", "未知专辑") }
-                    val artist = item.optString("artist", "未知歌手")
-                    val count = item.optInt("count", 0)
-                    // 代表曲目路径的字段名各版本服务端不一致，逐个兜底，
-                    // 否则专辑卡片拿不到 /api/tag/cover 地址，全部显示成占位图。
-                    val samplePath = sequenceOf("samplePath", "sample", "path", "filePath", "cover")
-                        .map { item.optString(it) }
-                        .firstOrNull { it.isNotBlank() }
-                        .orEmpty()
-                    val yearStr = item.optString("year")
-                    val year = yearStr.toIntOrNull()
-
-                    val sampleSongId = if (samplePath.isNotBlank()) "lemon_${md5(samplePath)}" else ""
-                    if (samplePath.isNotBlank()) songIdToPathMap[sampleSongId] = samplePath
-
-                    // 服务端直接给了封面地址时优先用它（自定义封面/外链封面）；
-                    // 否则用代表曲目路径反查 /api/tag/cover 内嵌封面。
-                    val serverCover = sequenceOf("coverUrl", "cover_url", "picUrl", "img")
-                        .map { item.optString(it) }
-                        .firstOrNull { it.startsWith("http") }
-                        .orEmpty()
-                    val cover = when {
-                        serverCover.isNotBlank() -> serverCover
-                        sampleSongId.isNotBlank() -> getCoverArtUrl(sampleSongId)
-                        else -> ""
+                val pageAddedCount = client.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string() ?: ""
+                    if (!resp.isSuccessful) {
+                        if (page == 1) {
+                            return@withContext Result.failure(Exception("获取专辑失败 (HTTP ${resp.code})"))
+                        } else {
+                            return@use 0
+                        }
+                    }
+                    val json = JSONObject(body)
+                    val totalFromRoot = json.optInt("total", -1)
+                    val totalFromData = json.optJSONObject("data")?.optInt("total", -1) ?: -1
+                    val reportedTotal = if (totalFromRoot >= 0) totalFromRoot else totalFromData
+                    if (reportedTotal >= 0) {
+                        expectedTotal = reportedTotal
                     }
 
-                    albums.add(
-                        UnifiedAlbum(
-                            id = "lemon_album_${md5("$artist/$name")}",
-                            title = name,
-                            artist = artist,
-                            coverUrl = cover,
-                            songCount = count,
-                            year = year
+                    val dataArr = json.optJSONArray("data")
+                        ?: json.optJSONObject("data")?.optJSONArray("list")
+                        ?: json.optJSONArray("list")
+                        ?: JSONArray()
+                    if (dataArr.length() == 0) return@use 0
+
+                    var addedInPage = 0
+                    for (i in 0 until dataArr.length()) {
+                        val item = dataArr.optJSONObject(i) ?: continue
+                        val rawName = item.optString("name").ifBlank { item.optString("album", "未知专辑") }
+                        val name = SongMatchingResolver.unescapeMusicText(rawName)
+                        val rawArtist = item.optString("artist", "未知歌手")
+                        val artist = SongMatchingResolver.unescapeMusicText(rawArtist)
+                        val count = sequenceOf("count", "songCount", "trackCount", "total", "musicNum")
+                            .map { item.optInt(it, 0) }
+                            .firstOrNull { it > 0 }
+                            ?: item.optJSONArray("tracks")?.length()
+                            ?: item.optJSONArray("songs")?.length()
+                            ?: 0
+                        val samplePath = sequenceOf("samplePath", "sample", "path", "filePath", "cover")
+                            .map { item.optString(it) }
+                            .firstOrNull { it.isNotBlank() }
+                            .orEmpty()
+                        val uniqueKey = "$artist|$name|$samplePath"
+                        if (!seenUniqueKeys.add(uniqueKey)) continue
+
+                        val yearStr = item.optString("year")
+                        val year = yearStr.toIntOrNull()
+
+                        val sampleSongId = if (samplePath.isNotBlank()) "lemon_${md5(samplePath)}" else ""
+                        if (samplePath.isNotBlank()) songIdToPathMap[sampleSongId] = samplePath
+
+                        val serverCover = sequenceOf("coverUrl", "cover_url", "picUrl", "img")
+                            .map { item.optString(it) }
+                            .firstOrNull { it.startsWith("http") }
+                            .orEmpty()
+                        val cover = when {
+                            serverCover.isNotBlank() -> serverCover
+                            samplePath.isNotBlank() -> resolveCoverArtUrlForLocalPath(samplePath)
+                            else -> ""
+                        }
+
+                        val baseAlbumId = "lemon_album_${md5("$artist/$name")}"
+                        val finalAlbumId = if (seenIds.add(baseAlbumId)) {
+                            baseAlbumId
+                        } else {
+                            val altId = "${baseAlbumId}_${albums.size}"
+                            seenIds.add(altId)
+                            altId
+                        }
+
+                        albums.add(
+                            UnifiedAlbum(
+                                id = finalAlbumId,
+                                title = name,
+                                artist = artist,
+                                coverUrl = cover,
+                                songCount = count,
+                                year = year
+                            )
                         )
-                    )
+                        addedInPage++
+                    }
+                    addedInPage
                 }
-                Result.success(albums)
+
+                if (pageAddedCount <= 0) break
+                if (expectedTotal > 0 && albums.size >= expectedTotal) break
+                if (expectedTotal <= 0 && pageAddedCount < 48) break
+                page++
             }
+            Result.success(albums)
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music albums", e)
@@ -963,42 +1119,68 @@ class LemonMusicProtocol(
     override suspend fun getArtists(): Result<List<UnifiedArtist>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
-            // 同 getAlbums：原先硬编码 limit=500，超过即静默截断
-            val url = "$cleanBase/api/library/artists?all=1"
-            val req = newAuthRequest(url).get().build()
+            val pageSize = 500
+            val artists = ArrayList<UnifiedArtist>()
+            val seenNames = HashSet<String>()
+            var page = 1
+            var expectedTotal = -1
 
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取歌手失败 (HTTP ${resp.code})"))
-                val json = JSONObject(body)
-                // 响应信封兜底：该服务端在不同端点/版本上既可能返回 data: [...]，
-                // 也可能返回 { data: { list: [...], total: N } }（fetchOnlineSongList 就是这么兼容的）。
-                // 只认数组会让专辑/歌手页在另一种信封下静默为空，且不报任何错。
-                val dataArr = json.optJSONArray("data")
-                    ?: json.optJSONObject("data")?.optJSONArray("list")
-                    ?: json.optJSONArray("list")
-                    ?: JSONArray()
-                val artists = ArrayList<UnifiedArtist>(dataArr.length())
+            while (page <= 100) {
+                val url = "$cleanBase/api/library/artists?page=$page&limit=$pageSize"
+                val req = newAuthRequest(url).get().build()
 
-                for (i in 0 until dataArr.length()) {
-                    val item = dataArr.optJSONObject(i) ?: continue
-                    val name = item.optString("name", "未知歌手")
-                    val count = item.optInt("count", 0)
-                    val samplePath = item.optString("samplePath")
-                    val sampleSongId = if (samplePath.isNotBlank()) "lemon_${md5(samplePath)}" else ""
-                    if (samplePath.isNotBlank()) songIdToPathMap[sampleSongId] = samplePath
+                val pageAddedCount = client.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string() ?: ""
+                    if (!resp.isSuccessful) {
+                        if (page == 1) {
+                            return@withContext Result.failure(Exception("获取歌手失败 (HTTP ${resp.code})"))
+                        } else {
+                            return@use 0
+                        }
+                    }
+                    val json = JSONObject(body)
+                    val totalFromRoot = json.optInt("total", -1)
+                    val totalFromData = json.optJSONObject("data")?.optInt("total", -1) ?: -1
+                    val reportedTotal = if (totalFromRoot >= 0) totalFromRoot else totalFromData
+                    if (reportedTotal >= 0) {
+                        expectedTotal = reportedTotal
+                    }
 
-                    artists.add(
-                        UnifiedArtist(
-                            id = "lemon_artist_${md5(name)}",
-                            name = name,
-                            avatarUrl = if (sampleSongId.isNotBlank()) getCoverArtUrl(sampleSongId) else "",
-                            albumCount = count
+                    val dataArr = json.optJSONArray("data")
+                        ?: json.optJSONObject("data")?.optJSONArray("list")
+                        ?: json.optJSONArray("list")
+                        ?: JSONArray()
+                    if (dataArr.length() == 0) return@use 0
+
+                    var addedInPage = 0
+                    for (i in 0 until dataArr.length()) {
+                        val item = dataArr.optJSONObject(i) ?: continue
+                        val name = SongMatchingResolver.unescapeMusicText(item.optString("name", "未知歌手"))
+                        if (!seenNames.add(name)) continue
+                        val count = item.optInt("count", 0)
+                        val samplePath = item.optString("samplePath")
+                        val sampleSongId = if (samplePath.isNotBlank()) "lemon_${md5(samplePath)}" else ""
+                        if (samplePath.isNotBlank()) songIdToPathMap[sampleSongId] = samplePath
+
+                        artists.add(
+                            UnifiedArtist(
+                                id = "lemon_artist_${md5(name)}",
+                                name = name,
+                                avatarUrl = if (samplePath.isNotBlank()) resolveCoverArtUrlForLocalPath(samplePath) else "",
+                                albumCount = count
+                            )
                         )
-                    )
+                        addedInPage++
+                    }
+                    addedInPage
                 }
-                Result.success(artists)
+
+                if (pageAddedCount <= 0) break
+                if (expectedTotal > 0 && artists.size >= expectedTotal) break
+                if (expectedTotal <= 0 && pageAddedCount < 48) break
+                page++
             }
+            Result.success(artists)
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to fetch Lemon Music artists", e)
@@ -1026,32 +1208,68 @@ class LemonMusicProtocol(
                 val userDataRes = getLibraryUserData()
                 if (userDataRes.isSuccess) {
                     val userData = userDataRes.getOrNull()
-                    // A. 服务端「我的收藏」智能歌单 (放置在置顶首位)
                     val favArr = userData?.optJSONArray("favorites")
+                    val plArr = userData?.optJSONArray("playlists")
+
+                    // 批量预检收藏与歌单前几首本地曲目的 hasPicture 状态，避免把无内嵌封面(404)的链接塞入 4 宫格预览
+                    val candidateLocalPaths = ArrayList<String>()
+                    if (favArr != null) {
+                        for (fIdx in 0 until minOf(favArr.length(), 10)) {
+                            val favItem = favArr.opt(fIdx)
+                            if (favItem is JSONObject) {
+                                val lPath = favItem.optString("localPath").ifBlank { favItem.optString("filePath") }
+                                val cleanPath = (if (lPath.isNotBlank()) lPath else if (favItem.optString("key").startsWith("local:")) favItem.optString("key").removePrefix("local:") else "").trim()
+                                if (cleanPath.isNotBlank()) candidateLocalPaths.add(cleanPath)
+                            } else if (favItem is String && favItem.isNotBlank()) {
+                                val clean = favItem.removePrefix("local:").trim()
+                                if (clean.startsWith("/") || clean.contains("\\")) candidateLocalPaths.add(clean)
+                            }
+                        }
+                    }
+                    if (plArr != null) {
+                        for (i in 0 until plArr.length()) {
+                            val pl = plArr.optJSONObject(i) ?: continue
+                            val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+                            val snapshots = pl.optJSONObject("trackSnapshots")
+                            for (tIdx in 0 until minOf(tracks.length(), 8)) {
+                                val tItem = tracks.opt(tIdx)
+                                val rawKey = when (tItem) {
+                                    is String -> tItem
+                                    is JSONObject -> tItem.optString("localPath").ifBlank { tItem.optString("filePath").ifBlank { tItem.optString("key") } }
+                                    else -> ""
+                                }.trim()
+                                val sn = if (rawKey.isNotBlank()) snapshots?.optJSONObject(rawKey) ?: snapshots?.optJSONObject(rawKey.removePrefix("local:")) else null
+                                val localPath = sn?.optString("localPath")?.ifBlank { sn.optString("filePath") }.orEmpty().ifBlank {
+                                    if (rawKey.startsWith("local:") || rawKey.startsWith("/") || rawKey.contains("\\")) rawKey.removePrefix("local:") else ""
+                                }.trim()
+                                if (localPath.isNotBlank()) candidateLocalPaths.add(localPath)
+                            }
+                        }
+                    }
+                    ensureLocalPathsMetadataLoaded(candidateLocalPaths)
+
+                    // A. 服务端「我的收藏」智能歌单 (放置在置顶首位)
                     if (favArr != null && favArr.length() > 0) {
                         val favPreviewCovers = ArrayList<String>()
                         for (fIdx in 0 until favArr.length()) {
                             if (favPreviewCovers.size >= 4) break
                             val favItem = favArr.opt(fIdx)
                             if (favItem is JSONObject) {
-                                var pic = favItem.optString("picUrl").ifBlank { favItem.optString("img") }
+                                var pic = extractTrackCoverFromJson(favItem)
                                 if (pic.isBlank()) {
                                     val lPath = favItem.optString("localPath").ifBlank { favItem.optString("filePath") }
-                                    val cleanPath = (if (lPath.isNotBlank()) lPath else favItem.optString("key").removePrefix("local:")).trim()
+                                    val cleanPath = (if (lPath.isNotBlank()) lPath else if (favItem.optString("key").startsWith("local:")) favItem.optString("key").removePrefix("local:") else "").trim()
                                     if (cleanPath.isNotBlank()) {
-                                        pic = getCoverArtUrlForPath(cleanPath)
+                                        pic = resolveCoverArtUrlForLocalPath(cleanPath)
                                     }
                                 }
-                                if (pic.isNotBlank()) {
-                                    val fullUrl = if (pic.startsWith("http://") || pic.startsWith("https://") || pic.startsWith("data:")) pic else "$cleanBase$pic"
-                                    if (!favPreviewCovers.contains(fullUrl)) {
-                                        favPreviewCovers.add(fullUrl)
-                                    }
+                                if (pic.isNotBlank() && !favPreviewCovers.contains(pic)) {
+                                    favPreviewCovers.add(pic)
                                 }
                             } else if (favItem is String && favItem.isNotBlank()) {
                                 val clean = favItem.removePrefix("local:").trim()
                                 if (clean.isNotBlank()) {
-                                    val pic = getCoverArtUrlForPath(clean)
+                                    val pic = resolveCoverArtUrlForLocalPath(clean)
                                     if (pic.isNotBlank() && !favPreviewCovers.contains(pic)) {
                                         favPreviewCovers.add(pic)
                                     }
@@ -1074,14 +1292,13 @@ class LemonMusicProtocol(
                     }
 
                     // B. user-data 中的 playlists 自定义歌单
-                    val plArr = userData?.optJSONArray("playlists")
                     if (plArr != null) {
                         for (i in 0 until plArr.length()) {
                             val pl = plArr.optJSONObject(i) ?: continue
                             val id = pl.optString("id", "lemon_pl_$i")
                             if (seenIds.add(id)) {
                                 val name = pl.optString("name", "未命名歌单")
-                                var coverUrl = pl.optString("coverUrl")
+                                var coverUrl = normalizeImageUrl(pl.optString("coverUrl"), cleanBase)
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
                                 val previewCovers = ArrayList<String>()
@@ -1090,19 +1307,16 @@ class LemonMusicProtocol(
                                     while (it.hasNext() && previewCovers.size < 4) {
                                         val k = it.next()
                                         val sn = snapshots.optJSONObject(k)
-                                        var p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        var p = if (sn != null) extractTrackCoverFromJson(sn) else ""
                                         if (p.isBlank()) {
                                             val localPath = sn?.optString("localPath")?.ifBlank { sn.optString("filePath") } ?: ""
                                             val cleanLocalPath = if (localPath.isNotBlank()) localPath else if (k.startsWith("local:")) k.removePrefix("local:") else ""
                                             if (cleanLocalPath.isNotBlank()) {
-                                                p = getCoverArtUrlForPath(cleanLocalPath)
+                                                p = resolveCoverArtUrlForLocalPath(cleanLocalPath)
                                             }
                                         }
-                                        if (p.isNotBlank()) {
-                                            val fullUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            if (!previewCovers.contains(fullUrl)) {
-                                                previewCovers.add(fullUrl)
-                                            }
+                                        if (p.isNotBlank() && !previewCovers.contains(p)) {
+                                            previewCovers.add(p)
                                         }
                                     }
                                 }
@@ -1110,13 +1324,20 @@ class LemonMusicProtocol(
                                     for (tIdx in 0 until tracks.length()) {
                                         if (previewCovers.size >= 4) break
                                         val tItem = tracks.opt(tIdx)
+                                        if (tItem is JSONObject) {
+                                            val objPic = extractTrackCoverFromJson(tItem)
+                                            if (objPic.isNotBlank() && !previewCovers.contains(objPic)) {
+                                                previewCovers.add(objPic)
+                                                continue
+                                            }
+                                        }
                                         val rawPath = when (tItem) {
                                             is String -> tItem
                                             is JSONObject -> tItem.optString("localPath").ifBlank { tItem.optString("filePath").ifBlank { tItem.optString("key") } }
                                             else -> ""
                                         }
                                         if (rawPath.startsWith("local:") || rawPath.contains("/") || rawPath.contains("\\")) {
-                                            val cover = getCoverArtUrlForPath(rawPath.removePrefix("local:"))
+                                            val cover = resolveCoverArtUrlForLocalPath(rawPath.removePrefix("local:"))
                                             if (cover.isNotBlank() && !previewCovers.contains(cover)) {
                                                 previewCovers.add(cover)
                                             }
@@ -1125,8 +1346,6 @@ class LemonMusicProtocol(
                                 }
                                 if (coverUrl.isBlank() && previewCovers.isNotEmpty()) {
                                     coverUrl = previewCovers.first()
-                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
-                                    coverUrl = "$cleanBase$coverUrl"
                                 }
                                 playlists.add(
                                     UnifiedPlaylist(
@@ -1162,7 +1381,7 @@ class LemonMusicProtocol(
                             val id = pl.optString("id", "lemon_pl_$i")
                             if (seenIds.add(id)) {
                                 val name = pl.optString("name", "未命名歌单")
-                                var coverUrl = pl.optString("coverUrl")
+                                var coverUrl = normalizeImageUrl(pl.optString("coverUrl"), cleanBase)
                                 val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
                                 val snapshots = pl.optJSONObject("trackSnapshots")
                                 val previewCovers = ArrayList<String>()
@@ -1171,19 +1390,16 @@ class LemonMusicProtocol(
                                     while (it.hasNext() && previewCovers.size < 4) {
                                         val k = it.next()
                                         val sn = snapshots.optJSONObject(k)
-                                        var p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
+                                        var p = if (sn != null) extractTrackCoverFromJson(sn) else ""
                                         if (p.isBlank()) {
                                             val localPath = sn?.optString("localPath")?.ifBlank { sn.optString("filePath") } ?: ""
                                             val cleanLocalPath = if (localPath.isNotBlank()) localPath else if (k.startsWith("local:")) k.removePrefix("local:") else ""
                                             if (cleanLocalPath.isNotBlank()) {
-                                                p = getCoverArtUrlForPath(cleanLocalPath)
+                                                p = resolveCoverArtUrlForLocalPath(cleanLocalPath)
                                             }
                                         }
-                                        if (p.isNotBlank()) {
-                                            val fullUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            if (!previewCovers.contains(fullUrl)) {
-                                                previewCovers.add(fullUrl)
-                                            }
+                                        if (p.isNotBlank() && !previewCovers.contains(p)) {
+                                            previewCovers.add(p)
                                         }
                                     }
                                 }
@@ -1191,13 +1407,20 @@ class LemonMusicProtocol(
                                     for (tIdx in 0 until tracks.length()) {
                                         if (previewCovers.size >= 4) break
                                         val tItem = tracks.opt(tIdx)
+                                        if (tItem is JSONObject) {
+                                            val objPic = extractTrackCoverFromJson(tItem)
+                                            if (objPic.isNotBlank() && !previewCovers.contains(objPic)) {
+                                                previewCovers.add(objPic)
+                                                continue
+                                            }
+                                        }
                                         val rawPath = when (tItem) {
                                             is String -> tItem
                                             is JSONObject -> tItem.optString("localPath").ifBlank { tItem.optString("filePath").ifBlank { tItem.optString("key") } }
                                             else -> ""
                                         }
                                         if (rawPath.startsWith("local:") || rawPath.contains("/") || rawPath.contains("\\")) {
-                                            val cover = getCoverArtUrlForPath(rawPath.removePrefix("local:"))
+                                            val cover = resolveCoverArtUrlForLocalPath(rawPath.removePrefix("local:"))
                                             if (cover.isNotBlank() && !previewCovers.contains(cover)) {
                                                 previewCovers.add(cover)
                                             }
@@ -1206,8 +1429,6 @@ class LemonMusicProtocol(
                                 }
                                 if (coverUrl.isBlank() && previewCovers.isNotEmpty()) {
                                     coverUrl = previewCovers.first()
-                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
-                                    coverUrl = "$cleanBase$coverUrl"
                                 }
                                 playlists.add(
                                     UnifiedPlaylist(
@@ -1297,7 +1518,8 @@ class LemonMusicProtocol(
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("play_id") }
                     val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "精选推荐") })
-                    val cover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    val rawCover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
+                    val cover = normalizeImageUrl(rawCover, cleanBase)
                     val count = item.optInt("total", item.optInt("count", 30))
                     if (id.isNotBlank()) {
                         playlists.add(
@@ -1357,10 +1579,35 @@ class LemonMusicProtocol(
     private fun normalizeImageUrl(rawUrl: String?, cleanBase: String): String {
         if (rawUrl.isNullOrBlank()) return ""
         var url = rawUrl.trim()
+        if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) {
+            return ""
+        }
         if (url.startsWith("//")) {
             url = "https:$url"
         } else if (url.startsWith("/") && !url.startsWith("/data")) {
             url = "$cleanBase$url"
+        } else if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("data:") && !url.startsWith("file:") && !url.startsWith("content:")) {
+            // 酷我短相对路径，如 "120/23/45/123456.jpg" 或 "500/..."
+            if (url.matches(Regex("^\\d+/.*"))) {
+                val upgraded = url.replaceFirst(Regex("^(120|150|240|300)/"), "500/")
+                url = "https://img1.kuwo.cn/star/albumcover/$upgraded"
+            } else {
+                url = "$cleanBase/${url.trimStart('/')}"
+            }
+        }
+        if (url.contains("{size}")) {
+            url = url.replace("{size}", "500")
+        }
+        if (url.contains("/star/albumcover/120/")) {
+            url = url.replace("/star/albumcover/120/", "/star/albumcover/500/")
+        }
+        if (url.startsWith("http://")) {
+            val lower = url.lowercase()
+            if (lower.contains("kuwo.cn") || lower.contains("koowo.cn") || lower.contains("kugou.com") ||
+                lower.contains("gtimg.cn") || lower.contains("126.net") || lower.contains("music.migu.cn")
+            ) {
+                url = "https://" + url.removePrefix("http://")
+            }
         }
         return url
     }
@@ -1595,7 +1842,7 @@ class LemonMusicProtocol(
     ): Result<List<UnifiedAlbum>> = withContext(Dispatchers.IO) {
         val cacheKey = "${cleanBase}_${source}_${region}_${page}_$limit"
         val cached = discoverNewAlbumsCache[cacheKey]
-        if (cached != null && System.currentTimeMillis() - cached.first < DISCOVER_CACHE_TTL_MS) {
+        if (cached != null && System.currentTimeMillis() - cached.first < DISCOVER_CACHE_TTL_MS && cached.second.any { it.coverUrl.isNotBlank() }) {
             return@withContext Result.success(cached.second)
         }
         try {
@@ -1626,6 +1873,15 @@ class LemonMusicProtocol(
                         .ifBlank { item.optString("albumPic") }
                         .ifBlank { item.optString("imgurl") }
                         .ifBlank { item.optString("coverUrl") }
+                        .ifBlank { item.optString("hts_img") }
+                    if (cover.isBlank()) {
+                        val albumMid = item.optString("albumMid").ifBlank { item.optString("albummid") }.ifBlank {
+                            if (source == "tx" && id.length >= 10 && id.all { it.isLetterOrDigit() }) id else ""
+                        }
+                        if (albumMid.isNotBlank()) {
+                            cover = "https://y.gtimg.cn/music/photo_new/T002R500x500M000${albumMid}.jpg"
+                        }
+                    }
                     cover = normalizeImageUrl(cover, cleanBase)
                     val count = item.optInt("total", item.optInt("count", item.optInt("songCount", 0)))
                     val yearStr = item.optString("publishTime").ifBlank { item.optString("year") }
@@ -1642,7 +1898,7 @@ class LemonMusicProtocol(
                         )
                     )
                 }
-                if (albums.isNotEmpty()) {
+                if (albums.isNotEmpty() && albums.any { it.coverUrl.isNotBlank() }) {
                     discoverNewAlbumsCache[cacheKey] = Pair(System.currentTimeMillis(), albums)
                 }
                 Result.success(albums)
@@ -1711,6 +1967,7 @@ class LemonMusicProtocol(
             }
 
             val songs = ArrayList<UnifiedSong>()
+            val seenSongIds = HashSet<String>()
             val missingPaths = ArrayList<String>()
 
             // C. 若是「我的收藏」智能歌单：直接从 /api/library/user-data 提取 favorites
@@ -1720,76 +1977,48 @@ class LemonMusicProtocol(
                     val userData = userDataRes.getOrNull()
                     val favArr = userData?.optJSONArray("favorites")
                     if (favArr != null) {
+                        val favLocalPaths = ArrayList<String>()
                         for (j in 0 until favArr.length()) {
                             val item = favArr.opt(j)
                             if (item is JSONObject) {
-                                val sName = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title") })
-                                val sSinger = SongMatchingResolver.unescapeMusicText(item.optString("singer").ifBlank { item.optString("artist", "未知歌手") })
-                                val sAlbum = SongMatchingResolver.unescapeMusicText(item.optString("album", "未知专辑"))
-                                val sLocalPath = item.optString("localPath").ifBlank { item.optString("filePath") }
-                                var sPic = item.optString("picUrl").ifBlank { item.optString("img") }
-                                val sSource = item.optString("source").ifBlank { item.optString("platform") }
-                                val sSongId = item.optString("songId").ifBlank { item.optString("id") }
-                                val durMs = (item.optDouble("interval", item.optDouble("duration", 0.0)) * 1000).toLong()
+                                val lPath = item.optString("localPath").ifBlank { item.optString("filePath") }
+                                val cleanPath = (if (lPath.isNotBlank()) lPath else if (item.optString("key").startsWith("local:")) item.optString("key").removePrefix("local:") else "").trim()
+                                if (cleanPath.isNotBlank()) favLocalPaths.add(cleanPath)
+                            } else if (item is String && item.isNotBlank()) {
+                                val clean = item.removePrefix("local:").trim()
+                                if (clean.startsWith("/") || clean.contains("\\")) favLocalPaths.add(clean)
+                            }
+                        }
+                        ensureLocalPathsMetadataLoaded(favLocalPaths)
 
-                                if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
-                                    sPic = "$cleanBase$sPic"
-                                }
-
-                                if (sLocalPath.isNotBlank() || item.optString("key").startsWith("local:")) {
-                                    val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else item.optString("key").removePrefix("local:")).trim()
-                                    val songId = "lemon_${md5(cleanPath)}"
-                                    val streamUrl = getStreamUrlForPath(cleanPath)
-                                    val coverUrl = if (sPic.isNotBlank()) sPic else getCoverArtUrlForPath(cleanPath)
-                                    val song = UnifiedSong(
-                                        id = songId,
-                                        title = sName.ifBlank { cleanPath.substringAfterLast('/').substringBeforeLast('.') },
-                                        artist = sSinger,
-                                        artistId = "artist_${sSinger.hashCode()}",
-                                        album = sAlbum,
-                                        albumId = "album_${sAlbum.hashCode()}",
-                                        durationMs = durMs,
-                                        coverUrl = coverUrl,
-                                        streamUrl = streamUrl,
-                                        serverId = "lemon_music",
-                                        localFilePath = null,
-                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                                        bitRate = 320,
-                                        format = cleanPath.substringAfterLast('.', "flac").lowercase(),
-                                        isFavorite = true,
-                                        relativeFolderPath = extractRelativeFolderPath(cleanPath, sSinger, sAlbum)
-                                    )
-                                    songIdToPathMap[songId] = cleanPath
-                                    songIdToSongMap[songId] = song
-                                    songs.add(song)
-                                } else if (sSource.isNotBlank() && sSource != "local") {
-                                    val platform = sSource.ifBlank { "kw" }
-                                    val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_${sSongId.ifBlank { item.optString("key") }}"
-                                    val song = UnifiedSong(
-                                        id = onlineId,
-                                        title = sName.ifBlank { "在线曲目" },
-                                        artist = sSinger,
-                                        artistId = "artist_${sSinger.hashCode()}",
-                                        album = sAlbum,
-                                        albumId = "album_${sAlbum.hashCode()}",
-                                        durationMs = durMs,
-                                        coverUrl = sPic,
-                                        streamUrl = "lemon_online://$platform/${sSongId.ifBlank { item.optString("key") }}",
-                                        serverId = "lemon_online",
-                                        localFilePath = null,
-                                        downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                                        bitRate = 320,
-                                        format = "mp3",
-                                        isFavorite = true,
-                                        rawMetaJson = item.toString()
-                                    )
-                                    songs.add(song)
+                        for (j in 0 until favArr.length()) {
+                            val item = favArr.opt(j)
+                            if (item is JSONObject) {
+                                val parsed = parseUserDataTrack(item)?.copy(isFavorite = true)
+                                if (parsed != null && seenSongIds.add(parsed.id)) {
+                                    if (parsed.serverId == "lemon_music") {
+                                        val lPath = item.optString("localPath").ifBlank { item.optString("filePath") }
+                                        val cleanPath = (if (lPath.isNotBlank()) lPath else item.optString("key").removePrefix("local:")).trim()
+                                        if (cleanPath.isNotBlank()) {
+                                            songIdToPathMap[parsed.id] = cleanPath
+                                            songIdToSongMap[parsed.id] = parsed
+                                        }
+                                    }
+                                    songs.add(parsed)
                                 }
                             } else {
                                 val pathStr = item?.toString() ?: ""
                                 val clean = pathStr.removePrefix("local:").trim()
                                 if (clean.isNotBlank()) {
-                                    missingPaths.add(clean)
+                                    val cachedId = "lemon_${md5(clean)}"
+                                    val cachedSong = songIdToSongMap[cachedId]
+                                    if (cachedSong != null) {
+                                        if (seenSongIds.add(cachedSong.id)) {
+                                            songs.add(cachedSong.copy(isFavorite = true))
+                                        }
+                                    } else {
+                                        missingPaths.add(clean)
+                                    }
                                 }
                             }
                         }
@@ -1848,86 +2077,144 @@ class LemonMusicProtocol(
                     val trackKeys = finalPl.optJSONArray("trackKeys") ?: finalPl.optJSONArray("paths") ?: finalPl.optJSONArray("tracks") ?: JSONArray()
                     val snapshots = finalPl.optJSONObject("trackSnapshots")
 
+                    // 预检歌单中所有本地曲目的 hasPicture 状态，避免无内嵌封面的曲目被填充为 404 的 /api/tag/cover 链接
+                    val playlistLocalPaths = ArrayList<String>()
                     for (j in 0 until trackKeys.length()) {
-                        val rawKey = when (val item = trackKeys.opt(j)) {
-                            is String -> item
-                            is JSONObject -> item.optString("key").ifBlank { item.optString("filePath").ifBlank { item.optString("id") } }
+                        val rawItem = trackKeys.opt(j)
+                        val rawKey = when (rawItem) {
+                            is String -> rawItem.trim()
+                            is JSONObject -> rawItem.optString("key").ifBlank { rawItem.optString("filePath").ifBlank { rawItem.optString("localPath") } }.trim()
                             else -> ""
                         }
-                        if (rawKey.isBlank()) continue
+                        val snapshot = (if (rawKey.isNotBlank()) snapshots?.optJSONObject(rawKey) else null)
+                            ?: (if (rawKey.startsWith("local:")) snapshots?.optJSONObject(rawKey.removePrefix("local:")) else if (rawKey.isNotBlank()) snapshots?.optJSONObject("local:$rawKey") else null)
+                            ?: (rawItem as? JSONObject)
+                        val sLocalPath = snapshot?.optString("localPath")?.ifBlank { snapshot.optString("filePath") }.orEmpty()
+                        val cleanLocalPath = (if (sLocalPath.isNotBlank()) sLocalPath else if (rawKey.startsWith("local:") || rawKey.startsWith("/") || rawKey.contains("\\")) rawKey.removePrefix("local:") else "").trim()
+                        if (cleanLocalPath.isNotBlank()) {
+                            playlistLocalPaths.add(cleanLocalPath)
+                        }
+                    }
+                    ensureLocalPathsMetadataLoaded(playlistLocalPaths)
 
-                        val snapshot = snapshots?.optJSONObject(rawKey)
-                            ?: (if (trackKeys.opt(j) is JSONObject) trackKeys.opt(j) as JSONObject else null)
+                    for (j in 0 until trackKeys.length()) {
+                        val rawItem = trackKeys.opt(j)
+                        val rawKey = when (rawItem) {
+                            is String -> rawItem.trim()
+                            is JSONObject -> rawItem.optString("key").ifBlank { rawItem.optString("filePath").ifBlank { rawItem.optString("localPath").ifBlank { rawItem.optString("id") } } }.trim()
+                            else -> ""
+                        }
+                        if (rawKey.isBlank() && rawItem !is JSONObject) continue
+
+                        val snapshot = (if (rawKey.isNotBlank()) snapshots?.optJSONObject(rawKey) else null)
+                            ?: (if (rawKey.startsWith("local:")) snapshots?.optJSONObject(rawKey.removePrefix("local:")) else if (rawKey.isNotBlank()) snapshots?.optJSONObject("local:$rawKey") else null)
+                            ?: (rawItem as? JSONObject)
 
                         if (snapshot != null) {
                             val sName = SongMatchingResolver.unescapeMusicText(snapshot.optString("name").ifBlank { snapshot.optString("title") })
                             val sSinger = SongMatchingResolver.unescapeMusicText(snapshot.optString("singer").ifBlank { snapshot.optString("artist", "未知歌手") })
                             val sAlbum = SongMatchingResolver.unescapeMusicText(snapshot.optString("album", "未知专辑"))
                             val sLocalPath = snapshot.optString("localPath").ifBlank { snapshot.optString("filePath") }
-                            val sSource = snapshot.optString("source").ifBlank { snapshot.optString("platform") }
-                            var sPic = snapshot.optString("picUrl").ifBlank { snapshot.optString("img") }
-                            val sSongId = snapshot.optString("songId").ifBlank { snapshot.optString("id") }
-                            val interval = snapshot.optDouble("interval", snapshot.optDouble("duration", 0.0))
-                            val durMs = (interval * 1000).toLong()
-
-                            if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
-                                sPic = "$cleanBase$sPic"
+                            val sSource = snapshot.optString("source").ifBlank { snapshot.optString("platform") }.ifBlank {
+                                if (rawKey.contains(":") && !rawKey.startsWith("local:")) rawKey.substringBefore(":") else ""
                             }
+                            val sPic = extractTrackCoverFromJson(snapshot)
+                            val interval = snapshot.optDouble("interval", snapshot.optDouble("duration", 0.0))
+                            val durMs = normalizeNumericDurationMs(interval)
 
-                            if (sLocalPath.isNotBlank() || rawKey.startsWith("local:")) {
+                            if (sLocalPath.isNotBlank() || rawKey.startsWith("local:") || (sSource.isBlank() && (rawKey.startsWith("/") || rawKey.contains("\\")))) {
                                 val cleanLocalPath = (if (sLocalPath.isNotBlank()) sLocalPath else rawKey.removePrefix("local:")).trim()
                                 val songId = "lemon_${md5(cleanLocalPath)}"
+                                val cached = songIdToSongMap[songId]
                                 val streamUrl = getStreamUrlForPath(cleanLocalPath)
-                                val coverUrl = if (sPic.isNotBlank()) sPic else getCoverArtUrlForPath(cleanLocalPath)
+                                val coverUrl = resolveCoverArtUrlForLocalPath(cleanLocalPath, sPic)
                                 val ext = cleanLocalPath.substringAfterLast('.', "flac").lowercase()
                                 val song = UnifiedSong(
                                     id = songId,
-                                    title = sName.ifBlank { cleanLocalPath.substringAfterLast('/').substringBeforeLast('.') },
-                                    artist = sSinger,
+                                    title = sName.ifBlank { cached?.title ?: cleanLocalPath.replace('\\', '/').substringAfterLast('/').substringBeforeLast('.') },
+                                    artist = if (sSinger != "未知歌手" || cached == null) sSinger else cached.artist,
                                     artistId = "artist_${sSinger.hashCode()}",
-                                    album = sAlbum,
+                                    album = if (sAlbum != "未知专辑" || cached == null) sAlbum else cached.album,
                                     albumId = "album_${sAlbum.hashCode()}",
-                                    durationMs = durMs,
+                                    durationMs = if (durMs > 0L) durMs else (cached?.durationMs ?: 0L),
                                     coverUrl = coverUrl,
                                     streamUrl = streamUrl,
                                     serverId = "lemon_music",
-                                    localFilePath = null,
-                                    downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                                    bitRate = 320,
+                                    localFilePath = cached?.localFilePath,
+                                    downloadStatus = cached?.downloadStatus ?: DownloadStatus.NOT_DOWNLOADED,
+                                    bitRate = cached?.bitRate ?: 320,
                                     format = ext,
-                                    isFavorite = false,
+                                    isFavorite = cached?.isFavorite ?: false,
                                     relativeFolderPath = extractRelativeFolderPath(cleanLocalPath, sSinger, sAlbum)
                                 )
                                 songIdToPathMap[songId] = cleanLocalPath
                                 songIdToSongMap[songId] = song
-                                songs.add(song)
+                                if (seenSongIds.add(song.id)) {
+                                    songs.add(song)
+                                }
                             } else {
                                 val platform = sSource.ifBlank { "kw" }
-                                val onlineId = if (sSongId.startsWith("lemon_online_")) sSongId else "lemon_online_${platform}_${sSongId.ifBlank { rawKey }}"
-                                val song = UnifiedSong(
+                                val extractedId = extractOnlineSongIdFromJson(snapshot, rawKey, sName, sSinger)
+                                if (extractedId.isNotBlank()) {
+                                    val onlineId = if (extractedId.startsWith("lemon_online_")) extractedId else "lemon_online_${platform}_$extractedId"
+                                    val streamId = extractedId.removePrefix("lemon_online_${platform}_")
+                                    val cached = songIdToSongMap[onlineId]
+                                    val song = UnifiedSong(
+                                        id = onlineId,
+                                        title = sName.ifBlank { cached?.title ?: "在线曲目" },
+                                        artist = if (sSinger != "未知歌手" || cached == null) sSinger else cached.artist,
+                                        artistId = "artist_${sSinger.hashCode()}",
+                                        album = if (sAlbum != "未知专辑" || cached == null) sAlbum else cached.album,
+                                        albumId = "album_${sAlbum.hashCode()}",
+                                        durationMs = if (durMs > 0L) durMs else (cached?.durationMs ?: 0L),
+                                        coverUrl = sPic.ifBlank { cached?.coverUrl ?: "" },
+                                        streamUrl = "lemon_online://$platform/$streamId",
+                                        serverId = "lemon_online",
+                                        localFilePath = cached?.localFilePath,
+                                        downloadStatus = cached?.downloadStatus ?: DownloadStatus.NOT_DOWNLOADED,
+                                        bitRate = 320,
+                                        format = "mp3",
+                                        isFavorite = cached?.isFavorite ?: false,
+                                        rawMetaJson = snapshot.toString()
+                                    )
+                                    if (seenSongIds.add(song.id)) {
+                                        songs.add(song)
+                                    }
+                                }
+                            }
+                        } else if (rawKey.contains(":") && !rawKey.startsWith("local:") && !rawKey.contains("/") && !rawKey.contains("\\")) {
+                            val platform = rawKey.substringBefore(":").ifBlank { "kw" }
+                            val sid = rawKey.substringAfter(":").trim()
+                            if (sid.isNotBlank()) {
+                                val onlineId = if (sid.startsWith("lemon_online_")) sid else "lemon_online_${platform}_$sid"
+                                val cached = songIdToSongMap[onlineId]
+                                val song = cached ?: UnifiedSong(
                                     id = onlineId,
-                                    title = sName.ifBlank { "在线曲目" },
-                                    artist = sSinger,
-                                    artistId = "artist_${sSinger.hashCode()}",
-                                    album = sAlbum,
-                                    albumId = "album_${sAlbum.hashCode()}",
-                                    durationMs = durMs,
-                                    coverUrl = sPic,
-                                    streamUrl = "lemon_online://$platform/${sSongId.ifBlank { rawKey }}",
+                                    title = "在线曲目 ($sid)",
+                                    artist = "未知歌手",
+                                    album = "未知专辑",
+                                    durationMs = 0L,
+                                    coverUrl = "",
+                                    streamUrl = "lemon_online://$platform/$sid",
                                     serverId = "lemon_online",
-                                    localFilePath = null,
-                                    downloadStatus = DownloadStatus.NOT_DOWNLOADED,
-                                    bitRate = 320,
-                                    format = "mp3",
-                                    isFavorite = false,
-                                    rawMetaJson = snapshot.toString()
+                                    format = "mp3"
                                 )
-                                songs.add(song)
+                                if (seenSongIds.add(song.id)) {
+                                    songs.add(song)
+                                }
                             }
                         } else {
                             val clean = rawKey.removePrefix("local:").trim()
                             if (clean.isNotBlank()) {
-                                missingPaths.add(clean)
+                                val cachedId = "lemon_${md5(clean)}"
+                                val cachedSong = songIdToSongMap[cachedId]
+                                if (cachedSong != null) {
+                                    if (seenSongIds.add(cachedSong.id)) {
+                                        songs.add(cachedSong)
+                                    }
+                                } else {
+                                    missingPaths.add(clean)
+                                }
                             }
                         }
                     }
@@ -1960,6 +2247,8 @@ class LemonMusicProtocol(
                                 // 统一归一化，避免毫秒被当秒放大 1000 倍
                                 val durationMs = normalizeNumericDurationMs(item.optDouble("duration", 0.0))
                                 val songId = "lemon_${md5(filePath)}"
+                                val hasPic = if (item.has("hasPicture")) item.optBoolean("hasPicture", false) else true
+                                songIdHasEmbeddedCoverMap[songId] = hasPic
                                 songIdToPathMap[songId] = filePath
 
                                 val song = UnifiedSong(
@@ -1968,14 +2257,17 @@ class LemonMusicProtocol(
                                     artist = artist,
                                     album = album,
                                     durationMs = durationMs,
-                                    coverUrl = getCoverArtUrl(songId),
+                                    coverUrl = resolveCoverArtUrlForLocalPath(filePath),
                                     streamUrl = getStreamUrlForPathWithPreferredQuality(songIdToPathMap[songId] ?: ""),
                                     serverId = "lemon_music",
                                     format = item.optString("format", "flac"),
+                                    isFavorite = (playlistId == "lemon_favorites"),
                                     relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
                                 )
                                 songIdToSongMap[songId] = song
-                                songs.add(song)
+                                if (seenSongIds.add(song.id)) {
+                                    songs.add(song)
+                                }
                             }
                         }
                     }
@@ -2171,10 +2463,110 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 解析服务器本地音频文件的有效封面 URL：
+     * 1. 若快照或外部已提供非 /api/tag/cover 的封面 URL，优先使用并记入缓存；
+     * 2. 若已通过在线搜索补齐过真实封面 (songIdResolvedCoverMap)，直接复用；
+     * 3. 若服务端明确标记该文件 hasPicture == false，绝不返回必定 404 的 /api/tag/cover 链接，返回空串交由上层补齐；
+     * 4. 其余情况返回 /api/tag/cover?path=...
+     */
+    fun resolveCoverArtUrlForLocalPath(path: String, explicitCover: String = ""): String {
+        val cleanExplicit = explicitCover.trim()
+        val cleanPath = path.removePrefix("local:").trim()
+        val songId = if (cleanPath.isNotBlank()) "lemon_${md5(cleanPath)}" else ""
+        if (cleanExplicit.isNotBlank() && !cleanExplicit.contains("/api/tag/cover")) {
+            if (songId.isNotBlank()) {
+                registerResolvedCover(songId, cleanExplicit)
+            }
+            return cleanExplicit
+        }
+        if (songId.isNotBlank()) {
+            songIdResolvedCoverMap[songId]?.takeIf { it.isNotBlank() }?.let { return it }
+            val cachedCover = songIdToSongMap[songId]?.coverUrl?.trim().orEmpty()
+            if (cachedCover.isNotBlank() && !cachedCover.contains("/api/tag/cover")) {
+                return cachedCover
+            }
+            if (songIdHasEmbeddedCoverMap[songId] == false) {
+                return ""
+            }
+        }
+        return if (cleanPath.isNotBlank()) getCoverArtUrlForPath(cleanPath) else ""
+    }
+
+    /**
+     * 批量预检服务器本地路径的元数据与 hasPicture 状态 (/api/library/tracks/by-paths)，
+     * 确保在 getSongList 尚未完成或单独拉取歌单时也能准确获知曲目是否含有内嵌封面。
+     */
+    private fun ensureLocalPathsMetadataLoaded(paths: Collection<String>) {
+        val unknownPaths = paths.map { it.removePrefix("local:").trim() }
+            .filter { it.isNotBlank() && !songIdHasEmbeddedCoverMap.containsKey("lemon_${md5(it)}") }
+            .distinct()
+        if (unknownPaths.isEmpty()) return
+        try {
+            val payload = JSONObject().apply {
+                put("paths", JSONArray(unknownPaths))
+            }
+            val req = newAuthRequest("$cleanBase/api/library/tracks/by-paths")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (resp.isSuccessful && body.isNotBlank()) {
+                    val json = JSONObject(body)
+                    val arr = json.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        val item = arr.optJSONObject(i) ?: continue
+                        val filePath = item.optString("filePath").trim()
+                        if (filePath.isBlank()) continue
+                        val songId = "lemon_${md5(filePath)}"
+                        val hasPic = if (item.has("hasPicture")) item.optBoolean("hasPicture", false) else true
+                        songIdHasEmbeddedCoverMap[songId] = hasPic
+                        songIdToPathMap[songId] = filePath
+                        val trackId = item.optString("trackId").ifBlank { item.optString("id") }
+                        if (trackId.isNotBlank()) songIdToTrackIdMap[songId] = trackId
+                        if (!songIdToSongMap.containsKey(songId)) {
+                            val fileName = item.optString("fileName")
+                            val title = SongMatchingResolver.unescapeMusicText(
+                                item.optString("title").ifBlank { item.optString("parsedTitle") }.ifBlank { fileName.substringBeforeLast('.', fileName) }
+                            )
+                            val artist = SongMatchingResolver.unescapeMusicText(
+                                item.optString("artist").ifBlank { item.optString("parsedArtist") }.ifBlank { "未知歌手" }
+                            )
+                            val album = SongMatchingResolver.unescapeMusicText(item.optString("album").ifBlank { "未知专辑" })
+                            val durationMs = normalizeNumericDurationMs(item.optDouble("duration", 0.0))
+                            val coverUrl = resolveCoverArtUrlForLocalPath(filePath)
+                            songIdToSongMap[songId] = UnifiedSong(
+                                id = songId,
+                                title = title,
+                                artist = artist,
+                                artistId = "lemon_artist_${md5(artist)}",
+                                album = album,
+                                albumId = "lemon_album_${md5("$artist/$album")}",
+                                durationMs = durationMs,
+                                coverUrl = coverUrl,
+                                streamUrl = getStreamUrlForPathWithPreferredQuality(filePath),
+                                serverId = "lemon_music",
+                                format = item.optString("format", "flac").lowercase(),
+                                relativeFolderPath = extractRelativeFolderPath(filePath, artist, album)
+                            )
+                        } else if (!hasPic) {
+                            val existing = songIdToSongMap[songId]
+                            if (existing != null && existing.coverUrl.contains("/api/tag/cover")) {
+                                songIdToSongMap[songId] = existing.copy(coverUrl = songIdResolvedCoverMap[songId] ?: "")
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureLocalPathsMetadataLoaded failed: ${e.message}")
+        }
+    }
+
     override fun getCoverArtUrl(mediaId: String, size: Int): String {
         val path = songIdToPathMap[mediaId] ?: ""
         return if (path.isNotBlank()) {
-            getCoverArtUrlForPath(path)
+            resolveCoverArtUrlForLocalPath(path)
         } else ""
     }
 
@@ -3191,6 +3583,13 @@ class LemonMusicProtocol(
                     else -> JSONArray()
                 }
 
+                // 对齐柠檬服务端：从 /api/settings 中的 source.enabledPlatforms 读取禁用状态（移至循环外单次读取）
+                val srvPlatformsRaw = runCatching {
+                    val sObj = getServerSettings().getOrNull()
+                    sObj?.optString("source.enabledPlatforms")
+                }.getOrNull()
+                val srvPlatformsJson = srvPlatformsRaw?.takeIf { it.isNotBlank() }?.let { runCatching { JSONObject(it) }.getOrNull() }
+
                 val list = ArrayList<LemonSourceScriptInfo>(arr.length())
                 for (i in 0 until arr.length()) {
                     val item = arr.optJSONObject(i) ?: continue
@@ -3231,17 +3630,11 @@ class LemonMusicProtocol(
                             }
                         }
                     }
-                    // 对齐柠檬服务端：从 /api/settings 中的 source.enabledPlatforms 读取禁用状态
-                    val srvPlatformsRaw = runCatching {
-                        val sObj = getServerSettings().getOrNull()
-                        sObj?.optString("source.enabledPlatforms")
-                    }.getOrNull()
-                    if (!srvPlatformsRaw.isNullOrBlank()) {
+                    if (srvPlatformsJson != null) {
                         runCatching {
-                            val pJson = JSONObject(srvPlatformsRaw)
                             val sid = item.optString("id").ifBlank { (i + 1).toString() }
-                            if (pJson.has(sid)) {
-                                val enabledArr = pJson.optJSONArray(sid) ?: JSONArray()
+                            if (srvPlatformsJson.has(sid)) {
+                                val enabledArr = srvPlatformsJson.optJSONArray(sid) ?: JSONArray()
                                 val enabledSet = mutableSetOf<String>()
                                 for (k in 0 until enabledArr.length()) {
                                     enabledSet.add(enabledArr.optString(k).lowercase())
@@ -3270,14 +3663,6 @@ class LemonMusicProtocol(
                     )
                 }
 
-                // 若服务端未导入第三方额外自定义脚本，自动展现服务器原生内置的 5 大就绪音源
-                if (list.isEmpty()) {
-                    list.add(LemonSourceScriptInfo(id = "builtin_kw", name = "酷我音乐 (服务端原生通道)", description = "服务端原生直连通道，支持 128K/320K/FLAC/Hi-Res 高解析解析与缓存", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("kw"), isActive = true, healthSummary = "连接正常"))
-                    list.add(LemonSourceScriptInfo(id = "builtin_wy", name = "网易云音乐 (服务端原生通道)", description = "服务端原生直连通道，支持全网榜单、热歌推荐与歌单同步", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("wy"), isActive = true, healthSummary = "连接正常"))
-                    list.add(LemonSourceScriptInfo(id = "builtin_tx", name = "QQ音乐 (服务端原生通道)", description = "服务端原生直连通道，支持海量正版流行曲目与新歌首发推荐", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("tx"), isActive = true, healthSummary = "连接正常"))
-                    list.add(LemonSourceScriptInfo(id = "builtin_kg", name = "酷狗音乐 (服务端原生通道)", description = "服务端原生直连通道，支持全景音效及经典老歌极速检索", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("kg"), isActive = true, healthSummary = "连接正常"))
-                    list.add(LemonSourceScriptInfo(id = "builtin_mg", name = "咪咕音乐 (服务端原生通道)", description = "服务端原生直连通道，无损超清品质与官方专属曲库通道", author = "柠檬音乐官方", version = "内置核心", supportedPlatforms = listOf("mg"), isActive = true, healthSummary = "连接正常"))
-                }
                 Result.success(list)
             }
         } catch (e: Exception) {
@@ -3398,6 +3783,85 @@ class LemonMusicProtocol(
                 if (resp.isSuccessful) Result.success(true)
                 else Result.failure(Exception("删除音源失败 (HTTP ${resp.code})"))
             }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 获取指定音源脚本的内容/源码 (/api/source/:id/raw 或 /api/source/:id)
+     */
+    suspend fun fetchSourceScriptContent(sourceId: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            fun isValidJs(text: String): Boolean {
+                val t = text.trim()
+                if (t.length < 20) return false
+                if (t.startsWith("<!doctype", ignoreCase = true) ||
+                    t.startsWith("<html", ignoreCase = true) ||
+                    t.startsWith("<head", ignoreCase = true) ||
+                    t.startsWith("<body", ignoreCase = true) ||
+                    t.startsWith("<?xml", ignoreCase = true)) {
+                    return false
+                }
+                return t.contains("lx.") || t.contains("cerumusic") || t.contains("module.exports") || t.contains("EVENT_NAMES") || t.contains("@name")
+            }
+
+            // 尝试 1: GET /api/source/:id/raw
+            runCatching {
+                val req1 = newAuthRequest("$cleanBase/api/source/$sourceId/raw").get().build()
+                client.newCall(req1).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        if (isValidJs(body)) {
+                            return@withContext Result.success(body)
+                        }
+                    }
+                }
+            }
+
+            // 尝试 2: GET /api/source/:id
+            val req2 = newAuthRequest("$cleanBase/api/source/$sourceId").get().build()
+            client.newCall(req2).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    if (body.trimStart().startsWith("{")) {
+                        val json = JSONObject(body)
+                        val dataObj = json.optJSONObject("data") ?: json
+                        val scriptStr = dataObj.optString("script")
+                            .ifBlank { dataObj.optString("content") }
+                            .ifBlank { dataObj.optString("code") }
+                        if (isValidJs(scriptStr)) {
+                            return@withContext Result.success(scriptStr)
+                        }
+                    } else if (isValidJs(body)) {
+                        return@withContext Result.success(body)
+                    }
+                }
+            }
+
+            // 尝试 3: GET /api/source/detail?id=:id
+            runCatching {
+                val req3 = newAuthRequest("$cleanBase/api/source/detail?id=$sourceId").get().build()
+                client.newCall(req3).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        if (body.trimStart().startsWith("{")) {
+                            val json = JSONObject(body)
+                            val dataObj = json.optJSONObject("data") ?: json
+                            val scriptStr = dataObj.optString("script")
+                                .ifBlank { dataObj.optString("content") }
+                                .ifBlank { dataObj.optString("code") }
+                            if (isValidJs(scriptStr)) {
+                                return@withContext Result.success(scriptStr)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Result.failure(Exception("服务端未返回该脚本的代码内容"))
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Result.failure(e)
@@ -3586,91 +4050,105 @@ class LemonMusicProtocol(
      * 在服务器端创建全新自定义歌单
      */
     suspend fun createCustomPlaylist(name: String, coverUrl: String = ""): Result<UnifiedPlaylist> = withContext(Dispatchers.IO) {
-        try {
-            ensureAuthenticatedOrThrow()
-            val existingPlaylists = fetchExistingPlaylistsRaw()
+        withUserDataWriteLock {
+            try {
+                ensureAuthenticatedOrThrow()
+                val existingPlaylists = fetchExistingPlaylistsRaw()
 
-            val newId = "pl_${System.currentTimeMillis()}_${(1000..9999).random()}"
-            val newPlObj = JSONObject().apply {
-                put("id", newId)
-                put("name", name)
-                put("createdAt", System.currentTimeMillis())
-                put("trackKeys", JSONArray())
-                put("trackSnapshots", JSONObject())
-                put("coverUrl", coverUrl)
-                put("coverMode", if (coverUrl.isNotBlank()) "custom" else "auto")
-                put("playlistType", "custom")
-            }
+                val newId = "pl_${System.currentTimeMillis()}_${(1000..9999).random()}"
+                val newPlObj = JSONObject().apply {
+                    put("id", newId)
+                    put("name", name)
+                    put("createdAt", System.currentTimeMillis())
+                    put("trackKeys", JSONArray())
+                    put("trackSnapshots", JSONObject())
+                    put("coverUrl", coverUrl)
+                    put("coverMode", if (coverUrl.isNotBlank()) "custom" else "auto")
+                    put("playlistType", "custom")
+                }
 
-            existingPlaylists.add(0, newPlObj)
-            val saveArr = JSONArray()
-            existingPlaylists.forEach { saveArr.put(it) }
+                existingPlaylists.add(0, newPlObj)
+                val saveArr = JSONArray()
+                existingPlaylists.forEach { saveArr.put(it) }
 
-            val saveRes = saveCustomPlaylists(saveArr)
-            if (saveRes.isSuccess) {
-                Result.success(
-                    UnifiedPlaylist(
-                        id = newId,
-                        name = name,
-                        coverUrl = coverUrl,
-                        songCount = 0,
-                        isOnline = true,
-                        serverId = "lemon_music",
-                        isDiscover = false
+                val saveRes = saveCustomPlaylists(saveArr)
+                if (saveRes.isSuccess) {
+                    Result.success(
+                        UnifiedPlaylist(
+                            id = newId,
+                            name = name,
+                            coverUrl = coverUrl,
+                            songCount = 0,
+                            isOnline = true,
+                            serverId = "lemon_music",
+                            isDiscover = false
+                        )
                     )
-                )
-            } else {
-                Result.failure(saveRes.exceptionOrNull() ?: Exception("保存新建歌单失败"))
+                } else {
+                    Result.failure(saveRes.exceptionOrNull() ?: Exception("保存新建歌单失败"))
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
             }
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            Result.failure(e)
         }
     }
 
     /**
      * 向服务器指定歌单追加曲目
      */
-    suspend fun addTracksToCustomPlaylist(playlistId: String, songKeys: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
-        try {
-            ensureAuthenticatedOrThrow()
-            val existingPlaylists = fetchExistingPlaylistsRaw()
+    suspend fun addTracksToCustomPlaylist(
+        playlistId: String,
+        songKeys: List<String>,
+        snapshots: Map<String, JSONObject> = emptyMap()
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        withUserDataWriteLock {
+            try {
+                ensureAuthenticatedOrThrow()
+                val existingPlaylists = fetchExistingPlaylistsRaw()
 
-            var found = false
-            for (pl in existingPlaylists) {
-                if (pl.optString("id") == playlistId) {
-                    val trackKeysArr = pl.optJSONArray("trackKeys") ?: JSONArray()
-                    val existingSet = HashSet<String>()
-                    for (k in 0 until trackKeysArr.length()) {
-                        existingSet.add(trackKeysArr.optString(k))
-                    }
-                    for (rawKey in songKeys) {
-                        val key = when {
-                            rawKey.startsWith("local:") || rawKey.contains(":") -> rawKey
-                            rawKey.startsWith("/") -> "local:$rawKey"
-                            else -> rawKey
+                var found = false
+                for (pl in existingPlaylists) {
+                    if (pl.optString("id") == playlistId) {
+                        val trackKeysArr = pl.optJSONArray("trackKeys") ?: JSONArray()
+                        val snapshotsObj = pl.optJSONObject("trackSnapshots") ?: JSONObject()
+                        val existingSet = HashSet<String>()
+                        for (k in 0 until trackKeysArr.length()) {
+                            existingSet.add(trackKeysArr.optString(k))
                         }
-                        if (!existingSet.contains(key)) {
-                            trackKeysArr.put(key)
-                            existingSet.add(key)
+                        for (rawKey in songKeys) {
+                            val key = when {
+                                rawKey.startsWith("local:") || rawKey.contains(":") -> rawKey
+                                rawKey.startsWith("/") -> "local:$rawKey"
+                                else -> rawKey
+                            }
+                            if (!existingSet.contains(key)) {
+                                trackKeysArr.put(key)
+                                existingSet.add(key)
+                            }
+                            val snap = snapshots[rawKey] ?: snapshots[key]
+                            if (snap != null) {
+                                snapshotsObj.put(key, snap)
+                            }
                         }
+                        pl.put("trackKeys", trackKeysArr)
+                        pl.put("trackSnapshots", snapshotsObj)
+                        found = true
+                        break
                     }
-                    pl.put("trackKeys", trackKeysArr)
-                    found = true
-                    break
                 }
-            }
 
-            if (!found) {
-                return@withContext Result.failure(Exception("服务器未找到指定歌单: $playlistId"))
-            }
+                if (!found) {
+                    return@withUserDataWriteLock Result.failure(Exception("服务器未找到指定歌单: $playlistId"))
+                }
 
-            val saveArr = JSONArray()
-            existingPlaylists.forEach { saveArr.put(it) }
-            saveCustomPlaylists(saveArr)
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            Result.failure(e)
+                val saveArr = JSONArray()
+                existingPlaylists.forEach { saveArr.put(it) }
+                saveCustomPlaylists(saveArr)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
+            }
         }
     }
 
@@ -3678,16 +4156,18 @@ class LemonMusicProtocol(
      * 从服务器删除指定歌单
      */
     suspend fun deleteCustomPlaylist(playlistId: String): Result<Boolean> = withContext(Dispatchers.IO) {
-        try {
-            ensureAuthenticatedOrThrow()
-            val existingPlaylists = fetchExistingPlaylistsRaw().filter { it.optString("id") != playlistId }
+        withUserDataWriteLock {
+            try {
+                ensureAuthenticatedOrThrow()
+                val existingPlaylists = fetchExistingPlaylistsRaw().filter { it.optString("id") != playlistId }
 
-            val saveArr = JSONArray()
-            existingPlaylists.forEach { saveArr.put(it) }
-            saveCustomPlaylists(saveArr)
-        } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            Result.failure(e)
+                val saveArr = JSONArray()
+                existingPlaylists.forEach { saveArr.put(it) }
+                saveCustomPlaylists(saveArr)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
+            }
         }
     }
 

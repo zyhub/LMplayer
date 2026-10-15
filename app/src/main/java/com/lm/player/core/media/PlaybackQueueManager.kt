@@ -20,8 +20,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.lm.player.core.database.entity.toUnifiedSong
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -66,6 +69,52 @@ object PlaybackQueueManager {
      * 同一首歌 600ms 内只接受一次切换。
      */
     private val favoriteToggleGuard = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val favJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
+    // 全局睡眠定时器状态 (0: 未设置, -1: 播完当前曲, >0: 设定分钟)
+    private val _sleepTimerMinutesFlow = MutableStateFlow(0)
+    val sleepTimerMinutesFlow: StateFlow<Int> = _sleepTimerMinutesFlow.asStateFlow()
+
+    private val _sleepTimerRemainingSecFlow = MutableStateFlow(0L)
+    val sleepTimerRemainingSecFlow: StateFlow<Long> = _sleepTimerRemainingSecFlow.asStateFlow()
+
+    private var sleepTimerJob: Job? = null
+    var sleepTimerStopAfterCurrent: Boolean = false
+        private set
+
+    fun setSleepTimer(minutes: Int, context: Context? = null) {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        if (minutes == 0) {
+            _sleepTimerMinutesFlow.value = 0
+            _sleepTimerRemainingSecFlow.value = 0L
+            sleepTimerStopAfterCurrent = false
+            return
+        }
+        _sleepTimerMinutesFlow.value = minutes
+        if (minutes == -1) {
+            sleepTimerStopAfterCurrent = true
+            _sleepTimerRemainingSecFlow.value = 0L
+            return
+        }
+        sleepTimerStopAfterCurrent = false
+        val totalSec = minutes * 60L
+        _sleepTimerRemainingSecFlow.value = totalSec
+        sleepTimerJob = coroutineScope.launch {
+            var rem = totalSec
+            while (rem > 0 && isActive) {
+                delay(1000L)
+                rem--
+                _sleepTimerRemainingSecFlow.value = rem
+            }
+            if (isActive && rem <= 0) {
+                _sleepTimerMinutesFlow.value = 0
+                _sleepTimerRemainingSecFlow.value = 0L
+                val ctx = context?.applicationContext ?: appContext
+                ctx?.let { pause(it) }
+            }
+        }
+    }
 
     // 注意：监听器幂等判定已改为 listenerAttachedPlayerRef（弱引用），见 ensurePlayerListener
     private var appContext: Context? = null
@@ -533,43 +582,42 @@ object PlaybackQueueManager {
         }
     }
 
+    fun pause(context: Context) {
+        val appCtx = context.applicationContext
+        ensurePlayerListener(appCtx)
+        val player = Media3Factory.getSharedExoPlayer(appCtx)
+        if (player.isPlaying) {
+            player.pause()
+            AudioSharingManager.onPhonePlayStateChangedIfCasting(appCtx, false)
+        }
+    }
+
     fun updateMetadata(songs: List<UnifiedSong>) {
-        // **必须在后台线程做**：songs 是整个曲库（2 万首级别）。
-        // 此前本函数直接在调用方线程（MainActivity 的 invalidationTrackerFlow.collect 体 = 主线程）
-        // 执行 associateBy + map + mergeSongMetadata，每次数据库失效都要在主线程处理 2 万条，
-        // 而 mergeSongMetadata 内部还会对每首歌做 2 次 File.exists() → 最多 4 万次磁盘 stat。
-        // 结果是「每次同步/扫描都卡死主线程」，必然 ANR。
-        // 这里只做主线程安全的引用赋值，真正的重算丢到单线程计算池串行执行。
-        if (_playlistFlow.value.isEmpty()) {
-            _playlistFlow.value = songs
-        } else {
-            val snapshot = _playlistFlow.value
-            metadataExecutor.execute {
-                val songMap = songs.associateBy { it.id }
-                val merged = snapshot.map { existing ->
+        if (songs.isEmpty()) return
+        metadataExecutor.execute {
+            val songMap = songs.associateBy { it.id }
+            _playlistFlow.update { current ->
+                if (current.isEmpty()) current else current.map { existing ->
                     val matched = songMap[existing.id]
                     if (matched != null) mergeSongMetadata(existing, matched) else existing
                 }
-                _playlistFlow.value = merged
             }
-        }
-        val current = _currentSongFlow.value
-        if (current != null) {
-            val updated = songs.firstOrNull { it.id == current.id }
-            if (updated != null) {
-                val merged = mergeSongMetadata(current, updated)
-                if (merged != current) {
-                    _currentSongFlow.value = merged
-                    savePlaybackState(song = merged, commitSync = false)
+            _recentPlayedSongsFlow.update { current ->
+                if (current.isEmpty()) current else current.map { existing ->
+                    val matched = songMap[existing.id]
+                    if (matched != null) mergeSongMetadata(existing, matched) else existing
                 }
             }
-        }
-        // 最近播放足迹同样要跟上最新的本地化元数据：下载完成后点开「最近播放」应能直接播放本地文件
-        if (_recentPlayedSongsFlow.value.isNotEmpty()) {
-            val recentMap = songs.associateBy { it.id }
-            _recentPlayedSongsFlow.value = _recentPlayedSongsFlow.value.map { existing ->
-                val matched = recentMap[existing.id]
-                if (matched != null) mergeSongMetadata(existing, matched) else existing
+            val current = _currentSongFlow.value
+            if (current != null) {
+                val updated = songMap[current.id]
+                if (updated != null) {
+                    val merged = mergeSongMetadata(current, updated)
+                    if (merged != current) {
+                        _currentSongFlow.value = merged
+                        savePlaybackState(song = merged, commitSync = false)
+                    }
+                }
             }
         }
     }
@@ -627,6 +675,205 @@ object PlaybackQueueManager {
     private var lastBgErrorRetryTimeMs: Long = 0L
     private var lastBgErrorQualityIdx: Int = 0
 
+    data class PreClickPlaybackSnapshot(
+        val previousSong: UnifiedSong?,
+        val previousQueue: List<UnifiedSong>,
+        val previousPositionMs: Long,
+        val wasPlaying: Boolean,
+        val previousRecentPlayed: List<UnifiedSong>
+    )
+
+    @Volatile
+    private var preClickSnapshot: PreClickPlaybackSnapshot? = null
+    @Volatile
+    private var pendingOnlineSongId: String? = null
+    private var bufferingTimeoutJob: Job? = null
+    private const val ONLINE_BUFFER_TIMEOUT_MS = 10_000L
+
+    fun isNetworkConnected(context: Context): Boolean {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return false
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ||
+                 caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                 caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                 caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun hasValidLocalFile(song: UnifiedSong?): Boolean {
+        val path = song?.localFilePath ?: return false
+        if (path.isBlank()) return false
+        return if (path.startsWith("content://")) {
+            true
+        } else {
+            try {
+                val f = java.io.File(path)
+                f.exists() && f.length() > 0L
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * 在点播无本地缓存的在线歌曲前，记录点击前的歌曲、队列、播放进度与状态快照，并启动缓存超时守卫
+     */
+    fun captureSnapshotBeforeOnlinePlay(context: Context, targetSong: UnifiedSong) {
+        val appCtx = context.applicationContext
+        if (hasValidLocalFile(targetSong)) {
+            pendingOnlineSongId = null
+            preClickSnapshot = null
+            bufferingTimeoutJob?.cancel()
+            bufferingTimeoutJob = null
+            return
+        }
+        val currentSong = _currentSongFlow.value
+        // 仅当当前未处于另一首待缓冲在线歌曲的挂起态（或当前歌曲就是已正常播放的歌曲）时，才捕获点击前快照
+        if (pendingOnlineSongId == null || (currentSong != null && currentSong.id != pendingOnlineSongId && currentSong.id != targetSong.id)) {
+            val player = try { Media3Factory.getSharedExoPlayer(appCtx) } catch (_: Exception) { null }
+            val currentPos = if (currentSong != null) {
+                (player?.currentPosition?.takeIf { it > 0L } ?: getSavedPositionMs(appCtx)).coerceAtLeast(0L)
+            } else 0L
+            preClickSnapshot = PreClickPlaybackSnapshot(
+                previousSong = currentSong?.takeIf { it.id != targetSong.id },
+                previousQueue = _playlistFlow.value,
+                previousPositionMs = currentPos,
+                wasPlaying = player?.isPlaying == true,
+                previousRecentPlayed = _recentPlayedSongsFlow.value
+            )
+        }
+        pendingOnlineSongId = targetSong.id
+        startOnlineBufferingWatchdog(appCtx, targetSong.id)
+    }
+
+    fun confirmOnlineSongReady(songId: String) {
+        if (pendingOnlineSongId == songId) {
+            pendingOnlineSongId = null
+            preClickSnapshot = null
+            bufferingTimeoutJob?.cancel()
+            bufferingTimeoutJob = null
+        }
+    }
+
+    fun startOnlineBufferingWatchdog(
+        context: Context,
+        targetSongId: String,
+        timeoutMs: Long = ONLINE_BUFFER_TIMEOUT_MS
+    ) {
+        val appCtx = context.applicationContext
+        bufferingTimeoutJob?.cancel()
+        bufferingTimeoutJob = coroutineScope.launch {
+            delay(timeoutMs)
+            if (pendingOnlineSongId == targetSongId && _currentSongFlow.value?.id == targetSongId) {
+                val player = try { Media3Factory.getSharedExoPlayer(appCtx) } catch (_: Exception) { null }
+                val isReady = player != null && player.playbackState == Player.STATE_READY
+                if (!isReady) {
+                    Log.w(TAG, "Online song buffering timed out after ${timeoutMs}ms for $targetSongId, rolling back")
+                    rollbackUnplayableSong(
+                        context = appCtx,
+                        failedSongId = targetSongId,
+                        reasonToast = "在线歌曲缓存超时，已自动回退至点击前的歌曲"
+                    )
+                } else {
+                    confirmOnlineSongReady(targetSongId)
+                }
+            }
+        }
+    }
+
+    /**
+     * 当无网络或在线歌曲缓存超时/解析失败时，回退至点击前的歌曲与进度（若点击前无歌曲则释放播放栏与播放界面）
+     */
+    fun rollbackUnplayableSong(
+        context: Context,
+        failedSongId: String,
+        reasonToast: String? = null
+    ) {
+        val appCtx = context.applicationContext
+        bufferingTimeoutJob?.cancel()
+        bufferingTimeoutJob = null
+        playJob?.cancel()
+        playJob = null
+
+        val snapshot = preClickSnapshot
+        pendingOnlineSongId = null
+        preClickSnapshot = null
+
+        coroutineScope.launch(Dispatchers.Main) {
+            if (!reasonToast.isNullOrBlank()) {
+                Toast.makeText(appCtx, reasonToast, Toast.LENGTH_SHORT).show()
+            }
+            val player = try { Media3Factory.getSharedExoPlayer(appCtx) } catch (_: Exception) { null }
+            player?.stop()
+            player?.clearMediaItems()
+
+            if (snapshot != null && snapshot.previousRecentPlayed.isNotEmpty()) {
+                _recentPlayedSongsFlow.value = snapshot.previousRecentPlayed
+                persistRecentPlayed(appCtx, snapshot.previousRecentPlayed)
+            } else if (_recentPlayedSongsFlow.value.any { it.id == failedSongId }) {
+                val cleaned = _recentPlayedSongsFlow.value.filterNot { it.id == failedSongId }
+                _recentPlayedSongsFlow.value = cleaned
+                persistRecentPlayed(appCtx, cleaned)
+            }
+
+            val prevSong = snapshot?.previousSong?.takeIf { it.id != failedSongId }
+            if (prevSong != null) {
+                val restoredQueue = snapshot.previousQueue.takeIf { it.isNotEmpty() } ?: listOf(prevSong)
+                _playlistFlow.value = restoredQueue
+                _currentSongFlow.value = prevSong
+                savePlaybackState(appCtx, prevSong, snapshot.previousPositionMs, commitSync = true)
+
+                if (hasValidLocalFile(prevSong) || isNetworkConnected(appCtx)) {
+                    playJob = coroutineScope.launch {
+                        try {
+                            val db = ZdsDatabase.getInstance(appCtx)
+                            val router = PlaybackRouter(db.downloadDao(), appCtx)
+                            val mediaItem = router.resolveMediaItem(prevSong)
+                            val exo = Media3Factory.getSharedExoPlayer(appCtx)
+                            if (snapshot.previousPositionMs > 0L) {
+                                exo.setMediaItem(mediaItem, snapshot.previousPositionMs)
+                            } else {
+                                exo.setMediaItem(mediaItem)
+                            }
+                            exo.prepare()
+                            if (snapshot.wasPlaying) {
+                                exo.play()
+                            } else {
+                                exo.pause()
+                                _isPlayingFlow.value = false
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to restore previous song media item on rollback", e)
+                            _isPlayingFlow.value = false
+                        }
+                    }
+                } else {
+                    _isPlayingFlow.value = false
+                }
+            } else {
+                _currentSongFlow.value = null
+                _playlistFlow.value = emptyList()
+                _isPlayingFlow.value = false
+                try {
+                    appCtx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+                        .edit()
+                        .remove("last_played_song_id")
+                        .remove("last_played_song_title")
+                        .remove("last_played_song_artist")
+                        .remove("last_played_song_json")
+                        .putLong("last_played_position_ms", 0L)
+                        .apply()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     /**
      * 已挂过监听器的播放器实例（弱引用）。
      *
@@ -655,6 +902,7 @@ object PlaybackQueueManager {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
                 if (playing) {
+                    _currentSongFlow.value?.id?.let { confirmOnlineSongReady(it) }
                     PlaybackService.startPlaybackService(appCtx)
                     startPeriodicPositionSave(appCtx, player)
                 } else {
@@ -667,7 +915,14 @@ object PlaybackQueueManager {
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED) {
+                if (playbackState == Player.STATE_READY) {
+                    _currentSongFlow.value?.id?.let { confirmOnlineSongReady(it) }
+                } else if (playbackState == Player.STATE_ENDED) {
+                    if (sleepTimerStopAfterCurrent) {
+                        setSleepTimer(0)
+                        appContext?.let { pause(it) }
+                        return
+                    }
                     if (_isRepeatFlow.value && _currentSongFlow.value != null) {
                         playSong(_currentSongFlow.value!!, appCtx)
                     } else {
@@ -677,43 +932,83 @@ object PlaybackQueueManager {
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                // 车机/手机挂后台且主界面未处于前台时的自动容灾降级换源重连与切歌保障
                 val targetSong = _currentSongFlow.value ?: return
-                val resumePos = player.currentPosition.coerceAtLeast(0L)
-                val prefQ = LemonMusicProtocol.getPreferredStreamQuality(appCtx)
-                val qChain = LemonMusicProtocol.getFallbackQualities(prefQ)
-                val currentIdx = if (lastBgErrorRetrySongId == targetSong.id) lastBgErrorQualityIdx else 0
-                val nextIdx = currentIdx + 1
-                if (nextIdx < qChain.size) {
-                    lastBgErrorRetrySongId = targetSong.id
-                    lastBgErrorQualityIdx = nextIdx
-                    val nextQ = qChain[nextIdx]
-                    val label = AudioQuality.fromKey(nextQ).label
-                    coroutineScope.launch(Dispatchers.Main) {
-                        Toast.makeText(appCtx, "当前音质无法缓冲，已自动为您换源降至【$label】播放", Toast.LENGTH_SHORT).show()
-                    }
-                    playSong(
-                        targetSong = targetSong,
+                if (!hasValidLocalFile(targetSong) && !isNetworkConnected(appCtx)) {
+                    rollbackUnplayableSong(
                         context = appCtx,
-                        startPositionMs = resumePos,
-                        forceRefresh = true,
-                        overrideQuality = nextQ
+                        failedSongId = targetSong.id,
+                        reasonToast = "当前无网络连接，无法播放在线歌曲，已回退至点击前的歌曲"
                     )
-                } else {
-                    val now = System.currentTimeMillis()
-                    val canRetry = lastBgErrorRetrySongId != targetSong.id || (now - lastBgErrorRetryTimeMs) > 12_000L
-                    if (canRetry) {
+                    return
+                }
+                val resumePos = player.currentPosition.coerceAtLeast(0L)
+                val autoFallback = appCtx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
+                    .getBoolean("auto_fallback_to_local", true)
+
+                coroutineScope.launch(Dispatchers.IO) {
+                    // 1. 若开启自动回退本地，先查本地匹配文件
+                    if (autoFallback) {
+                        try {
+                            val db = ZdsDatabase.getInstance(appCtx)
+                            val allSongs = db.songDao().getAllSongsList()
+                            val matched = allSongs.asSequence().map { it.toUnifiedSong() }.firstOrNull {
+                                val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                                hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                                    it.title, it.artist, it.durationMs,
+                                    targetSong.title, targetSong.artist, targetSong.durationMs,
+                                    it.album, targetSong.album
+                                ))
+                            }
+                            if (_currentSongFlow.value?.id == targetSong.id && matched != null && matched.localFilePath != targetSong.localFilePath) {
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(appCtx, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
+                                }
+                                val localSong = targetSong.copy(
+                                    localFilePath = matched.localFilePath,
+                                    streamUrl = matched.localFilePath ?: "",
+                                    downloadStatus = DownloadStatus.DOWNLOADED
+                                )
+                                playSong(
+                                    targetSong = localSong,
+                                    context = appCtx,
+                                    startPositionMs = resumePos
+                                )
+                                return@launch
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to probe local fallback", e)
+                        }
+                    }
+
+                    // 2. 音质降级与换源重试
+                    val prefQ = LemonMusicProtocol.getPreferredStreamQuality(appCtx)
+                    val qChain = LemonMusicProtocol.getFallbackQualities(prefQ)
+                    val currentIdx = if (lastBgErrorRetrySongId == targetSong.id) lastBgErrorQualityIdx else 0
+                    val nextIdx = currentIdx + 1
+                    if (nextIdx < qChain.size) {
                         lastBgErrorRetrySongId = targetSong.id
-                        lastBgErrorRetryTimeMs = now
-                        lastBgErrorQualityIdx = 0
-                        Log.w(TAG, "Background onPlayerError (${error.message}), auto-retrying ${targetSong.title} at ${resumePos}ms")
+                        lastBgErrorQualityIdx = nextIdx
+                        val nextQ = qChain[nextIdx]
+                        val label = AudioQuality.fromKey(nextQ).label
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(appCtx, "当前音质无法缓冲，已自动为您换源降至【$label】播放", Toast.LENGTH_SHORT).show()
+                        }
                         playSong(
                             targetSong = targetSong,
                             context = appCtx,
                             startPositionMs = resumePos,
-                            forceRefresh = true
+                            forceRefresh = true,
+                            overrideQuality = nextQ
                         )
+                        return@launch
                     }
+
+                    // 3. 回退至点击前的歌曲
+                    rollbackUnplayableSong(
+                        context = appCtx,
+                        failedSongId = targetSong.id,
+                        reasonToast = "当前歌曲《${targetSong.title}》缓存超时或无法播放，已回退至点击前的歌曲"
+                    )
                 }
             }
         })
@@ -730,6 +1025,21 @@ object PlaybackQueueManager {
     ) {
         val appCtx = context.applicationContext
         ensurePlayerListener(appCtx)
+        // 若不是降级重试且目标歌曲无本地物理文件，先捕获点击前快照并检查网络/启动缓存超时守卫
+        if (!forceRefresh && overrideQuality == null) {
+            captureSnapshotBeforeOnlinePlay(appCtx, targetSong)
+            if (!hasValidLocalFile(targetSong) && !isNetworkConnected(appCtx)) {
+                rollbackUnplayableSong(
+                    context = appCtx,
+                    failedSongId = targetSong.id,
+                    reasonToast = "当前无网络连接，无法播放在线歌曲，已回退至点击前的歌曲"
+                )
+                return
+            }
+        } else if (!hasValidLocalFile(targetSong)) {
+            startOnlineBufferingWatchdog(appCtx, targetSong.id)
+        }
+
         PlaybackService.startPlaybackService(appCtx)
         _currentSongFlow.value = targetSong
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
@@ -763,6 +1073,17 @@ object PlaybackQueueManager {
                     forceRefresh = forceRefresh,
                     overrideQuality = overrideQuality
                 )
+                val uriStr = mediaItem.localConfiguration?.uri?.toString().orEmpty()
+                if (!hasValidLocalFile(targetSong) &&
+                    (uriStr.isBlank() || uriStr.startsWith("lemon_online://"))
+                ) {
+                    rollbackUnplayableSong(
+                        context = appCtx,
+                        failedSongId = targetSong.id,
+                        reasonToast = "在线歌曲直链解析失败，已回退至点击前的歌曲"
+                    )
+                    return@launch
+                }
                 val player = Media3Factory.getSharedExoPlayer(appCtx)
                 if (startPositionMs > 0L) {
                     player.setMediaItem(mediaItem, startPositionMs)
@@ -777,6 +1098,13 @@ object PlaybackQueueManager {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error playing song: ", e)
+                if (!hasValidLocalFile(targetSong)) {
+                    rollbackUnplayableSong(
+                        context = appCtx,
+                        failedSongId = targetSong.id,
+                        reasonToast = "在线歌曲播放失败，已回退至点击前的歌曲"
+                    )
+                }
             }
         }
     }
@@ -900,7 +1228,8 @@ object PlaybackQueueManager {
         } catch (_: Throwable) {}
 
         // 3. 异步持久化与服务器双向同步
-        coroutineScope.launch(Dispatchers.IO) {
+        favJobs[target.id]?.cancel()
+        val job = coroutineScope.launch(Dispatchers.IO) {
             try {
                 val db = ZdsDatabase.getInstance(appCtx)
                 val existing = db.songDao().getSongById(target.id)
@@ -923,8 +1252,9 @@ object PlaybackQueueManager {
                                 bitRate = updated.bitRate,
                                 format = updated.format,
                                 isFavorite = newFav,
-                                relativeFolderPath = updated.rawMetaJson ?: updated.relativeFolderPath,
-                                addedTimestamp = System.currentTimeMillis()
+                                relativeFolderPath = updated.relativeFolderPath,
+                                addedTimestamp = System.currentTimeMillis(),
+                                rawMetaJson = updated.rawMetaJson
                             )
                         )
                     )
@@ -982,9 +1312,13 @@ object PlaybackQueueManager {
                     }
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.e(TAG, "toggleFavorite async error", e)
+            } finally {
+                favJobs.remove(target.id)
             }
         }
+        favJobs[target.id] = job
     }
 
 

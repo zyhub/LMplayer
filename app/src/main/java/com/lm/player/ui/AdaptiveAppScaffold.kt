@@ -30,7 +30,7 @@ import kotlin.math.abs
  */
 @Composable
 fun AdaptiveAppScaffold(
-    windowSizeClass: WindowWidthSizeClass,
+    windowSizeClass: WindowWidthSizeClass? = null,
     currentScreen: Screen,
     currentPlayingSong: UnifiedSong?,
     isPlaying: Boolean,

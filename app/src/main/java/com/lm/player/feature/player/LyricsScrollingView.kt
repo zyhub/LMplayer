@@ -949,7 +949,18 @@ fun CoverFiveLineGradientLyrics(
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
-    val useSystemFont = prefs.getBoolean("lyric_use_system_font", true)
+    var useSystemFont by remember { mutableStateOf(prefs.getBoolean("lyric_use_system_font", true)) }
+    DisposableEffect(prefs) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+            if (key == "lyric_use_system_font") {
+                useSystemFont = sp.getBoolean(key, true)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose {
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        }
+    }
     val lyricFontFamily = remember(useSystemFont) {
         SystemFontManager.getSystemFontFamily(useSystemFont)
     }

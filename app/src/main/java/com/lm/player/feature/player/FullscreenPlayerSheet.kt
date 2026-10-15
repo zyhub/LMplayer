@@ -55,6 +55,7 @@ import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.media.AudioSharingManager
+import com.lm.player.core.media.PlaybackQueueManager
 import com.lm.player.core.media.ShareProtocolType
 import com.lm.player.core.model.*
 import java.io.File
@@ -155,69 +156,12 @@ fun FullscreenPlayerSheet(
     var showPortraitAddToPlaylistMenu by remember { mutableStateOf(false) }
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
-    var activeTimerMinutes by remember { mutableStateOf(0) }
+    val activeTimerMinutes by PlaybackQueueManager.sleepTimerMinutesFlow.collectAsState()
+    val sleepTimerRemainingSec by PlaybackQueueManager.sleepTimerRemainingSecFlow.collectAsState()
     var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
 
-    // ===== 睡眠定时关闭：真正生效的实现 =====
-    // 与 TV 端同源问题：此前只有 activeTimerMinutes 一个 remember 状态 + 一句 Toast，
-    // 全工程没有任何消费者，用户设置后永远不会生效。现在用到期时间戳 + 协程真倒计时。
-    var sleepTimerEndsAtMs by remember { mutableStateOf(0L) }
-    var sleepTimerRemainingSec by remember { mutableStateOf(0L) }
-    var sleepTimerRevision by remember { mutableStateOf(0) }
-    // 「播完当前曲」(-1 档) 单独标记，否则会被当成「已到期」立即停止
-    var sleepTimerStopAfterCurrent by remember { mutableStateOf(false) }
-    // 「播完当前曲」在**设置那一刻**正在播的曲目 id。
-    // 关键：不能用 sleepTimerStopAfterCurrent 本身作为 LaunchedEffect 的 key ——
-    // applySleepTimer(-1) 把它置 true 会立刻重启该 effect，脚本当即判定「本曲已播完」，
-    // 表现为「一选播完当前曲就马上停播」。改为记录当时曲目、只在 song.id 变化时才结算。
-    var sleepTimerArmedSongId by remember { mutableStateOf("") }
-
-    LaunchedEffect(sleepTimerRevision, sleepTimerEndsAtMs) {
-        if (sleepTimerEndsAtMs <= 0L) {
-            sleepTimerRemainingSec = 0L
-            return@LaunchedEffect
-        }
-        while (true) {
-            val remain = sleepTimerEndsAtMs - System.currentTimeMillis()
-            if (remain <= 0L) break
-            sleepTimerRemainingSec = (remain + 999L) / 1000L
-            kotlinx.coroutines.delay(1000L)
-        }
-        sleepTimerRemainingSec = 0L
-        sleepTimerEndsAtMs = 0L
-        activeTimerMinutes = 0
-        if (isPlaying) {
-            onTogglePlayPause()
-        }
-        Toast.makeText(context, "睡眠定时已到，已停止播放", Toast.LENGTH_SHORT).show()
-    }
-
-    // 「播完当前曲」的落地：只有「设置时正在播的那首歌」真的换了，才算播完。
-    // key 里**不能**包含 sleepTimerStopAfterCurrent 本身，否则设置动作会立刻触发结算，
-    // 表现为「一选播完当前曲就马上停播」。
-    LaunchedEffect(song.id) {
-        if (sleepTimerStopAfterCurrent && sleepTimerArmedSongId.isNotBlank() && song.id != sleepTimerArmedSongId) {
-            sleepTimerStopAfterCurrent = false
-            sleepTimerArmedSongId = ""
-            activeTimerMinutes = 0
-            sleepTimerRemainingSec = 0L
-            // 到点时如果用户已手动暂停，不要再反转成播放
-            if (isPlaying) {
-                onTogglePlayPause()
-            }
-            Toast.makeText(context, "当前曲目已播完，已停止播放", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    /** 统一的定时器设置入口：min > 0 为分钟数；min == -1 为「播完当前曲」；min == 0 为取消 */
     fun applySleepTimer(min: Int) {
-        activeTimerMinutes = min
-        sleepTimerStopAfterCurrent = min == -1
-        // 记录「设置那一刻正在播的曲目」：只有它被换掉才算播完
-        sleepTimerArmedSongId = if (min == -1) song.id else ""
-        sleepTimerEndsAtMs = if (min > 0) System.currentTimeMillis() + min * 60_000L else 0L
-        sleepTimerRemainingSec = 0L
-        sleepTimerRevision++
+        PlaybackQueueManager.setSleepTimer(min, context)
         when {
             min > 0 -> Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
             min == -1 -> Toast.makeText(context, "已设置：播完当前曲目后停止", Toast.LENGTH_SHORT).show()
@@ -806,7 +750,7 @@ fun FullscreenPlayerSheet(
                                         Icon(
                                             imageVector = Icons.Default.Timer,
                                             contentDescription = "定时关闭",
-                                            tint = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor,
+                                            tint = if (activeTimerMinutes != 0) AppleRed else secondaryTextColor,
                                             modifier = Modifier.size(toolbarIconSize)
                                         )
                                     }
@@ -1558,7 +1502,7 @@ fun FullscreenPlayerSheet(
                             Icon(
                                 imageVector = Icons.Default.Timer,
                                 contentDescription = "定时关闭",
-                                tint = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor,
+                                tint = if (activeTimerMinutes != 0) AppleRed else secondaryTextColor,
                                 modifier = Modifier.size(24.dp)
                             )
                         }
@@ -1731,6 +1675,8 @@ fun SleepTimerDropdownMenu(
                 "将在 %d:%02d 后停止播放".format(java.util.Locale.US, m, s)
             } else if (activeTimerMinutes > 0) {
                 "已设置：${activeTimerMinutes}分钟后停止"
+            } else if (activeTimerMinutes == -1) {
+                "已设置：播完当前曲后停止"
             } else {
                 "睡眠定时关闭"
             },
@@ -1772,7 +1718,7 @@ fun SleepTimerDropdownMenu(
             )
         }
 
-        if (activeTimerMinutes > 0) {
+        if (activeTimerMinutes != 0) {
             HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
             DropdownMenuItem(
                 text = {

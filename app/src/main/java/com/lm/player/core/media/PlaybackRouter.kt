@@ -83,9 +83,7 @@ class PlaybackRouter(
             }
         }
 
-        val currentPreferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
-        val targetBitRate = com.lm.player.core.model.AudioQuality.fromKey(currentPreferredQuality).bitrate
-        val isStaleProxyQuality = (song.streamUrl.contains("/api/play/proxy") && song.bitRate != targetBitRate) || overrideQuality != null
+        val isStaleProxyQuality = overrideQuality != null
 
         var finalStreamUrl = if ((forceRefresh || isStaleProxyQuality) && (song.id.startsWith("lemon_online_") || song.streamUrl.contains("/api/play/proxy"))) {
             ""
@@ -110,7 +108,7 @@ class PlaybackRouter(
                 try {
                     val db = ZdsDatabase.getInstance(context)
                     val active = db.serverDao().getActiveServer()
-                        ?: db.serverDao().getAllServers().firstOrNull { it.id == song.serverId || it.type == ServerType.LEMON_MUSIC }
+                        ?: if (!isOnlineId) db.serverDao().getAllServers().firstOrNull { it.id == song.serverId } else null
 
                     if (active != null && active.type == ServerType.LEMON_MUSIC) {
                         val client = NetworkClientFactory.createOkHttpClient(context)
@@ -155,14 +153,14 @@ class PlaybackRouter(
                         var resolvedFormat = song.format
                         var resolvedBitRate = song.bitRate
 
-                        // 2. 若流地址仍为空或为待解析在线标识，通过柠檬服务端 /api/play/url 换取服务器代理流 (/api/play/proxy) 或服务器本地缓存流
+                        // 2. 若流地址仍为空或为待解析在线标识：通过柠檬服务端 /api/play/url 换取播放流
                         if (finalStreamUrl.isBlank() || finalStreamUrl.startsWith("lemon_online://")) {
                             val cleanId = song.id.removePrefix("lemon_online_")
                             val source = if (cleanId.contains("_")) cleanId.substringBefore("_") else "kw"
                             val meta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
                                 ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
-
                             val preferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
+
                             val resolvedStream = protocol.resolveOnlineStreamWithQuality(
                                 songId = song.id,
                                 source = source,
@@ -233,9 +231,15 @@ class PlaybackRouter(
         } else if (finalStreamUrl.startsWith("content://")) {
             Log.d(TAG, "Routing to SAF content uri: $finalStreamUrl")
             Uri.parse(finalStreamUrl)
-        } else {
+        } else if (finalStreamUrl.startsWith("http://") || finalStreamUrl.startsWith("https://")) {
             Log.d(TAG, "Routing to remote stream: $finalStreamUrl")
             Uri.parse(finalStreamUrl)
+        } else if (finalStreamUrl.startsWith("/") && File(finalStreamUrl).let { it.exists() && it.length() > 0 }) {
+            Log.d(TAG, "Routing to direct file path: $finalStreamUrl")
+            Uri.fromFile(File(finalStreamUrl))
+        } else {
+            Log.e(TAG, "Invalid stream URL for ${song.title}: '$finalStreamUrl'")
+            throw IllegalStateException("未能解析到有效的音频播放地址，请检查网络或音源设置")
         }
 
         val isOffline = uri.scheme == "file" || uri.scheme == "content"

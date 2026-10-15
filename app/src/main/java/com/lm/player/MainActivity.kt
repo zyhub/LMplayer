@@ -61,6 +61,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
+import com.lm.player.core.database.entity.toUnifiedSong
 import androidx.room.invalidationTrackerFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -118,18 +119,6 @@ class MainActivity : ComponentActivity() {
     private var playNextAction: (() -> Unit)? = null
     private var playPreviousAction: (() -> Unit)? = null
     private var togglePlayAction: (() -> Unit)? = null
-    private var mediaCommandReceiver: BroadcastReceiver? = null
-
-    /**
-     * 磁盘探测专用线程池：用于 onPlayerError 里的「整库文件存在性」筛查。
-     *
-     * 该类回调**不是挂起函数**，无法使用 withContext；用单线程池既能把 O(n) 磁盘 stat
-     * 移出调用线程，又保证探测串行、不会并发打满 IO。线程池为 Activity 级复用，
-     * 不在每次播放错误时新建（否则会持续泄漏线程）。
-     */
-    private val diskProbeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "player-error-disk-probe").apply { isDaemon = true }
-    }
 
     // 运行时权限申请器 (兼容 Android 6.0 ~ Android 14+)
     // 结果必须被处理：此前回调是空的（{ _ -> }），用户点「拒绝」后没有任何说明，
@@ -215,10 +204,7 @@ class MainActivity : ComponentActivity() {
         }
         startPlaybackService()
 
-        // 3. 注册方向盘按键与车载控制广播监听器
-        registerMediaCommandReceiver()
-
-        // 4. 申请 Android 6.0 / 13+ 运行时权限
+        // 3. 申请 Android 6.0 / 13+ 运行时权限
         requestAppPermissions()
 
         setContent {
@@ -393,21 +379,44 @@ class MainActivity : ComponentActivity() {
                 key2 = allDownloads
             ) {
                 value = withContext(Dispatchers.IO) {
-                    val downloadedFromSongList = songList.filter {
+                    val rawDownloadedFromSongList = songList.filter {
                         (it.downloadStatus == DownloadStatus.DOWNLOADED ||
                          it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
                          !it.localFilePath.isNullOrBlank()) &&
                         (it.localFilePath?.let { p -> p.startsWith("content://") || File(p).exists() } ?: (it.downloadStatus == DownloadStatus.DOWNLOADED))
                     }
 
+                    // 先对 songList 内部的已下载歌曲按物理路径去重（若同一文件同时存在服务器曲目与 local_storage 临时记录，优先保留服务器曲目）
+                    val dedupByPathMap = LinkedHashMap<String, UnifiedSong>(rawDownloadedFromSongList.size)
+                    for (song in rawDownloadedFromSongList) {
+                        val normPath = song.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { it.isNotBlank() }
+                            ?: "id:${song.id}"
+                        val existing = dedupByPathMap[normPath]
+                        if (existing == null) {
+                            dedupByPathMap[normPath] = song
+                        } else {
+                            val existingIsLocalOnly = existing.serverId in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                            val incomingIsServer = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                            if (existingIsLocalOnly && incomingIsServer) {
+                                dedupByPathMap[normPath] = song
+                            }
+                        }
+                    }
+                    val downloadedFromSongList = dedupByPathMap.values.distinctBy { it.id }
+
                     val songIdsInList = downloadedFromSongList.map { it.id }.toSet()
-                    val localPathsInList = downloadedFromSongList.mapNotNull { it.localFilePath }.toSet()
+                    val localPathsInList = downloadedFromSongList.mapNotNull {
+                        it.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { p -> p.isNotBlank() }
+                    }.toSet()
 
                     val complementaryFromDownloads = allDownloads.filter { record ->
+                        val normRecPath = record.localFilePath?.trim()?.replace('\\', '/')?.lowercase()
                         record.status == DownloadStatus.DOWNLOADED &&
                         !songIdsInList.contains(record.songId) &&
-                        (record.localFilePath == null || !localPathsInList.contains(record.localFilePath)) &&
+                        (normRecPath.isNullOrBlank() || !localPathsInList.contains(normRecPath)) &&
                         (record.localFilePath != null && File(record.localFilePath).exists())
+                    }.distinctBy {
+                        it.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { p -> p.isNotBlank() } ?: it.songId
                     }.map { record ->
                         val file = record.localFilePath?.let { File(it) }
                         val ext = file?.extension?.ifBlank { "mp3" } ?: "mp3"
@@ -433,11 +442,21 @@ class MainActivity : ComponentActivity() {
                     // 下载管理「已完成」按下载完成时间倒序：最新下载的排在最前。
                     // 下载记录（downloads 表）是完成时间的唯一来源；没有记录时回落到歌曲自身的加入时间。
                     val completedTsBySongId = allDownloads.associate { it.songId to it.completedTimestamp }
-                    (downloadedFromSongList + complementaryFromDownloads).sortedWith(
-                        compareByDescending<UnifiedSong> { song ->
-                            completedTsBySongId[song.id]?.takeIf { it > 0L } ?: song.addedTimestamp
-                        }
-                    )
+                    val completedTsByPath = allDownloads.mapNotNull { rec ->
+                        val p = rec.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { it.isNotBlank() }
+                        if (p != null && rec.completedTimestamp > 0L) p to rec.completedTimestamp else null
+                    }.toMap()
+                    (downloadedFromSongList + complementaryFromDownloads)
+                        .distinctBy { it.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { p -> p.isNotBlank() } ?: it.id }
+                        .distinctBy { it.id }
+                        .sortedWith(
+                            compareByDescending<UnifiedSong> { song ->
+                                val normPath = song.localFilePath?.trim()?.replace('\\', '/')?.lowercase()
+                                completedTsBySongId[song.id]?.takeIf { it > 0L }
+                                    ?: (if (normPath != null) completedTsByPath[normPath] else null)
+                                    ?: song.addedTimestamp
+                            }
+                        )
                 }
             }
 
@@ -451,6 +470,11 @@ class MainActivity : ComponentActivity() {
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
             var isFullPlayerVisible by rememberSaveable { mutableStateOf(false) }
             var isLyricsMode by remember { mutableStateOf(false) }
+            LaunchedEffect(currentSong) {
+                if (currentSong == null && isFullPlayerVisible) {
+                    isFullPlayerVisible = false
+                }
+            }
 
             // 正在播放歌曲定位悬浮按钮状态（记录歌曲所属列表页面 + 仅在播放中且列表滑动时显示，播放界面不显示）
             var playingListScreen by remember { mutableStateOf(Screen.HOME) }
@@ -740,6 +764,20 @@ class MainActivity : ComponentActivity() {
                             database.playlistDao().insertPlaylists(plEntities)
                         }
 
+                        // 成功同步曲库后，若开启离线同步推送，自动将离线/本地期间下载的歌曲推送至柠檬服务端排队下载与归档
+                        try {
+                            val syncPrefs = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
+                            if (syncPrefs.getBoolean("offline_sync_auto_push", false)) {
+                                val syncManager = com.lm.player.core.sync.OfflineSyncManager.getInstance(this@MainActivity)
+                                val pushResult = syncManager.pushAllPendingTasksToServer()
+                                if (pushResult.isSuccess && (pushResult.getOrNull() ?: 0) > 0) {
+                                    Log.i("MainActivity", "Successfully auto-pushed ${pushResult.getOrNull()} offline downloads to Lemon server.")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Auto-push offline downloads to server failed", e)
+                        }
+
                         if (showToast) {
                             withContext(Dispatchers.Main) {
                                 Toast.makeText(this@MainActivity, "已成功从 NAS 同步全量媒体数据与歌单", Toast.LENGTH_SHORT).show()
@@ -763,15 +801,21 @@ class MainActivity : ComponentActivity() {
                     val mapped = withContext(Dispatchers.IO) {
                         entities.map { entity ->
                             val previewUrls = database.playlistDao().getPlaylistCoverUrls(entity.id)
+                                .filter { it.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it) }
                             val storedUrls = if (entity.coverUrl.contains("|")) {
-                                entity.coverUrl.split("|").filter { it.isNotBlank() }
-                            } else if (entity.coverUrl.isNotBlank()) {
+                                entity.coverUrl.split("|").filter { it.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it) }
+                            } else if (entity.coverUrl.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(entity.coverUrl)) {
                                 listOf(entity.coverUrl)
                             } else {
                                 emptyList()
                             }
                             val effectivePreviews = if (previewUrls.isNotEmpty()) previewUrls else storedUrls
-                            val effectiveCover = entity.coverUrl.substringBefore("|").ifBlank { effectivePreviews.firstOrNull() ?: "" }
+                            val rawPrimary = entity.coverUrl.substringBefore("|")
+                            val effectiveCover = if (rawPrimary.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(rawPrimary)) {
+                                rawPrimary
+                            } else {
+                                effectivePreviews.firstOrNull() ?: ""
+                            }
                             UnifiedPlaylist(
                                 id = entity.id,
                                 name = entity.name,
@@ -1078,7 +1122,6 @@ class MainActivity : ComponentActivity() {
                         streamUrl = resolvedLocalPath,
                         downloadStatus = DownloadStatus.DOWNLOADED
                     )
-                    // 播放足迹由 PlaybackQueueManager.playSong 统一记录，此处无需再记一次
                     val resolvedQueue = activeQueue.map { if (it.id == localSong.id) localSong else it }
                     PlaybackQueueManager.playSong(
                         targetSong = localSong,
@@ -1086,114 +1129,6 @@ class MainActivity : ComponentActivity() {
                         newPlaylist = resolvedQueue,
                         startPositionMs = startPositionMs
                     )
-                } else if (
-                    (targetSong.serverId == "lemon_online" || targetSong.id.startsWith("lemon_online_")) &&
-                    !targetSong.streamUrl.contains("/api/play/local")
-                ) {
-                    // 立即同步当前歌曲状态与持久化，确保异步解析流地址期间界面与状态一致
-                    PlaybackQueueManager.updateCurrentSong(targetSong)
-                    if (!contextQueue.isNullOrEmpty()) {
-                        PlaybackQueueManager.setQueue(contextQueue)
-                    }
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                            ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                            ?: run {
-                                val entity = try {
-                                    database.serverDao().getActiveServer()
-                                        ?: database.serverDao().getAllServers().firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                                } catch (_: Exception) { null }
-                                entity?.let {
-                                    ServerConfig(
-                                        id = it.id,
-                                        name = it.name,
-                                        type = it.type,
-                                        serverUrl = it.serverUrl,
-                                        username = it.username,
-                                        tokenOrApiKey = it.tokenOrApiKey,
-                                        saltOrSecret = it.saltOrSecret,
-                                        syncMode = it.syncMode,
-                                        isCurrentActive = it.isCurrentActive
-                                    )
-                                }
-                            }
-                        if (active != null) {
-                            val protocol = LemonMusicProtocol(
-                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
-                                active.serverUrl,
-                                active.username,
-                                active.tokenOrApiKey
-                            )
-                            val cleanId = targetSong.id.removePrefix("lemon_online_")
-                            val source = if (cleanId.contains("_")) cleanId.substringBefore("_") else "kw"
-                            val meta = targetSong.rawMetaJson?.takeIf { it.trim().startsWith("{") }
-                                ?: targetSong.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
-
-                            // 依据当前网络状态 (Wi-Fi/VPN vs 移动流量) 智能选择试听音质并阶梯探测
-                            val preferredQuality = LemonMusicProtocol.getPreferredStreamQuality(this@MainActivity)
-                            val resolvedStream = protocol.resolveOnlineStreamWithQuality(
-                                songId = targetSong.id,
-                                source = source,
-                                preferredQuality = preferredQuality,
-                                metaJson = meta,
-                                fallbackTitle = targetSong.title,
-                                fallbackArtist = targetSong.artist
-                            ).getOrNull()
-
-                            var realUrl = resolvedStream?.url
-
-                            if (realUrl.isNullOrBlank()) {
-                                // 若第三方在线源暂时无法返回直链，自动回退匹配资料库中完全同版本的服务端歌曲有效流地址
-                                val matchedServerSong = songList.firstOrNull {
-                                    (it.streamUrl.startsWith("http://") || it.streamUrl.startsWith("https://")) &&
-                                    SongMatchingResolver.isSongMatch(
-                                        it.title, it.artist, it.durationMs,
-                                        targetSong.title, targetSong.artist, targetSong.durationMs,
-                                        it.album, targetSong.album
-                                    )
-                                }
-                                if (matchedServerSong != null) {
-                                    val srvPath = LemonMusicProtocol.getServerFilePath(
-                                        matchedServerSong.id,
-                                        matchedServerSong.streamUrl,
-                                        matchedServerSong.coverUrl
-                                    )
-                                    realUrl = if (!srvPath.isNullOrBlank()) {
-                                        protocol.ensureAuthenticated()
-                                        protocol.getStreamUrlForPath(srvPath)
-                                    } else {
-                                        matchedServerSong.streamUrl
-                                    }
-                                }
-                            }
-
-                            if (!realUrl.isNullOrBlank()) {
-                                val resolvedSong = targetSong.copy(
-                                    streamUrl = realUrl,
-                                    format = resolvedStream?.format ?: targetSong.format,
-                                    bitRate = resolvedStream?.bitRate ?: targetSong.bitRate
-                                )
-                                withContext(Dispatchers.Main) {
-                                    val resolvedQueue = activeQueue.map { if (it.id == resolvedSong.id) resolvedSong else it }
-                                    PlaybackQueueManager.playSong(
-                                        targetSong = resolvedSong,
-                                        context = this@MainActivity,
-                                        newPlaylist = resolvedQueue,
-                                        startPositionMs = startPositionMs
-                                    )
-                                }
-                                return@launch
-                            }
-                        }
-                        withContext(Dispatchers.Main) {
-                            PlaybackQueueManager.playSong(
-                                targetSong = targetSong,
-                                context = this@MainActivity,
-                                newPlaylist = activeQueue,
-                                startPositionMs = startPositionMs
-                            )
-                        }
-                    }
                 } else {
                     PlaybackQueueManager.playSong(
                         targetSong = targetSong,
@@ -1305,7 +1240,7 @@ class MainActivity : ComponentActivity() {
                     // 关键修复：服务器曲库歌曲的 streamUrl 是 /api/play/local?path=…&token=…，
                     // **URL 里没有音质参数**，以前被当作"直链歌曲"直接下载，拉到的其实是服务器上的
                     // 原文件（可能是无损）——选 320K 却下到无损就是这么来的。
-                    if (activeServer != null && DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
+                    if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
                         downloadEngine.startDownload(
                             song = preparedSong,
                             urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) }
@@ -1428,10 +1363,10 @@ class MainActivity : ComponentActivity() {
                             }
                             enqueuedCount++
                             val preparedSong = songToDownload.copy(format = safeFormat, bitRate = quality.bitrate)
-                            if (serverForRefetch != null) {
+                            if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
                                 downloadEngine.startDownload(
                                     song = preparedSong,
-                                    urlResolver = { resolveDownloadUrlFor(this@MainActivity, serverForRefetch, songToDownload, quality) }
+                                    urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) }
                                 )
                             } else {
                                 downloadEngine.startDownload(preparedSong)
@@ -1466,130 +1401,23 @@ class MainActivity : ComponentActivity() {
              */
             val handleToggleFavorite: (UnifiedSong) -> Unit = { songToFav ->
                 val newFav = !songToFav.isFavorite
-                val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
-                    uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
-                val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                val willCacheToServer = newFav && isAutoCache && activeServer != null
-                val targetServerId = activeServer?.id?.ifBlank { "lemon_music" } ?: "lemon_music"
-                val effectiveServerId = when {
-                    willCacheToServer && (songToFav.serverId.isBlank() || songToFav.serverId == "lemon_online" || songToFav.serverId == "default") -> targetServerId
-                    songToFav.serverId.isNotBlank() && songToFav.serverId != "lemon_online" -> songToFav.serverId
-                    else -> "lemon_online"
-                }
-                val updatedSong = songToFav.copy(isFavorite = newFav, serverId = effectiveServerId)
+                val updatedSong = songToFav.copy(isFavorite = newFav)
                 songList = if (songList.any { it.id == songToFav.id }) {
                     songList.map { if (it.id == songToFav.id) updatedSong else it }
                 } else {
                     listOf(updatedSong) + songList
                 }
-                // 「我喜欢的音乐」以服务器收藏为准，这里先把本机这份镜像改掉，
-                // 确保用户点击红心后即时生效
                 serverFavoriteSongs = if (newFav) {
                     (listOf(updatedSong) + serverFavoriteSongs).distinctBy { it.id }
                 } else {
                     serverFavoriteSongs.filterNot { it.id == songToFav.id }
-                }
-                if (PlaybackQueueManager.currentSongFlow.value?.id == songToFav.id) {
-                    PlaybackQueueManager.updateCurrentSong(updatedSong)
                 }
                 Toast.makeText(
                     this@MainActivity,
                     if (newFav) "已加入「我喜欢的音乐」" else "已从「我喜欢的音乐」移除",
                     Toast.LENGTH_SHORT
                 ).show()
-                lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        val existing = database.songDao().getSongById(songToFav.id)
-                        if (existing == null) {
-                            database.songDao().insertSongs(
-                                listOf(
-                                    SongEntity(
-                                        id = updatedSong.id,
-                                        title = updatedSong.title.ifBlank { "未知曲目" },
-                                        artist = updatedSong.artist.ifBlank { "未知歌手" },
-                                        artistId = updatedSong.artistId.ifBlank { "artist_${updatedSong.artist.hashCode()}" },
-                                        album = updatedSong.album.ifBlank { "单曲精选" },
-                                        albumId = updatedSong.albumId.ifBlank { "album_${updatedSong.album.hashCode()}" },
-                                        durationMs = updatedSong.durationMs,
-                                        coverUrl = updatedSong.coverUrl,
-                                        streamUrl = updatedSong.streamUrl,
-                                        serverId = updatedSong.serverId,
-                                        localFilePath = updatedSong.localFilePath,
-                                        downloadStatus = updatedSong.downloadStatus,
-                                        bitRate = updatedSong.bitRate,
-                                        format = updatedSong.format,
-                                        isFavorite = newFav,
-                                        relativeFolderPath = updatedSong.rawMetaJson ?: updatedSong.relativeFolderPath,
-                                        addedTimestamp = System.currentTimeMillis()
-                                    )
-                                )
-                            )
-                        } else {
-                            database.songDao().updateFavorite(songToFav.id, newFav)
-                            if (willCacheToServer) {
-                                database.songDao().updateServerId(songToFav.id, updatedSong.serverId)
-                            }
-                        }
-                        if (newFav) {
-                            database.playlistDao().addSongToPlaylist(
-                                com.lm.player.core.database.entity.PlaylistSongEntity(
-                                    playlistId = "lemon_favorites",
-                                    songId = songToFav.id
-                                )
-                            )
-                        } else {
-                            database.playlistDao().removeSongFromPlaylist("lemon_favorites", songToFav.id)
-                        }
-                        database.playlistDao().updateSongCount("lemon_favorites")
-
-                        if (activeServer != null) {
-                            val protocol = LemonMusicProtocol(
-                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
-                                activeServer.serverUrl,
-                                activeServer.username,
-                                activeServer.tokenOrApiKey
-                            )
-                            protocol.toggleFavoriteSongOnServer(updatedSong, newFav)
-                            syncServerPlaylists(activeServer)
-                            val favs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()
-                            if (favs != null) {
-                                val mappedFavs = if (isAutoCache) {
-                                    favs.map { s ->
-                                        if (s.serverId == "lemon_online" || s.serverId.isBlank() || s.serverId == "default") {
-                                            s.copy(serverId = activeServer.id.ifBlank { "lemon_music" })
-                                        } else s
-                                    }
-                                } else favs
-                                withContext(Dispatchers.Main) {
-                                    serverFavoriteSongs = mappedFavs
-                                }
-                            }
-                            // 收藏后自动缓存到服务器
-                            val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
-                                uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
-                            if (newFav && isAutoCache) {
-                                try {
-                                    val qKey = uiPrefs.getString("auto_cache_server_quality", null)
-                                        ?: uiPrefs.getString("default_download_quality", AudioQuality.Q_320K.key)
-                                        ?: AudioQuality.Q_320K.key
-                                    val targetQuality = AudioQuality.fromKey(qKey)
-                                    val serverTask = DownloadRequestPlanner.buildServerDownloadTask(updatedSong, targetQuality)
-                                    val cacheRes = protocol.addServerDownloadTasks(listOf(serverTask))
-                                    withContext(Dispatchers.Main) {
-                                        if (cacheRes.isSuccess) {
-                                            Toast.makeText(this@MainActivity, "已同步提交服务器缓存 [${targetQuality.badge}]", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    Log.w("MainActivity", "autoCacheOnFavorite error", e)
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.e("MainActivity", "handleToggleFavorite error", e)
-                    }
-                }
+                PlaybackQueueManager.toggleFavorite(this@MainActivity, songToFav)
             }
 
             val handleAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { targetPlaylist, songToAdd ->
@@ -1623,7 +1451,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                        // 2. 本地插入 playlist_songs 关联
+                        // 2. 本地插入 playlist_songs 关联并补齐歌单封面
                         database.playlistDao().addSongToPlaylist(
                             com.lm.player.core.database.entity.PlaylistSongEntity(
                                 playlistId = targetPlaylist.id,
@@ -1631,8 +1459,17 @@ class MainActivity : ComponentActivity() {
                             )
                         )
                         database.playlistDao().updateSongCount(targetPlaylist.id)
+                        if (songToAdd.coverUrl.isNotBlank()) {
+                            database.playlistDao().getPlaylistById(targetPlaylist.id)?.let { plEntity ->
+                                val existingCovers = plEntity.coverUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+                                if (!existingCovers.contains(songToAdd.coverUrl) && existingCovers.size < 4) {
+                                    existingCovers.add(songToAdd.coverUrl)
+                                    database.playlistDao().insertPlaylist(plEntity.copy(coverUrl = existingCovers.joinToString("|")))
+                                }
+                            }
+                        }
 
-                        // 3. 若为云端在线歌单且配置了服务端，同步至服务器 customPlaylists
+                        // 3. 若为云端在线歌单且配置了服务端，同步至服务器 customPlaylists (携带完整 trackSnapshots)
                         val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                         if (targetPlaylist.isOnline && active != null) {
                             val protocol = LemonMusicProtocol(
@@ -1642,6 +1479,12 @@ class MainActivity : ComponentActivity() {
                                 active.tokenOrApiKey
                             )
                             val serverPath = LemonMusicProtocol.getServerFilePath(songToAdd.id, songToAdd.streamUrl, songToAdd.coverUrl)
+                            val isOnlineTrack = songToAdd.id.startsWith("lemon_online_") || songToAdd.streamUrl.startsWith("lemon_online://")
+                            val onlineParts = if (songToAdd.id.startsWith("lemon_online_")) {
+                                songToAdd.id.removePrefix("lemon_online_").split("_", limit = 2)
+                            } else emptyList()
+                            val onlinePlatform = onlineParts.getOrNull(0)?.ifBlank { "kw" } ?: "kw"
+                            val onlineRawId = onlineParts.getOrNull(1)?.ifBlank { songToAdd.id } ?: songToAdd.id
                             val key = when {
                                 !serverPath.isNullOrBlank() -> "local:$serverPath"
                                 songToAdd.id.startsWith("lemon_") && songToAdd.streamUrl.contains("path=") -> {
@@ -1650,9 +1493,26 @@ class MainActivity : ComponentActivity() {
                                     } catch (_: Exception) { null }
                                     if (decoded != null) "local:$decoded" else songToAdd.id
                                 }
+                                isOnlineTrack -> "$onlinePlatform:$onlineRawId"
                                 else -> songToAdd.id
                             }
-                            protocol.addTracksToCustomPlaylist(targetPlaylist.id, listOf(key))
+                            val snapObj = org.json.JSONObject().apply {
+                                put("key", key)
+                                put("name", songToAdd.title)
+                                put("singer", songToAdd.artist)
+                                put("album", songToAdd.album)
+                                put("picUrl", songToAdd.coverUrl)
+                                put("interval", (songToAdd.durationMs / 1000L).toInt())
+                                if (key.startsWith("local:")) {
+                                    put("source", "local")
+                                    put("localPath", key.removePrefix("local:"))
+                                } else {
+                                    put("source", onlinePlatform)
+                                    put("songId", onlineRawId)
+                                }
+                            }
+                            protocol.addTracksToCustomPlaylist(targetPlaylist.id, listOf(key), mapOf(key to snapObj))
+                            syncServerPlaylists(active)
                         }
                     } catch (e: Exception) {
                         Log.e("MainActivity", "handleAddToPlaylist error", e)
@@ -1676,7 +1536,7 @@ class MainActivity : ComponentActivity() {
                                     active.username,
                                     active.tokenOrApiKey
                                 )
-                                val res = protocol.createCustomPlaylist(playlistName)
+                                val res = protocol.createCustomPlaylist(playlistName, coverUrl = songToAdd.coverUrl)
                                 if (res.isSuccess) {
                                     res.getOrNull()?.let {
                                         newPlId = it.id
@@ -1695,6 +1555,7 @@ class MainActivity : ComponentActivity() {
                             com.lm.player.core.database.entity.PlaylistEntity(
                                 id = newPlId,
                                 name = playlistName,
+                                coverUrl = songToAdd.coverUrl,
                                 serverId = if (isOnlinePl && active != null) active.id else "local_storage",
                                 isOnline = isOnlinePl,
                                 songCount = 1
@@ -1704,6 +1565,7 @@ class MainActivity : ComponentActivity() {
                         val createdPlaylist = UnifiedPlaylist(
                             id = newPlId,
                             name = playlistName,
+                            coverUrl = songToAdd.coverUrl,
                             isOnline = isOnlinePl,
                             serverId = if (isOnlinePl && active != null) active.id else "local_storage",
                             songCount = 1
@@ -1781,126 +1643,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 监听 ExoPlayer 在线容灾回退与中途断流无缝断点续播及音质降级
-            var lastStreamRetrySongId by remember { mutableStateOf("") }
-            var lastStreamRetryTimeMs by remember { mutableStateOf(0L) }
-            var lastStreamRetryQualityIdx by remember { mutableStateOf(0) }
-            DisposableEffect(exoPlayer, currentSong, songList, autoFallbackToLocal) {
-                val listener = object : Player.Listener {
-                    override fun onPlayerError(error: PlaybackException) {
-                        Log.e("MainActivity", "Player Error encountered: ${error.message}", error)
-                        val targetSong = currentSong
-                        val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
-                        if (targetSong != null) {
-                            // 本地回退与音质降级必须**严格串行**：若本地匹配在后台异步进行、
-                            // 主流程继续往下走，命中本地文件时就会「先 playSong(降质在线) 再
-                            // playSong(本地)」双重起播（互相 cancel + 两条矛盾 Toast + 浪费一级降级档位）。
-                            // 注意：不能用「异步完成后置标记」来短路 —— 那时代码早已走完降级分支。
-                            // **纠正一个错误前提**：Media3Factory 构建 ExoPlayer 时未 setLooper，
-                            // 因此 applicationLooper = 主 Looper，Player.Listener 回调运行在**主线程**。
-                            // 所以「放到 IO 线程并等它返回」在这里等于**冻结主线程**，不能这么做。
-                            // 正确做法见下方 diskProbeExecutor 的异步查 + 主线程复核。
-                            if (autoFallbackToLocal) {
-                                // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
-                                //   **必须在 IO 线程做**：候选集是整个曲库，逐条 File.exists() 是 O(n) 磁盘
-                                //   stat。onPlayerError 运行在 ExoPlayer 主线程，若在此同步遍历，
-                                //   大曲库 + 在线断流时会在主线程打出成百上千次 stat，直接掉帧甚至 ANR。
-                                //   这里改为「异步查 + 查到再续播」，不阻塞播放器回调。
-                                val fallbackCandidates = songList + completedDownloadedSongs
-                                // 非阻塞：整库 stat 丢给 diskProbeExecutor，查完再回主线程复核。
-                                // 原实现用 .get(3s) 会**冻结主线程最多 3 秒**（在线流反复断流时反复冻结），
-                                // 且超时后 Future 不取消，单线程池会堆积不可中断的整库扫描。
-                                @Suppress("UNCHECKED_CAST")
-                                val probe = java.util.concurrent.CompletableFuture.supplyAsync({
-                                    fallbackCandidates.firstOrNull {
-                                        val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                                        hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
-                                            it.title, it.artist, it.durationMs,
-                                            targetSong.title, targetSong.artist, targetSong.durationMs,
-                                            it.album, targetSong.album
-                                        ))
-                                    }
-                                }, diskProbeExecutor)
-                                probe.thenAccept { matchedLocalSong ->
-                                    // 回到主线程复核并续播
-                                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                                        // 复核「用户是否已经切歌」：整库磁盘 stat 可能耗时数百毫秒，
-                                        // 这期间用户完全可能点了别的歌；不复核就会把上一首的本地文件
-                                        // 重新 playSong 回来（表现为「自己跳回上一首」）。
-                                        if (currentSong?.id != targetSong.id) {
-                                            Log.i("MainActivity", "本地回退跳过：用户已切歌")
-                                        } else if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
-                                            Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
-                                            val localSong = targetSong.copy(
-                                                localFilePath = matchedLocalSong.localFilePath,
-                                                streamUrl = matchedLocalSong.localFilePath ?: "",
-                                                downloadStatus = DownloadStatus.DOWNLOADED
-                                            )
-                                            PlaybackQueueManager.playSong(
-                                                targetSong = localSong,
-                                                context = this@MainActivity,
-                                                startPositionMs = resumePos
-                                            )
-                                        }
-                                    }
-                                }
-                            }
 
-                            // 2. 音质降级与换源重试：若在线流或高音质(Hi-Res/FLAC)播放中途断流/无法缓冲，
-                            // 参考柠檬音乐机制按音质候选链 (flac24bit -> flac -> 320k -> 128k) 依次换源降低音质重试并提示用户
-                            val preferredQuality = LemonMusicProtocol.getPreferredStreamQuality(this@MainActivity)
-                            val fallbackQualities = LemonMusicProtocol.getFallbackQualities(preferredQuality)
-                            val currentDowngradeIdx = if (lastStreamRetrySongId == targetSong.id) lastStreamRetryQualityIdx else 0
-                            val nextQualityIdx = currentDowngradeIdx + 1
-                            if (nextQualityIdx < fallbackQualities.size) {
-                                lastStreamRetrySongId = targetSong.id
-                                lastStreamRetryTimeMs = System.currentTimeMillis()
-                                lastStreamRetryQualityIdx = nextQualityIdx
-                                val nextQualityKey = fallbackQualities[nextQualityIdx]
-                                val nextQualityLabel = AudioQuality.fromKey(nextQualityKey).label
-                                Log.i("MainActivity", "Auto-downgrading quality for ${targetSong.title} to $nextQualityKey ($nextQualityLabel) at ${resumePos}ms")
-                                Toast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
-                                PlaybackQueueManager.playSong(
-                                    targetSong = targetSong,
-                                    context = this@MainActivity,
-                                    startPositionMs = resumePos,
-                                    forceRefresh = true,
-                                    overrideQuality = nextQualityKey
-                                )
-                                return
-                            }
-
-                            if (autoFallbackToLocal) {
-                                // 3. 若降级仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
-                                val matchedServerSong = songList.firstOrNull {
-                                    it.id != targetSong.id &&
-                                    it.streamUrl != targetSong.streamUrl &&
-                                    (it.streamUrl.contains("/api/play/local") || it.streamUrl.startsWith("http")) &&
-                                    SongMatchingResolver.isSongMatch(
-                                        it.title, it.artist, it.durationMs,
-                                        targetSong.title, targetSong.artist, targetSong.durationMs,
-                                        it.album, targetSong.album
-                                    )
-                                }
-                                if (matchedServerSong != null) {
-                                    Toast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()
-                                    PlaybackQueueManager.playSong(
-                                        targetSong = matchedServerSong,
-                                        context = this@MainActivity,
-                                        startPositionMs = resumePos
-                                    )
-                                    return
-                                }
-                            }
-                        }
-                        Toast.makeText(this@MainActivity, "当前歌曲《${currentSong?.title ?: "未知"}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
-                    }
-                }
-                exoPlayer?.addListener(listener)
-                onDispose {
-                    exoPlayer?.removeListener(listener)
-                }
-            }
 
             CompositionLocalProvider(
                 LocalDensity provides adaptiveDensity,
@@ -1958,10 +1701,11 @@ class MainActivity : ComponentActivity() {
                         // key 用「当前页面」与「服务器身份」本身，而不是布尔表达式：
                         // 表达式作 key 时，任何一次同步导致 serversList 变成新实例都会让
                         // activeLemonServerForSearch 变化，从而重复拉取整份服务器收藏；
-                        // 且布尔值无法区分「从 HOME 进 LIBRARY」与「从 MINE 进 LIBRARY」。
                         LaunchedEffect(
                             activeLemonServerForSearch?.id,
                             activeLemonServerForSearch?.tokenOrApiKey,
+                            activeServerId,
+                            activeServerName,
                             favoritesRefreshTrigger,
                             currentScreen
                         ) {
@@ -1970,13 +1714,55 @@ class MainActivity : ComponentActivity() {
                                 try {
                                     val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                     val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
-                                    protocol.getPlaylistSongs("lemon_favorites").getOrNull()
+                                    val rawFavs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()?.distinctBy { it.id }
+                                    if (rawFavs != null) {
+                                        rawFavs.map { s ->
+                                            val validCover = s.coverUrl.takeIf { it.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it) }
+                                                ?: LemonMusicProtocol.getResolvedCover(s.id)
+                                            if (!validCover.isNullOrBlank()) {
+                                                if (validCover != s.coverUrl) s.copy(coverUrl = validCover) else s
+                                            } else {
+                                                s.copy(coverUrl = "")
+                                            }
+                                        }
+                                    } else null
                                 } catch (e: Exception) {
                                     Log.w("MainActivity", "Fetching server favorites failed", e)
                                     null
                                 }
                             }
-                            if (fetched != null) serverFavoriteSongs = fetched
+                            if (fetched != null) serverFavoriteSongs = fetched.distinctBy { it.id }
+                        }
+
+                        val isLocalModeHeader = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                        val activeOnlineServer = if (isLocalModeHeader) null else serversList.firstOrNull { it.isCurrentActive }
+                        val useDiscoverHome = activeOnlineServer != null
+
+                        // 统一模式切换刷新规则：切换本地曲库与在线服务器时自动刷新全量关联数据，防止跨模式状态残留引发错误
+                        val switchToLocalLibraryMode: (String) -> Unit = { displayName ->
+                            activeServerName = displayName
+                            activeServerId = "local_mode"
+                            serverAlbums = emptyList()
+                            recentlyAddedSongs = emptyList()
+                            LemonMusicProtocol.clearDiscoverCache()
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                database.serverDao().clearActiveServer()
+                                val dlDir = downloadEngine.getDownloadDir()
+                                LocalMediaScanner.scanCustomDirectory(this@MainActivity, dlDir.absolutePath, database)
+                                LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                            }
+                        }
+
+                        val switchToOnlineServerMode: (ServerConfig) -> Unit = { selectedServer ->
+                            activeServerName = selectedServer.name
+                            activeServerId = selectedServer.id
+                            LemonMusicProtocol.clearDiscoverCache()
+                            refreshServerFavorites()
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                database.serverDao().setActiveServer(selectedServer.id)
+                                syncServerPlaylists(selectedServer)
+                                syncServerSongs(selectedServer)
+                            }
                         }
 
                         // 响应式脚手架 (横屏大屏与竖屏手机统一使用底部悬浮一体化播放导航栏 + 弹出式左滑搜索框)
@@ -1997,7 +1783,7 @@ class MainActivity : ComponentActivity() {
                         onSearchTypeChange = { newType ->
                             currentSearchType = newType
                         },
-                        showOnlineSourceSelector = (activeLemonServerForSearch != null),
+                        showOnlineSourceSelector = useDiscoverHome,
                         blurAlpha = blurAlpha,
                         enableBottomBarAnimation = enableBottomBarAnimation,
                         useLinearAnimation = true,
@@ -2052,13 +1838,59 @@ class MainActivity : ComponentActivity() {
                         ) { targetScreen ->
                             when (targetScreen) {
                                 Screen.HOME -> {
-                                    val activeServer = serversList.firstOrNull { it.isCurrentActive }
-                                    val isLemonMusic = activeServer?.type == ServerType.LEMON_MUSIC &&
-                                            !activeServerName.contains("本地") && !activeServerName.contains("已下载")
-
-                                    if (isLemonMusic && activeServer != null) {
+                                    val activeServer = activeOnlineServer
+                                    if (!useDiscoverHome) {
+                                        LocalMusicHomeScreen(
+                                            serverName = activeServerName.ifBlank { "本地 · 已下载" },
+                                            recentSongs = completedDownloadedSongs,
+                                            configuredServers = serversList,
+                                            blurAlpha = blurAlpha,
+                                            recentlyAddedSongs = recentlyAddedSongs,
+                                            recentlyPlayedSongs = recentlyPlayedSongs,
+                                            discoverPlaylists = playlistsList.filter { it.isDiscover },
+                                            homeDisplayConfig = homeDisplayConfig,
+                                            activeDownloadTasks = activeDownloadTasks,
+                                            activeDownloadCount = activeDownloadTasks.size,
+                                            currentPlayingSong = currentSong,
+                                            isPlaying = isPlaying,
+                                            locateSongTrigger = locateSongTrigger,
+                                            scrollToTopTrigger = scrollToTopTrigger,
+                                            onListScrollingChange = { isSongListScrolling = it },
+                                            onScrollPositionChange = { isScrolledAwayFromTop = it },
+                                            onSongClick = { song, queue -> playSongWithQueue(song, queue) },
+                                            onDownloadSong = handleDownloadSong,
+                                            onDownloadSongWithOptions = handleDownloadWithOptions,
+                                            onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
+                                            onSelectLocalServer = {
+                                                switchToLocalLibraryMode("本地 · 已下载")
+                                            },
+                                            onSelectServer = { selectedServer ->
+                                                switchToOnlineServerMode(selectedServer)
+                                            },
+                                            onSyncNow = {
+                                                Toast.makeText(this@MainActivity, "正在扫描核对本地已下载音乐...", Toast.LENGTH_SHORT).show()
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    val dlDir = downloadEngine.getDownloadDir()
+                                                    LocalMediaScanner.scanCustomDirectory(this@MainActivity, dlDir.absolutePath, database)
+                                                    LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                }
+                                            },
+                                            onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
+                                            onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
+                                            onScanLocalMedia = {
+                                                Toast.makeText(this@MainActivity, "正在扫描本机音乐文件...", Toast.LENGTH_SHORT).show()
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    val dlDir = downloadEngine.getDownloadDir()
+                                                    LocalMediaScanner.scanCustomDirectory(this@MainActivity, dlDir.absolutePath, database)
+                                                    LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                }
+                                            },
+                                            onSubViewActiveChange = { isChildSubViewActive = it },
+                                            contentPadding = innerPadding
+                                        )
+                                    } else {
                                         LemonDiscoverHomeScreen(
-                                            serverName = activeServerName,
+                                            serverName = activeServerName.ifBlank { "本地曲库" },
                                             configuredServers = serversList,
                                             currentSource = currentOnlineSource,
                                             onSourceChange = { newSrc ->
@@ -2081,117 +1913,88 @@ class MainActivity : ComponentActivity() {
                                             onDownloadSongWithOptions = handleDownloadWithOptions,
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
-                                                activeServerName = "本地 · 已下载"
-                                                navigateToScreen(Screen.HOME)
+                                                switchToLocalLibraryMode("本地曲库")
                                             },
                                             onSelectServer = { selectedServer ->
-                                                activeServerName = selectedServer.name
-                                                activeServerId = selectedServer.id
-                                                lifecycleScope.launch(Dispatchers.IO) {
-                                                    database.serverDao().setActiveServer(selectedServer.id)
-                                                    syncServerPlaylists(selectedServer)
-                                                    syncServerSongs(selectedServer)
-                                                }
+                                                switchToOnlineServerMode(selectedServer)
                                             },
                                             onSyncNow = {
-                                                Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
-                                                syncServerSongs(activeServer)
+                                                if (activeServer != null) {
+                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
+                                                    syncServerPlaylists(activeServer)
+                                                    syncServerSongs(activeServer)
+                                                    refreshServerFavorites()
+                                                } else {
+                                                    Toast.makeText(this@MainActivity, "正在刷新本地曲库与发现页数据...", Toast.LENGTH_SHORT).show()
+                                                    switchToLocalLibraryMode("本地曲库")
+                                                }
                                             },
                                             onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
                                             onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
                                             onSearchClick = { isSearchDialogOpen = true },
                                             onFetchDiscoverPlaylists = { src ->
                                                 val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                proto.getDiscoverRecommendPlaylists(source = src.key, page = 1, limit = 20).getOrNull() ?: emptyList()
+                                                val proto = activeServer?.let { LemonMusicProtocol(client, it.serverUrl, it.username, it.tokenOrApiKey) }
+                                                val srvRes = proto?.getDiscoverRecommendPlaylists(source = src.key, page = 1, limit = 20)?.getOrNull()
+                                                if (!srvRes.isNullOrEmpty()) {
+                                                    srvRes
+                                                } else {
+                                                    playlistsList.filter { it.isDiscover || it.id.startsWith("discover_") || it.songCount > 0 }.take(10)
+                                                }
                                             },
                                             onFetchDiscoverToplists = { src ->
-                                                val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                proto.getDiscoverToplists(source = src.key).getOrNull() ?: emptyList()
+                                                if (activeServer != null) {
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    proto.getDiscoverToplists(source = src.key).getOrNull() ?: emptyList()
+                                                } else emptyList()
                                             },
                                             onFetchDiscoverNewSongs = { src ->
-                                                val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                proto.getDiscoverNewSongs(source = src.key, limit = 30).getOrNull() ?: emptyList()
+                                                if (activeServer != null) {
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    proto.getDiscoverNewSongs(source = src.key, limit = 30).getOrNull() ?: emptyList()
+                                                } else emptyList()
                                             },
                                             onFetchDiscoverNewAlbums = { src ->
-                                                val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                proto.getDiscoverNewAlbums(source = src.key).getOrNull() ?: emptyList()
+                                                if (activeServer != null) {
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    proto.getDiscoverNewAlbums(source = src.key).getOrNull() ?: emptyList()
+                                                } else emptyList()
                                             },
                                             onParseExternalPlaylist = { url, src ->
-                                                val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                proto.parseExternalPlaylist(urlOrId = url, source = src.key).getOrNull() ?: emptyList()
+                                                if (activeServer != null) {
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    proto.parseExternalPlaylist(urlOrId = url, source = src.key).getOrNull() ?: emptyList()
+                                                } else {
+                                                    emptyList()
+                                                }
                                             },
                                             onFetchCollectionSongs = { collectionId, src ->
-                                                val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
                                                 if (collectionId.startsWith("lemon_toplist_")) {
-                                                    val rawId = collectionId.substringAfterLast('_')
-                                                    proto.getDiscoverToplistSongs(toplistId = rawId, source = src.key).getOrNull() ?: emptyList()
-                                                } else {
+                                                    val rem = collectionId.removePrefix("lemon_toplist_")
+                                                    val tlSource = rem.substringBefore('_', src.key).ifBlank { src.key }
+                                                    val rawId = rem.substringAfter('_', rem)
+                                                    if (activeServer != null) {
+                                                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                        val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                        proto.getDiscoverToplistSongs(toplistId = rawId, source = tlSource).getOrNull() ?: emptyList()
+                                                    } else emptyList()
+                                                } else if (collectionId.startsWith("lemon_discover_album_") || collectionId.startsWith("lemon_discover_")) {
+                                                    if (activeServer != null) {
+                                                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                        val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                        proto.getPlaylistSongs(collectionId).getOrNull() ?: emptyList()
+                                                    } else emptyList()
+                                                } else if (activeServer != null) {
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
                                                     proto.getPlaylistSongs(collectionId).getOrNull() ?: emptyList()
-                                                }
-                                            },
-                                            onSubViewActiveChange = { isChildSubViewActive = it },
-                                            contentPadding = innerPadding
-                                        )
-                                    } else {
-                                        LocalMusicHomeScreen(
-                                            serverName = activeServerName,
-                                            recentSongs = songList,
-                                            configuredServers = serversList,
-                                            blurAlpha = blurAlpha,
-                                            recentlyAddedSongs = recentlyAddedSongs,
-                                            recentlyPlayedSongs = recentlyPlayedSongs,
-                                            discoverPlaylists = playlistsList.filter { it.isDiscover || it.id.startsWith("discover_") },
-                                            homeDisplayConfig = homeDisplayConfig,
-                                            activeDownloadTasks = activeDownloadTasks,
-                                            activeDownloadCount = activeDownloadTasks.size,
-                                            currentPlayingSong = currentSong,
-                                            isPlaying = isPlaying,
-                                            locateSongTrigger = locateSongTrigger,
-                                            scrollToTopTrigger = scrollToTopTrigger,
-                                            onScrollPositionChange = { isScrolledAwayFromTop = it },
-                                            onListScrollingChange = { isSongListScrolling = it },
-                                            onSongClick = { song, queue -> playSongWithQueue(song, queue) },
-                                            onDownloadSong = handleDownloadSong,
-                                            onDownloadSongWithOptions = handleDownloadWithOptions,
-                                            onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
-                                            onSelectLocalServer = {
-                                                activeServerName = "本地模式"
-                                                navigateToScreen(Screen.HOME)
-                                            },
-                                            onSelectServer = { selectedServer ->
-                                                activeServerName = selectedServer.name
-                                                activeServerId = selectedServer.id
-                                                lifecycleScope.launch(Dispatchers.IO) {
-                                                    database.serverDao().setActiveServer(selectedServer.id)
-                                                    syncServerSongs(selectedServer)
-                                                }
-                                            },
-                                            onSyncNow = {
-                                                val active = serversList.firstOrNull { it.isCurrentActive }
-                                                if (active != null) {
-                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库...", Toast.LENGTH_SHORT).show()
-                                                    syncServerSongs(active)
                                                 } else {
-                                                    Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
+                                                    database.playlistDao().getSongsForPlaylist(collectionId).map { it.toUnifiedSong() }
                                                 }
-                                            },
-                                            onOpenDownloads = {
-                                                navigateToScreen(Screen.DOWNLOADS)
-                                            },
-                                            onGoToSettings = {
-                                                navigateToScreen(Screen.SETTINGS)
-                                            },
-                                            onPlaylistClick = {
-                                                navigateToScreen(Screen.LIBRARY)
-                                            },
-                                            onScanLocalMedia = {
-                                                navigateToScreen(Screen.SETTINGS)
                                             },
                                             onSubViewActiveChange = { isChildSubViewActive = it },
                                             contentPadding = innerPadding
@@ -2204,11 +2007,27 @@ class MainActivity : ComponentActivity() {
                                     val activeConfig = if (isLocalMode) null else serversList.firstOrNull { it.isCurrentActive }
                                     val librarySongs = remember(songList, activeConfig, isLocalMode) {
                                         if (isLocalMode || activeConfig == null) {
-                                            songList.filter {
+                                            val rawLocal = songList.filter {
                                                 it.downloadStatus == DownloadStatus.DOWNLOADED ||
                                                 it.serverId in listOf("local_storage", "local_folder", "local_saf") ||
                                                 !it.localFilePath.isNullOrBlank()
                                             }
+                                            val byPath = LinkedHashMap<String, UnifiedSong>(rawLocal.size)
+                                            for (song in rawLocal) {
+                                                val key = song.localFilePath?.trim()?.replace('\\', '/')?.lowercase()?.takeIf { it.isNotBlank() }
+                                                    ?: "id:${song.id}"
+                                                val existing = byPath[key]
+                                                if (existing == null) {
+                                                    byPath[key] = song
+                                                } else {
+                                                    val existingIsLocalOnly = existing.serverId in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                                                    val incomingIsServer = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                                                    if (existingIsLocalOnly && incomingIsServer) {
+                                                        byPath[key] = song
+                                                    }
+                                                }
+                                            }
+                                            byPath.values.distinctBy { it.id }
                                         } else {
                                             // 在线模式：展示属于当前服务器的真实曲目**以及所有已收藏曲目**。
                                             // 「我喜欢的音乐」是跨服务器的用户资产：收藏一首别的服务器的曲目后，
@@ -2218,7 +2037,7 @@ class MainActivity : ComponentActivity() {
                                                 it.serverId == activeConfig.serverUrl ||
                                                 it.isFavorite ||
                                                 (activeConfig.type == ServerType.LEMON_MUSIC && (it.serverId == "lemon_music" || it.serverId == activeConfig.id))
-                                            }
+                                            }.distinctBy { it.id }
                                         }
                                     }
                                     // 「我喜欢的音乐」的数据口径：
@@ -2231,10 +2050,18 @@ class MainActivity : ComponentActivity() {
                                         serverFavoriteSongs, librarySongs, completedDownloadedSongs, isLocalMode
                                     ) {
                                         when {
-                                            serverFavoriteSongs.isEmpty() -> librarySongs.filter { it.isFavorite }
+                                            serverFavoriteSongs.isEmpty() -> librarySongs.filter { it.isFavorite }.distinctBy { it.id }
                                             !isLocalMode -> serverFavoriteSongs.map { fav ->
-                                                librarySongs.firstOrNull { it.id == fav.id } ?: fav
-                                            }
+                                                val matched = librarySongs.firstOrNull { it.id == fav.id }
+                                                if (matched != null) {
+                                                    matched.copy(
+                                                        coverUrl = matched.coverUrl.ifBlank { fav.coverUrl },
+                                                        isFavorite = true
+                                                    )
+                                                } else {
+                                                    fav.copy(isFavorite = true)
+                                                }
+                                            }.distinctBy { it.id }
                                             else -> serverFavoriteSongs.mapNotNull { fav ->
                                                 completedDownloadedSongs.firstOrNull { local ->
                                                     local.id == fav.id || SongMatchingResolver.isSongMatch(
@@ -2246,6 +2073,11 @@ class MainActivity : ComponentActivity() {
                                                         durationMs2 = fav.durationMs,
                                                         album1 = local.album,
                                                         album2 = fav.album
+                                                    )
+                                                }?.let { matchedLocal ->
+                                                    matchedLocal.copy(
+                                                        coverUrl = matchedLocal.coverUrl.ifBlank { fav.coverUrl },
+                                                        isFavorite = true
                                                     )
                                                 }
                                             }.distinctBy { it.id }
@@ -2280,26 +2112,21 @@ class MainActivity : ComponentActivity() {
                                         onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onListScrollingChange = { isSongListScrolling = it },
                                         onSelectLocalServer = {
-                                            activeServerName = "本地模式"
+                                            switchToLocalLibraryMode("本地模式")
                                         },
                                         onSelectServer = { selectedServer ->
-                                            activeServerName = selectedServer.name
-                                            activeServerId = selectedServer.id
-                                            lifecycleScope.launch(Dispatchers.IO) {
-                                                database.serverDao().setActiveServer(selectedServer.id)
-                                                syncServerPlaylists(selectedServer)
-                                                syncServerSongs(selectedServer)
-                                            }
+                                            switchToOnlineServerMode(selectedServer)
                                         },
                                         onSyncNow = {
                                             val active = serversList.firstOrNull { it.isCurrentActive }
-                                            if (active != null) {
+                                            if (active != null && !isLocalMode) {
                                                 Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
                                                 syncServerPlaylists(active)
                                                 syncServerSongs(active)
                                                 refreshServerFavorites()
                                             } else {
-                                                Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(this@MainActivity, "正在刷新本地曲库数据...", Toast.LENGTH_SHORT).show()
+                                                switchToLocalLibraryMode(activeServerName.ifBlank { "本地模式" })
                                             }
                                         },
                                         onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
@@ -2449,15 +2276,102 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 } else songList.filter { it.isFavorite }
                                                 (rawList + favExtras).distinctBy { it.id }
-                                            } else rawList
+                                            } else rawList.distinctBy { it.id }
 
                                             // 全局统一匹配：将歌单曲目与本地缓存/下载物理文件即时比对并挂载
-                                            SongMatchingResolver.resolveSongList(
+                                            val resolvedList = SongMatchingResolver.resolveSongList(
                                                 incomingSongs = mergedList,
                                                 allCachedSongs = songList,
                                                 activeTasks = activeDownloadTasks,
                                                 downloadDir = downloadEngine.getDownloadDir()
-                                            )
+                                            ).distinctBy { it.id }
+
+                                            // 歌单内歌曲封面兜底补齐：先匹配本地/服务器已知封面，仍无封面则并发查询公开音源补齐
+                                            val localMatchedList = resolvedList.map { s ->
+                                                val currentValid = s.coverUrl.takeIf { it.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it) }
+                                                    ?: LemonMusicProtocol.getResolvedCover(s.id)
+                                                if (!currentValid.isNullOrBlank()) {
+                                                    if (currentValid != s.coverUrl) s.copy(coverUrl = currentValid) else s
+                                                } else {
+                                                    val cachedCover = songList.firstOrNull {
+                                                        it.coverUrl.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it.coverUrl) && (
+                                                            it.id == s.id ||
+                                                            SongMatchingResolver.isSongMatch(it.title, it.artist, it.durationMs, s.title, s.artist, s.durationMs, it.album, s.album) ||
+                                                            (s.album.isNotBlank() && s.album != "未知专辑" && it.album.equals(s.album, ignoreCase = true))
+                                                        )
+                                                    }?.coverUrl ?: serverFavoriteSongs.firstOrNull {
+                                                        it.coverUrl.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it.coverUrl) && (
+                                                            it.id == s.id ||
+                                                            SongMatchingResolver.isSongMatch(it.title, it.artist, it.durationMs, s.title, s.artist, s.durationMs, it.album, s.album)
+                                                        )
+                                                    }?.coverUrl
+                                                    if (!cachedCover.isNullOrBlank()) {
+                                                        LemonMusicProtocol.registerResolvedCover(s.id, cachedCover)
+                                                        s.copy(coverUrl = cachedCover)
+                                                    } else {
+                                                        s.copy(coverUrl = "")
+                                                    }
+                                                }
+                                            }
+
+                                            val finalSongs = if (localMatchedList.any { it.coverUrl.isBlank() && it.title.isNotBlank() } && activeConfig != null) {
+                                                withContext(Dispatchers.IO) {
+                                                    var onlineFetchCount = 0
+                                                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                                                    val proto = LemonMusicProtocol(client, activeConfig.serverUrl, activeConfig.username, activeConfig.tokenOrApiKey)
+                                                    val jobs = localMatchedList.map { s ->
+                                                        if (s.coverUrl.isBlank() && s.title.isNotBlank() && onlineFetchCount < 16) {
+                                                            onlineFetchCount++
+                                                            async {
+                                                                val q = if (s.artist.isNotBlank() && s.artist != "未知歌手") "${s.title} ${s.artist}" else s.title
+                                                                val foundCover = try {
+                                                                    proto.searchOnline(q, "kw", 1, 3)
+                                                                        .getOrNull()
+                                                                        ?.firstOrNull { it.coverUrl.isNotBlank() }
+                                                                        ?.coverUrl
+                                                                        ?: proto.searchOnline(q, "tx", 1, 3)
+                                                                            .getOrNull()
+                                                                            ?.firstOrNull { it.coverUrl.isNotBlank() }
+                                                                            ?.coverUrl
+                                                                } catch (_: Exception) { null }
+                                                                if (!foundCover.isNullOrBlank()) {
+                                                                    LemonMusicProtocol.registerResolvedCover(s.id, foundCover)
+                                                                    try {
+                                                                        database.songDao().getSongById(s.id)?.let { dbSong ->
+                                                                            if (dbSong.coverUrl.isBlank() || dbSong.coverUrl.contains("/api/tag/cover")) {
+                                                                                database.songDao().insertSongs(listOf(dbSong.copy(coverUrl = foundCover)))
+                                                                            }
+                                                                        }
+                                                                    } catch (_: Exception) {}
+                                                                    s.copy(coverUrl = foundCover)
+                                                                } else s
+                                                            }
+                                                        } else {
+                                                            async { s }
+                                                        }
+                                                    }
+                                                    jobs.map { it.await() }
+                                                }
+                                            } else localMatchedList
+
+                                            // 同步用歌单内前 4 首有封面的歌曲回写歌单卡片封面
+                                            val topCovers = finalSongs.mapNotNull {
+                                                it.coverUrl.takeIf { c -> c.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(c) }
+                                            }.distinct().take(4)
+                                            if (topCovers.isNotEmpty()) {
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    try {
+                                                        database.playlistDao().getPlaylistById(playlistId)?.let { entity ->
+                                                            val joined = topCovers.joinToString("|")
+                                                            if (entity.coverUrl != joined || entity.songCount != finalSongs.size) {
+                                                                database.playlistDao().insertPlaylist(entity.copy(coverUrl = joined, songCount = finalSongs.size))
+                                                            }
+                                                        }
+                                                    } catch (_: Exception) {}
+                                                }
+                                            }
+
+                                            finalSongs
                                         },
                                         onFetchServerFolders = { parentId ->
                                             if (activeConfig != null) {
@@ -2613,7 +2527,9 @@ class MainActivity : ComponentActivity() {
                                         blurAlpha = blurAlpha,
                                         onBlurAlphaChange = { newAlpha ->
                                             blurAlpha = newAlpha
-                                            uiPrefs.edit().putFloat("ui_blur_alpha", newAlpha).apply()
+                                        },
+                                        onBlurAlphaChangeFinished = {
+                                            uiPrefs.edit().putFloat("ui_blur_alpha", blurAlpha).apply()
                                         },
                                         enableBottomBarAnimation = enableBottomBarAnimation,
                                         onEnableBottomBarAnimationChange = { isEnabled ->
@@ -2668,10 +2584,7 @@ class MainActivity : ComponentActivity() {
                                             onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                         },
                                         onSelectServer = { server ->
-                                            lifecycleScope.launch(Dispatchers.IO) {
-                                                database.serverDao().setActiveServer(server.id)
-                                                syncServerSongs(server)
-                                            }
+                                            switchToOnlineServerMode(server)
                                         },
                                         onAddOrUpdateServer = { serverConfig ->
                                             lifecycleScope.launch(Dispatchers.IO) {
@@ -2688,13 +2601,19 @@ class MainActivity : ComponentActivity() {
                                                         isCurrentActive = true
                                                     )
                                                 )
-                                                database.serverDao().setActiveServer(serverConfig.id)
-                                                syncServerSongs(serverConfig)
+                                                withContext(Dispatchers.Main) {
+                                                    switchToOnlineServerMode(serverConfig)
+                                                }
                                             }
                                         },
                                         onDeleteServer = { serverIdToDelete ->
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 database.serverDao().deleteServer(serverIdToDelete)
+                                                database.songDao().deleteSongsByServer(serverIdToDelete)
+                                                database.playlistDao().deletePlaylistsByServer(serverIdToDelete)
+                                            }
+                                            if (activeServerId == serverIdToDelete) {
+                                                switchToLocalLibraryMode("本地曲库")
                                             }
                                         },
                                         onOpenDownloads = {
@@ -2877,15 +2796,17 @@ class MainActivity : ComponentActivity() {
                                         )
                                     }
                             }
-                            val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>)? = remember(activeLemonServerForSearch) {
+                            val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>) = remember(activeLemonServerForSearch) {
                                 val srv = activeLemonServerForSearch
-                                if (srv != null) {
-                                    { keyword, source, page, limit ->
+                                { keyword, source, page, limit ->
+                                    if (srv != null) {
                                         val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                         val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
                                         protocol.searchOnline(keyword, source = source.key, page = page, limit = limit).getOrNull() ?: emptyList()
+                                    } else {
+                                        emptyList()
                                     }
-                                } else null
+                                }
                             }
                             val onlineSearchAlbumsCallback: (suspend (String, OnlineMusicSource) -> List<UnifiedAlbum>)? = remember(activeLemonServerForSearch) {
                                 val srv = activeLemonServerForSearch
@@ -3203,24 +3124,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun registerMediaCommandReceiver() {
-        try {
-            mediaCommandReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    // PlaybackService 是媒体指令执行的唯一真相源，避免广播回路导致二次调用
-                }
-            }
-            val filter = IntentFilter(PlaybackService.ACTION_MEDIA_COMMAND)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(mediaCommandReceiver, filter, RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(mediaCommandReceiver, filter)
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Failed to register mediaCommandReceiver", e)
-        }
-    }
-
     /**
      * 按键级防抖时间戳。
      *
@@ -3438,9 +3341,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        mediaCommandReceiver?.let {
-            try { unregisterReceiver(it) } catch (_: Exception) {}
-        }
         val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
         PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
         // 只有当用户**明确要求退出**时才停播。
@@ -3476,18 +3376,20 @@ class MainActivity : ComponentActivity() {
  */
 private suspend fun resolveDownloadUrlFor(
     context: android.content.Context,
-    server: com.lm.player.core.model.ServerConfig,
+    server: com.lm.player.core.model.ServerConfig?,
     song: UnifiedSong,
     quality: AudioQuality
 ): String? {
     return try {
-        val protocol = LemonMusicProtocol(
-            NetworkClientFactory.createOkHttpClient(context),
-            server.serverUrl,
-            server.username,
-            server.tokenOrApiKey
-        )
-        DownloadRequestPlanner.resolveStreamAtQuality(protocol, song, quality)?.url
+        val protocol = if (server != null) {
+            LemonMusicProtocol(
+                NetworkClientFactory.createOkHttpClient(context),
+                server.serverUrl,
+                server.username,
+                server.tokenOrApiKey
+            )
+        } else null
+        DownloadRequestPlanner.resolveStreamAtQuality(protocol, song, quality, context)?.url
     } catch (e: Exception) {
         android.util.Log.w("MainActivity", "Resolve download stream failed for ${song.title}", e)
         null

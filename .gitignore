@@ -1,4 +1,4 @@
-*.iml
+ï»¿*.iml
 .gradle
 /local.properties
 /.idea
@@ -16,6 +16,12 @@ captures
 app.tgz
 icon_downloaded.png
 
-# µ÷ÊÔ½ØÍ¼£¨ÅÅ²éÊ±ÁÙÊ±²úÉú£¬ÎğÌá½»£©
+# è°ƒè¯•æˆªå›¾ï¼ˆæ’æŸ¥æ—¶ä¸´æ—¶äº§ç”Ÿï¼Œå‹¿æäº¤ï¼‰
 /_dbg_*.png
 /screenshot_*.png
+
+/LM/
+/server/
+*audit*.md
+*å®¡è®¡*.md
+*tvcar*.md

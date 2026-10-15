@@ -1372,6 +1372,13 @@ object AudioSharingManager {
         val totalLen = file.length()
         val mime = mimeTypeForExtension(file.extension)
 
+        if (totalLen <= 0L) {
+            val emptyResp = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            out.write(emptyResp.toByteArray(Charsets.UTF_8))
+            out.flush()
+            return
+        }
+
         var startByte = 0L
         var endByte = totalLen - 1L
         var isPartial = false

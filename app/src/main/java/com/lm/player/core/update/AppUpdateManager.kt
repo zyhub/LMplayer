@@ -219,8 +219,8 @@ object AppUpdateManager {
      * 语义化版本号比较 (例如 "1.2.0" > "1.1.0")
      */
     fun isVersionNewer(latestVersion: String, currentVersion: String): Boolean {
-        val lParts = latestVersion.trimStart('v', 'V').split('.').mapNotNull { it.toIntOrNull() }
-        val cParts = currentVersion.trimStart('v', 'V').split('.').mapNotNull { it.toIntOrNull() }
+        val lParts = latestVersion.trimStart('v', 'V').split('.').mapNotNull { it.takeWhile { c -> c.isDigit() }.toIntOrNull() }
+        val cParts = currentVersion.trimStart('v', 'V').split('.').mapNotNull { it.takeWhile { c -> c.isDigit() }.toIntOrNull() }
         val maxLen = maxOf(lParts.size, cParts.size)
         for (i in 0 until maxLen) {
             val l = lParts.getOrElse(i) { 0 }
@@ -252,30 +252,30 @@ object AppUpdateManager {
                 val body = response.body ?: throw Exception("Empty response body")
                 val totalLength = body.contentLength()
 
-                val inputStream: InputStream = body.byteStream()
-                val outputStream = FileOutputStream(apkFile)
                 val buffer = ByteArray(8 * 1024)
                 var bytesRead: Int
                 var totalBytesRead = 0L
                 var lastReportTime = 0L
                 var lastReportProgress = 0f
 
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    outputStream.write(buffer, 0, bytesRead)
-                    totalBytesRead += bytesRead
-                    val progress = if (totalLength > 0) totalBytesRead.toFloat() / totalLength else 0f
-                    val now = System.currentTimeMillis()
-                    if (now - lastReportTime >= 150L || progress - lastReportProgress >= 0.01f) {
-                        lastReportTime = now
-                        lastReportProgress = progress
-                        withContext(Dispatchers.Main) {
-                            onProgress(progress, totalBytesRead, totalLength)
+                body.byteStream().use { inputStream ->
+                    FileOutputStream(apkFile).use { outputStream ->
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            outputStream.write(buffer, 0, bytesRead)
+                            totalBytesRead += bytesRead
+                            val progress = if (totalLength > 0) totalBytesRead.toFloat() / totalLength else 0f
+                            val now = System.currentTimeMillis()
+                            if (now - lastReportTime >= 150L || progress - lastReportProgress >= 0.01f) {
+                                lastReportTime = now
+                                lastReportProgress = progress
+                                withContext(Dispatchers.Main) {
+                                    onProgress(progress, totalBytesRead, totalLength)
+                                }
+                            }
                         }
+                        outputStream.flush()
                     }
                 }
-                outputStream.flush()
-                outputStream.close()
-                inputStream.close()
 
                 withContext(Dispatchers.Main) {
                     onProgress(if (totalLength > 0) 1f else 0f, totalLength.coerceAtLeast(0L), totalLength)

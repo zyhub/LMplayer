@@ -12,8 +12,8 @@ android {
         applicationId = "com.lm.player"
         minSdk = 23
         targetSdk = 34
-        versionCode = 60
-        versionName = "1.7.25"
+        versionCode = 61
+        versionName = "1.7.26"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

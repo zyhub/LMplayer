@@ -93,15 +93,17 @@ object Media3Factory {
 
         val upstreamFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
 
-        val cache = getSimpleCache(context)
-        val cacheDataSinkFactory = CacheDataSink.Factory()
-            .setCache(cache)
-            .setFragmentSize(20L * 1024 * 1024) // 20MB 单切片，避免默认 5MB 频繁断开重连触发服务端代理并发限制
-        val cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(cache)
-            .setUpstreamDataSourceFactory(upstreamFactory)
-            .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val cacheDataSourceFactory by lazy {
+            val cache = getSimpleCache(context)
+            val cacheDataSinkFactory = CacheDataSink.Factory()
+                .setCache(cache)
+                .setFragmentSize(20L * 1024 * 1024) // 20MB 单切片，避免默认 5MB 频繁断开重连触发服务端代理并发限制
+            CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(upstreamFactory)
+                .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        }
 
         return DataSource.Factory {
             if (isCacheEnabled) {

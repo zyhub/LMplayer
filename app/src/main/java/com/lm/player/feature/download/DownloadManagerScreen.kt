@@ -73,8 +73,13 @@ fun DownloadManagerScreen(
     val dimensions = LocalAppDimensions.current
     val scope = rememberCoroutineScope()
     var selectedTab by remember { mutableIntStateOf(if (activeTasks.isNotEmpty()) 0 else 2) } // 0: 本地下载, 1: 服务器下载, 2: 已完成
+    val syncManager = remember { com.lm.player.core.sync.OfflineSyncManager.getInstance(context) }
+    val pendingPushCount by syncManager.pendingPushCount.collectAsState()
+    val isPushingToServer by syncManager.isPushing.collectAsState()
+
     var isMultiSelectMode by remember { mutableStateOf(false) }
     val selectedSongIds = remember { mutableStateListOf<String>() }
+    var showFineGrainedSyncDialog by remember { mutableStateOf(false) }
 
     var isMultiSelectActiveMode by remember { mutableStateOf(false) }
     val selectedActiveTaskIds = remember { mutableStateListOf<String>() }
@@ -695,6 +700,82 @@ fun DownloadManagerScreen(
                             }
                         }
 
+                        // 离线下载待推送到服务器专属看板
+                        if (pendingPushCount > 0) {
+                            item {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(Icons.Default.CloudUpload, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("离线下载待同步至服务器", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                                            }
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = "发现 $pendingPushCount 首离线期间下载的歌曲，可一键推送到柠檬 NAS 服务器曲库下载归档",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            OutlinedButton(
+                                                onClick = { showFineGrainedSyncDialog = true },
+                                                enabled = !isPushingToServer,
+                                                shape = RoundedCornerShape(12.dp),
+                                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.8f)),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                                modifier = Modifier.height(34.dp)
+                                            ) {
+                                                Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(14.dp), tint = AppleRed)
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text("多选同步", fontSize = 12.sp, color = AppleRed, fontWeight = FontWeight.SemiBold)
+                                            }
+
+                                            Button(
+                                                onClick = {
+                                                    scope.launch {
+                                                        val res = syncManager.pushAllPendingTasksToServer()
+                                                        if (res.isSuccess) {
+                                                            val count = res.getOrDefault(0)
+                                                            Toast.makeText(context, "已成功推送 $count 首歌曲至服务器下载队列", Toast.LENGTH_SHORT).show()
+                                                        } else {
+                                                            Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                                },
+                                                enabled = !isPushingToServer,
+                                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                                shape = RoundedCornerShape(12.dp),
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                                modifier = Modifier.height(34.dp)
+                                            ) {
+                                                if (isPushingToServer) {
+                                                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text("推送中", fontSize = 12.sp, color = Color.White)
+                                                } else {
+                                                    Icon(Icons.Default.Upload, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
+                                                    Spacer(modifier = Modifier.width(3.dp))
+                                                    Text("一键推送", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 已下载歌曲列表
                         if (completedSongs.isNotEmpty()) {
                             item {
@@ -886,7 +967,37 @@ fun DownloadManagerScreen(
                         )
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    val res = syncManager.pushSelectedTasksToServer(selectedSongIds)
+                                    if (res.isSuccess) {
+                                        val count = res.getOrDefault(0)
+                                        Toast.makeText(context, "已成功精细化推送 $count 首已选歌曲至服务器", Toast.LENGTH_SHORT).show()
+                                        selectedSongIds.clear()
+                                        isMultiSelectMode = false
+                                    } else {
+                                        Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            enabled = selectedSongIds.isNotEmpty() && !isPushingToServer,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            if (isPushingToServer) {
+                                CircularProgressIndicator(color = Color.White, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("同步中", fontSize = 12.sp, color = Color.White)
+                            } else {
+                                Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("同步至服务器 (${selectedSongIds.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                        }
+
                         Button(
                             onClick = { showBatchDeleteConfirmDialog = true },
                             enabled = selectedSongIds.isNotEmpty(),
@@ -933,6 +1044,147 @@ fun DownloadManagerScreen(
             dismissButton = {
                 TextButton(onClick = { showBatchDeleteConfirmDialog = false }) {
                     Text("取消")
+                }
+            }
+        )
+    }
+
+    // 5.1 精细化多选同步到服务器弹窗
+    if (showFineGrainedSyncDialog) {
+        val pendingList by syncManager.pendingPushList.collectAsState()
+        val selectedSyncSongIds = remember(pendingList) {
+            mutableStateListOf<String>().apply { addAll(pendingList.map { it.songId }) }
+        }
+        AlertDialog(
+            onDismissRequest = { showFineGrainedSyncDialog = false },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, contentDescription = null, tint = AppleRed, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("精细化同步至服务器", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    }
+                    if (pendingList.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                if (selectedSyncSongIds.size == pendingList.size) {
+                                    selectedSyncSongIds.clear()
+                                } else {
+                                    selectedSyncSongIds.clear()
+                                    selectedSyncSongIds.addAll(pendingList.map { it.songId })
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = if (selectedSyncSongIds.size == pendingList.size) "取消全选" else "全选",
+                                color = AppleRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = "请勾选需要推送到柠檬 NAS 服务器下载归档的离线歌曲 (已选 ${selectedSyncSongIds.size}/${pendingList.size} 首)：",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    if (pendingList.isEmpty()) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("暂无待同步的离线下载记录", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        Box(modifier = Modifier.heightIn(max = 320.dp)) {
+                            LazyColumn(
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                items(pendingList, key = { it.songId }) { item ->
+                                    val isChecked = item.songId in selectedSyncSongIds
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (isChecked) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                        border = BorderStroke(1.dp, if (isChecked) AppleRed.copy(alpha = 0.4f) else borderColor),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .clickable {
+                                                if (isChecked) selectedSyncSongIds.remove(item.songId) else selectedSyncSongIds.add(item.songId)
+                                            }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Checkbox(
+                                                checked = isChecked,
+                                                onCheckedChange = { chk ->
+                                                    if (chk) selectedSyncSongIds.add(item.songId) else selectedSyncSongIds.remove(item.songId)
+                                                },
+                                                colors = CheckboxDefaults.colors(checkedColor = AppleRed),
+                                                modifier = Modifier.size(24.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            AlbumArtworkImage(
+                                                model = item.coverUrl,
+                                                seedId = item.songId,
+                                                modifier = Modifier.size(36.dp),
+                                                cornerRadius = 6.dp
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(item.title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Text("${item.artist} · ${item.chosenQuality.ifBlank { "320k" }}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val toSync = selectedSyncSongIds.toList()
+                        showFineGrainedSyncDialog = false
+                        scope.launch {
+                            val res = syncManager.pushSelectedTasksToServer(toSync)
+                            if (res.isSuccess) {
+                                val count = res.getOrDefault(0)
+                                Toast.makeText(context, "已成功精细化推送 $count 首歌曲至服务器", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    enabled = selectedSyncSongIds.isNotEmpty() && !isPushingToServer,
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("开始同步 (${selectedSyncSongIds.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { showFineGrainedSyncDialog = false },
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("取消", fontSize = 12.sp)
                 }
             }
         )

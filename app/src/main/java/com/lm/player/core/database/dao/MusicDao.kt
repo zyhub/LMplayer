@@ -187,6 +187,27 @@ interface DownloadDao {
 
     @Query("DELETE FROM downloads WHERE localFilePath = :localPath")
     suspend fun deleteDownloadByLocalPath(localPath: String)
+
+    @Query("SELECT * FROM downloads WHERE serverPushStatus = 1 ORDER BY completedTimestamp DESC")
+    fun getPendingServerPushFlow(): Flow<List<DownloadEntity>>
+
+    @Query("SELECT * FROM downloads WHERE serverPushStatus = 1 ORDER BY completedTimestamp DESC")
+    suspend fun getPendingServerPushList(): List<DownloadEntity>
+
+    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus = 1")
+    fun getPendingServerPushCountFlow(): Flow<Int>
+
+    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus = 1")
+    suspend fun getPendingServerPushCount(): Int
+
+    @Query("UPDATE downloads SET serverPushStatus = :status, lastPushTime = :pushTime, pushErrorMessage = :errorMessage WHERE songId = :songId")
+    suspend fun updateServerPushStatus(songId: String, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null)
+
+    @Query("UPDATE downloads SET serverPushStatus = :status, lastPushTime = :pushTime, pushErrorMessage = :errorMessage WHERE songId IN (:songIds)")
+    suspend fun updateServerPushStatusBatch(songIds: List<String>, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null)
+
+    @Query("UPDATE downloads SET serverPushStatus = :status WHERE serverPushStatus = :fromStatus")
+    suspend fun markAllServerPushStatus(fromStatus: Int, status: Int)
 }
 
 @Dao
@@ -205,6 +226,9 @@ interface ServerDao {
 
     @Query("UPDATE servers SET isCurrentActive = (id = :activeServerId)")
     suspend fun setActiveServer(activeServerId: String)
+
+    @Query("UPDATE servers SET isCurrentActive = 0")
+    suspend fun clearActiveServer()
 
     @Query("DELETE FROM servers WHERE id = :serverId")
     suspend fun deleteServer(serverId: String)

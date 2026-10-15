@@ -416,9 +416,9 @@ object SongMatchingResolver {
             }
 
             val effectiveCover = when {
-                rawSong.coverUrl.isNotBlank() -> rawSong.coverUrl
-                match?.coverUrl?.isNotBlank() == true -> match.coverUrl
-                else -> ""
+                rawSong.coverUrl.isNotBlank() && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(rawSong.coverUrl) -> rawSong.coverUrl
+                match?.coverUrl?.isNotBlank() == true && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(match.coverUrl) -> match.coverUrl
+                else -> com.lm.player.core.network.LemonMusicProtocol.getResolvedCover(rawSong.id) ?: ""
             }
 
             val effectiveAddedTimestamp = when {
@@ -596,7 +596,9 @@ object SongMatchingResolver {
             val finalIsFavorite = incoming.isFavorite || (existing?.isFavorite == true) || (existingMatch?.isFavorite == true)
             val candidateRelPath = incoming.relativeFolderPath ?: existing?.relativeFolderPath ?: existingMatch?.relativeFolderPath
             val finalRelPath = candidateRelPath?.takeIf { !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100 }
-            val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existing?.coverUrl ?: existingMatch?.coverUrl ?: "")
+            val existingValidCover = listOfNotNull(existing?.coverUrl, existingMatch?.coverUrl)
+                .firstOrNull { it.isNotBlank() && !it.contains("/api/tag/cover") }
+            val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existingValidCover ?: "")
 
             val localExt = validLocalPath?.takeIf { !it.startsWith("content://") }
                 ?.substringAfterLast('.', "")
@@ -636,16 +638,18 @@ object SongMatchingResolver {
             val orphanedSongs = existingServerSongs.filter { !incomingIds.contains(it.id) }
 
             if (orphanedSongs.isNotEmpty()) {
+                val claimedLocalPaths = preservedEntities.mapNotNull { it.localFilePath?.takeIf { p -> p.isNotBlank() } }.toSet()
                 val toDeleteIds = ArrayList<String>()
                 for (orphan in orphanedSongs) {
                     val localPath = orphan.localFilePath
                     val hasValidLocalFile = !localPath.isNullOrBlank() && File(localPath).let { it.exists() && it.length() > 0 }
-                    if (hasValidLocalFile) {
-                        // 本地已有有效物理下载文件：降级归属为 local_storage，保留本地离线播放，但不占在线服务器库名额
+                    if (hasValidLocalFile && !claimedLocalPaths.contains(localPath)) {
+                        // 本地已有有效物理下载文件且未被新同步的服务器曲目认领：降级归属为 local_storage，保留本地离线播放
                         database.songDao().updateServerId(orphan.id, "local_storage")
                     } else {
-                        // 本地无实体文件：彻底从数据库物理删除
+                        // 本地无实体文件，或该物理文件已被新服务器曲目认领：彻底从数据库物理删除，防止已下载列表重复显示
                         toDeleteIds.add(orphan.id)
+                        database.downloadDao().deleteDownload(orphan.id)
                     }
                 }
                 if (toDeleteIds.isNotEmpty()) {
