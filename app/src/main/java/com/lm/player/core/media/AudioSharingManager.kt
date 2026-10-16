@@ -133,6 +133,18 @@ object AudioSharingManager {
     private val sharedContentUriRegistry = ConcurrentHashMap<String, String>()
     private val sharedRemoteStreamRegistry = ConcurrentHashMap<String, RemoteStreamProxyEntry>()
     private val sharedCoverUrlRegistry = ConcurrentHashMap<String, RemoteStreamProxyEntry>()
+    private var castSessionSecret = java.util.UUID.randomUUID().toString()
+
+    private fun generateSecureToken(prefix: String, rawId: String): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("MD5")
+            val digest = md.digest("$prefix:$rawId:$castSessionSecret".toByteArray(Charsets.UTF_8))
+            val hex = digest.joinToString("") { "%02x".format(it) }
+            "${prefix}_${hex.take(16)}"
+        } catch (_: Exception) {
+            "${prefix}_${(rawId + castSessionSecret).hashCode().toUInt()}"
+        }
+    }
 
     @Volatile
     private var lastCastSongId: String = ""
@@ -870,6 +882,16 @@ object AudioSharingManager {
         _activeCastDevice.value = null
         lastCastSongId = ""
         muteLocalPlayerForCasting(context, mute = false)
+        sharedFileRegistry.clear()
+        sharedContentUriRegistry.clear()
+        sharedRemoteStreamRegistry.clear()
+        sharedCoverUrlRegistry.clear()
+        castSessionSecret = java.util.UUID.randomUUID().toString()
+        runCatching {
+            httpServerSocket?.close()
+            httpServerSocket = null
+            httpServerPort = 0
+        }
         if (current == null) return@withContext
         runCatching {
             if (current.protocol == ShareProtocolType.DLNA_UPNP && current.avTransportControlUrl.isNotBlank()) {
@@ -903,7 +925,7 @@ object AudioSharingManager {
 
         if (localFile != null && !localIp.isNullOrBlank() && port > 0) {
             val ext = localFile.extension.ifBlank { song.format.ifBlank { "mp3" } }.lowercase(Locale.US)
-            val token = "song_${song.id.hashCode().toUInt()}"
+            val token = generateSecureToken("song", song.id)
             sharedFileRegistry[token] = localFile
             return "http://$localIp:$port/media/$token.$ext"
         }
@@ -913,7 +935,7 @@ object AudioSharingManager {
             .firstOrNull { it.startsWith("content://") }
         if (!contentUriStr.isNullOrBlank() && !localIp.isNullOrBlank() && port > 0) {
             val ext = song.format.ifBlank { "mp3" }.lowercase(Locale.US)
-            val token = "content_${song.id.hashCode().toUInt()}"
+            val token = generateSecureToken("content", song.id)
             sharedContentUriRegistry[token] = contentUriStr
             return "http://$localIp:$port/content/$token.$ext"
         }
@@ -976,7 +998,7 @@ object AudioSharingManager {
             val mimeType = mimeTypeForExtension(ext)
             // 通过本机局域网 HTTP 代理网关转发远程流，确保电视无需鉴权即可顺畅拉流播放
             if (!localIp.isNullOrBlank() && port > 0) {
-                val token = "proxy_${song.id.hashCode().toUInt()}"
+                val token = generateSecureToken("proxy", song.id)
                 sharedRemoteStreamRegistry[token] = RemoteStreamProxyEntry(
                     upstreamUrl = remoteUrl,
                     authHeader = authHeader,
@@ -1001,7 +1023,7 @@ object AudioSharingManager {
         val port = ensureLocalHttpServerStarted(context)
         if (port > 0 && (rawCoverUrl.startsWith("http://") || rawCoverUrl.startsWith("https://"))) {
             val bearer = NetworkClientFactory.getActiveAuthToken()
-            val token = "cover_${song.id.hashCode().toUInt()}"
+            val token = generateSecureToken("cover", song.id)
             sharedCoverUrlRegistry[token] = RemoteStreamProxyEntry(
                 upstreamUrl = rawCoverUrl,
                 authHeader = bearer.takeIf { it.isNotBlank() }?.let { "Bearer $it" },
@@ -1317,9 +1339,14 @@ object AudioSharingManager {
                 val rawPath = parts[1].substringBefore("?")
 
                 var rangeHeader: String? = null
+                var headerCount = 0
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isEmpty()) break
+                    headerCount++
+                    if (headerCount > 64 || line.length > 4096) {
+                        return
+                    }
                     if (line.startsWith("Range:", ignoreCase = true)) {
                         rangeHeader = line.substringAfter(":").trim()
                     }

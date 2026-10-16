@@ -65,6 +65,7 @@ abstract class ZdsDatabase : RoomDatabase() {
                 )
                     .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
                     .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
+                    .fallbackToDestructiveMigration()
                     .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                 INSTANCE = instance

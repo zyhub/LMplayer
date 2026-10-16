@@ -8,6 +8,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -409,11 +410,11 @@ fun LibrarySearchDialog(
                             contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            items(
+                            itemsIndexed(
                                 items = resolvedDrillDownSongs,
-                                key = { "drill_${it.id}" },
-                                contentType = { "drill_song_item" }
-                            ) { song ->
+                                key = { index, song -> "drill_${song.id}_$index" },
+                                contentType = { _, _ -> "drill_song_item" }
+                            ) { _, song ->
                                 SongListItemRow(
                                     song = song,
                                     isServerConnected = isServerConnected,
@@ -500,11 +501,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(vertical = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = localSongResults,
-                                            key = { "local_${it.id}" },
-                                            contentType = { "search_song_item" }
-                                        ) { song ->
+                                            key = { index, song -> "local_${song.id}_$index" },
+                                            contentType = { _, _ -> "search_song_item" }
+                                        ) { _, song ->
                                             SongListItemRow(
                                                 song = song,
                                                 isServerConnected = isServerConnected,
@@ -530,11 +531,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = resolvedOnlineSongs,
-                                            key = { "online_${it.id}" },
-                                            contentType = { "search_online_song_item" }
-                                        ) { song ->
+                                            key = { index, song -> "online_${song.id}_$index" },
+                                            contentType = { _, _ -> "search_online_song_item" }
+                                        ) { _, song ->
                                             SongListItemRow(
                                                 song = song,
                                                 isServerConnected = isServerConnected,
@@ -589,11 +590,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(vertical = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = localAlbumResults,
-                                            key = { "local_album_${it.id}_${it.title}" },
-                                            contentType = { "search_album_item" }
-                                        ) { album ->
+                                            key = { index, album -> "local_album_${album.id}_${album.title}_$index" },
+                                            contentType = { _, _ -> "search_album_item" }
+                                        ) { _, album ->
                                             SearchAlbumListItem(
                                                 album = album,
                                                 onClick = {
@@ -617,11 +618,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = onlineAlbumResults,
-                                            key = { "online_album_${it.id}" },
-                                            contentType = { "search_online_album_item" }
-                                        ) { album ->
+                                            key = { index, album -> "online_album_${album.id}_$index" },
+                                            contentType = { _, _ -> "search_online_album_item" }
+                                        ) { _, album ->
                                             SearchAlbumListItem(
                                                 album = album,
                                                 onClick = {
@@ -634,7 +635,7 @@ fun LibrarySearchDialog(
                                                         try {
                                                             drillDownSongs = onFetchCollectionSongs?.invoke(album.id).orEmpty()
                                                         } catch (_: Exception) {
-                                                            drillDownSongs = emptyList()
+                                                             drillDownSongs = emptyList()
                                                         } finally {
                                                             isLoadingDrillDown = false
                                                         }
@@ -669,11 +670,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(vertical = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = localPlaylistResults,
-                                            key = { "local_pl_${it.id}" },
-                                            contentType = { "search_playlist_item" }
-                                        ) { pl ->
+                                            key = { index, pl -> "local_pl_${pl.id}_$index" },
+                                            contentType = { _, _ -> "search_playlist_item" }
+                                        ) { _, pl ->
                                             SearchPlaylistListItem(
                                                 playlist = pl,
                                                 onClick = {
@@ -706,11 +707,11 @@ fun LibrarySearchDialog(
                                                 modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
                                             )
                                         }
-                                        items(
+                                        itemsIndexed(
                                             items = onlinePlaylistResults,
-                                            key = { "online_pl_${it.id}" },
-                                            contentType = { "search_online_playlist_item" }
-                                        ) { pl ->
+                                            key = { index, pl -> "online_pl_${pl.id}_$index" },
+                                            contentType = { _, _ -> "search_online_playlist_item" }
+                                        ) { _, pl ->
                                             SearchPlaylistListItem(
                                                 playlist = pl,
                                                 onClick = {

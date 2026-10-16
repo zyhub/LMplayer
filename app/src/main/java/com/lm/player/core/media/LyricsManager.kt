@@ -733,10 +733,53 @@ object EmbeddedLyricsExtractor {
     private fun extractMp4(file: File): String? {
         try {
             RandomAccessFile(file, "r").use { raf ->
-                val searchLen = raf.length().coerceAtMost(12 * 1024 * 1024L)
-                val bytes = ByteArray(searchLen.toInt())
-                raf.readFully(bytes)
-                return extractMp4FromBytes(bytes)
+                val fileLen = raf.length()
+                var pos = 0L
+                val headerBuf = ByteArray(8)
+                val extendedBuf = ByteArray(8)
+
+                while (pos + 8 <= fileLen) {
+                    raf.seek(pos)
+                    if (raf.read(headerBuf) < 8) break
+                    val rawSize = ((headerBuf[0].toLong() and 0xFF) shl 24) or
+                            ((headerBuf[1].toLong() and 0xFF) shl 16) or
+                            ((headerBuf[2].toLong() and 0xFF) shl 8) or
+                            (headerBuf[3].toLong() and 0xFF)
+                    val atomType = String(headerBuf, 4, 4, Charsets.US_ASCII)
+
+                    val (atomSize, headerLen) = when (rawSize) {
+                        1L -> {
+                            if (raf.read(extendedBuf) < 8) break
+                            val bigSize = ((extendedBuf[0].toLong() and 0xFF) shl 56) or
+                                    ((extendedBuf[1].toLong() and 0xFF) shl 48) or
+                                    ((extendedBuf[2].toLong() and 0xFF) shl 40) or
+                                    ((extendedBuf[3].toLong() and 0xFF) shl 32) or
+                                    ((extendedBuf[4].toLong() and 0xFF) shl 24) or
+                                    ((extendedBuf[5].toLong() and 0xFF) shl 16) or
+                                    ((extendedBuf[6].toLong() and 0xFF) shl 8) or
+                                    (extendedBuf[7].toLong() and 0xFF)
+                            Pair(bigSize, 16L)
+                        }
+                        0L -> {
+                            Pair(fileLen - pos, 8L)
+                        }
+                        else -> {
+                            Pair(rawSize, 8L)
+                        }
+                    }
+
+                    if (atomSize < headerLen) break
+
+                    if (atomType == "moov") {
+                        val payloadSize = (atomSize - headerLen).coerceIn(0L, 8 * 1024 * 1024L).toInt()
+                        val moovBytes = ByteArray(payloadSize)
+                        raf.seek(pos + headerLen)
+                        raf.readFully(moovBytes)
+                        return extractMp4FromBytes(moovBytes)
+                    }
+
+                    pos += atomSize
+                }
             }
         } catch (_: Exception) {}
         return null

@@ -63,6 +63,7 @@ import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.database.entity.toUnifiedSong
 import androidx.room.invalidationTrackerFlow
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import androidx.compose.ui.platform.LocalDensity
@@ -909,6 +910,7 @@ class MainActivity : ComponentActivity() {
                 // 大曲库下 CursorWindow 2MB 放不下会抛 IllegalStateException 闪退），
                 // 改为 Room 官方 invalidationTrackerFlow 监听 songs 表变化 + 分页读取聚合
                 database.invalidationTrackerFlow("songs")
+                    .debounce(400L)
                     .map { database.songDao().getAllSongsList() }
                     .collect { songEntities ->
                     val (mappedSongs, recAdded) = withContext(Dispatchers.IO) {

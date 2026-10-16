@@ -86,6 +86,9 @@ class PlaybackService : MediaSessionService() {
         const val CMD_PREV = "CMD_PREV"
         const val CMD_TOGGLE_FAVORITE = "CMD_TOGGLE_FAVORITE"
 
+        const val INTERNAL_AUTH_TOKEN_EXTRA = "internal_auth_token"
+        internal val INTERNAL_COMMAND_SECRET = java.util.UUID.randomUUID().toString()
+
         // 仅在手机端关闭「启用挂后台手机灵动岛」时屏蔽的手机系统通知中心/状态栏胶囊包名（不影响车机桌面与蓝牙播控）
         private val PHONE_SYSTEM_ISLAND_PACKAGES = setOf(
             "com.android.systemui",
@@ -109,7 +112,9 @@ class PlaybackService : MediaSessionService() {
             try {
                 isExplicitStopping = false
                 val appCtx = context.applicationContext
-                val serviceIntent = Intent(appCtx, PlaybackService::class.java)
+                val serviceIntent = Intent(appCtx, PlaybackService::class.java).apply {
+                    setPackage(appCtx.packageName)
+                }
                 ContextCompat.startForegroundService(appCtx, serviceIntent)
             } catch (e: Throwable) {
                 Log.w(TAG, "startPlaybackService warning: ${e.message}")
@@ -154,9 +159,13 @@ class PlaybackService : MediaSessionService() {
                 Media3Factory.releaseSharedPlayer()
                 val stopIntent = Intent(context, PlaybackService::class.java).apply {
                     action = ACTION_STOP_SERVICE
+                    putExtra(INTERNAL_AUTH_TOKEN_EXTRA, INTERNAL_COMMAND_SECRET)
+                    setPackage(context.packageName)
                 }
                 context.startService(stopIntent)
-                context.stopService(Intent(context, PlaybackService::class.java))
+                context.stopService(Intent(context, PlaybackService::class.java).apply {
+                    setPackage(context.packageName)
+                })
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping PlaybackService", e)
             }
@@ -595,6 +604,15 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        if (action == ACTION_STOP_SERVICE || action == ACTION_MEDIA_COMMAND) {
+            val authToken = intent.getStringExtra(INTERNAL_AUTH_TOKEN_EXTRA)
+            if (authToken != INTERNAL_COMMAND_SECRET) {
+                Log.w(TAG, "Rejecting unauthorized intent call for action $action")
+                return START_NOT_STICKY
+            }
+        }
+
         if (intent?.action == ACTION_STOP_SERVICE) {
             isExplicitStopping = true
             try {

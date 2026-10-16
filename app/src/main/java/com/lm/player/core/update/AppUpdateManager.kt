@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.7.25"
-    const val CURRENT_VERSION_CODE = 60
+    const val CURRENT_VERSION_NAME = "1.7.26"
+    const val CURRENT_VERSION_CODE = 61
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -305,6 +305,11 @@ object AppUpdateManager {
                 return
             }
 
+            if (!verifyApkSignatureMatch(context, apkFile)) {
+                Toast.makeText(context, "更新安装包签名校验失败，已终止安装以保障安全", Toast.LENGTH_LONG).show()
+                return
+            }
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val hasInstallPermission = try {
                     context.packageManager.canRequestPackageInstalls()
@@ -344,6 +349,68 @@ object AppUpdateManager {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.e(TAG, "Failed to launch package installer", e)
             Toast.makeText(context, "调起安装器失败: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * 校验待安装 APK 与当前应用的签名指纹一致性
+     */
+    private fun verifyApkSignatureMatch(context: Context, apkFile: File): Boolean {
+        return try {
+            val pm = context.packageManager
+            val currentPkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNATURES)
+            }
+
+            val archiveInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pm.getPackageArchiveInfo(apkFile.absolutePath, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageArchiveInfo(apkFile.absolutePath, android.content.pm.PackageManager.GET_SIGNATURES)
+            }
+
+            if (archiveInfo == null) {
+                Log.w(TAG, "Failed to parse archive info from ${apkFile.absolutePath}")
+                return true
+            }
+
+            // 包名一致性校验
+            if (archiveInfo.packageName != context.packageName) {
+                Log.w(TAG, "Package name mismatch: downloaded ${archiveInfo.packageName} != current ${context.packageName}")
+                return false
+            }
+
+            val currentSigs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                currentPkgInfo.signingInfo?.signingCertificateHistory?.map { it.toByteArray().contentHashCode() }
+                    ?: currentPkgInfo.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+            } else {
+                @Suppress("DEPRECATION")
+                currentPkgInfo.signatures?.map { it.toByteArray().contentHashCode() }
+            }
+
+            val archiveSigs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                archiveInfo.signingInfo?.signingCertificateHistory?.map { it.toByteArray().contentHashCode() }
+                    ?: archiveInfo.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+            } else {
+                @Suppress("DEPRECATION")
+                archiveInfo.signatures?.map { it.toByteArray().contentHashCode() }
+            }
+
+            if (currentSigs.isNullOrEmpty() || archiveSigs.isNullOrEmpty()) {
+                return true
+            }
+
+            val match = currentSigs.any { it in archiveSigs }
+            if (!match) {
+                Log.e(TAG, "Signature hash mismatch between installed app and update APK!")
+            }
+            match
+        } catch (e: Exception) {
+            Log.w(TAG, "verifyApkSignatureMatch exception: ${e.message}")
+            true
         }
     }
 }

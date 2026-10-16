@@ -328,7 +328,7 @@ fun AddToPlaylistDropdownMenu(
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = modifier.widthIn(min = 280.dp, max = 340.dp)
+        modifier = modifier.widthIn(min = 280.dp, max = 340.dp).heightIn(max = 420.dp)
     ) {
         // 1. 顶部标题
         Text(
@@ -444,7 +444,7 @@ fun AddToPlaylistDropdownMenu(
                 Text("暂无自建歌单，可点击上方新建", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
-            playlists.take(8).forEach { pl ->
+            playlists.forEach { pl ->
                 DropdownMenuItem(
                     text = {
                         Row(

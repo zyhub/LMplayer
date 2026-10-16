@@ -87,19 +87,6 @@ import kotlinx.coroutines.launch
  * 6. 全部歌曲高保真流 (带格式/音质标签、收藏、下载弹窗、多维排序、多选/全选下载)
  * 7. 页面内无缝下钻视图 (歌单/歌手/专辑/流派详情，不遮挡底部悬浮播放栏)
  */
-/**
- * 资料库主列表（LocalLibraryScreen 的 LazyColumn）各板块的**固定下标**。
- *
- * 必须与实际 item 顺序保持一致；一旦上方布局增删板块，请同步更新这里。
- * 抽成常量是为了避免此前「魔法数字 3 漏算了无条件存在的歌单区」导致的定位偏移缺陷。
- */
-private const val LOCAL_LIBRARY_SECTION_HEADER_INDEX = 0
-private const val LOCAL_LIBRARY_SECTION_BENTO_INDEX = 1
-private const val LOCAL_LIBRARY_SECTION_PLAYLISTS_INDEX = 2
-private const val LOCAL_LIBRARY_SECTION_RECENT_INDEX = 3
-private const val LOCAL_LIBRARY_SECTION_FOLDERS_INDEX = 4
-private const val LOCAL_LIBRARY_SECTION_ALL_SONGS_HEADER_INDEX = 5
-
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,

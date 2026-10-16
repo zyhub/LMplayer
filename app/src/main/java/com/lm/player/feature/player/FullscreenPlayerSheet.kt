@@ -298,6 +298,45 @@ fun FullscreenPlayerSheet(
     val surfaceGlassColor = if (isDark) Color(0xFF2C2C30).copy(alpha = 0.75f) else Color(0xFFEAEAEE).copy(alpha = 0.85f)
     val circleButtonBg = if (isDark) Color(0xFF25252A) else Color(0xFFF2F2F7)
 
+    if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO) {
+        RetroCoverFlowPlayerView(
+            song = song,
+            playlist = playlist,
+            isPlaying = isPlaying,
+            progressMs = progressMs,
+            totalDurationMs = totalDurationMs,
+            lyrics = lyrics,
+            isShuffle = isShuffle,
+            isRepeat = isRepeat,
+            activeTimerMinutes = activeTimerMinutes,
+            fontSizeSp = lyricsFontSize,
+            lyricsOffsetMs = lyricsOffsetMs,
+            lyricTheme = currentLyricTheme,
+            allPlaylists = allPlaylists,
+            isServerConnected = isServerConnected,
+            onTogglePlayPause = onTogglePlayPause,
+            onNext = onNext,
+            onPrevious = onPrevious,
+            onSeekTo = onSeekTo,
+            onSelectSongFromQueue = onSelectSongFromQueue,
+            onToggleFavorite = onToggleFavorite,
+            onToggleShuffle = onToggleShuffle,
+            onToggleRepeat = onToggleRepeat,
+            onAddToPlaylist = onAddToPlaylist,
+            onCreatePlaylistAndAddSong = onCreatePlaylistAndAddSong,
+            onDownloadSongWithOptions = onDownloadSongWithOptions,
+            onSelectTimer = { min -> applySleepTimer(min) },
+            onFontSizeChange = updateFontSize,
+            onOffsetChange = updateOffset,
+            onThemeChange = updateTheme,
+            onSwitchPlayerTheme = updatePlayerThemeStyle,
+            onOpenSleepTimer = { showSleepTimerPanel = true },
+            onOpenAudioSpecs = { showAudioSpecsPanel = true },
+            onDismiss = onDismiss
+        )
+        return
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -810,6 +849,30 @@ fun FullscreenPlayerSheet(
                                         onDismissRequest = { showAudioSpecsPanel = false },
                                         song = song
                                     )
+                                }
+
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(toolbarBtnSize)
+                                            .clip(CircleShape)
+                                            .clickable {
+                                                val next = if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN) {
+                                                    com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO
+                                                } else {
+                                                    com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN
+                                                }
+                                                updatePlayerThemeStyle(next)
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Style,
+                                            contentDescription = "怀旧专辑流",
+                                            tint = secondaryTextColor,
+                                            modifier = Modifier.size(toolbarIconSize)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1550,6 +1613,24 @@ fun FullscreenPlayerSheet(
                             onDismissRequest = { showAudioSpecsPanel = false },
                             song = song
                         )
+                    }
+
+                    Box {
+                        IconButton(onClick = {
+                            val next = if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN) {
+                                com.lm.player.core.designsystem.theme.PlayerThemeStyle.IPOD_RETRO
+                            } else {
+                                com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN
+                            }
+                            updatePlayerThemeStyle(next)
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.Style,
+                                contentDescription = "怀旧专辑流",
+                                tint = secondaryTextColor,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
                 }
             }

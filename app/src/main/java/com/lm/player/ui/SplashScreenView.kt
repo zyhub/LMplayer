@@ -86,6 +86,8 @@ fun SplashScreenView(
 
         LaunchedEffect(Unit) {
             startAnimation = true
+            kotlinx.coroutines.delay(1200)
+            onSplashFinished()
         }
 
         Box(
@@ -179,7 +181,7 @@ fun SplashScreenView(
                     .alpha(logoAlpha)
             ) {
                 Text(
-                    text = "v1.1.0 • Hi-Fi Automotive Edition",
+                    text = "v1.7.26 • Hi-Fi Automotive Edition",
                     style = TextStyle(
                         fontSize = 11.sp,
                         color = Color.White.copy(alpha = 0.35f),

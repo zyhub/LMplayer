@@ -1,4 +1,4 @@
-﻿package com.lm.player.feature.settings
+package com.lm.player.feature.settings
 
 import android.os.Environment
 import android.widget.Toast
@@ -55,14 +55,16 @@ fun LocalFolderPickerDialog(
     var showCreateDirDialog by remember { mutableStateOf(false) }
     var newDirName by remember { mutableStateOf("") }
 
-    // 获取当前目录下的所有子文件夹与文件 (文件夹置顶)
-    val currentItems = remember(currentDir) {
-        try {
-            currentDir.listFiles()?.filter { !it.name.startsWith(".") }
-                ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-                ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
+    // 获取当前目录下的所有子文件夹与文件 (文件夹置顶，IO 异步防卡顿)
+    val currentItems by produceState<List<File>>(initialValue = emptyList(), currentDir) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                currentDir.listFiles()?.filter { !it.name.startsWith(".") }
+                    ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+                    ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
     }
 

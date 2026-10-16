@@ -29,11 +29,25 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystoreFile = project.rootProject.file("keystore.jks")
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            } else {
+                initWith(getByName("debug"))
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android.txt"),
                 "proguard-rules.pro"
@@ -54,7 +68,8 @@ android {
         jvmTarget = "1.8"
         freeCompilerArgs += listOf(
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
-            "-opt-in=androidx.media3.common.util.UnstableApi"
+            "-opt-in=androidx.media3.common.util.UnstableApi",
+            "-opt-in=kotlinx.coroutines.FlowPreview"
         )
     }
 

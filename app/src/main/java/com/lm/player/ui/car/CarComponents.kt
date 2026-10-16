@@ -1,4 +1,4 @@
-﻿package com.lm.player.ui.car
+package com.lm.player.ui.car
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,6 +33,7 @@ import com.lm.player.core.model.UnifiedSong
 fun CarSideNavigationBar(
     currentScreen: Screen,
     onNavigate: (Screen) -> Unit,
+    onSearchClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -79,7 +80,7 @@ fun CarSideNavigationBar(
 
         // 底部搜索项
         IconButton(
-            onClick = { /* 搜索 */ },
+            onClick = onSearchClick,
             modifier = Modifier
                 .size(52.dp)
                 .background(Color(0xFF24242A), CircleShape)

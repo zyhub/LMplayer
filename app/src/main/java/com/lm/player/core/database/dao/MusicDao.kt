@@ -156,7 +156,12 @@ interface SongDao {
     suspend fun clearNonDownloadedSongs()
 
     @Query("DELETE FROM songs WHERE serverId NOT IN (:validServerIds) AND downloadStatus != 'DOWNLOADED' AND (localFilePath IS NULL OR localFilePath = '')")
-    suspend fun deleteOrphanSongs(validServerIds: List<String>)
+    suspend fun deleteOrphanSongsRaw(validServerIds: List<String>)
+
+    suspend fun deleteOrphanSongs(validServerIds: List<String>) {
+        if (validServerIds.isEmpty()) return
+        validServerIds.chunked(500).forEach { deleteOrphanSongsRaw(it) }
+    }
 
     @Query("SELECT id FROM songs WHERE serverId = :serverId")
     suspend fun getSongIdsByServer(serverId: String): List<String>
@@ -180,7 +185,12 @@ interface DownloadDao {
     suspend fun insertOrUpdate(download: DownloadEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertDownloads(downloads: List<DownloadEntity>)
+    suspend fun insertDownloadsRaw(downloads: List<DownloadEntity>)
+
+    suspend fun insertDownloads(downloads: List<DownloadEntity>) {
+        if (downloads.isEmpty()) return
+        downloads.chunked(500).forEach { insertDownloadsRaw(it) }
+    }
 
     @Query("DELETE FROM downloads WHERE songId = :songId")
     suspend fun deleteDownload(songId: String)
@@ -204,7 +214,14 @@ interface DownloadDao {
     suspend fun updateServerPushStatus(songId: String, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null)
 
     @Query("UPDATE downloads SET serverPushStatus = :status, lastPushTime = :pushTime, pushErrorMessage = :errorMessage WHERE songId IN (:songIds)")
-    suspend fun updateServerPushStatusBatch(songIds: List<String>, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null)
+    suspend fun updateServerPushStatusBatchRaw(songIds: List<String>, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null)
+
+    suspend fun updateServerPushStatusBatch(songIds: List<String>, status: Int, pushTime: Long = System.currentTimeMillis(), errorMessage: String? = null) {
+        if (songIds.isEmpty()) return
+        songIds.chunked(500).forEach { chunk ->
+            updateServerPushStatusBatchRaw(chunk, status, pushTime, errorMessage)
+        }
+    }
 
     @Query("UPDATE downloads SET serverPushStatus = :status WHERE serverPushStatus = :fromStatus")
     suspend fun markAllServerPushStatus(fromStatus: Int, status: Int)

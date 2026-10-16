@@ -715,50 +715,75 @@ object AudioMetadataEmbedder {
 
     private fun adjustChunkOffsets(moovBytes: ByteArray, delta: Long): ByteArray {
         val copy = moovBytes.copyOf()
-        val stco = "stco".toByteArray(Charsets.US_ASCII)
-        val co64 = "co64".toByteArray(Charsets.US_ASCII)
+        parseAndAdjustBoxes(copy, 8, copy.size, delta, isInsideStbl = false)
+        return copy
+    }
 
-        // 1. 调整 32 位 stco
-        for (i in 0 until copy.size - stco.size - 8) {
-            if (copy[i] == stco[0] && copy[i + 1] == stco[1] && copy[i + 2] == stco[2] && copy[i + 3] == stco[3]) {
-                val countOffset = i + 8
-                if (countOffset + 4 <= copy.size) {
-                    val entryCount = ByteBuffer.wrap(copy, countOffset, 4).int
-                    var curPos = countOffset + 4
-                    for (c in 0 until entryCount) {
-                        if (curPos + 4 > copy.size) break
-                        val oldOffset = ByteBuffer.wrap(copy, curPos, 4).int.toLong() and 0xFFFFFFFFL
-                        val newOffset = (oldOffset + delta).toInt()
-                        copy[curPos] = ((newOffset shr 24) and 0xFF).toByte()
-                        copy[curPos + 1] = ((newOffset shr 16) and 0xFF).toByte()
-                        copy[curPos + 2] = ((newOffset shr 8) and 0xFF).toByte()
-                        copy[curPos + 3] = (newOffset and 0xFF).toByte()
-                        curPos += 4
-                    }
+    private fun parseAndAdjustBoxes(data: ByteArray, startOffset: Int, endOffset: Int, delta: Long, isInsideStbl: Boolean) {
+        var pos = startOffset
+        while (pos + 8 <= endOffset) {
+            val rawSize = ByteBuffer.wrap(data, pos, 4).int.toLong() and 0xFFFFFFFFL
+            val boxType = String(data, pos + 4, 4, Charsets.US_ASCII)
+            val headerSize: Int
+            val boxSize: Long = when (rawSize) {
+                1L -> {
+                    if (pos + 16 > endOffset) break
+                    headerSize = 16
+                    ByteBuffer.wrap(data, pos + 8, 8).long
+                }
+                0L -> {
+                    headerSize = 8
+                    (endOffset - pos).toLong()
+                }
+                else -> {
+                    headerSize = 8
+                    rawSize
                 }
             }
-        }
 
-        // 2. 调整 64 位 co64
-        for (i in 0 until copy.size - co64.size - 8) {
-            if (copy[i] == co64[0] && copy[i + 1] == co64[1] && copy[i + 2] == co64[2] && copy[i + 3] == co64[3]) {
-                val countOffset = i + 8
-                if (countOffset + 4 <= copy.size) {
-                    val entryCount = ByteBuffer.wrap(copy, countOffset, 4).int
-                    var curPos = countOffset + 4
+            if (boxSize < headerSize || pos + boxSize > endOffset) {
+                break
+            }
+
+            val boxContentStart = pos + headerSize
+            val boxContentEnd = (pos + boxSize).toInt()
+
+            if (isInsideStbl) {
+                if (boxType == "stco" && boxContentStart + 8 <= boxContentEnd) {
+                    val entryCount = ByteBuffer.wrap(data, boxContentStart + 4, 4).int
+                    var curPos = boxContentStart + 8
                     for (c in 0 until entryCount) {
-                        if (curPos + 8 > copy.size) break
-                        val oldOffset = ByteBuffer.wrap(copy, curPos, 8).long
-                        val newOffset = oldOffset + delta
+                        if (curPos + 4 > boxContentEnd) break
+                        val oldOffset = ByteBuffer.wrap(data, curPos, 4).int.toLong() and 0xFFFFFFFFL
+                        val newOffset = (oldOffset + delta).coerceIn(0L, 0xFFFFFFFFL)
+                        data[curPos] = ((newOffset shr 24) and 0xFF).toByte()
+                        data[curPos + 1] = ((newOffset shr 16) and 0xFF).toByte()
+                        data[curPos + 2] = ((newOffset shr 8) and 0xFF).toByte()
+                        data[curPos + 3] = (newOffset and 0xFF).toByte()
+                        curPos += 4
+                    }
+                } else if (boxType == "co64" && boxContentStart + 8 <= boxContentEnd) {
+                    val entryCount = ByteBuffer.wrap(data, boxContentStart + 4, 4).int
+                    var curPos = boxContentStart + 8
+                    for (c in 0 until entryCount) {
+                        if (curPos + 8 > boxContentEnd) break
+                        val oldOffset = ByteBuffer.wrap(data, curPos, 8).long
+                        val newOffset = (oldOffset + delta).coerceAtLeast(0L)
                         val bb = ByteBuffer.allocate(8).putLong(newOffset)
-                        val newBytes = bb.array()
-                        System.arraycopy(newBytes, 0, copy, curPos, 8)
+                        System.arraycopy(bb.array(), 0, data, curPos, 8)
                         curPos += 8
                     }
                 }
+            } else {
+                if (boxType == "trak" || boxType == "mdia" || boxType == "minf") {
+                    parseAndAdjustBoxes(data, boxContentStart, boxContentEnd, delta, isInsideStbl = false)
+                } else if (boxType == "stbl") {
+                    parseAndAdjustBoxes(data, boxContentStart, boxContentEnd, delta, isInsideStbl = true)
+                }
             }
+
+            pos += boxSize.toInt()
         }
-        return copy
     }
 
     // =========================================================================

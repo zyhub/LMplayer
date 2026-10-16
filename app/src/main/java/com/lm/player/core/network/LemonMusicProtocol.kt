@@ -2351,11 +2351,7 @@ class LemonMusicProtocol(
         val endpoint = if (isApe) "/api/play/local-ape" else "/api/play/local"
         val enc = try { URLEncoder.encode(cleanPath, "UTF-8").replace("+", "%20") } catch (_: Exception) { cleanPath }
         val qParam = if (!quality.isNullOrBlank()) "&quality=$quality" else ""
-        return if (authToken.isNotBlank()) {
-            "$cleanBase$endpoint?path=$enc&token=$authToken$qParam"
-        } else {
-            "$cleanBase$endpoint?path=$enc$qParam"
-        }
+        return "$cleanBase$endpoint?path=$enc$qParam"
     }
 
     /**
@@ -2390,10 +2386,6 @@ class LemonMusicProtocol(
                     val url = json.optString("url").trim()
                     if (url.isNotBlank() && !url.equals("null", ignoreCase = true)) {
                         var fullUrl = if (url.startsWith("/")) "$cleanBase$url" else url
-                        if (fullUrl.startsWith(cleanBase) && authToken.isNotBlank() && !fullUrl.contains("token=") && !fullUrl.contains("ticket=")) {
-                            val sep = if (fullUrl.contains("?")) "&" else "?"
-                            fullUrl = "${fullUrl}${sep}token=$authToken"
-                        }
                         if (quality.isNotBlank() && !fullUrl.contains("quality=")) {
                             val sep = if (fullUrl.contains("?")) "&" else "?"
                             fullUrl = "${fullUrl}${sep}quality=$quality"
@@ -2456,11 +2448,7 @@ class LemonMusicProtocol(
         if (path.isBlank()) return ""
         val cleanPath = path.removePrefix("local:").trim()
         val enc = try { URLEncoder.encode(cleanPath, "UTF-8").replace("+", "%20") } catch (_: Exception) { cleanPath }
-        return if (authToken.isNotBlank()) {
-            "$cleanBase/api/tag/cover?path=$enc&token=$authToken"
-        } else {
-            "$cleanBase/api/tag/cover?path=$enc"
-        }
+        return "$cleanBase/api/tag/cover?path=$enc"
     }
 
     /**
@@ -2844,14 +2832,19 @@ class LemonMusicProtocol(
                 val dataObj = json.optJSONObject("data")
                 val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
                 val songs = ArrayList<UnifiedSong>(list.length())
+                val seenSongIds = HashSet<String>()
 
                 for (i in 0 until list.length()) {
                     val s = list.optJSONObject(i) ?: continue
-                    val songId = s.optString("songmid")
+                    val rawSongId = s.optString("songmid")
                         .ifBlank { s.optString("songId") }
                         .ifBlank { s.optString("hash") }
                         .ifBlank { s.optString("copyrightId") }
-                        .ifBlank { s.optString("id", "s_$i") }
+                        .ifBlank {
+                            val raw = s.optString("id")
+                            if (raw.isBlank() || raw == "0") "" else raw
+                        }
+                    val songId = if (rawSongId.isBlank() || rawSongId == "0") "s_${page}_${i}_${System.identityHashCode(s)}" else rawSongId
                     val name = SongMatchingResolver.unescapeMusicText(
                         s.optString("name").ifBlank { s.optString("title", "") }
                     )
@@ -2872,7 +2865,12 @@ class LemonMusicProtocol(
                     cover = normalizeImageUrl(cover, cleanBase)
                     val sSource = s.optString("source", source)
 
-                    val unifiedId = "lemon_online_${sSource}_$songId"
+                    var unifiedId = "lemon_online_${sSource}_$songId"
+                    if (seenSongIds.contains(unifiedId)) {
+                        unifiedId = "${unifiedId}_${page}_$i"
+                    }
+                    seenSongIds.add(unifiedId)
+
                     songs.add(
                         UnifiedSong(
                             id = unifiedId,
@@ -2924,11 +2922,16 @@ class LemonMusicProtocol(
                         val dataObj = json.optJSONObject("data")
                         val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
                         val albums = ArrayList<UnifiedAlbum>(list.length())
+                        val seenAlbumIds = HashSet<String>()
                         for (i in 0 until list.length()) {
                             val item = list.optJSONObject(i) ?: continue
-                            val id = item.optString("id")
+                            val rawId = item.optString("id")
                                 .ifBlank { item.optString("albumMid") }
-                                .ifBlank { item.optString("albumId", "album_$i") }
+                                .ifBlank {
+                                    val raw = item.optString("albumId")
+                                    if (raw.isBlank() || raw == "0") "" else raw
+                                }
+                            val id = if (rawId.isBlank() || rawId == "0") "album_${page}_${i}_${System.identityHashCode(item)}" else rawId
                             val name = SongMatchingResolver.unescapeMusicText(
                                 item.optString("name").ifBlank { item.optString("title", "") }
                             )
@@ -2945,9 +2948,16 @@ class LemonMusicProtocol(
                             val yearStr = item.optString("publishTime").ifBlank { item.optString("year") }
                             val year = yearStr.take(4).toIntOrNull()
                             val sSource = item.optString("source", source)
+
+                            var unifiedId = "lemon_discover_album_${sSource}_$id"
+                            if (seenAlbumIds.contains(unifiedId)) {
+                                unifiedId = "${unifiedId}_${page}_$i"
+                            }
+                            seenAlbumIds.add(unifiedId)
+
                             albums.add(
                                 UnifiedAlbum(
-                                    id = "lemon_discover_album_${sSource}_$id",
+                                    id = unifiedId,
                                     title = name,
                                     artist = artist,
                                     coverUrl = cover,
@@ -2993,10 +3003,12 @@ class LemonMusicProtocol(
                 val dataObj = json.optJSONObject("data")
                 val list = dataObj?.optJSONArray("list") ?: json.optJSONArray("data") ?: JSONArray()
                 val playlists = ArrayList<UnifiedPlaylist>(list.length())
+                val seenPlaylistIds = HashSet<String>()
 
                 for (i in 0 until list.length()) {
                     val item = list.optJSONObject(i) ?: continue
-                    val id = item.optString("id").ifBlank { item.optString("play_id") }
+                    val rawId = item.optString("id").ifBlank { item.optString("play_id") }
+                    val id = if (rawId.isBlank() || rawId == "0") "pl_${page}_${i}_${System.identityHashCode(item)}" else rawId
                     val name = SongMatchingResolver.unescapeMusicText(
                         item.optString("name").ifBlank { item.optString("title", "") }
                     )
@@ -3008,9 +3020,16 @@ class LemonMusicProtocol(
                     cover = normalizeImageUrl(cover, cleanBase)
                     val count = item.optInt("total", item.optInt("count", 0))
                     val sSource = item.optString("source", source)
+
+                    var unifiedId = "lemon_rec_${sSource}_$id"
+                    if (seenPlaylistIds.contains(unifiedId)) {
+                        unifiedId = "${unifiedId}_${page}_$i"
+                    }
+                    seenPlaylistIds.add(unifiedId)
+
                     playlists.add(
                         UnifiedPlaylist(
-                            id = "lemon_rec_${sSource}_$id",
+                            id = unifiedId,
                             name = name,
                             coverUrl = cover,
                             songCount = count,

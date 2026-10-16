@@ -15,6 +15,7 @@ import com.lm.player.core.network.NetworkClientFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -52,8 +53,50 @@ class DownloadEngine(
         )
     )
 
-    @Volatile
-    private var downloadSemaphore = kotlinx.coroutines.sync.Semaphore(
+    private class DynamicSemaphore(initialPermits: Int) {
+        @Volatile
+        private var permits = initialPermits
+        @Volatile
+        private var running = 0
+        private val lock = Any()
+
+        fun setPermits(newPermits: Int) {
+            synchronized(lock) {
+                permits = newPermits
+                (lock as java.lang.Object).notifyAll()
+            }
+        }
+
+        suspend fun <T> withPermit(action: suspend () -> T): T {
+            acquire()
+            try {
+                return action()
+            } finally {
+                release()
+            }
+        }
+
+        private suspend fun acquire() {
+            while (true) {
+                synchronized(lock) {
+                    if (running < permits) {
+                        running++
+                        return
+                    }
+                }
+                delay(80)
+            }
+        }
+
+        private fun release() {
+            synchronized(lock) {
+                running = (running - 1).coerceAtLeast(0)
+                (lock as java.lang.Object).notifyAll()
+            }
+        }
+    }
+
+    private val downloadSemaphore = DynamicSemaphore(
         prefs.getInt("max_concurrent", 3).coerceIn(1, 10)
     )
 
@@ -134,7 +177,7 @@ class DownloadEngine(
             .apply()
 
         if (oldMax != normalizedSettings.maxConcurrent) {
-            downloadSemaphore = kotlinx.coroutines.sync.Semaphore(normalizedSettings.maxConcurrent.coerceIn(1, 10))
+            downloadSemaphore.setPermits(normalizedSettings.maxConcurrent.coerceIn(1, 10))
             Log.i(TAG, "Download concurrency limit updated to ${normalizedSettings.maxConcurrent}")
         }
     }
@@ -418,7 +461,9 @@ class DownloadEngine(
         folderHierarchy: String? = null,
         urlResolver: (suspend () -> String?)? = null
     ) {
-        if (jobMap.containsKey(song.id)) {
+        val placeholderJob = Job()
+        val existingJob = jobMap.putIfAbsent(song.id, placeholderJob)
+        if (existingJob != null) {
             coroutineScope.launch(Dispatchers.Main) {
                 Toast.makeText(context, "「${song.title}」正在下载中，请稍候...", Toast.LENGTH_SHORT).show()
             }
@@ -694,7 +739,7 @@ class DownloadEngine(
 
                         if (!coroutineContext.isActive) {
                             Log.i(TAG, "Download inactive for ${song.title}, aborting post-processing")
-                            return@launch
+                            return@withPermit
                         }
 
                         // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
@@ -822,11 +867,8 @@ class DownloadEngine(
                         }
                     }
                 } finally {
-                    if (currentJob != null) {
-                        jobMap.remove(song.id, currentJob)
-                    } else {
-                        jobMap.remove(song.id)
-                    }
+                    val targetJob = currentJob ?: placeholderJob
+                    jobMap.remove(song.id, targetJob)
                 }
             }
         }
