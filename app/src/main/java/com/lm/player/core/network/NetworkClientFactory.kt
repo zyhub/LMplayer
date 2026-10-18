@@ -6,7 +6,9 @@ import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import org.conscrypt.Conscrypt
+import java.security.SecureRandom
 import java.security.Security
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
@@ -225,6 +227,21 @@ object NetworkClientFactory {
                 Log.w(TAG, "Using platform default SSL engine as fallback", e)
             }
         }
+
+        // 自动兼容自签名、过期、域名不匹配、证书链不完整的 HTTPS 服务器。
+        // 仅用于当前自建服务端场景；这会放宽全局 TLS 校验，请勿用于公共支付/账号场景。
+        val trustAllManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        val trustAllContext = SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(trustAllManager), SecureRandom())
+        }
+        builder.sslSocketFactory(trustAllContext.socketFactory, trustAllManager)
+        builder.hostnameVerifier { _, _ -> true }
 
         val client = builder.build()
         sharedClient = client

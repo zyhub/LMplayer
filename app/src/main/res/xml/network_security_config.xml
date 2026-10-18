@@ -1,13 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <!-- 在线音源 CDN 仍可能返回 http 直链；只对这些媒体域名放行，服务器/更新默认要求 HTTPS。 -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">qq.com</domain>
-        <domain includeSubdomains="true">kugou.com</domain>
-        <domain includeSubdomains="true">kuwo.cn</domain>
-        <domain includeSubdomains="true">126.net</domain>
-        <domain includeSubdomains="true">163.com</domain>
-        <domain includeSubdomains="true">migu.cn</domain>
-    </domain-config>
+    <!-- 允许局域网 HTTP 服务器；公网 HTTP 由 ServerUrlPolicy 在应用层拒绝。 -->
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

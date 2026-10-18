@@ -78,10 +78,11 @@ class LMApplication : Application(), ImageLoaderFactory {
             runCatching {
                 db.serverDao().getAllServers().forEach { server ->
                     if (!ServerTokenCipher.isEncrypted(server.tokenOrApiKeyEncrypted)) {
-                        db.serverDao().updateServerToken(
-                            server.id,
-                            ServerTokenCipher.encrypt(server.tokenOrApiKey)
-                        )
+                        val encrypted = ServerTokenCipher.encrypt(server.tokenOrApiKey)
+                        // 加密失败会回退明文；不要用空值覆盖旧 Token。
+                        if (encrypted.isNotBlank()) {
+                            db.serverDao().updateServerToken(server.id, encrypted)
+                        }
                     }
                 }
             }

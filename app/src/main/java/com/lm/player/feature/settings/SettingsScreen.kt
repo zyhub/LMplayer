@@ -54,6 +54,7 @@ import com.lm.player.core.model.*
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
 import com.lm.player.core.network.ServerLatencyMonitor
+import com.lm.player.core.network.ServerUrlPolicy
 import com.lm.player.core.source.ServerSourceRepository
 import com.lm.player.core.update.AppUpdateManager
 import com.lm.player.core.update.UpdateInfo
@@ -2233,6 +2234,10 @@ fun SettingsScreen(
                                     Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
                                     return@OutlinedButton
                                 }
+                                ServerUrlPolicy.validate(cleanUrl)?.let { error ->
+                                    Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                                    return@OutlinedButton
+                                }
                                 serverUrlInput = cleanUrl
                                 isTestingConnection = true
                                 testResultMsg = null
@@ -2302,6 +2307,10 @@ fun SettingsScreen(
                             onClick = {
                                 val cleanUrl = normalizeServerUrl(serverUrlInput)
                                 if (cleanUrl.isNotBlank()) {
+                                    ServerUrlPolicy.validate(cleanUrl)?.let { error ->
+                                        Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                                        return@Button
+                                    }
                                     val newConfig = ServerConfig(
                                         id = editingServer?.id ?: "srv_${System.currentTimeMillis()}",
                                         name = serverNameInput.ifBlank { "我的音乐服务器" },

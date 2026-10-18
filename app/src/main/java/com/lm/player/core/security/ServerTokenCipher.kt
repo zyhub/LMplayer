@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -31,7 +32,11 @@ object ServerTokenCipher {
             val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
             PREFIX + Base64.encodeToString(iv, Base64.NO_WRAP) + ":" +
                 Base64.encodeToString(encrypted, Base64.NO_WRAP)
-        }.getOrDefault("")
+        }.getOrElse { error ->
+            // 加密失败时保留明文，避免登录成功后 Token 被写成空值。
+            Log.e("ServerTokenCipher", "Token encrypt failed; storing plaintext", error)
+            plain
+        }
     }
 
     fun decrypt(value: String): String {

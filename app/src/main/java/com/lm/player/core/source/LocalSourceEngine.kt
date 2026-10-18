@@ -165,7 +165,7 @@ class LocalSourceEngine(
         globalThis.lx = {
           EVENT_NAMES: { request: "request", inited: "inited", updateAlert: "updateAlert" },
           env: "android",
-          version: "1.7.27",
+          version: "1.7.28",
           on: function(event, handler) { globalThis.__handlers[event] = handler; },
           send: function(event, data) { globalThis.__sent[event] = data; },
           request: function(url, options, callback) {

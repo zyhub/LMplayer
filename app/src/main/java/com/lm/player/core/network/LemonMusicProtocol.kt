@@ -50,6 +50,7 @@ class LemonMusicProtocol(
 ) : NasMusicProtocol {
 
     private val cleanBase = serverUrl.trim().trimEnd('/')
+    private val urlPolicyError = ServerUrlPolicy.validate(cleanBase)
     private val authCacheKey = "${cleanBase}_${username.trim()}"
 
     /**
@@ -421,14 +422,13 @@ class LemonMusicProtocol(
      * 登录鉴权：支持快速会话校验与用户名密码登录
      */
     override suspend fun authenticate(config: ServerConfig): Result<String> = withContext(Dispatchers.IO) {
+        urlPolicyError?.let { return@withContext Result.failure(IllegalArgumentException(it)) }
         try {
-            // 1. 若已有 token，优先测试 /api/auth/me 免密验证
-            // 阈值统一为 32 并只认「令牌形态」：此前这里是 >= 20，而 init/ensureAuthenticated 用 32，
-            // 导致 20~31 位的用户**口令**会被当作 Bearer 令牌发往 /api/auth/me（明文口令进入请求头，
-            // 可能被代理或日志留存）。现在要求长度 >= 32 或明确以 lemon- 前缀开头。
+            // 1. 若已有 token，优先测试 /api/auth/me 免密验证。
+            // 内网自建服务端可能返回短 Token，不能再用长度 >= 32 判断；
+            // 任意非空凭据先试一次 Bearer，失败后再走账号密码登录。
             val candidateToken = authToken.ifBlank { sharedAuthTokens[authCacheKey].orEmpty() }.ifBlank { tokenOrPasswordPlain }
-            val looksLikeToken = candidateToken.startsWith("lemon-") || candidateToken.length >= 32
-            if (candidateToken.isNotBlank() && looksLikeToken) {
+            if (candidateToken.isNotBlank()) {
                 // 该分支整体独立 try：反代/门户页可能返回 200 + HTML 或空体，
                 // 此时 JSONObject(body) 会抛异常。若不单独捕获，异常会直达外层 catch
                 // 直接返回 Result.failure，**永远走不到下面的账号密码登录**。
@@ -523,12 +523,14 @@ class LemonMusicProtocol(
      * 现在改为失败即抛，由各方法的 catch 统一转成带明确原因的失败结果。
      */
     private suspend fun ensureAuthenticatedOrThrow() {
+        urlPolicyError?.let { throw IllegalStateException(it) }
         if (!ensureAuthenticated()) {
             throw IllegalStateException("鉴权失败：无法登录柠檬音乐服务端（请检查服务器地址/账号，或重新登录）")
         }
     }
 
     suspend fun ensureAuthenticated(): Boolean = withContext(Dispatchers.IO) {
+        urlPolicyError?.let { return@withContext false }
         if (authToken.isNotBlank()) return@withContext true
         val cached = sharedAuthTokens[authCacheKey]
         if (!cached.isNullOrBlank()) {
@@ -4133,7 +4135,7 @@ class LemonMusicProtocol(
     private suspend fun fetchExternalScript(url: String): String? {
         val req = Request.Builder()
             .url(url)
-            .header("User-Agent", "LMPlayer/1.7.27")
+            .header("User-Agent", "LMPlayer/1.7.28")
             .get()
             .build()
         client.newCall(req).execute().use { resp ->
