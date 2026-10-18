@@ -683,13 +683,19 @@ class PlaybackService : MediaSessionService() {
                 .getBoolean("stop_playback_on_exit", true)
         } catch (_: Throwable) { true }
         if (stopPlaybackOnExit) {
+            com.lm.player.core.source.SourceAccelerationController.stopAsync("task_removed")
             try {
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
                 // 用户设置「划掉任务时停止播放」= 明确要求结束播放，此时释放共享播放器，
                 // 让 WakeLock / WifiLock / 解码器随单例一起归还系统，而不是悬挂到进程结束。
                 Media3Factory.releaseSharedPlayer()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
                 stopSelf()
             } catch (_: Throwable) {}
         }

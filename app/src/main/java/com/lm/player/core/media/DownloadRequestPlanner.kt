@@ -53,6 +53,17 @@ object DownloadRequestPlanner {
     }
 
     /**
+     * 歌曲是否已经在**服务器曲库**里（serverId 为服务器实例 id，而不是 local_storage /
+     * lemon_online 这类本地或在线占位）。
+     *
+     * 用途：服务器已有该曲目时，禁止再次向 /api/download/add 提交同名任务。
+     * 服务端对「已有同名文件」的任务会进入 await_exist 等待用户确认，客户端却只看到
+     * 任务已提交，最终表现为「服务器下载队列一直排队、无法完成」。
+     */
+    fun isServerLibrarySong(song: UnifiedSong): Boolean =
+        song.serverId.isNotBlank() && song.serverId !in NON_SERVER_LIBRARY_IDS
+
+    /**
      * 本地已存在的文件是否满足目标音质档次（与 DownloadEngine 的防重复判定同一口径：
      * 无损与有损互不兼容，无损内部不再细分 flac / Hi-Res）。
      */
@@ -62,7 +73,8 @@ object DownloadRequestPlanner {
         return if (targetLossless) {
             existingLossless
         } else {
-            if (existingLossless) return false
+            // 已有无损文件对任何有损目标都算「已满足」，避免批量下载再存一份 FLAC
+            if (existingLossless) return true
             if (quality.bitrate >= 320 && song.bitRate in 1..255) return false
             true
         }
@@ -115,14 +127,71 @@ object DownloadRequestPlanner {
         protocol: LemonMusicProtocol?,
         song: UnifiedSong,
         quality: AudioQuality,
-        context: android.content.Context? = null
+        context: android.content.Context? = null,
+        // 下载链路专用：服务器曲库已有这首歌时直接取服务器原文件。
+        // 第三方音源返回的是 /api/play/proxy，实测大文件会被服务端代理限速到
+        // 2MB/156s 甚至卡死；服务器原文件 /api/play/local 稳定且快。
+        preferServerFile: Boolean = false,
+        // 降级候选需要先尝试服务器原文件时，跳过本地音源解析，避免又拿回同一个 403 地址。
+        skipLocalAcceleration: Boolean = false
     ): ResolvedDownloadStream? {
         if (protocol == null) return null
         protocol.ensureAuthenticated()
 
-        val serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
+        // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；失败回 NAS。
+        if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate() && isServerLibrarySong(song)) {
+            val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
+                protocol = protocol,
+                serverId = song.serverId,
+                song = song,
+                overrideQuality = quality.key
+            ).getOrNull()
+            resolved?.let { r ->
+                if (probeLocalUrl(r.url)) {
+                    return ResolvedDownloadStream(r.url, quality.format.lowercase(), quality.bitrate)
+                }
+            }
+        }
+
+        // 在线曲目：外网/内网高延迟且会话就绪时，先本地解析同音质直链。
+        // 失败完全不报错，继续走原来的服务器/音源链路。
+        if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+            val accelSource = resolveAccelerationSource(song)
+            if (accelSource.isBlank()) {
+                // 服务器曲库 ID 没有平台信息，无法安全匹配本地音源，直接走服务器。
+            } else {
+            val accelInfo = buildAccelerationInfo(song)
+            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
+                source = accelSource,
+                quality = quality.key,
+                musicInfoJson = accelInfo
+            )
+            local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let { url ->
+                if (probeLocalUrl(url)) {
+                    return ResolvedDownloadStream(url, quality.format.lowercase(), quality.bitrate)
+                }
+            }
+            }
+        }
+
+        var serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
             ?: song.relativeFolderPath?.trim()?.takeIf { it.looksLikeAudioPath() }
-        val trackId = LemonMusicProtocol.getServerTrackId(song.id)
+        var trackId = LemonMusicProtocol.getServerTrackId(song.id)
+
+        // 在线搜索结果的 ID 与服务器曲库 ID 对不上，streamUrl 又经常是空/本地路径。
+        // 用一次快速单曲查询补出服务器物理路径；查不到再走第三方音源。
+        if (serverPath == null && (song.serverId.isNotBlank() || song.id.startsWith("lemon_online_"))) {
+            val lookedUp = try {
+                protocol.findServerLibraryTrack(song.title, song.artist, song.durationMs, song.album)
+            } catch (_: Exception) {
+                null
+            }
+            if (lookedUp != null) {
+                serverPath = lookedUp.filePath
+                if (trackId.isNullOrBlank()) trackId = lookedUp.trackId
+                LemonMusicProtocol.registerServerFilePath(song.id, lookedUp.filePath, lookedUp.trackId)
+            }
+        }
 
         val serverExt = serverPath?.substringAfterLast('.', "")?.lowercase().orEmpty()
             .ifBlank { song.format.lowercase() }
@@ -137,6 +206,33 @@ object DownloadRequestPlanner {
         var format = quality.format.lowercase()
         var bitRate = quality.bitrate
 
+        // 下载链路：服务器已有该文件时直接走 /api/play/local。
+        // 即使服务器原文件是 FLAC、用户选的是 320K，也宁可下到无损（下载完成后的 toast
+        // 会如实显示实际音质），也不要卡在第三方代理的限速上。
+        val preferredServerPath = serverPath
+        // 只在服务器原文件音质「不低于」目标时直接用它；服务器只有 128K 而用户要 FLAC
+        // 时仍先尝试音源，音源失败再由步骤 3 回退服务器文件。
+        val targetLossless = quality.bitrate >= 800 || quality.format.lowercase() in LOSSLESS_EXTS
+        val serverCoversTarget = when {
+            serverExt in LOSSLESS_EXTS -> true
+            targetLossless -> false
+            else -> song.bitRate >= quality.bitrate - 64
+        }
+        if (preferServerFile && !preferredServerPath.isNullOrBlank() && serverCoversTarget) {
+            val serverUrl = protocol.getStreamUrlForPath(preferredServerPath, quality.key)
+                .takeIf { it.isNotBlank() }
+            if (!serverUrl.isNullOrBlank()) {
+                val actualFormat = serverExt.ifBlank { quality.format.lowercase() }
+                val actualBitRate = when {
+                    actualFormat in LOSSLESS_EXTS && song.bitRate < 800 -> 960
+                    actualFormat in LOSSLESS_EXTS -> song.bitRate
+                    song.bitRate > 0 -> song.bitRate
+                    else -> quality.bitrate
+                }
+                return ResolvedDownloadStream(serverUrl, actualFormat, actualBitRate)
+            }
+        }
+
         // 步骤 2：服务器原文件不是目标音质 → 优先向音源按目标音质解析（含逐级降级 + 同名搜索回退）
         if (!serverMatchesTarget) {
             val meta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
@@ -148,7 +244,10 @@ object DownloadRequestPlanner {
                     preferredQuality = quality.key,
                     metaJson = meta,
                     fallbackTitle = song.title,
-                    fallbackArtist = song.artist
+                    fallbackArtist = song.artist,
+                    // 下载链路最多等 10 秒拿目标音质：服务器已有该文件时必须尽快回退到
+                    // /api/play/local，而不是让进度条永远停在 0% 等音源逐档降级。
+                    maxDurationMs = 10_000L
                 ).getOrNull()
             } catch (_: Exception) {
                 null
@@ -192,6 +291,58 @@ object DownloadRequestPlanner {
 
         val finalUrl = url?.takeIf { it.isNotBlank() } ?: return null
         return ResolvedDownloadStream(finalUrl, format, bitRate)
+    }
+
+    /** 下载前轻量探测，避免本地直链 403/过期导致整个下载失败；失败则无感回服务器。 */
+    private fun probeLocalUrl(url: String): Boolean = runCatching {
+        val builder = okhttp3.Request.Builder()
+            .url(url)
+            .header("Range", "bytes=0-0")
+            .get()
+        com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(url).forEach { (k, v) ->
+            builder.header(k, v)
+        }
+        val req = builder.build()
+        probeClient.newCall(req).execute().use { resp ->
+            val type = resp.header("Content-Type").orEmpty().lowercase()
+            (resp.code == 200 || resp.code == 206) && !type.contains("text/html")
+        }
+    }.getOrDefault(false)
+
+    private val probeClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    /** 服务器曲库 ID 不带平台前缀，必须从 rawMetaJson 的 source/platform 取；取不到就不加速。 */
+    private fun resolveAccelerationSource(song: UnifiedSong): String {
+        val clean = song.id.removePrefix("lemon_online_")
+        if (clean != song.id || song.serverId == "lemon_online") {
+            return if (clean.contains("_")) clean.substringBefore("_") else "kw"
+        }
+        val meta = runCatching { JSONObject(song.rawMetaJson ?: "{}") }.getOrNull()
+        val source = meta?.optString("source").orEmpty().ifBlank { meta?.optString("platform").orEmpty() }
+        return source.lowercase().takeIf { it in setOf("kw", "kg", "tx", "wy", "mg") }.orEmpty()
+    }
+
+    private fun buildAccelerationInfo(song: UnifiedSong): String {
+        val obj = runCatching { JSONObject(song.rawMetaJson ?: "{}") }.getOrDefault(JSONObject())
+        val clean = song.id.removePrefix("lemon_online_")
+        val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+        if (rawId.isNotBlank()) {
+            if (obj.optString("id").isBlank()) obj.put("id", rawId)
+            if (obj.optString("songId").isBlank()) obj.put("songId", rawId)
+        }
+        if (obj.optString("name").isBlank()) obj.put("name", song.title)
+        if (obj.optString("singer").isBlank()) obj.put("singer", song.artist)
+        if (obj.optString("albumName").isBlank()) obj.put("albumName", song.album)
+        listOf("hash", "songmid").forEach { key ->
+            if (obj.has(key) && obj.optString(key).isBlank()) obj.remove(key)
+        }
+        return obj.toString()
     }
 
     private fun hasAudioExt(path: String): Boolean {

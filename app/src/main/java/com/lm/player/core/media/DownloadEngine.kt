@@ -13,6 +13,7 @@ import com.lm.player.core.model.DownloadTask
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.core.network.NetworkClientFactory
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,6 +41,36 @@ class DownloadEngine(
 ) {
     private val TAG = "DownloadEngine"
     private val okHttpClient = NetworkClientFactory.createOkHttpClient(context)
+
+    // 下载专用客户端：给 DNS 解析加 5 秒硬超时。
+    // 某些网络/模拟器解析第三方 CDN 域名会无限挂起，OkHttp 的 connectTimeout 管不到
+    // DNS 阶段，表现为下载永远停在 0%。超时后由下载逻辑回退到服务端代理。
+    private val dnsExecutor = java.util.concurrent.Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "lm-download-dns").apply { isDaemon = true }
+    }
+    private val downloadClient = okHttpClient.newBuilder()
+        .dns(object : okhttp3.Dns {
+            override fun lookup(hostname: String): List<java.net.InetAddress> {
+                val future = dnsExecutor.submit<List<java.net.InetAddress>> {
+                    okhttp3.Dns.SYSTEM.lookup(hostname)
+                }
+                return try {
+                    future.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (e: Exception) {
+                    future.cancel(true)
+                    throw java.net.UnknownHostException("DNS timeout: $hostname")
+                }
+            }
+        })
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        // 慢速网络/限速源上单个 1MB 分片可能持续 1~2 分钟，60s 的默认 readTimeout
+        // 会在仍有数据时误判失败；放宽到 180s，callTimeout 仍由共享客户端限制在 300s。
+        .readTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+        // 强制 HTTP/1.1：服务端（Express/反代）在大文件流上对 HTTP/2 流控处理不稳定，
+        // 实测 OkHttp 的 h2 连接读到约 500KB 后停止收到 WINDOW_UPDATE，下载永久卡住；
+        // 同一地址用 HTTP/1.1 可完整读完。下载不需要多路复用，降级没有副作用。
+        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+        .build()
 
     private val prefs = context.getSharedPreferences("zds_download_prefs", Context.MODE_PRIVATE)
 
@@ -104,12 +135,26 @@ class DownloadEngine(
         /** 无损音频容器：凡属于此集合的音质档次与有损档次互不兼容 */
         private val LOSSLESS_AUDIO_EXTS = setOf("flac", "wav", "ape", "alac", "dsf", "dff")
 
+        /** 非「服务器曲库」的 serverId：本机扫描、在线占位等；其余非空值都视为服务器曲库 */
+        private val NON_SERVER_LIBRARY_IDS = setOf("local_storage", "local_folder", "local_saf", "lemon_online")
+
         /**
          * 实际下载音质的展示文案。
          * 直链里带 320/128 标记时以它为准 —— 音源缺目标音质会逐级降级
          * (flac24bit→flac→320k→128k)，此时请求的 320k 与实际到手的 128k 不同，
          * 必须把降级结果如实告诉用户。
          */
+        private fun readAudioBitRate(file: File): Int = try {
+            val retriever = android.media.MediaMetadataRetriever()
+            retriever.setDataSource(file.absolutePath)
+            val bitRate = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_BITRATE)
+                ?.toLongOrNull()?.let { (it / 1000L).toInt() } ?: 0
+            retriever.release()
+            bitRate
+        } catch (_: Throwable) {
+            0
+        }
+
         private fun actualQualityLabel(url: String?, format: String, bitRate: Int): String {
             val ext = format.lowercase()
             if (ext in LOSSLESS_AUDIO_EXTS) {
@@ -194,6 +239,38 @@ class DownloadEngine(
 
     private val jobMap = ConcurrentHashMap<String, Job>()
     private val urlResolverMap = ConcurrentHashMap<String, suspend () -> String?>()
+    private val fallbackResolverMap = ConcurrentHashMap<String, suspend (Int) -> String?>()
+
+    /** 该 serverId 是否代表「柠檬服务端曲库」中的一首歌（而不是本机扫描/在线占位） */
+    private fun isServerLibraryId(serverId: String?): Boolean =
+        !serverId.isNullOrBlank() && serverId !in NON_SERVER_LIBRARY_IDS
+
+    /**
+     * 服务端在线音源返回的是 /api/play/proxy?url=<真实CDN>&ticket=…。
+     * 实测该代理在播放/下载 1MB 后会出现严重限速（2MB 花了 156 秒），而内层 CDN
+     * 直链 9MB 只需约 1 秒。下载时优先解出内层直链；失败再由调用方回退到代理。
+     */
+    private fun unwrapServerProxyUrl(url: String): String {
+        if (!url.contains("/api/play/proxy") || !url.contains("url=")) return url
+        return try {
+            val encoded = url.substringAfter("url=").substringBefore("&")
+            if (encoded.isBlank()) return url
+            val decoded = java.net.URLDecoder.decode(encoded, "UTF-8").trim()
+            if (decoded.startsWith("http://") || decoded.startsWith("https://")) decoded else url
+        } catch (_: Exception) {
+            url
+        }
+    }
+
+    /** 解析 Content-Range: "bytes 0-1048575/28007147" -> (start, end, total)；total 为 * 时返回 -1 */
+    private fun parseContentRange(header: String?): Triple<Long, Long, Long>? {
+        if (header.isNullOrBlank()) return null
+        val m = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""").find(header) ?: return null
+        val start = m.groupValues[1].toLongOrNull() ?: return null
+        val end = m.groupValues[2].toLongOrNull() ?: return null
+        val total = m.groupValues[3].toLongOrNull() ?: -1L
+        return Triple(start, end, total)
+    }
 
     /**
      * 从文件魔数头 (Magic Bytes)、Content-Type 或 URL 参数精准识别音频真实封装扩展名
@@ -390,13 +467,14 @@ class DownloadEngine(
 
         val existingByPath = songDao.getSongByLocalPath(localFilePath)
         val existingById = songDao.getSongById(song.id)
-        val isSongServerLinked = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
-        val isExistingPathServerLinked = existingByPath != null && existingByPath.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+        val isExistingPathServerLinked = existingByPath != null && isServerLibraryId(existingByPath.serverId)
 
         // 若数据库中已有另一条不同 ID 的记录指向同一物理文件：
-        // 优先保留已关联服务器的曲目记录，清理冗余的本地/在线临时 ID 记录，防止已下载列表重复出现两条相同歌曲
+        // 优先保留**已关联服务器**的曲目记录，清理冗余的本地/在线临时 ID 记录，防止
+        // 已下载列表重复出现两条相同歌曲；也避免把服务器曲库记录删掉后只留下在线 ID
+        // （后者会在下一次服务端同步/差量清理时被当作孤儿删掉，下载记录随之悬空）。
         if (existingByPath != null && existingByPath.id != song.id) {
-            if (isExistingPathServerLinked && !isSongServerLinked) {
+            if (isExistingPathServerLinked) {
                 songDao.updateDownloadStatusSpecsAndTimestamp(
                     songId = existingByPath.id,
                     status = DownloadStatus.DOWNLOADED,
@@ -405,7 +483,9 @@ class DownloadEngine(
                     bitRate = computedBitRate,
                     timestamp = System.currentTimeMillis()
                 )
-                if (existingById != null) {
+                // 同 ID 的旧记录若只是同一首歌的在线占位，删掉它避免双份；
+                // 绝不删除 existingByPath（服务器曲库记录就是 canonical owner）。
+                if (existingById != null && existingById.id != existingByPath.id) {
                     songDao.deleteSongById(song.id)
                 }
                 downloadDao.deleteDownload(song.id)
@@ -459,26 +539,23 @@ class DownloadEngine(
     fun startDownload(
         song: UnifiedSong,
         folderHierarchy: String? = null,
-        urlResolver: (suspend () -> String?)? = null
-    ) {
-        val placeholderJob = Job()
-        val existingJob = jobMap.putIfAbsent(song.id, placeholderJob)
-        if (existingJob != null) {
-            coroutineScope.launch(Dispatchers.Main) {
-                Toast.makeText(context, "「${song.title}」正在下载中，请稍候...", Toast.LENGTH_SHORT).show()
-            }
-            return
-        }
-
-        if (urlResolver != null) {
-            urlResolverMap[song.id] = urlResolver
-        }
-
-        // 立即向活跃任务映射中加入，确保 UI 在点击瞬间立即可见 (避免直链解析网络延迟导致下载中空白)
-        updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
-
-        var currentJob: Job? = null
-        val job = coroutineScope.launch(Dispatchers.IO) {
+        urlResolver: (suspend () -> String?)? = null,
+        fallbackResolver: (suspend (Int) -> String?)? = null
+    ): Boolean {
+        // 关键：Job 必须用 LAZY 创建、先放入 jobMap 再 start；整段协程体（含所有提前 return）
+        // 都必须在 try/finally 内。旧实现先 put 一个 placeholder、启动协程后再把真实 Job
+        // 覆盖进 map，存在两个必现问题：
+        //  1) 「目标文件已存在」等提前 return 的分支没有 finally 清理，map 里永久残留一个
+        //     已完成的 Job，此后同一首歌再点下载永远提示「正在下载中，请稍候」；
+        //  2) 协程先结束、map 后写入时还会把旧 Job 写回去，所以服务器已下载的歌曲（本地
+        //     通常也有文件，走的正是提前 return 分支）最容易触发。
+        // 现在 map 中始终是真实 Job，且 finally 用 remove(key, selfJob) 只清理自己，
+        // 不会误删暂停后立刻续传产生的新任务。
+        val job = coroutineScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            val selfJob = coroutineContext[Job]
+            var initialEntityRef: DownloadEntity? = null
+            try {
+            Log.i(TAG, "Download job started: ${song.title} (id=${song.id})")
             val dbRelativePath = if (song.relativeFolderPath.isNullOrBlank()) {
                 try {
                     songDao.getSongById(song.id)?.relativeFolderPath
@@ -511,7 +588,10 @@ class DownloadEngine(
                 return if (requestedLossless) {
                     realExt in LOSSLESS_AUDIO_EXTS
                 } else {
-                    if (realExt in LOSSLESS_AUDIO_EXTS) return false
+                    // 本地已有无损文件时，它对任何有损目标都属于「更高规格已存在」。
+                    // 旧逻辑返回 false，会为了 320K 再下载一份同名 FLAC（服务器曲库歌曲
+                    // 在 preferServerFile 下拿到的仍是 FLAC），既浪费时间又占双倍空间。
+                    if (realExt in LOSSLESS_AUDIO_EXTS) return true
                     if (song.bitRate >= 320) {
                         val existingBitRate = songDao.getSongByLocalPath(f.absolutePath)?.bitRate
                             ?: record?.let { if (it.localFilePath == f.absolutePath) song.bitRate else 0 }
@@ -534,7 +614,7 @@ class DownloadEngine(
                 }
                 val canonicalOwner = songDao.getSongByLocalPath(validPath)
                 val targetRecordSongId = if (canonicalOwner != null && canonicalOwner.id != song.id &&
-                    canonicalOwner.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                    isServerLibraryId(canonicalOwner.serverId)
                 ) {
                     canonicalOwner.id
                 } else {
@@ -546,7 +626,9 @@ class DownloadEngine(
                     song.id.removePrefix("lemon_online_").substringBefore("_")
                 } else "kw"
                 val rawMetaInitial = song.rawMetaJson ?: song.relativeFolderPath
-                val isServerSongInitial = song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                // 以实际 canonical 记录为准：若同一物理文件已属于服务器曲库，则不能标成待推送
+                val targetServerLinked = isServerLibraryId(songDao.getSongById(targetRecordSongId)?.serverId) ||
+                    isServerLibraryId(song.serverId)
                 downloadDao.insertOrUpdate(
                     DownloadEntity(
                         songId = targetRecordSongId,
@@ -563,11 +645,12 @@ class DownloadEngine(
                         platformSongId = song.id.removePrefix("lemon_online_${platformInitial}_"),
                         chosenQuality = if (song.bitRate >= 800) "flac" else if (song.bitRate >= 320) "320k" else "128k",
                         rawMetaJson = rawMetaInitial,
-                        serverPushStatus = if (isServerSongInitial) 0 else 1
+                        serverPushStatus = if (targetServerLinked) 0 else 1
                     )
                 )
                 removeTask(song.id)
                 urlResolverMap.remove(song.id)
+                    fallbackResolverMap.remove(song.id)
                 withContext(Dispatchers.Main) {
                     // 说清楚是"哪个音质档次"已有，用户才不会以为选 320K 被无视了。
                     // 取已有文件自身的扩展名，而不是本次请求的格式
@@ -600,12 +683,19 @@ class DownloadEngine(
                 rawMetaJson = rawMeta,
                 serverPushStatus = if (isServerSong) 0 else 1
             )
+            initialEntityRef = initialEntity
             downloadDao.insertOrUpdate(initialEntity)
             
             updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
 
             // 3. 进入并发信号量等待队列 (超出并发上限自动排队)
+            Log.i(TAG, "Waiting for download permit: ${song.title}")
+            // 下载完成后的元数据内嵌放到 withPermit 之外执行：它会发网络请求（封面/歌词），
+            // 若占着并发许可，用户看到「已完成」后再下下一首就会一直「排队等待中」。
+            var completedFileForMetadata: File? = null
+            var completedSongForMetadata: UnifiedSong? = null
             downloadSemaphore.withPermit {
+                Log.i(TAG, "Download permit acquired: ${song.title}")
                 var actualDestFile = destFile
                 try {
                     // 动态解析真实直链：**只要调用方传了解析器就以解析结果为准**。
@@ -615,12 +705,18 @@ class DownloadEngine(
                     // 与用户所选的下载音质完全无关。这是"选低音质仍下到无损"的第二个根因。
                     var effectiveStreamUrl = song.streamUrl
                     val activeResolver = urlResolver ?: urlResolverMap[song.id]
+                    val activeFallback = fallbackResolver ?: fallbackResolverMap[song.id]
                     if (activeResolver != null) {
+                        Log.i(TAG, "Resolving download stream: ${song.title}")
                         val resolved = runCatching { activeResolver() }.getOrNull()
+                        Log.i(TAG, "Resolved download stream: ${song.title} -> ${if (resolved.isNullOrBlank()) "null" else "ok"}")
                         if (!resolved.isNullOrBlank()) {
                             effectiveStreamUrl = resolved
                         }
                     }
+                    // 保存服务端代理原地址用于失败回退；实际下载优先走解出的 CDN 直链
+                    val proxyStreamUrl = effectiveStreamUrl
+                    effectiveStreamUrl = unwrapServerProxyUrl(effectiveStreamUrl)
                     if (effectiveStreamUrl.isBlank() && !record?.remoteUrl.isNullOrBlank() && record?.remoteUrl?.startsWith("http") == true) {
                         effectiveStreamUrl = record.remoteUrl
                     }
@@ -635,118 +731,268 @@ class DownloadEngine(
                         actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$preDetectedExt")
                     }
 
-                    val tempDestFile = File("${actualDestFile.absolutePath}.download")
+                    var tempDestFile = File("${actualDestFile.absolutePath}.download")
                     var existingBytes = if (tempDestFile.exists()) tempDestFile.length() else 0L
 
-                    fun buildDownloadRequest(rangeStart: Long): Request {
+                    // **分片下载**：服务端 /api/play/local 与 /api/play/proxy 的长时间整段流
+                    // 在 0.5~1.5MB 左右会停住（实测），只有单次 1MB 左右的 Range 请求稳定。
+                    // 因此每 1MB 发一次 Range，读完立刻关连接再续下一段，既避开服务端长连接
+                    // 的限速/断流，也让断点续传的偏移校验变得精确。
+                    val rangeChunkBytes = 1024L * 1024L
+                    var totalLength = -1L
+                    var totalRead = existingBytes
+                    var lastTime = System.currentTimeMillis()
+                    var lastBytes = existingBytes
+                    var contentTypeHeader = ""
+                    var downloadCompleted = false
+                    var loopCount = 0
+                    var resetCount = 0
+
+                    fun buildDownloadRequest(
+                        rangeStart: Long,
+                        rangeEnd: Long,
+                        targetUrl: String = effectiveStreamUrl
+                    ): Request {
                         val rb = Request.Builder()
-                            .url(effectiveStreamUrl)
-                        val cdnHeaders = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(effectiveStreamUrl)
+                            .url(targetUrl)
+                        val cdnHeaders = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(targetUrl)
                         cdnHeaders.forEach { (k, v) -> rb.header(k, v) }
-                        if (rangeStart > 0L) {
-                            rb.header("Range", "bytes=$rangeStart-")
-                        }
+                        rb.header("Range", "bytes=$rangeStart-$rangeEnd")
                         return rb.build()
                     }
 
-                    var response = okHttpClient.newCall(buildDownloadRequest(existingBytes)).execute()
-                    if (response.code == 416 && existingBytes > 0L) {
-                        response.close()
-                        tempDestFile.delete()
-                        existingBytes = 0L
-                        response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
-                    }
+                    var canFallbackToProxy = effectiveStreamUrl != proxyStreamUrl &&
+                        proxyStreamUrl.startsWith("http") && proxyStreamUrl.contains("/api/play/proxy")
 
-                    // 断点续传必须校验服务端实际返回的**起始偏移**，不能只看状态码是不是 206。
-                    // 若服务端/中间代理返回了偏移不一致的 206（或客户端断点文件被外部改动），
-                    // 把新数据直接 append 到本地残片会拼出一个头部正常、中段错乱的文件 ——
-                    // 播放器能解出时长但音频杂音/跳帧，而且魔数检测依然判定为合法 flac/mp3，
-                    // 用户与日志都极难发现。此处在进入读取前先校验并丢弃残片从头下载。
-                    if (response.code == 206 && existingBytes > 0L) {
-                        val contentRange = response.header("Content-Range")
-                        val rangeStart = contentRange
-                            ?.substringAfter("bytes", "")
-                            ?.substringBefore("-")
-                            ?.trim()
-                            ?.toLongOrNull()
-                        if (rangeStart == null || rangeStart != existingBytes) {
-                            Log.w(
-                                TAG,
-                                "断点偏移不匹配 (本地=$existingBytes, 服务端=$contentRange)，丢弃残片重新下载: ${song.title}"
-                            )
-                            response.close()
-                            tempDestFile.delete()
+                    var fallbackAttempt = 0
+                    var maxProgressSeen = 0f
+
+                    // 403/超时后按“服务器原文件 → 降一级音质 → 再降一级”的候选链切换。
+                    // 切换时丢弃旧临时文件，避免把 Hi-Res 的半截数据拼进 FLAC。
+                    suspend fun switchToFallback(): Boolean {
+                        val fallback = activeFallback ?: return false
+                        while (fallbackAttempt < 8) {
+                            val next = runCatching { fallback(fallbackAttempt++) }.getOrNull()
+                            if (next.isNullOrBlank() || next == effectiveStreamUrl) continue
+                            val nextExt = detectAudioExtension(null, next, "")
+                            if (nextExt != null && !actualDestFile.name.endsWith(".$nextExt", true)) {
+                                actualDestFile = File(destFile.parentFile, "${destFile.nameWithoutExtension}.$nextExt")
+                            }
+                            runCatching { tempDestFile.delete() }
+                            effectiveStreamUrl = next
+                            tempDestFile = File("${actualDestFile.absolutePath}.download")
                             existingBytes = 0L
-                            response = okHttpClient.newCall(buildDownloadRequest(0L)).execute()
+                            totalLength = -1L
+                            totalRead = 0L
+                            lastBytes = 0L
+                            lastTime = System.currentTimeMillis()
+                            contentTypeHeader = ""
+                            resetCount = 0
+                            canFallbackToProxy = false
+                            // 新候选是另一份文件，进度不能沿用旧候选的 100%
+                            maxProgressSeen = 0f
+                            Log.w(TAG, "Download fallback #${fallbackAttempt}: ${song.title} -> ${next.substringBefore('?')}")
+                            return true
+                        }
+                        return false
+                    }
+
+                    fun executeChunk(rangeStart: Long, rangeEnd: Long): okhttp3.Response {
+                        return try {
+                            downloadClient.newCall(buildDownloadRequest(rangeStart, rangeEnd)).execute()
+                        } catch (e: java.io.IOException) {
+                            if (!canFallbackToProxy) throw e
+                            Log.w(TAG, "Direct CDN connect failed (${e.message}), fallback to server proxy: ${song.title}")
+                            effectiveStreamUrl = proxyStreamUrl
+                            canFallbackToProxy = false
+                            downloadClient.newCall(buildDownloadRequest(rangeStart, rangeEnd)).execute()
                         }
                     }
 
-                    response.use { resp ->
-                        if (!resp.isSuccessful) {
-                            throw Exception("HTTP 下载失败: ${resp.code}")
+                    while (!downloadCompleted) {
+                        if (!coroutineContext.isActive) {
+                            Log.i(TAG, "Download cancelled/paused: ${song.title}")
+                            return@withPermit
                         }
+                        loopCount++
+                        if (loopCount > 50_000) throw Exception("下载分片次数异常，请重试")
 
-                        val body = resp.body ?: throw Exception("响应体为空")
-                        val contentTypeHeader = resp.header("Content-Type").orEmpty()
-
-                        val isRangeOk = resp.code == 206
-                        val append = isRangeOk && existingBytes > 0L
-                        val totalLength = if (isRangeOk) {
-                            existingBytes + body.contentLength()
+                        if (tempDestFile.exists()) existingBytes = tempDestFile.length()
+                        if (totalLength > 0 && existingBytes >= totalLength) {
+                            downloadCompleted = true
+                            break
+                        }
+                        if (existingBytes < 0L) existingBytes = 0L
+                        val rangeStart = existingBytes
+                        val rangeEnd = if (totalLength > 0) {
+                            minOf(rangeStart + rangeChunkBytes - 1, totalLength - 1)
                         } else {
-                            if (!append && tempDestFile.exists()) tempDestFile.delete()
-                            body.contentLength()
+                            rangeStart + rangeChunkBytes - 1
+                        }
+                        if (rangeEnd < rangeStart) {
+                            downloadCompleted = true
+                            break
                         }
 
-                        var lastTime = System.currentTimeMillis()
-                        var lastBytes = if (append) existingBytes else 0L
-                        var totalRead = if (append) existingBytes else 0L
+                        var response = try {
+                            executeChunk(rangeStart, rangeEnd)
+                        } catch (e: java.io.IOException) {
+                            if (!switchToFallback()) throw e
+                            continue
+                        }
+                        if (!response.isSuccessful) {
+                            Log.w(TAG, "Download chunk rejected (${response.code}): ${song.title}")
+                            response.close()
+                            if (switchToFallback()) continue
+                            throw Exception("HTTP 下载失败: ${response.code}")
+                        }
+                        Log.i(
+                            TAG,
+                            "Download chunk $rangeStart-$rangeEnd -> ${response.code} (${response.request.url.host})"
+                        )
+                        if ((response.body?.contentLength() ?: -1L) == 0L) {
+                            Log.w(TAG, "Empty audio body: ${song.title}")
+                            response.close()
+                            if (switchToFallback()) continue
+                            throw Exception("响应体为空")
+                        }
 
-                        body.byteStream().use { input ->
-                            FileOutputStream(tempDestFile, append).use { output ->
-                                val buffer = ByteArray(8 * 1024)
-                                var bytesRead: Int
+                        if (response.code == 416) {
+                            response.close()
+                            // 文件恰好是 chunk 整数倍时，最后一段之后会返回 416；
+                            // 服务端没给过总长度时按「已到末尾」处理，避免反复删档重下。
+                            if (rangeStart > 0L && totalLength <= 0L) {
+                                downloadCompleted = true
+                                break
+                            }
+                            if (rangeStart > 0L && resetCount < 1) {
+                                tempDestFile.delete()
+                                existingBytes = 0L
+                                totalLength = -1L
+                                totalRead = 0L
+                                resetCount++
+                                continue
+                            }
+                            if (switchToFallback()) continue
+                            throw Exception("HTTP 下载失败: 416")
+                        }
 
-                                while (input.read(buffer).also { bytesRead = it } != -1) {
-                                    if (!coroutineContext.isActive) {
-                                        Log.i(TAG, "Download task cancelled or paused for ${song.title}")
-                                        break
-                                    }
-                                    output.write(buffer, 0, bytesRead)
-                                    totalRead += bytesRead
+                        var restartFromZero = false
+                        response.use { resp ->
+                            val body = resp.body ?: throw Exception("响应体为空")
+                            contentTypeHeader = resp.header("Content-Type").orEmpty()
 
-                                    val now = System.currentTimeMillis()
-                                    if (now - lastTime >= 300 || totalRead == totalLength) {
-                                        val speed = if (now > lastTime) ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L else 0L
-                                        lastTime = now
-                                        lastBytes = totalRead
-                                        val progress = if (totalLength > 0) (totalRead.toFloat() / totalLength).coerceIn(0f, 1f) else 0f
-                                        updateTask(
-                                            DownloadTask(
-                                                song = song.copy(streamUrl = effectiveStreamUrl),
-                                                progress = progress,
-                                                bytesDownloaded = totalRead,
-                                                totalBytes = totalLength,
-                                                speedKbps = speed,
-                                                status = DownloadStatus.DOWNLOADING
+                            val isRangeOk = resp.code == 206
+                            val parsedRange = parseContentRange(resp.header("Content-Range"))
+                            val serverStart = parsedRange?.first
+                            val serverTotal = parsedRange?.third ?: -1L
+                            if (serverTotal > 0L) totalLength = serverTotal
+
+                            if (isRangeOk && serverStart != null && serverStart != rangeStart) {
+                                Log.w(
+                                    TAG,
+                                    "断点偏移不匹配 (本地=$rangeStart, 服务端=${resp.header("Content-Range")})，丢弃残片重新下载: ${song.title}"
+                                )
+                                restartFromZero = true
+                                return@use
+                            }
+
+                            val append = isRangeOk && rangeStart > 0L
+                            var baseRead = rangeStart
+                            if (!isRangeOk) {
+                                // 个别源忽略 Range，返回 200 整段；丢弃残片从头写，避免拼接错乱
+                                if (tempDestFile.exists()) tempDestFile.delete()
+                                existingBytes = 0L
+                                totalLength = body.contentLength().takeIf { it > 0L } ?: -1L
+                                baseRead = 0L
+                                totalRead = 0L
+                            } else {
+                                totalRead = rangeStart
+                            }
+
+                            val bodyLength = body.contentLength()
+                            var chunkRead = 0L
+                            body.byteStream().use { input ->
+                                FileOutputStream(tempDestFile, append).use { output ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    var bytesRead: Int
+                                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                                        if (!coroutineContext.isActive) break
+                                        output.write(buffer, 0, bytesRead)
+                                        chunkRead += bytesRead
+                                        totalRead = baseRead + chunkRead
+
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastTime >= 300 || (totalLength > 0 && totalRead >= totalLength)) {
+                                            val speed = if (now > lastTime) {
+                                                ((totalRead - lastBytes) * 1000L / (now - lastTime)) / 1024L
+                                            } else 0L
+                                            lastTime = now
+                                            lastBytes = totalRead
+                                            val rawProgress = if (totalLength > 0) {
+                                                (totalRead.toFloat() / totalLength).coerceIn(0f, 1f)
+                                            } else 0f
+                                            maxProgressSeen = maxOf(maxProgressSeen, rawProgress)
+                                            updateTask(
+                                                DownloadTask(
+                                                    song = song.copy(streamUrl = effectiveStreamUrl),
+                                                    progress = maxProgressSeen,
+                                                    bytesDownloaded = totalRead,
+                                                    totalBytes = totalLength,
+                                                    speedKbps = speed,
+                                                    status = DownloadStatus.DOWNLOADING
+                                                )
                                             )
-                                        )
+                                        }
                                     }
+                                    output.flush()
                                 }
-                                output.flush()
+                            }
+
+                            if (!coroutineContext.isActive) return@use
+                            if (bodyLength >= 0L && chunkRead < bodyLength) {
+                                throw Exception("分片不完整（${chunkRead}/${bodyLength} 字节），请重试")
+                            }
+                            val newSize = if (tempDestFile.exists()) tempDestFile.length() else 0L
+                            existingBytes = newSize
+                            totalRead = newSize
+
+                            downloadCompleted = if (!isRangeOk) {
+                                true
+                            } else {
+                                val requested = rangeEnd - rangeStart + 1L
+                                (totalLength > 0L && existingBytes >= totalLength) ||
+                                    (bodyLength in 0L until requested) ||
+                                    (bodyLength < 0L && newSize - rangeStart < requested)
                             }
                         }
 
-                        if (!coroutineContext.isActive) {
-                            Log.i(TAG, "Download inactive for ${song.title}, aborting post-processing")
-                            return@withPermit
+                        if (!coroutineContext.isActive) return@withPermit
+                        if (restartFromZero) {
+                            if (resetCount >= 1) throw Exception("服务端 Range 偏移异常")
+                            resetCount++
+                            tempDestFile.delete()
+                            existingBytes = 0L
+                            totalLength = -1L
+                            totalRead = 0L
+                            continue
                         }
+                        if (!downloadCompleted && tempDestFile.length() == rangeStart) {
+                            throw Exception("下载停滞，请重试")
+                        }
+                    }
 
-                        // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
-                        val realAudioExt = detectAudioExtension(tempDestFile, effectiveStreamUrl, contentTypeHeader)
-                        if (realAudioExt != null && !actualDestFile.name.endsWith(".$realAudioExt", ignoreCase = true)) {
-                            actualDestFile = File(actualDestFile.parentFile, "${actualDestFile.nameWithoutExtension}.$realAudioExt")
-                        }
+                    if (tempDestFile.length() <= 0L) {
+                        throw Exception("服务端返回了空文件")
+                    }
+                    if (totalLength > 0L && tempDestFile.length() < totalLength) {
+                        throw Exception("下载不完整（已接收 ${tempDestFile.length()} / $totalLength 字节），请重试")
+                    }
+
+                    // 下载完成后，通过文件魔数头 (fLaC / ID3 / RIFF / ftyp) 与 Content-Type 二次精准校准真实文件扩展名
+                    val realAudioExt = detectAudioExtension(tempDestFile, effectiveStreamUrl, contentTypeHeader)
+                    if (realAudioExt != null && !actualDestFile.name.endsWith(".$realAudioExt", ignoreCase = true)) {
+                        actualDestFile = File(actualDestFile.parentFile, "${actualDestFile.nameWithoutExtension}.$realAudioExt")
                     }
 
                     // 原子化重命名临时文件为正式音频文件
@@ -759,10 +1005,17 @@ class DownloadEngine(
                     }
 
                     val finalExt = actualDestFile.extension.lowercase().ifBlank { song.format.lowercase() }
+                    val probedBitRate = readAudioBitRate(actualDestFile)
+                    val actualBitRate = probedBitRate.takeIf { it > 0 } ?: when {
+                        finalExt in LOSSLESS_AUDIO_EXTS -> 960
+                        effectiveStreamUrl.contains("320") -> 320
+                        effectiveStreamUrl.contains("128") -> 128
+                        else -> song.bitRate
+                    }
                     val finalSong = song.copy(
                         streamUrl = effectiveStreamUrl,
                         format = finalExt,
-                        bitRate = if (finalExt in listOf("flac", "wav")) song.bitRate.coerceAtLeast(960) else song.bitRate
+                        bitRate = actualBitRate
                     )
 
                     // ===== 收尾顺序是本文件最容易踩坑的地方，务必看清以下分工 =====
@@ -789,7 +1042,7 @@ class DownloadEngine(
                     // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表（先清理同一物理路径的冗余旧记录）
                     val canonicalOwner = songDao.getSongByLocalPath(actualDestFile.absolutePath)
                     val targetRecordSongId = if (canonicalOwner != null && canonicalOwner.id != song.id &&
-                        canonicalOwner.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")
+                        isServerLibraryId(canonicalOwner.serverId)
                     ) {
                         canonicalOwner.id
                     } else {
@@ -799,6 +1052,12 @@ class DownloadEngine(
                     if (targetRecordSongId != song.id) {
                         downloadDao.deleteDownload(song.id)
                     }
+                    // 顺序很重要：saveOrUpdateSongEntity 在处理「同一物理文件已属于服务器曲库记录」时
+                    // 会清理 downloads 表中的冗余记录。必须**先**写 songs 表、再写 completedEntity，
+                    // 否则刚插入的完成/待同步记录会被它删掉，表现为「下载完成但下载管理里没有记录」。
+                    saveOrUpdateSongEntity(finalSong.copy(coverUrl = effectiveCover), actualDestFile.absolutePath)
+                    val targetServerLinked = isServerLibraryId(songDao.getSongById(targetRecordSongId)?.serverId) ||
+                        isServerLibraryId(song.serverId)
                     val completedEntity = initialEntity.copy(
                         songId = targetRecordSongId,
                         status = DownloadStatus.DOWNLOADED,
@@ -807,12 +1066,18 @@ class DownloadEngine(
                         remoteUrl = effectiveStreamUrl,
                         bytesDownloaded = actualDestFile.length(),
                         totalBytes = actualDestFile.length(),
-                        completedTimestamp = System.currentTimeMillis()
+                        completedTimestamp = System.currentTimeMillis(),
+                        // 以实际落库的 canonical 记录为准：服务器曲库已有此歌时不能再标成待推送，
+                        // 否则离线同步会把它再次推到服务端，形成「已有同名文件」的 await_exist 死队列。
+                        serverPushStatus = if (targetServerLinked) 0 else 1
                     )
                     downloadDao.insertOrUpdate(completedEntity)
-                    saveOrUpdateSongEntity(finalSong.copy(coverUrl = effectiveCover), actualDestFile.absolutePath)
                     removeTask(song.id)
                     urlResolverMap.remove(song.id)
+                    fallbackResolverMap.remove(song.id)
+                    // 许可释放后再做元数据；这里只登记，不占用 withPermit
+                    completedFileForMetadata = actualDestFile
+                    completedSongForMetadata = finalSong
                     Log.i(TAG, "Song ${song.title} downloaded to ${actualDestFile.absolutePath}（元数据将在后台继续内嵌）")
 
                     withContext(Dispatchers.Main) {
@@ -824,22 +1089,6 @@ class DownloadEngine(
                             "「${song.title}」已完成离线下载 [实际音质: $actualQuality]",
                             Toast.LENGTH_SHORT
                         ).show()
-                    }
-
-                    // 6. 后台补全元数据（封面下载、歌词拉取、标签内嵌）—— 不阻塞「已完成」状态。
-                    //    NonCancellable：标签写入是文件级写操作，中途被打断会留下损坏的音频头。
-                    try {
-                        val localCoverPath = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                            postProcessDownloadedFile(actualDestFile, finalSong)
-                        }
-                        // 封面文件（cover.jpg）此时已落盘，列表下次刷新时会自然带上；
-                        // 不再为此额外写库 —— 下载结果本身已经是 DOWNLOADED 且路径正确，
-                        // 多一次写库只会多一次 songs 表失效通知（触发整库重算）。
-                        Log.i(TAG, "Song ${song.title} 元数据内嵌完成（封面=${localCoverPath ?: "无"}）")
-                    } catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
-                        // 元数据失败不影响下载结果：音频已完整落盘、库记录已是 DOWNLOADED
-                        Log.w(TAG, "元数据内嵌失败（不影响已下载文件）: ${song.title}", e)
                     }
 
                 } catch (e: Exception) {
@@ -862,18 +1111,74 @@ class DownloadEngine(
                         songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null)
                         removeTask(song.id)
                         urlResolverMap.remove(song.id)
+                    fallbackResolverMap.remove(song.id)
                         withContext(Dispatchers.Main) {
                             Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
                         }
                     }
-                } finally {
-                    val targetJob = currentJob ?: placeholderJob
-                    jobMap.remove(song.id, targetJob)
                 }
             }
+
+            // 6. 后台补全元数据（封面下载、歌词拉取、标签内嵌）—— 在 withPermit 之外执行，
+            //    不占用下载并发许可；标签写入用 NonCancellable，避免留下半截音频头。
+            completedFileForMetadata?.let { metaFile ->
+                val metaSong = completedSongForMetadata
+                if (metaSong != null) {
+                    try {
+                        val localCoverPath = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                            postProcessDownloadedFile(metaFile, metaSong)
+                        }
+                        Log.i(TAG, "Song ${metaSong.title} 元数据内嵌完成（封面=${localCoverPath ?: "无"}）")
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        Log.w(TAG, "元数据内嵌失败（不影响已下载文件）: ${metaSong.title}", e)
+                    }
+                }
+            }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) {
+                    // 用户暂停/取消：交给 pauseTask/cancelTask 维护状态，这里只记录
+                    Log.i(TAG, "Download job for ${song.title} cancelled before transfer loop")
+                } else {
+                    Log.e(TAG, "Download task failed before transfer loop for ${song.title}", e)
+                    initialEntityRef?.let { pending ->
+                        runCatching {
+                            downloadDao.insertOrUpdate(
+                                pending.copy(status = DownloadStatus.FAILED, errorMessage = e.message)
+                            )
+                        }
+                    }
+                    runCatching { songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null) }
+                    removeTask(song.id)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } finally {
+                if (selfJob != null) jobMap.remove(song.id, selfJob)
+                urlResolverMap.remove(song.id)
+                    fallbackResolverMap.remove(song.id)
+            }
         }
-        currentJob = job
-        jobMap[song.id] = job
+        val existingJob = jobMap.putIfAbsent(song.id, job)
+        if (existingJob != null) {
+            job.cancel()
+            coroutineScope.launch(Dispatchers.Main) {
+                Toast.makeText(context, "「${song.title}」正在下载中，请稍候...", Toast.LENGTH_SHORT).show()
+            }
+            return false
+        }
+        if (urlResolver != null) {
+            urlResolverMap[song.id] = urlResolver
+        }
+        if (fallbackResolver != null) {
+            fallbackResolverMap[song.id] = fallbackResolver
+        }
+        // 立即向活跃任务映射中加入，确保 UI 在点击瞬间立即可见 (避免直链解析网络延迟导致下载中空白)
+        updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
+        job.start()
+        Log.i(TAG, "Download enqueued: ${song.title} (id=${song.id}, resolver=${urlResolver != null})")
+        return true
     }
 
     /**
@@ -896,7 +1201,11 @@ class DownloadEngine(
     fun resumeTask(songId: String) {
         val task = _activeTasksMap.value[songId] ?: return
         if (task.status == DownloadStatus.PAUSED || !jobMap.containsKey(songId)) {
-            startDownload(task.song, urlResolver = urlResolverMap[songId])
+            startDownload(
+                task.song,
+                urlResolver = urlResolverMap[songId],
+                fallbackResolver = fallbackResolverMap[songId]
+            )
         }
     }
 
@@ -907,6 +1216,7 @@ class DownloadEngine(
         val task = _activeTasksMap.value[songId]
         jobMap.remove(songId)?.cancel()
         urlResolverMap.remove(songId)
+        fallbackResolverMap.remove(songId)
         removeTask(songId)
         coroutineScope.launch(Dispatchers.IO) {
             val record = downloadDao.getDownloadRecord(songId)

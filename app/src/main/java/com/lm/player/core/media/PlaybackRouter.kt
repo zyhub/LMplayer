@@ -26,6 +26,24 @@ class PlaybackRouter(
 ) {
     private val TAG = "PlaybackRouter"
 
+    /** 构造 LX 音源最小 musicInfo；空 hash/songmid 必须删除，否则脚本会优先取到空串。 */
+    private fun buildAccelerationInfo(song: UnifiedSong): String {
+        val obj = runCatching { org.json.JSONObject(song.rawMetaJson ?: "{}") }.getOrDefault(org.json.JSONObject())
+        val clean = song.id.removePrefix("lemon_online_")
+        val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+        if (rawId.isNotBlank()) {
+            if (obj.optString("id").isBlank()) obj.put("id", rawId)
+            if (obj.optString("songId").isBlank()) obj.put("songId", rawId)
+        }
+        if (obj.optString("name").isBlank()) obj.put("name", song.title)
+        if (obj.optString("singer").isBlank()) obj.put("singer", song.artist)
+        if (obj.optString("albumName").isBlank()) obj.put("albumName", song.album)
+        listOf("hash", "songmid").forEach { key ->
+            if (obj.has(key) && obj.optString(key).isBlank()) obj.remove(key)
+        }
+        return obj.toString()
+    }
+
     /**
      * 核心路由决策机制：
      * 1. 优先检测本地已下载文件 (Room 下载库、曲目本地路径、默认存储目录)。
@@ -115,8 +133,43 @@ class PlaybackRouter(
                         val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
                         protocol.ensureAuthenticated()
 
-                        // 1. 若已有服务端本地流地址或属于服务端曲库曲目，优先刷新鉴权 Token 与标准流地址
-                        if (finalStreamUrl.contains("/api/play/local") || isServerSong) {
+                        // 1. 音源加速优先：外网/内网高延迟时，先本地解析；即使这首歌在服务端有原文件，
+                        //    也允许用同曲目同音质直链加速。失败不报错，继续原有服务器路径。
+                        var accelerated = false
+                        // 服务端曲库曲目优先走 NAS 本地文件；只对真正的在线曲目做本地音源加速，
+                        // 避免把 lemon_<hash> 误当成平台标识传给脚本。
+                        if (isOnlineId && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                            val clean = song.id.removePrefix("lemon_online_")
+                            val accelSource = if (clean.contains("_")) clean.substringBefore("_") else "kw"
+                            val accelQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
+                            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
+                                source = accelSource,
+                                quality = accelQuality,
+                                musicInfoJson = buildAccelerationInfo(song)
+                            )
+                            local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let {
+                                finalStreamUrl = it
+                                accelerated = true
+                                Log.i(TAG, "Home/playback local acceleration resolved: ${song.title}")
+                            }
+                        } else if (isServerSong && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                            // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；
+                            // 1.5 秒内未命中就直接播 NAS 文件。
+                            val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
+                                protocol = protocol,
+                                serverId = active.id,
+                                song = song,
+                                overrideQuality = overrideQuality
+                            ).getOrNull()
+                            resolved?.let {
+                                finalStreamUrl = it.url
+                                accelerated = true
+                                Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
+                            }
+                        }
+
+                        // 2. 若已有服务端本地流地址或属于服务端曲库曲目，优先刷新鉴权 Token 与标准流地址
+                        if (!accelerated && (finalStreamUrl.contains("/api/play/local") || isServerSong)) {
                             var serverPath = LemonMusicProtocol.getServerFilePath(song.id, finalStreamUrl, song.coverUrl)
                             if (serverPath.isNullOrBlank()) {
                                 val rel = song.relativeFolderPath?.trim().orEmpty()
@@ -226,19 +279,19 @@ class PlaybackRouter(
         }
 
         val uri: Uri = if (resolvedLocalPath != null) {
-            Log.d(TAG, "Routing to local file: $resolvedLocalPath")
+            Log.d(TAG, "Routing to local file: ${com.lm.player.core.security.LogRedactor.url(resolvedLocalPath)}")
             Uri.fromFile(File(resolvedLocalPath))
         } else if (finalStreamUrl.startsWith("content://")) {
-            Log.d(TAG, "Routing to SAF content uri: $finalStreamUrl")
+            Log.d(TAG, "Routing to SAF content uri: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.parse(finalStreamUrl)
         } else if (finalStreamUrl.startsWith("http://") || finalStreamUrl.startsWith("https://")) {
-            Log.d(TAG, "Routing to remote stream: $finalStreamUrl")
+            Log.d(TAG, "Routing to remote stream: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.parse(finalStreamUrl)
         } else if (finalStreamUrl.startsWith("/") && File(finalStreamUrl).let { it.exists() && it.length() > 0 }) {
-            Log.d(TAG, "Routing to direct file path: $finalStreamUrl")
+            Log.d(TAG, "Routing to direct file path: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.fromFile(File(finalStreamUrl))
         } else {
-            Log.e(TAG, "Invalid stream URL for ${song.title}: '$finalStreamUrl'")
+            Log.e(TAG, "Invalid stream URL for ${song.title}: '${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}'")
             throw IllegalStateException("未能解析到有效的音频播放地址，请检查网络或音源设置")
         }
 

@@ -4,7 +4,10 @@ import androidx.room.*
 import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.PlaylistEntity
 import com.lm.player.core.database.entity.PlaylistSongEntity
+import com.lm.player.core.database.entity.ResolvedStreamCacheEntity
 import com.lm.player.core.database.entity.ServerEntity
+import com.lm.player.core.database.entity.ServerSourceEntity
+import com.lm.player.core.database.entity.ServerSourceMetaEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
 import kotlinx.coroutines.flow.Flow
@@ -152,6 +155,10 @@ interface SongDao {
     @Query("DELETE FROM songs WHERE serverId = :serverId")
     suspend fun deleteSongsByServer(serverId: String)
 
+    /** 删除历史非柠檬服务器前，先把已下载到本机的曲目转为本地记录，避免误删文件。 */
+    @Query("UPDATE songs SET serverId = 'local_storage' WHERE serverId = :serverId AND downloadStatus = 'DOWNLOADED' AND localFilePath IS NOT NULL AND localFilePath != ''")
+    suspend fun migrateDownloadedSongsToLocal(serverId: String)
+
     @Query("DELETE FROM songs WHERE downloadStatus != 'DOWNLOADED' AND (localFilePath IS NULL OR localFilePath = '')")
     suspend fun clearNonDownloadedSongs()
 
@@ -198,16 +205,19 @@ interface DownloadDao {
     @Query("DELETE FROM downloads WHERE localFilePath = :localPath")
     suspend fun deleteDownloadByLocalPath(localPath: String)
 
-    @Query("SELECT * FROM downloads WHERE serverPushStatus = 1 ORDER BY completedTimestamp DESC")
+    // 待同步口径必须包含 3 (上次推送失败) 与 2 (推送中，进程被杀后会由
+    // OfflineSyncManager 启动时恢复为 1)。只查 1 会让失败任务从看板上彻底消失，
+    // 用户既看不到失败原因，也没有重试入口。
+    @Query("SELECT * FROM downloads WHERE serverPushStatus IN (1, 2, 3) ORDER BY completedTimestamp DESC")
     fun getPendingServerPushFlow(): Flow<List<DownloadEntity>>
 
-    @Query("SELECT * FROM downloads WHERE serverPushStatus = 1 ORDER BY completedTimestamp DESC")
+    @Query("SELECT * FROM downloads WHERE serverPushStatus IN (1, 2, 3) ORDER BY completedTimestamp DESC")
     suspend fun getPendingServerPushList(): List<DownloadEntity>
 
-    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus = 1")
+    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus IN (1, 2, 3)")
     fun getPendingServerPushCountFlow(): Flow<Int>
 
-    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus = 1")
+    @Query("SELECT COUNT(*) FROM downloads WHERE serverPushStatus IN (1, 2, 3)")
     suspend fun getPendingServerPushCount(): Int
 
     @Query("UPDATE downloads SET serverPushStatus = :status, lastPushTime = :pushTime, pushErrorMessage = :errorMessage WHERE songId = :songId")
@@ -225,6 +235,42 @@ interface DownloadDao {
 
     @Query("UPDATE downloads SET serverPushStatus = :status WHERE serverPushStatus = :fromStatus")
     suspend fun markAllServerPushStatus(fromStatus: Int, status: Int)
+}
+
+@Dao
+interface ServerSourceDao {
+    @Query("SELECT * FROM server_sources WHERE serverId = :serverId ORDER BY isActive DESC, name ASC")
+    fun observeSources(serverId: String): Flow<List<ServerSourceEntity>>
+
+    @Query("SELECT * FROM server_sources WHERE serverId = :serverId ORDER BY isActive DESC, name ASC")
+    suspend fun getSources(serverId: String): List<ServerSourceEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSources(items: List<ServerSourceEntity>)
+
+    @Query("DELETE FROM server_sources WHERE serverId = :serverId")
+    suspend fun deleteSources(serverId: String)
+
+    @Query("SELECT * FROM server_source_meta WHERE serverId = :serverId LIMIT 1")
+    fun observeMeta(serverId: String): Flow<ServerSourceMetaEntity?>
+
+    @Query("SELECT * FROM server_source_meta WHERE serverId = :serverId LIMIT 1")
+    suspend fun getMeta(serverId: String): ServerSourceMetaEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertMeta(meta: ServerSourceMetaEntity)
+
+    @Query("SELECT * FROM resolved_stream_cache WHERE cacheKey = :cacheKey LIMIT 1")
+    suspend fun getCachedStream(cacheKey: String): ResolvedStreamCacheEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCachedStream(entity: ResolvedStreamCacheEntity)
+
+    @Query("DELETE FROM resolved_stream_cache WHERE expiresAt < :now")
+    suspend fun purgeExpiredStreams(now: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM resolved_stream_cache WHERE serverHost = :serverHost")
+    suspend fun clearCachedStreamsForHost(serverHost: String)
 }
 
 @Dao
@@ -249,6 +295,9 @@ interface ServerDao {
 
     @Query("DELETE FROM servers WHERE id = :serverId")
     suspend fun deleteServer(serverId: String)
+
+    @Query("UPDATE servers SET tokenOrApiKey = :encrypted WHERE id = :serverId")
+    suspend fun updateServerToken(serverId: String, encrypted: String)
 }
 
 @Dao

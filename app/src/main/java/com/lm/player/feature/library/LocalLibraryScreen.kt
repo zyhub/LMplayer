@@ -87,6 +87,33 @@ import kotlinx.coroutines.launch
  * 6. 全部歌曲高保真流 (带格式/音质标签、收藏、下载弹窗、多维排序、多选/全选下载)
  * 7. 页面内无缝下钻视图 (歌单/歌手/专辑/流派详情，不遮挡底部悬浮播放栏)
  */
+data class LocalLibraryCallbacks(
+    val onScrollPositionChange: (Boolean) -> Unit = {},
+    val onListScrollingChange: (Boolean) -> Unit = {},
+    val onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { _, _ -> },
+    val onDownloadSong: (UnifiedSong) -> Unit = {},
+    val onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { _, _, _ -> },
+    val onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { _, _, _ -> },
+    val onOpenDownloads: () -> Unit = {},
+    val onRefreshPlaylists: () -> Unit = {},
+    val onCreatePlaylist: (name: String, isOnline: Boolean) -> Unit = { _, _ -> },
+    val onDeletePlaylist: (playlistId: String) -> Unit = {},
+    val onToggleFavorite: ((UnifiedSong) -> Unit)? = null,
+    val onFetchPlaylistSongs: (suspend (playlistId: String, isOnline: Boolean) -> List<UnifiedSong>)? = null,
+    val onFetchServerFolders: (suspend (parentId: String?) -> List<ServerFolderItem>)? = null,
+    val onFetchServerFolderSongs: (suspend (folderId: String) -> List<UnifiedSong>)? = null,
+    val onFetchServerGenres: (suspend () -> List<UnifiedGenre>)? = null,
+    val onFetchServerScanStatus: (suspend () -> LemonScanStatus?)? = null,
+    val onTriggerServerScan: (suspend () -> Unit)? = null,
+    val onDeleteLocalFilePath: (suspend (String) -> Unit)? = null,
+    val onDeleteDownloadedSongs: ((List<UnifiedSong>) -> Unit)? = null,
+    val onSelectLocalServer: () -> Unit = {},
+    val onSelectServer: (ServerConfig) -> Unit = {},
+    val onSyncNow: () -> Unit = {},
+    val onGoToSettings: () -> Unit = {},
+    val onSubViewActiveChange: (Boolean) -> Unit = {}
+)
+
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
@@ -105,39 +132,39 @@ fun LocalLibraryScreen(
     isPlaying: Boolean = false,
     locateSongTrigger: Int = 0,
     scrollToTopTrigger: Int = 0,
-    onScrollPositionChange: (Boolean) -> Unit = {},
-    onListScrollingChange: (Boolean) -> Unit = {},
-    onSongClick: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, _ -> },
-    onDownloadSong: (UnifiedSong) -> Unit = {},
-    onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
-    onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { songs, target, quality ->
-        songs.forEach { onDownloadSongWithOptions(it, target, quality) }
-    },
-    onOpenDownloads: () -> Unit = {},
-    onRefreshPlaylists: () -> Unit = {},
-    onCreatePlaylist: (name: String, isOnline: Boolean) -> Unit = { _, _ -> },
-    onDeletePlaylist: (playlistId: String) -> Unit = {},
-    onToggleFavorite: ((UnifiedSong) -> Unit)? = null,
-    onFetchPlaylistSongs: (suspend (playlistId: String, isOnline: Boolean) -> List<UnifiedSong>)? = null,
-    onFetchServerFolders: (suspend (parentId: String?) -> List<ServerFolderItem>)? = null,
-    onFetchServerFolderSongs: (suspend (folderId: String) -> List<UnifiedSong>)? = null,
-    onFetchServerGenres: (suspend () -> List<UnifiedGenre>)? = null,
-    onFetchServerScanStatus: (suspend () -> LemonScanStatus?)? = null,
-    onTriggerServerScan: (suspend () -> Unit)? = null,
-    onDeleteLocalFilePath: (suspend (String) -> Unit)? = null,
-    onDeleteDownloadedSongs: ((List<UnifiedSong>) -> Unit)? = null,
     initialCategory: LibraryCategory? = null,
     currentServerName: String = "本地模式",
     configuredServers: List<ServerConfig> = emptyList(),
     blurAlpha: Float = 0.85f,
     dynamicCardEffects: Boolean = true,
-    onSelectLocalServer: () -> Unit = {},
-    onSelectServer: (ServerConfig) -> Unit = {},
-    onSyncNow: () -> Unit = {},
-    onGoToSettings: () -> Unit = {},
-    onSubViewActiveChange: (Boolean) -> Unit = {},
+    callbacks: LocalLibraryCallbacks = LocalLibraryCallbacks(),
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
+    val onScrollPositionChange = callbacks.onScrollPositionChange
+    val onListScrollingChange = callbacks.onListScrollingChange
+    val onSongClick = callbacks.onSongClick
+    val onDownloadSong = callbacks.onDownloadSong
+    val onDownloadSongWithOptions = callbacks.onDownloadSongWithOptions
+    val onBatchDownloadSongsWithOptions = callbacks.onBatchDownloadSongsWithOptions
+    val onOpenDownloads = callbacks.onOpenDownloads
+    val onRefreshPlaylists = callbacks.onRefreshPlaylists
+    val onCreatePlaylist = callbacks.onCreatePlaylist
+    val onDeletePlaylist = callbacks.onDeletePlaylist
+    val onToggleFavorite = callbacks.onToggleFavorite
+    val onFetchPlaylistSongs = callbacks.onFetchPlaylistSongs
+    val onFetchServerFolders = callbacks.onFetchServerFolders
+    val onFetchServerFolderSongs = callbacks.onFetchServerFolderSongs
+    val onFetchServerGenres = callbacks.onFetchServerGenres
+    val onFetchServerScanStatus = callbacks.onFetchServerScanStatus
+    val onTriggerServerScan = callbacks.onTriggerServerScan
+    val onDeleteLocalFilePath = callbacks.onDeleteLocalFilePath
+    val onDeleteDownloadedSongs = callbacks.onDeleteDownloadedSongs
+    val onSelectLocalServer = callbacks.onSelectLocalServer
+    val onSelectServer = callbacks.onSelectServer
+    val onSyncNow = callbacks.onSyncNow
+    val onGoToSettings = callbacks.onGoToSettings
+    val onSubViewActiveChange = callbacks.onSubViewActiveChange
+
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val dimensions = LocalAppDimensions.current

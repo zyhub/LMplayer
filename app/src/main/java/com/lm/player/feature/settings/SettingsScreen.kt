@@ -2,6 +2,7 @@ package com.lm.player.feature.settings
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -42,6 +43,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.database.entity.ServerSourceEntity
+import com.lm.player.core.database.entity.ServerSourceMetaEntity
 import com.lm.player.core.designsystem.theme.*
 import com.lm.player.core.media.DynamicIslandManager
 import com.lm.player.core.media.IslandDisplayMode
@@ -50,9 +53,14 @@ import com.lm.player.core.media.Media3Factory
 import com.lm.player.core.model.*
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
+import com.lm.player.core.network.ServerLatencyMonitor
+import com.lm.player.core.source.ServerSourceRepository
 import com.lm.player.core.update.AppUpdateManager
 import com.lm.player.core.update.UpdateInfo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -61,7 +69,7 @@ import kotlinx.coroutines.withContext
  */
 enum class SettingsTab(val label: String, val icon: ImageVector) {
     ACCOUNT("账号与服务", Icons.Default.CloudSync),
-    SOURCES("音源与脚本", Icons.Default.GraphicEq),
+    SOURCES("音源状态", Icons.Default.GraphicEq),
     LIBRARY_PATHS("存储与路径", Icons.Default.Folder),
     DOWNLOAD("下载偏好", Icons.Default.Download),
     PLAYBACK_UI("播放与外观", Icons.Default.Palette)
@@ -106,6 +114,7 @@ fun SettingsScreen(
     onLocalScanCompleted: () -> Unit = {},
     onStreamQualityChanged: () -> Unit = {},
     onOpenDownloads: () -> Unit,
+    onSyncNow: () -> Unit = {},
     onExitAppCompletely: () -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
@@ -128,9 +137,6 @@ fun SettingsScreen(
     var defaultDownloadTarget by remember {
         mutableStateOf(DownloadTarget.valueOf(prefs.getString("default_download_target", DownloadTarget.LOCAL.name) ?: DownloadTarget.LOCAL.name))
     }
-    var autoFallbackSource by remember {
-        mutableStateOf(prefs.getBoolean("source_fallback_enabled", true))
-    }
     var embedCoverMeta by remember {
         mutableStateOf(prefs.getBoolean("download_embed_cover", true))
     }
@@ -143,10 +149,12 @@ fun SettingsScreen(
     var autoCacheOnFavorite by remember {
         mutableStateOf(prefs.getBoolean("auto_cache_on_favorite", false) || prefs.getBoolean("auto_cache_to_server_on_favorite", false))
     }
+    var offlineSyncAutoPush by remember {
+        mutableStateOf(prefs.getBoolean("offline_sync_auto_push", false))
+    }
     var autoCacheServerQuality by remember {
         mutableStateOf(AudioQuality.fromKey(prefs.getString("auto_cache_server_quality", "320k") ?: "320k"))
     }
-    var expandedScriptIds by remember { mutableStateOf(setOf<String>()) }
     var maxConcurrentDownloads by remember(downloadSettings.maxConcurrent) {
         mutableIntStateOf(downloadSettings.maxConcurrent.coerceIn(1, 6))
     }
@@ -169,6 +177,7 @@ fun SettingsScreen(
 
     // 弹窗状态
     var showAddServerDialog by remember { mutableStateOf(false) }
+    var showServerManager by remember { mutableStateOf(false) }
     var editingServer by remember { mutableStateOf<ServerConfig?>(null) }
     var isTestingConnection by remember { mutableStateOf(false) }
     var cacheSizeBytes by remember { mutableStateOf(Media3Factory.getCacheSizeBytes(context)) }
@@ -191,18 +200,56 @@ fun SettingsScreen(
     var storageFreeSizeBytes by remember { mutableLongStateOf(0L) }
     var isCalculatingStorage by remember { mutableStateOf(false) }
 
-    // 服务端音源管理状态 (连接柠檬音乐服务端时可用)
+    // 服务端音源状态 (连接柠檬音乐服务端时可用；状态由 /api/source/list 落库)
     val activeServer = servers.firstOrNull { it.id == activeServerId } ?: servers.firstOrNull { it.isCurrentActive }
-    val isConnectedToLemonServer = activeServer != null && activeServer.type == ServerType.LEMON_MUSIC
+    val isLocalMode = activeServer == null
+    val lemonServers = remember(servers) { servers.filter { it.type == ServerType.LEMON_MUSIC } }
+    // 本地模式也会选一台已配置的柠檬服务器展示其缓存状态（明确标注「未连接」）；
+    // 不能因为切到本地模式就把服务端音源看板清空。
+    val sourceStatusServer = activeServer?.takeIf { it.type == ServerType.LEMON_MUSIC }
+        ?: servers.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+    val sourceServerHost = remember(sourceStatusServer?.serverUrl) {
+        val raw = sourceStatusServer?.serverUrl.orEmpty().trim()
+        raw.substringAfter("://", raw).substringBefore('/').substringBefore('?')
+    }
 
-    var sourceScripts by remember { mutableStateOf<List<LemonSourceScriptInfo>>(emptyList()) }
-    var isLoadingScripts by remember { mutableStateOf(false) }
+    val cachedSources by remember(sourceStatusServer?.id) {
+        sourceStatusServer?.let { database.serverSourceDao().observeSources(it.id) }
+            ?: flowOf(emptyList<ServerSourceEntity>())
+    }.collectAsState(initial = emptyList())
+    val cachedSourceMeta by remember(sourceStatusServer?.id) {
+        sourceStatusServer?.let { database.serverSourceDao().observeMeta(it.id) }
+            ?: flowOf<ServerSourceMetaEntity?>(null)
+    }.collectAsState(initial = null)
+    var isRefreshingSources by remember { mutableStateOf(false) }
+    var sourceStatusError by remember { mutableStateOf<String?>(null) }
+    // 实时连接探测：不能再用 Room 里 10 分钟前的缓存放行“在线/已授权”。
+    var liveServerOnline by remember(sourceStatusServer?.id) { mutableStateOf<Boolean?>(null) }
+    var liveServerLatency by remember(sourceStatusServer?.id) { mutableStateOf<Long?>(null) }
 
-    var showImportScriptDialog by remember { mutableStateOf(false) }
-    var importScriptUrl by remember { mutableStateOf("") }
-    var importScriptCode by remember { mutableStateOf("") }
-    var isImportingUrl by remember { mutableStateOf(true) }
-    var scriptToDelete by remember { mutableStateOf<LemonSourceScriptInfo?>(null) }
+    LaunchedEffect(sourceStatusServer?.id) {
+        val server = sourceStatusServer ?: run {
+            liveServerOnline = null
+            liveServerLatency = null
+            return@LaunchedEffect
+        }
+        while (isActive) {
+            val started = SystemClock.elapsedRealtime()
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    val client = NetworkClientFactory.createOkHttpClient(context)
+                    val proto = LemonMusicProtocol(client, server.serverUrl, server.username, server.tokenOrApiKey)
+                    proto.healthCheck(4_000L).getOrDefault(false)
+                }.getOrDefault(false)
+            }
+            val elapsed = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+            liveServerOnline = ok
+            liveServerLatency = if (ok) elapsed else null
+            ServerLatencyMonitor.record(sourceServerHost, elapsed, ok)
+            com.lm.player.core.source.SourceAccelerationController.onServerSample(sourceServerHost, elapsed, ok)
+            delay(if (ok) 15_000L else 6_000L)
+        }
+    }
 
     // 服务器保存路径管理状态
     var serverDownloadPath by remember { mutableStateOf("") }
@@ -221,18 +268,29 @@ fun SettingsScreen(
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
     var newLocalPathInput by remember { mutableStateOf("") }
 
-    // 当切换到音源脚本、下载偏好或存储路径 Tab 时，若连接了柠檬音乐则自动拉取同步
-    LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
+    // 当切换到音源状态、下载偏好或存储路径 Tab 时，若连接了柠檬音乐则自动拉取同步
+    LaunchedEffect(selectedTab, activeServer?.id, sourceStatusServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
         if (selectedTab == SettingsTab.LIBRARY_PATHS) {
             localMusicPaths = (prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths).toSet()
         }
-        if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
-            isLoadingScripts = true
-            val client = NetworkClientFactory.createOkHttpClient(context)
-            val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-            val result = proto.fetchSourceList()
-            sourceScripts = result.getOrDefault(emptyList())
-            isLoadingScripts = false
+        if (selectedTab == SettingsTab.SOURCES && liveServerOnline == true && sourceStatusServer != null) {
+            isRefreshingSources = true
+            sourceStatusError = null
+            try {
+                val client = NetworkClientFactory.createOkHttpClient(context)
+                val proto = LemonMusicProtocol(client, sourceStatusServer.serverUrl, sourceStatusServer.username, sourceStatusServer.tokenOrApiKey)
+                val result = ServerSourceRepository.syncFromServer(sourceStatusServer, proto, force = false)
+                if (result.isFailure) {
+                    sourceStatusError = result.exceptionOrNull()?.message ?: "音源状态同步失败"
+                }
+                com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                sourceStatusError = e.message ?: "音源状态同步失败"
+            } finally {
+                isRefreshingSources = false
+            }
         }
         if (selectedTab == SettingsTab.DOWNLOAD && activeServer?.type == ServerType.LEMON_MUSIC) {
             val client = NetworkClientFactory.createOkHttpClient(context)
@@ -442,210 +500,246 @@ fun SettingsScreen(
             when (selectedTab) {
                 // ==================== 1. 账号与服务 ====================
                 SettingsTab.ACCOUNT -> {
+                    val accountServer = sourceStatusServer
+                    val accountOnline = liveServerOnline == true
                     item {
-                        SettingsCard(title = "当前连接服务", icon = Icons.Default.Dns) {
-                            if (activeServer != null) {
-                                SettingInfoRow(label = "服务名称", value = activeServer.name)
-                                SettingInfoRow(label = "服务类型", value = activeServer.type.displayName)
-                                SettingInfoRow(label = "服务器地址", value = activeServer.serverUrl)
-                                SettingInfoRow(label = "登录账号", value = activeServer.username.ifBlank { "匿名/Token" })
-                                SettingInfoRow(label = "鉴权状态", value = if (activeServer.tokenOrApiKey.isNotBlank()) "已授权 (Bearer/ApiKey)" else "未配置")
-
-                                Spacer(modifier = Modifier.height(10.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        SettingsCard(title = "柠檬音乐账号", icon = Icons.Default.AccountCircle) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(54.dp)
+                                        .clip(CircleShape)
+                                        .background(AppleRed),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Button(
+                                    Text("L", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = accountServer?.username?.ifBlank { "Token 登录" } ?: "未登录",
+                                        fontSize = 17.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = when {
+                                            isLocalMode && accountServer != null -> "离线模式"
+                                            accountOnline -> "柠檬音乐账号 · 已登录"
+                                            accountServer != null -> "服务器离线"
+                                            else -> "未登录"
+                                        },
+                                        fontSize = 11.sp,
+                                        color = if (isLocalMode) MaterialTheme.colorScheme.onSurfaceVariant else if (accountOnline) MaterialTheme.colorScheme.onSurfaceVariant else AppleRed
+                                    )
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = when {
+                                        isLocalMode -> MaterialTheme.colorScheme.surfaceVariant
+                                        accountOnline -> Color(0xFF34C759).copy(alpha = 0.13f)
+                                        accountServer != null -> AppleRed.copy(alpha = 0.10f)
+                                        else -> MaterialTheme.colorScheme.surfaceVariant
+                                    }
+                                ) {
+                                    Text(
+                                        text = when {
+                                            isLocalMode -> "离线模式"
+                                            accountOnline -> if (accountServer?.tokenOrApiKey?.isNotBlank() == true) "已授权" else "未授权"
+                                            accountServer != null -> "未连接"
+                                            else -> "未登录"
+                                        },
+                                        fontSize = 10.sp,
+                                        color = when {
+                                            isLocalMode -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            accountOnline -> Color(0xFF228B45)
+                                            accountServer != null -> AppleRed
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                    )
+                                }
+                            }
+
+                            if (accountServer != null) {
+                                Spacer(modifier = Modifier.height(14.dp))
+                                HorizontalDivider(color = borderColor.copy(alpha = 0.6f))
+                                Spacer(modifier = Modifier.height(14.dp))
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(42.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(AppleRed.copy(alpha = 0.12f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Default.Dns, contentDescription = null, tint = AppleRed, modifier = Modifier.size(21.dp))
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(accountServer.name, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                                        Text(accountServer.serverUrl, fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Text(
+                                        text = when {
+                                            isLocalMode -> "离线模式"
+                                            accountOnline -> "已连接"
+                                            else -> "未连接"
+                                        },
+                                        fontSize = 10.sp,
+                                        color = when {
+                                            isLocalMode -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            accountOnline -> Color(0xFF228B45)
+                                            else -> AppleRed
+                                        },
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(14.dp))
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column {
+                                        Text(if (accountOnline) "${cachedSourceMeta?.activeSourceCount ?: 0}/${cachedSourceMeta?.totalSourceCount ?: 0}" else "0/0", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("激活音源", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Column {
+                                        Text(if (accountOnline) "${liveServerLatency ?: cachedSourceMeta?.latencyMs ?: "—"}ms" else "—", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("延迟", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Column {
+                                        Text(if (!accountOnline) "离线" else if (cachedSourceMeta?.lastSyncAt != null) "已同步" else "未同步", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("曲库状态", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(14.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
                                         onClick = {
-                                            isTestingConnection = true
-                                            coroutineScope.launch {
-                                                // try/finally 复位状态：抛异常时 isTestingConnection 会永久为 true，
-                                                // 「测试连接」按钮从此永久禁用并一直显示「测试中...」。
-                                                try {
-                                                    val client = NetworkClientFactory.createOkHttpClient(context)
-                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                    val res = proto.testConnection()
-                                                    if (res.isSuccess) {
-                                                        Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
-                                                    } else {
-                                                        Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                            if (!isTestingConnection) {
+                                                isTestingConnection = true
+                                                coroutineScope.launch {
+                                                    try {
+                                                        val client = NetworkClientFactory.createOkHttpClient(context)
+                                                        val proto = LemonMusicProtocol(client, accountServer.serverUrl, accountServer.username, accountServer.tokenOrApiKey)
+                                                        val res = proto.testConnection()
+                                                        Toast.makeText(
+                                                            context,
+                                                            if (res.isSuccess) "连接成功！服务端响应正常" else "连接失败: ${res.exceptionOrNull()?.message}",
+                                                            if (res.isSuccess) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                                                        ).show()
+                                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                                        throw e
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
+                                                    } finally {
+                                                        isTestingConnection = false
                                                     }
-                                                } catch (e: kotlinx.coroutines.CancellationException) {
-                                                    throw e
-                                                } catch (e: Exception) {
-                                                    Toast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
-                                                } finally {
-                                                    isTestingConnection = false
                                                 }
                                             }
                                         },
                                         enabled = !isTestingConnection,
-                                        shape = RoundedCornerShape(12.dp),
+                                        shape = RoundedCornerShape(14.dp),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text(if (isTestingConnection) "测试中..." else "测试连接", fontSize = 12.sp)
+                                    }
+                                    Button(
+                                        onClick = { showServerManager = true },
+                                        shape = RoundedCornerShape(14.dp),
                                         colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Text(if (isTestingConnection) "测试中..." else "测试连通性", fontSize = 13.sp)
-                                    }
-
-                                    OutlinedButton(
-                                        onClick = {
-                                            editingServer = activeServer
-                                            showAddServerDialog = true
-                                        },
-                                        shape = RoundedCornerShape(12.dp),
-                                        modifier = Modifier.weight(1f),
-                                        border = BorderStroke(1.dp, borderColor)
-                                    ) {
-                                        Text("编辑配置", fontSize = 13.sp)
+                                        Text("管理服务器", fontSize = 12.sp)
                                     }
                                 }
                             } else {
-                                Text(
-                                    text = "当前处于纯本地离线模式，未连接任何远程音乐服务器。",
-                                    fontSize = 13.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Spacer(modifier = Modifier.height(14.dp))
+                                Text("当前为本地离线模式，未连接柠檬音乐服务器。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Button(
+                                    onClick = { editingServer = null; showAddServerDialog = true },
+                                    shape = RoundedCornerShape(14.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
+                                ) {
+                                    Text("添加柠檬音乐服务器", fontSize = 12.sp)
+                                }
                             }
                         }
                     }
 
                     item {
-                        SettingsCard(title = "已配置的服务列表", icon = Icons.Default.Storage) {
-                            if (servers.isEmpty()) {
-                                Text("暂无配置的服务器", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            } else {
-                                servers.forEach { s ->
-                                    val isCurrent = s.id == activeServerId || s.isCurrentActive
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = if (isCurrent) AppleRed.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
-                                        contentColor = MaterialTheme.colorScheme.onSurface,
-                                        border = BorderStroke(1.dp, if (isCurrent) AppleRed else borderColor.copy(alpha = 0.4f)),
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 4.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .clickable { onSelectServer(s) }
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(12.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                                    if (isCurrent) {
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        Surface(shape = RoundedCornerShape(4.dp), color = AppleRed) {
-                                                            Text("当前使用", color = Color.White, fontSize = 9.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
-                                                        }
-                                                    }
-                                                }
-                                                Text(s.serverUrl, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-
-                                            Row {
-                                                IconButton(onClick = { editingServer = s; showAddServerDialog = true }, modifier = Modifier.size(28.dp)) {
-                                                    Icon(Icons.Default.Edit, contentDescription = "编辑", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
-                                                }
-                                                IconButton(onClick = { onDeleteServer(s.id) }, modifier = Modifier.size(28.dp)) {
-                                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
-                                                }
-                                            }
+                        SettingsCard(title = "软件更新", icon = Icons.Default.SystemUpdate) {
+                            SettingInfoRow(
+                                label = "当前版本",
+                                value = "v${AppUpdateManager.getAppVersionName(context)} (${AppUpdateManager.getAppVersionCode(context)})"
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        runCatching {
+                                            context.startActivity(
+                                                android.content.Intent(
+                                                    android.content.Intent.ACTION_VIEW,
+                                                    android.net.Uri.parse("https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
+                                                )
+                                            )
                                         }
                                     }
-                                }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}",
+                                    fontSize = 11.sp,
+                                    color = AppleRed,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = "复制地址",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.clickable {
+                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        clipboard.setPrimaryClip(
+                                            android.content.ClipData.newPlainText(
+                                                "GitHub",
+                                                "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}"
+                                            )
+                                        )
+                                        Toast.makeText(context, "GitHub 仓库地址已复制", Toast.LENGTH_SHORT).show()
+                                    }
+                                )
                             }
-
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(4.dp))
                             Button(
-                                onClick = { editingServer = null; showAddServerDialog = true },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("添加新服务器 (飞牛/柠檬/Subsonic/Navidrome)", color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp)
-                            }
-                        }
-                    }
-
-                    // 3. 软件版本与在线更新 (更新源: 用户仓库 zyhub/LMplayer)
-                    item {
-                        SettingsCard(title = "软件版本与在线更新", icon = Icons.Default.SystemUpdate) {
-                            val curVerName = AppUpdateManager.getAppVersionName(context)
-                            val curVerCode = AppUpdateManager.getAppVersionCode(context)
-                            SettingInfoRow(label = "当前版本", value = "v$curVerName (Build $curVerCode)")
-                            SettingInfoRow(label = "更新来源", value = AppUpdateManager.DEFAULT_GITHUB_REPO)
-                            SettingInfoRow(label = "开源地址", value = "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                Button(
-                                    onClick = {
+                                onClick = {
+                                    if (!isCheckingUpdate) {
                                         isCheckingUpdate = true
                                         coroutineScope.launch {
-                                            AppUpdateManager.resetUpdateIgnore(context)
                                             val res = AppUpdateManager.checkForUpdates(context)
                                             isCheckingUpdate = false
-                                            if (res.isSuccess) {
-                                                val info = res.getOrThrow()
+                                            res.onSuccess { info ->
                                                 activeUpdateInfo = info
                                                 if (info.hasUpdate) {
                                                     showUpdateDialog = true
                                                 } else {
-                                                    showVersionNotesDialog = true
+                                                    Toast.makeText(context, "当前已是最新版本 v${info.latestVersion}", Toast.LENGTH_SHORT).show()
                                                 }
-                                            } else {
-                                                Toast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
+                                            }.onFailure { e ->
+                                                Toast.makeText(context, "检查更新失败: ${e.message}", Toast.LENGTH_LONG).show()
                                             }
                                         }
-                                    },
-                                    enabled = !isCheckingUpdate,
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    if (isCheckingUpdate) {
-                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("检测中...", fontSize = 13.sp)
-                                    } else {
-                                        Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("检查新版本", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                                     }
-                                }
-
-                                OutlinedButton(
-                                    onClick = {
-                                        activeUpdateInfo = UpdateInfo(
-                                            hasUpdate = false,
-                                            latestVersion = curVerName,
-                                            latestVersionCode = curVerCode.toInt(),
-                                            releaseNotes = "【v${curVerName} 更新日志】\n\n" +
-                                                "1. 我喜欢的音乐：改为以柠檬服务器收藏为准加载，本地模式按「服务器收藏 ∩ 已下载」枚举，下载过的才显示\n" +
-                                                "2. 试听与下载音质修复：选最高音质无法播放的问题已解决，本平台无该音质时先跨平台同名曲同档补源，仍拿不到才逐档降级；批量下载同样生效，本地文件不受影响\n" +
-                                                "3. 搜索结果翻页：在线结果新增上一页/下一页，手机端每页 20 首",
-                                            downloadUrl = ""
-                                        )
-                                        showVersionNotesDialog = true
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier.weight(1f),
-                                    border = BorderStroke(1.dp, borderColor)
-                                ) {
-                                    Icon(Icons.Default.Notes, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("更新日志", fontSize = dimensions.bodySize)
-                                }
+                                },
+                                enabled = !isCheckingUpdate,
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (isCheckingUpdate) "检查中..." else "检查更新", fontSize = 12.sp)
                             }
                         }
                     }
@@ -664,282 +758,50 @@ fun SettingsScreen(
                                 onSelect = { onOnlineSourceChange(it) }
                             )
 
-                            Spacer(modifier = Modifier.height(14.dp))
-                            SettingSwitchRow(
-                                title = "自动音源容灾回退",
-                                subtitle = "当首选音源取链失败时，自动按顺序尝试备用音源 (对标柠檬音乐 source.fallbackMode)",
-                                checked = autoFallbackSource,
-                                onCheckedChange = {
-                                    autoFallbackSource = it
-                                    prefs.edit().putBoolean("source_fallback_enabled", it).apply()
-                                }
-                            )
                         }
                     }
 
 
                     item {
-                        SettingsCard(title = "服务端音源脚本管理", icon = Icons.Default.Extension) {
-                            if (!isConnectedToLemonServer) {
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                                    border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(12.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(Icons.Default.CloudOff, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            "当前未连接柠檬音乐服务端。音源脚本由服务端集中托管与调度，请在服务器设置中连接并激活柠檬音乐服务。",
-                                            fontSize = 12.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-                            } else {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "服务端已部署脚本 (${sourceScripts.size})",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Row {
-                                        IconButton(
-                                            onClick = {
-                                                isLoadingScripts = true
-                                                coroutineScope.launch {
-                                                    try {
-                                                        val proto = LemonMusicProtocol(
-                                                            NetworkClientFactory.createOkHttpClient(context),
-                                                            activeServer!!.serverUrl,
-                                                            activeServer.username,
-                                                            activeServer.tokenOrApiKey
-                                                        )
-                                                        sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                    } catch (e: kotlinx.coroutines.CancellationException) {
-                                                        throw e
-                                                    } catch (e: Exception) {
-                                                        Toast.makeText(context, "音源脚本加载失败: ${e.message}", Toast.LENGTH_LONG).show()
-                                                    } finally {
-                                                        isLoadingScripts = false
-                                                    }
-                                                }
-                                            },
-                                            modifier = Modifier.size(28.dp)
-                                        ) {
-                                            Icon(Icons.Default.Refresh, contentDescription = "刷新", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(16.dp))
-                                        }
-                                        IconButton(
-                                            onClick = {
-                                                showImportScriptDialog = true
-                                            },
-                                            modifier = Modifier.size(28.dp)
-                                        ) {
-                                            Icon(Icons.Default.Add, contentDescription = "导入到服务端", tint = AppleRed, modifier = Modifier.size(18.dp))
-                                        }
-                                    }
-                                }
-
-                                Spacer(modifier = Modifier.height(6.dp))
-
-                                if (isLoadingScripts) {
-                                    Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
-                                        CircularProgressIndicator(modifier = Modifier.size(24.dp), color = AppleRed)
-                                    }
-                                } else if (sourceScripts.isEmpty()) {
-                                    Text(
-                                        text = "服务端暂未部署音源脚本，请点击右上角「+」导入落雪音源脚本",
-                                        fontSize = 12.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                        ServerSourceStatusCard(
+                            serverName = sourceStatusServer?.name.orEmpty(),
+                            isConnected = !isLocalMode && liveServerOnline == true,
+                            serverHost = sourceServerHost,
+                            onlineLatencyMs = liveServerLatency,
+                            sources = cachedSources,
+                            meta = cachedSourceMeta,
+                            isRefreshing = isRefreshingSources,
+                            error = sourceStatusError,
+                            onRefresh = {
+                                if (sourceStatusServer == null) {
+                                    sourceStatusError = "请先配置柠檬音乐服务端"
                                 } else {
-                                    sourceScripts.forEach { script ->
-                                        val isExpanded = expandedScriptIds.contains(script.id)
-                                        Surface(
-                                            shape = RoundedCornerShape(12.dp),
-                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                                            contentColor = MaterialTheme.colorScheme.onSurface,
-                                            border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
-                                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                                        ) {
-                                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
-                                                Row(
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Row(
-                                                        modifier = Modifier.weight(1f).clickable {
-                                                            expandedScriptIds = if (isExpanded) expandedScriptIds - script.id else expandedScriptIds + script.id
-                                                        },
-                                                        verticalAlignment = Alignment.CenterVertically
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                                            contentDescription = if (isExpanded) "折叠平台设置" else "展开平台设置",
-                                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                            modifier = Modifier.size(20.dp)
-                                                        )
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        Column {
-                                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                                Text(script.name, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                                                if (script.version.isNotBlank()) {
-                                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                                    Text("v${script.version}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                                }
-                                                            }
-                                                            if (script.author.isNotBlank()) {
-                                                                Text("作者: ${script.author}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                            }
-                                                        }
-                                                    }
-
-                                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                                        Switch(
-                                                            checked = script.isActive,
-                                                            onCheckedChange = { enable ->
-                                                                if (activeServer != null) {
-                                                                    coroutineScope.launch {
-                                                                        val proto = LemonMusicProtocol(
-                                                                            NetworkClientFactory.createOkHttpClient(context),
-                                                                            activeServer.serverUrl,
-                                                                            activeServer.username,
-                                                                            activeServer.tokenOrApiKey
-                                                                        )
-                                                                        val res = if (enable) proto.activateSource(script.id) else proto.deactivateSource(script.id)
-                                                                        if (res.isSuccess) {
-                                                                            sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                                            Toast.makeText(context, if (enable) "音源已激活" else "音源已停用", Toast.LENGTH_SHORT).show()
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        )
-                                                        IconButton(
-                                                            onClick = {
-                                                                scriptToDelete = script
-                                                            },
-                                                            modifier = Modifier.size(28.dp)
-                                                        ) {
-                                                            Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed.copy(alpha = 0.8f), modifier = Modifier.size(16.dp))
-                                                        }
-                                                    }
-                                                }
-
-                                                // 折叠菜单：各平台独立解析开关
-                                                AnimatedVisibility(visible = isExpanded) {
-                                                    Column(
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .padding(top = 8.dp)
-                                                    ) {
-                                                        HorizontalDivider(
-                                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-                                                            thickness = 0.5.dp,
-                                                            modifier = Modifier.padding(vertical = 6.dp)
-                                                        )
-                                                        Text(
-                                                            text = "平台解析设置 (对接柠檬服务器)",
-                                                            fontSize = 11.sp,
-                                                            fontWeight = FontWeight.Medium,
-                                                            color = MaterialTheme.colorScheme.primary
-                                                        )
-                                                        Spacer(modifier = Modifier.height(6.dp))
-
-                                                        val platforms = script.supportedPlatforms.ifEmpty { listOf("kw", "kg", "tx", "wy", "mg") }
-                                                        platforms.forEach { platform ->
-                                                            val platformTitle = when (platform.lowercase()) {
-                                                                "kw" -> "酷我音乐"
-                                                                "kg" -> "酷狗音乐"
-                                                                "tx" -> "QQ音乐"
-                                                                "wy" -> "网易云音乐"
-                                                                "mg" -> "咪咕音乐"
-                                                                "bd" -> "百度音乐"
-                                                                else -> platform.uppercase()
-                                                            }
-                                                            val isPlatformEnabled = platform !in script.disabledPlatforms
-
-                                                            val togglePlatformAction: (Boolean) -> Unit = { enable ->
-                                                                if (activeServer != null) {
-                                                                    val oldScripts = sourceScripts
-                                                                    sourceScripts = sourceScripts.map { s ->
-                                                                        if (s.id == script.id) {
-                                                                            val nextDisabled = if (enable) s.disabledPlatforms - platform else s.disabledPlatforms + platform
-                                                                            s.copy(disabledPlatforms = nextDisabled.distinct())
-                                                                        } else s
-                                                                    }
-                                                                    coroutineScope.launch {
-                                                                        val proto = LemonMusicProtocol(
-                                                                            NetworkClientFactory.createOkHttpClient(context),
-                                                                            activeServer.serverUrl,
-                                                                            activeServer.username,
-                                                                            activeServer.tokenOrApiKey
-                                                                        )
-                                                                        val res = proto.updateSourcePlatformStatus(script.id, platform, enable)
-                                                                        if (res.isSuccess) {
-                                                                            Toast.makeText(context, "$platformTitle 解析已${if (enable) "开启" else "取消"}", Toast.LENGTH_SHORT).show()
-                                                                        } else {
-                                                                            sourceScripts = oldScripts
-                                                                            Toast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message ?: "请检查服务端连接"}", Toast.LENGTH_SHORT).show()
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            Row(
-                                                                modifier = Modifier
-                                                                    .fillMaxWidth()
-                                                                    .padding(vertical = 3.dp, horizontal = 4.dp)
-                                                                    .clip(RoundedCornerShape(8.dp))
-                                                                    .clickable { togglePlatformAction(!isPlatformEnabled) },
-                                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                                verticalAlignment = Alignment.CenterVertically
-                                                            ) {
-                                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                                    Surface(
-                                                                        shape = RoundedCornerShape(4.dp),
-                                                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                                                                    ) {
-                                                                        Text(
-                                                                            text = platform.uppercase(),
-                                                                            fontSize = 10.sp,
-                                                                            fontWeight = FontWeight.Bold,
-                                                                            color = MaterialTheme.colorScheme.primary,
-                                                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                                                        )
-                                                                    }
-                                                                    Spacer(modifier = Modifier.width(8.dp))
-                                                                    Text(
-                                                                        text = platformTitle,
-                                                                        fontSize = 12.sp,
-                                                                        color = MaterialTheme.colorScheme.onSurface
-                                                                    )
-                                                                }
-                                                                Switch(
-                                                                    checked = isPlatformEnabled,
-                                                                    onCheckedChange = { togglePlatformAction(it) },
-                                                                    modifier = Modifier.scale(0.85f)
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                    isRefreshingSources = true
+                                    sourceStatusError = null
+                                    coroutineScope.launch {
+                                        try {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                sourceStatusServer.serverUrl,
+                                                sourceStatusServer.username,
+                                                sourceStatusServer.tokenOrApiKey
+                                            )
+                                            val res = ServerSourceRepository.syncFromServer(sourceStatusServer, proto, force = true)
+                                            if (res.isFailure) {
+                                                sourceStatusError = res.exceptionOrNull()?.message ?: "音源状态同步失败"
                                             }
+                                            com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
+                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            sourceStatusError = e.message ?: "音源状态同步失败"
+                                        } finally {
+                                            isRefreshingSources = false
                                         }
                                     }
                                 }
                             }
-                        }
+                        )
                     }
                 }
 
@@ -1448,6 +1310,17 @@ fun SettingsScreen(
                                     }
                                 )
                             }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "离线下载自动同步至服务器",
+                                subtitle = "连接服务器并同步曲库时，自动把离线下载记录推送到服务器下载队列（默认关闭）",
+                                checked = offlineSyncAutoPush,
+                                onCheckedChange = {
+                                    offlineSyncAutoPush = it
+                                    prefs.edit().putBoolean("offline_sync_auto_push", it).apply()
+                                }
+                            )
                         }
                     }
                 }
@@ -2161,141 +2034,87 @@ fun SettingsScreen(
         }
     }
 
-    // 导入落雪脚本弹窗 (部署到服务器)
-    if (showImportScriptDialog) {
-        Dialog(onDismissRequest = { showImportScriptDialog = false }) {
+    if (showServerManager) {
+        Dialog(onDismissRequest = { showServerManager = false }) {
             Surface(
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(22.dp),
                 color = cardBg,
                 contentColor = MaterialTheme.colorScheme.onSurface,
                 border = BorderStroke(1.dp, borderColor),
-                modifier = Modifier.fillMaxWidth(0.94f).padding(16.dp)
+                modifier = Modifier.fillMaxWidth(0.95f).padding(12.dp)
             ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Text("导入云端音源脚本 (部署到服务器)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    Row(modifier = Modifier.fillMaxWidth()) {
-                        FilterChip(
-                            selected = isImportingUrl,
-                            onClick = { isImportingUrl = true },
-                            label = { Text("URL 在线导入") }
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        FilterChip(
-                            selected = !isImportingUrl,
-                            onClick = { isImportingUrl = false },
-                            label = { Text("脚本代码直接粘贴") }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    if (isImportingUrl) {
-                        OutlinedTextField(
-                            value = importScriptUrl,
-                            onValueChange = { importScriptUrl = it },
-                            label = { Text("脚本远程地址 (URL)") },
-                            placeholder = { Text("https://example.com/source.js") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    } else {
-                        OutlinedTextField(
-                            value = importScriptCode,
-                            onValueChange = { importScriptCode = it },
-                            label = { Text("脚本 JS 源码") },
-                            placeholder = { Text("粘贴落雪脚本 JavaScript 代码...") },
-                            modifier = Modifier.fillMaxWidth().height(140.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(20.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        OutlinedButton(onClick = { showImportScriptDialog = false }, modifier = Modifier.weight(1f)) {
-                            Text("取消")
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("服务器管理", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                            Text("仅柠檬音乐 · 已配置 ${lemonServers.size} 台", fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        Button(
-                            onClick = {
-                                if (activeServer != null) {
-                                    coroutineScope.launch {
-                                        val proto = LemonMusicProtocol(
-                                            NetworkClientFactory.createOkHttpClient(context),
-                                            activeServer.serverUrl,
-                                            activeServer.username,
-                                            activeServer.tokenOrApiKey
-                                        )
-                                        val res = if (isImportingUrl) {
-                                            proto.importSourceUrl(importScriptUrl.trim())
-                                        } else {
-                                            proto.importSourceScript(importScriptCode.trim())
+                        IconButton(onClick = { showServerManager = false }) {
+                            Icon(Icons.Default.Close, contentDescription = "关闭", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    if (lemonServers.isEmpty()) {
+                        Text("暂无柠檬音乐服务器", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        Column(modifier = Modifier.heightIn(max = 430.dp).verticalScroll(rememberScrollState())) {
+                            lemonServers.forEach { s ->
+                                val isCurrent = s.id == activeServerId || s.isCurrentActive
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = if (isCurrent) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                    border = BorderStroke(1.dp, if (isCurrent) AppleRed.copy(alpha = 0.5f) else borderColor),
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                                ) {
+                                    Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(s.name, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                                if (isCurrent) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text("当前", fontSize = 9.sp, color = AppleRed, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                            Text(s.serverUrl, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                                         }
-                                        if (res.isSuccess) {
-                                            Toast.makeText(context, "云端音源部署成功！", Toast.LENGTH_SHORT).show()
-                                            sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                            showImportScriptDialog = false
-                                        } else {
-                                            Toast.makeText(context, "导入失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                        IconButton(onClick = { editingServer = s; showServerManager = false; showAddServerDialog = true }, modifier = Modifier.size(30.dp)) {
+                                            Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
+                                        }
+                                        IconButton(onClick = { onDeleteServer(s.id) }, modifier = Modifier.size(30.dp)) {
+                                            Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
+                                        }
+                                        TextButton(onClick = { onSelectServer(s); showServerManager = false }) {
+                                            Text(if (isCurrent) "使用中" else "切换", fontSize = 11.sp, color = if (isCurrent) MaterialTheme.colorScheme.onSurfaceVariant else AppleRed)
                                         }
                                     }
-                                } else {
-                                    Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
                                 }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("确定导入")
+                            }
                         }
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = { editingServer = null; showServerManager = false; showAddServerDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("添加柠檬音乐服务器", fontSize = 12.sp)
                     }
                 }
             }
         }
     }
 
-    // 删除脚本确认
-    if (scriptToDelete != null) {
-        val s = scriptToDelete!!
-        AlertDialog(
-            onDismissRequest = { scriptToDelete = null },
-            title = { Text("确认删除云端音源脚本？") },
-            text = { Text("即将删除音源脚本「${s.name}」，删除后将无法从该脚本获取在线播放和搜索。") },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val toDelete = scriptToDelete
-                        scriptToDelete = null
-                        if (toDelete != null && activeServer != null) {
-                            coroutineScope.launch {
-                                val proto = LemonMusicProtocol(
-                                    NetworkClientFactory.createOkHttpClient(context),
-                                    activeServer.serverUrl,
-                                    activeServer.username,
-                                    activeServer.tokenOrApiKey
-                                )
-                                proto.deleteSource(toDelete.id)
-                                sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                Toast.makeText(context, "云端脚本已删除", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
-                ) {
-                    Text("删除", color = Color.White)
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = { scriptToDelete = null }) {
-                    Text("取消")
-                }
-            }
-        )
-    }
-
     // 添加/编辑服务器配置弹窗
     if (showAddServerDialog) {
         var serverNameInput by remember { mutableStateOf(editingServer?.name ?: "") }
-        var serverTypeInput by remember { mutableStateOf(editingServer?.type ?: ServerType.LEMON_MUSIC) }
+        val serverTypeInput = ServerType.LEMON_MUSIC
         var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
         var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
         var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
@@ -2323,13 +2142,27 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(0.96f).padding(12.dp)
             ) {
                 Column(modifier = Modifier.padding(18.dp)) {
-                    Text(if (editingServer != null) "编辑服务器" else "添加新服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(if (editingServer != null) "编辑柠檬音乐服务器" else "添加柠檬音乐服务器", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = AppleRed,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("柠檬音乐", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                Text("固定类型 · 仅支持柠檬音乐服务端", fontSize = 9.5.sp, color = Color.White.copy(alpha = 0.85f))
+                            }
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
 
                     OutlinedTextField(
                         value = serverNameInput,
                         onValueChange = { serverNameInput = it },
-                        label = { Text("服务器名称 (如 飞牛NAS/客厅柠檬)") },
+                        label = { Text("服务器名称（可选，如 客厅柠檬）") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )

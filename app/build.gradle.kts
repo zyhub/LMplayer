@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -12,8 +14,8 @@ android {
         applicationId = "com.lm.player"
         minSdk = 23
         targetSdk = 34
-        versionCode = 61
-        versionName = "1.7.26"
+        versionCode = 62
+        versionName = "1.7.27"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -25,21 +27,31 @@ android {
         }
 
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+            // x86_64 仅用于 BlueStacks/模拟器 ADB 验证 QuickJS 原生库
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
         }
     }
 
     signingConfigs {
         create("release") {
             val keystoreFile = project.rootProject.file("keystore.jks")
-            if (keystoreFile.exists()) {
-                storeFile = keystoreFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
-                keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
-                keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
-            } else {
-                initWith(getByName("debug"))
+            val propsFile = project.rootProject.file("keystore.properties")
+            if (!keystoreFile.exists()) {
+                throw GradleException("Release keystore.jks is required; refusing to fall back to debug signing.")
             }
+            val props = Properties().apply {
+                if (propsFile.exists()) propsFile.inputStream().use { load(it) }
+            }
+            storeFile = keystoreFile
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+                ?: props.getProperty("storePassword")
+                ?: throw GradleException("KEYSTORE_PASSWORD or keystore.properties is required.")
+            keyAlias = System.getenv("KEY_ALIAS")
+                ?: props.getProperty("keyAlias")
+                ?: throw GradleException("KEY_ALIAS or keystore.properties is required.")
+            keyPassword = System.getenv("KEY_PASSWORD")
+                ?: props.getProperty("keyPassword")
+                ?: throw GradleException("KEY_PASSWORD or keystore.properties is required.")
         }
     }
 
@@ -132,6 +144,9 @@ dependencies {
     implementation("androidx.palette:palette-ktx:1.0.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
+
+    // 本地音源解析引擎；固定使用 Kotlin 1.9.x 兼容版本
+    implementation("io.github.dokar3:quickjs-kt-android:1.0.0-alpha02")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

@@ -30,8 +30,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.7.26"
-    const val CURRENT_VERSION_CODE = 61
+    const val CURRENT_VERSION_NAME = "1.7.27"
+    const val CURRENT_VERSION_CODE = 62
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"
@@ -374,7 +374,7 @@ object AppUpdateManager {
 
             if (archiveInfo == null) {
                 Log.w(TAG, "Failed to parse archive info from ${apkFile.absolutePath}")
-                return true
+                return false
             }
 
             // 包名一致性校验
@@ -384,23 +384,24 @@ object AppUpdateManager {
             }
 
             val currentSigs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                currentPkgInfo.signingInfo?.signingCertificateHistory?.map { it.toByteArray().contentHashCode() }
-                    ?: currentPkgInfo.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+                currentPkgInfo.signingInfo?.signingCertificateHistory?.map { certificateFingerprint(it.toByteArray()) }
+                    ?: currentPkgInfo.signingInfo?.apkContentsSigners?.map { certificateFingerprint(it.toByteArray()) }
             } else {
                 @Suppress("DEPRECATION")
-                currentPkgInfo.signatures?.map { it.toByteArray().contentHashCode() }
+                currentPkgInfo.signatures?.map { certificateFingerprint(it.toByteArray()) }
             }
 
             val archiveSigs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                archiveInfo.signingInfo?.signingCertificateHistory?.map { it.toByteArray().contentHashCode() }
-                    ?: archiveInfo.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+                archiveInfo.signingInfo?.signingCertificateHistory?.map { certificateFingerprint(it.toByteArray()) }
+                    ?: archiveInfo.signingInfo?.apkContentsSigners?.map { certificateFingerprint(it.toByteArray()) }
             } else {
                 @Suppress("DEPRECATION")
-                archiveInfo.signatures?.map { it.toByteArray().contentHashCode() }
+                archiveInfo.signatures?.map { certificateFingerprint(it.toByteArray()) }
             }
 
             if (currentSigs.isNullOrEmpty() || archiveSigs.isNullOrEmpty()) {
-                return true
+                Log.e(TAG, "Missing signing certificate on installed app or update APK")
+                return false
             }
 
             val match = currentSigs.any { it in archiveSigs }
@@ -410,7 +411,12 @@ object AppUpdateManager {
             match
         } catch (e: Exception) {
             Log.w(TAG, "verifyApkSignatureMatch exception: ${e.message}")
-            true
+            false
         }
     }
+
+    private fun certificateFingerprint(cert: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(cert)
+            .joinToString("") { "%02x".format(it) }
 }

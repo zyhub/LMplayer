@@ -10,7 +10,9 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
+import com.lm.player.core.crash.CrashLogManager
 import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.security.ServerTokenCipher
 import com.lm.player.core.media.DynamicIslandManager
 import com.lm.player.core.network.NetworkClientFactory
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +25,8 @@ class LMApplication : Application(), ImageLoaderFactory {
 
     override fun onCreate() {
         super.onCreate()
+        ServerTokenCipher.init(this)
+        CrashLogManager.install(this)
 
         // 1. 监听应用前后台切换，实现“应用内隐藏灵动岛，挂后台时手机顶部即时呈现概念版灵动岛”
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
@@ -69,7 +73,22 @@ class LMApplication : Application(), ImageLoaderFactory {
             // Room 首次 open 要建库/校验 schema，是在磁盘上做实事的操作。
             // 放在主线程会直接拖慢冷启动首帧（与上面的注释目标相矛盾），此处挪进 IO 协程。
             // 单例本身是 @Volatile + synchronized 的，主线程后续取用拿到的是同一实例。
-            ZdsDatabase.getInstance(this@LMApplication)
+            val db = ZdsDatabase.getInstance(this@LMApplication)
+            // 旧库明文 Token 一次性迁移为 Keystore 加密值。
+            runCatching {
+                db.serverDao().getAllServers().forEach { server ->
+                    if (!ServerTokenCipher.isEncrypted(server.tokenOrApiKeyEncrypted)) {
+                        db.serverDao().updateServerToken(
+                            server.id,
+                            ServerTokenCipher.encrypt(server.tokenOrApiKey)
+                        )
+                    }
+                }
+            }
+            com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
+            com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
+            com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
+
         }
 
         // 3. 后台灵动岛引擎初始化（纯内存状态读取，无磁盘 IO）

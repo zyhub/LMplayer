@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 仅 debug 构建允许局域网 HTTP 调试；release 使用主配置。 -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

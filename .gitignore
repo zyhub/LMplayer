@@ -1,4 +1,4 @@
-﻿*.iml
+*.iml
 .gradle
 /local.properties
 /.idea
@@ -15,6 +15,8 @@ captures
 *.log
 app.tgz
 icon_downloaded.png
+keystore.jks
+keystore.properties
 
 # 调试截图（排查时临时产生，勿提交）
 /_dbg_*.png

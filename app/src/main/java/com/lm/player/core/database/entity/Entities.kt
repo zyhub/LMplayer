@@ -72,6 +72,83 @@ data class DownloadEntity(
     val pushErrorMessage: String? = null
 )
 
+/**
+ * 服务器音源状态快照（本地缓存）。
+ *
+ * 数据全部来自服务端 /api/source/list 的 active / health / sources 字段，
+ * 用于「音源状态看板」和服务器延迟升高时的本地缓存展示；
+ * 不做本地脚本执行，避免把未经校验的 JS 放进手机运行。
+ */
+@Entity(
+    tableName = "server_sources",
+    indices = [
+        Index(value = ["serverId"]),
+        Index(value = ["isActive"]),
+        Index(value = ["fetchedAt"])
+    ]
+)
+data class ServerSourceEntity(
+    @PrimaryKey val key: String, // serverId + "::" + sourceId
+    val serverId: String,
+    val sourceId: String,
+    val name: String,
+    val description: String = "",
+    val author: String = "",
+    val version: String = "",
+    val homepage: String = "",
+    val isActive: Boolean = false,
+    val healthLevel: String = "unknown",
+    val healthBadge: String = "",
+    val healthTip: String = "",
+    val healthUnhealthy: Boolean = false,
+    val healthSampleCount: Int = 0,
+    val healthPreviewCount: Int = 0,
+    val healthRatio: Double = 0.0,
+    val healthPlatformsJson: String = "[]",
+    val platformsJson: String = "[]",
+    val disabledPlatformsJson: String = "[]",
+    val rawScriptCached: Boolean = false,
+    val fetchedAt: Long = System.currentTimeMillis()
+)
+
+/** 服务器连接/音源同步的元状态：用于判断「服务器是否最近在线」和延迟高低 */
+@Entity(tableName = "server_source_meta")
+data class ServerSourceMetaEntity(
+    @PrimaryKey val serverId: String,
+    val serverName: String = "",
+    val fallbackMode: String = "auto",
+    val activeSourceCount: Int = 0,
+    val totalSourceCount: Int = 0,
+    val latencyMs: Long = 0L,
+    val lastOnlineAt: Long = 0L,
+    val lastSyncAt: Long = 0L,
+    val lastError: String? = null
+)
+
+/**
+ * 最近成功解析出的播放/下载直链（短时本地兜底）。
+ * 仅在服务器最近在线且当前请求延迟偏高时使用；超过 TTL 自动失效。
+ */
+@Entity(
+    tableName = "resolved_stream_cache",
+    indices = [
+        Index(value = ["serverHost"]),
+        Index(value = ["expiresAt"])
+    ]
+)
+data class ResolvedStreamCacheEntity(
+    @PrimaryKey val cacheKey: String, // serverHost + "|" + songId + "|" + quality
+    val serverHost: String,
+    val songId: String,
+    val quality: String,
+    val url: String,
+    val format: String = "",
+    val bitRate: Int = 0,
+    val sourceId: String = "",
+    val updatedAt: Long = System.currentTimeMillis(),
+    val expiresAt: Long = System.currentTimeMillis() + 10 * 60 * 1000L
+)
+
 @Entity(tableName = "servers")
 data class ServerEntity(
     @PrimaryKey val id: String,
@@ -79,11 +156,16 @@ data class ServerEntity(
     val type: ServerType,
     val serverUrl: String,
     val username: String,
-    val tokenOrApiKey: String,
+    // Room 列名保持不变以兼容旧库；值使用 Android Keystore AES-GCM 加密。
+    @androidx.room.ColumnInfo(name = "tokenOrApiKey")
+    val tokenOrApiKeyEncrypted: String,
     val saltOrSecret: String,
     val syncMode: SyncMode = SyncMode.DIRECT,
     val isCurrentActive: Boolean
-)
+) {
+    /** 旧库明文值会原样返回；新写入值自动解密。 */
+    val tokenOrApiKey: String get() = com.lm.player.core.security.ServerTokenCipher.decrypt(tokenOrApiKeyEncrypted)
+}
 
 @Entity(
     tableName = "playlists",

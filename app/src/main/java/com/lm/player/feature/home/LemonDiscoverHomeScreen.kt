@@ -259,8 +259,15 @@ fun LemonDiscoverHomeScreen(
 
     val dynamicPalettes = remember { ALL_RANDOM_LIQUID_PALETTES.shuffled().take(5) }
 
-    val isScrolledAway = (activeCollectionTitle != null && (collectionListState.firstVisibleItemIndex > 0 || collectionListState.firstVisibleItemScrollOffset > 0)) ||
-        (activeCollectionTitle == null && (discoverListState.firstVisibleItemIndex > 0 || discoverListState.firstVisibleItemScrollOffset > 0))
+    val isScrolledAway by remember(activeCollectionTitle) {
+        derivedStateOf {
+            if (activeCollectionTitle != null) {
+                collectionListState.firstVisibleItemIndex > 0 || collectionListState.firstVisibleItemScrollOffset > 0
+            } else {
+                discoverListState.firstVisibleItemIndex > 0 || discoverListState.firstVisibleItemScrollOffset > 0
+            }
+        }
+    }
     LaunchedEffect(isScrolledAway) {
         onScrollPositionChange(isScrolledAway)
     }

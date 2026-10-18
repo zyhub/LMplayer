@@ -75,6 +75,10 @@ fun DownloadManagerScreen(
     var selectedTab by remember { mutableIntStateOf(if (activeTasks.isNotEmpty()) 0 else 2) } // 0: 本地下载, 1: 服务器下载, 2: 已完成
     val syncManager = remember { com.lm.player.core.sync.OfflineSyncManager.getInstance(context) }
     val pendingPushCount by syncManager.pendingPushCount.collectAsState()
+    val pendingPushList by syncManager.pendingPushList.collectAsState()
+    val pendingPushFailedCount = remember(pendingPushList) {
+        pendingPushList.count { it.serverPushStatus == 3 }
+    }
     val isPushingToServer by syncManager.isPushing.collectAsState()
 
     var isMultiSelectMode by remember { mutableStateOf(false) }
@@ -722,7 +726,11 @@ fun DownloadManagerScreen(
                                             }
                                             Spacer(modifier = Modifier.height(4.dp))
                                             Text(
-                                                text = "发现 $pendingPushCount 首离线期间下载的歌曲，可一键推送到柠檬 NAS 服务器曲库下载归档",
+                                                text = if (pendingPushFailedCount > 0) {
+                                                    "发现 $pendingPushCount 首待同步，其中 $pendingPushFailedCount 首上次推送失败，可重试"
+                                                } else {
+                                                    "发现 $pendingPushCount 首离线期间下载的歌曲，可一键推送到柠檬 NAS 服务器曲库下载归档"
+                                                },
                                                 fontSize = 11.sp,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
@@ -748,7 +756,12 @@ fun DownloadManagerScreen(
                                                         val res = syncManager.pushAllPendingTasksToServer()
                                                         if (res.isSuccess) {
                                                             val count = res.getOrDefault(0)
-                                                            Toast.makeText(context, "已成功推送 $count 首歌曲至服务器下载队列", Toast.LENGTH_SHORT).show()
+                                                            val msg = if (count > 0) {
+                                                                "已成功推送 $count 首歌曲至服务器下载队列"
+                                                            } else {
+                                                                "没有需要推送的歌曲（可能已在服务器曲库）"
+                                                            }
+                                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                                         } else {
                                                             Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                                                         }
@@ -970,11 +983,18 @@ fun DownloadManagerScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Button(
                             onClick = {
+                                val requestedCount = selectedSongIds.size
                                 scope.launch {
-                                    val res = syncManager.pushSelectedTasksToServer(selectedSongIds)
+                                    val res = syncManager.pushSelectedTasksToServer(selectedSongIds.toList())
                                     if (res.isSuccess) {
                                         val count = res.getOrDefault(0)
-                                        Toast.makeText(context, "已成功精细化推送 $count 首已选歌曲至服务器", Toast.LENGTH_SHORT).show()
+                                        val skipped = (requestedCount - count).coerceAtLeast(0)
+                                        val msg = if (count > 0) {
+                                            "已推送 $count 首已选歌曲至服务器" + if (skipped > 0) "（$skipped 首已在服务器或缺少在线来源，已跳过）" else ""
+                                        } else {
+                                            "没有可推送的歌曲（所选歌曲可能已在服务器曲库）"
+                                        }
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                         selectedSongIds.clear()
                                         isMultiSelectMode = false
                                     } else {
@@ -1148,6 +1168,16 @@ fun DownloadManagerScreen(
                                                 Text(item.title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                                 Spacer(modifier = Modifier.height(2.dp))
                                                 Text("${item.artist} · ${item.chosenQuality.ifBlank { "320k" }}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                if (item.serverPushStatus == 3 && !item.pushErrorMessage.isNullOrBlank()) {
+                                                    Spacer(modifier = Modifier.height(2.dp))
+                                                    Text(
+                                                        text = "上次推送失败：${item.pushErrorMessage}",
+                                                        fontSize = 9.5.sp,
+                                                        color = MaterialTheme.colorScheme.error,
+                                                        maxLines = 2,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -1166,7 +1196,13 @@ fun DownloadManagerScreen(
                             val res = syncManager.pushSelectedTasksToServer(toSync)
                             if (res.isSuccess) {
                                 val count = res.getOrDefault(0)
-                                Toast.makeText(context, "已成功精细化推送 $count 首歌曲至服务器", Toast.LENGTH_SHORT).show()
+                                val skipped = (toSync.size - count).coerceAtLeast(0)
+                                val msg = if (count > 0) {
+                                    "已推送 $count 首歌曲至服务器" + if (skipped > 0) "（$skipped 首已在服务器或缺少在线来源，已跳过）" else ""
+                                } else {
+                                    "没有可推送的歌曲（所选歌曲可能已在服务器曲库）"
+                                }
+                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                             }

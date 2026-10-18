@@ -3,6 +3,7 @@ package com.lm.player
 import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
@@ -88,11 +89,14 @@ import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.*
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
+import com.lm.player.core.crash.CrashLogDialog
+import com.lm.player.core.crash.CrashLogManager
 import com.lm.player.core.update.AppUpdateManager
 import com.lm.player.core.update.UpdateInfo
 import com.lm.player.feature.download.DownloadManagerScreen
 import com.lm.player.feature.home.LemonDiscoverHomeScreen
 import com.lm.player.feature.home.LocalMusicHomeScreen
+import com.lm.player.feature.library.LocalLibraryCallbacks
 import com.lm.player.feature.library.LocalLibraryScreen
 import com.lm.player.feature.player.FullscreenPlayerSheet
 import com.lm.player.feature.search.LibrarySearchDialog
@@ -222,6 +226,7 @@ class MainActivity : ComponentActivity() {
 
             // 启动过渡状态 (默认 false 确保 0ms 瞬间秒开呈现主屏)
             var isSplashVisible by remember { mutableStateOf(false) }
+            var pendingCrashLog by remember { mutableStateOf(CrashLogManager.consumePending(this@MainActivity)) }
 
             // 外观主题、毛玻璃与动效状态（从 SharedPreferences 持久化恢复）
             val savedThemeName = remember {
@@ -608,7 +613,7 @@ class MainActivity : ComponentActivity() {
                                     type = updatedConfig.type,
                                     serverUrl = updatedConfig.serverUrl,
                                     username = updatedConfig.username,
-                                    tokenOrApiKey = updatedConfig.tokenOrApiKey,
+                                    tokenOrApiKeyEncrypted = com.lm.player.core.security.ServerTokenCipher.encrypt(updatedConfig.tokenOrApiKey),
                                     saltOrSecret = updatedConfig.saltOrSecret,
                                     syncMode = updatedConfig.syncMode,
                                     isCurrentActive = updatedConfig.isCurrentActive
@@ -765,6 +770,27 @@ class MainActivity : ComponentActivity() {
                             database.playlistDao().insertPlaylists(plEntities)
                         }
 
+                        // 同步服务端启用音源的状态/健康度/平台能力到本地数据库。
+                        // 失败不影响曲库同步；下次进入设置页或重新同步时会再试。
+                        try {
+                            com.lm.player.core.source.ServerSourceRepository.syncFromServer(
+                                server = config,
+                                protocol = activeProto,
+                                force = false
+                            )
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Syncing server source status failed", e)
+                        }
+
+                        // 启动/刷新本地音源加速会话（仅内存，失败自动回退服务器）
+                        try {
+                            com.lm.player.core.source.SourceAccelerationController.start(
+                                this@MainActivity, config, activeProto
+                            )
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Starting source acceleration failed", e)
+                        }
+
                         // 成功同步曲库后，若开启离线同步推送，自动将离线/本地期间下载的歌曲推送至柠檬服务端排队下载与归档
                         try {
                             val syncPrefs = getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
@@ -850,7 +876,46 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(Unit) {
-                database.serverDao().getAllServersFlow().collect { entities ->
+                database.serverDao().getAllServersFlow().collect { allEntities ->
+                    // 只保留柠檬音乐；历史非柠檬服务器按用户要求删除。
+                    // 先迁移已下载文件到本地曲库，再清理该服务器的在线镜像与配置。
+                    val legacy = allEntities.filter { it.type != ServerType.LEMON_MUSIC }
+                    if (legacy.isNotEmpty()) {
+                        // 删除前保存一份加密配置备份，便于误删恢复。
+                        runCatching {
+                            val backupDir = java.io.File(filesDir, "legacy_backups").apply { mkdirs() }
+                            val backupFile = java.io.File(backupDir, "servers_${System.currentTimeMillis()}.json")
+                            val arr = org.json.JSONArray()
+                            legacy.forEach { old ->
+                                arr.put(
+                                    org.json.JSONObject()
+                                        .put("id", old.id)
+                                        .put("name", old.name)
+                                        .put("type", old.type.name)
+                                        .put("serverUrl", old.serverUrl)
+                                        .put("username", old.username)
+                                        .put("tokenOrApiKeyEncrypted", old.tokenOrApiKeyEncrypted)
+                                        .put("saltOrSecret", old.saltOrSecret)
+                                        .put("syncMode", old.syncMode.name)
+                                        .put("isCurrentActive", old.isCurrentActive)
+                                )
+                            }
+                            backupFile.writeText(arr.toString())
+                        }.onFailure { Log.w("MainActivity", "Backup legacy servers failed", it) }
+                        withContext(Dispatchers.IO) {
+                            legacy.forEach { old ->
+                                runCatching {
+                                    database.songDao().migrateDownloadedSongsToLocal(old.id)
+                                    database.songDao().deleteSongsByServer(old.id)
+                                    database.playlistDao().deletePlaylistsByServer(old.id)
+                                    database.serverSourceDao().deleteSources(old.id)
+                                    database.serverDao().deleteServer(old.id)
+                                    Log.i("MainActivity", "Deleted legacy non-Lemon server: ${old.name} (${old.type})")
+                                }.onFailure { Log.w("MainActivity", "Delete legacy server failed: ${old.id}", it) }
+                            }
+                        }
+                    }
+                    val entities = allEntities.filter { it.type == ServerType.LEMON_MUSIC }
                     serversList = entities.map {
                         ServerConfig(
                             id = it.id,
@@ -1156,7 +1221,19 @@ class MainActivity : ComponentActivity() {
 
                 // 1. 服务端缓存调度 (SERVER 或 BOTH)
                 if (target == DownloadTarget.SERVER || target == DownloadTarget.BOTH) {
-                    if (activeServer == null) {
+                    // 服务器曲库已有此歌时绝不能再次提交 /api/download/add：服务端会把它当成
+                    // 「已有同名文件」进入 await_exist 队列，手机端只看到提交成功，实际永远
+                    // 排队等确认。BOTH 仍继续执行本地分支，不受影响。
+                    val serverAlreadyHasSong = DownloadRequestPlanner.isServerLibrarySong(songToDownload)
+                    if (serverAlreadyHasSong) {
+                        if (target == DownloadTarget.SERVER) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "服务器曲库已有《${songToDownload.title}》，已跳过重复提交",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    } else if (activeServer == null) {
                         Toast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
                     } else {
                         lifecycleScope.launch(Dispatchers.IO) {
@@ -1242,17 +1319,23 @@ class MainActivity : ComponentActivity() {
                     // 关键修复：服务器曲库歌曲的 streamUrl 是 /api/play/local?path=…&token=…，
                     // **URL 里没有音质参数**，以前被当作"直链歌曲"直接下载，拉到的其实是服务器上的
                     // 原文件（可能是无损）——选 320K 却下到无损就是这么来的。
-                    if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
+                    val enqueued = if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
                         downloadEngine.startDownload(
                             song = preparedSong,
-                            urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) }
+                            urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) },
+                            fallbackResolver = { attempt ->
+                                resolveDownloadFallbackFor(this@MainActivity, activeServer, songToDownload, quality, attempt)
+                            }
                         )
-                        Toast.makeText(this@MainActivity, "已加入下载队列 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
                     } else {
                         // 纯本地文件：没有可换音质的来源，沿用本地直链下载
                         downloadEngine.startDownload(preparedSong)
-                        Toast.makeText(this@MainActivity, "已加入本地下载: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
                     }
+                    if (enqueued) {
+                        Toast.makeText(this@MainActivity, "已加入下载队列 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
+                    }
+                    // enqueued == false 时 DownloadEngine 已经提示「正在下载中」，不再重复弹错 */
+
                 }
             }
 
@@ -1265,7 +1348,18 @@ class MainActivity : ComponentActivity() {
 
                     // 1. 服务端批量缓存调度 (SERVER 或 BOTH)
                     if (target == DownloadTarget.SERVER || target == DownloadTarget.BOTH) {
-                        if (activeServer == null) {
+                        // 已经在服务器曲库里的歌不再提交，否则服务端会为「同名文件已存在」
+                        // 创建 await_exist 任务并一直排队；只把真正缺的歌曲交给服务端。
+                        val serverSongs = distinctSongs.filterNot { DownloadRequestPlanner.isServerLibrarySong(it) }
+                        if (serverSongs.isEmpty()) {
+                            if (target == DownloadTarget.SERVER) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "所选歌曲均已在服务器曲库，已跳过重复提交",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        } else if (activeServer == null) {
                             Toast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
                         } else {
                             lifecycleScope.launch(Dispatchers.IO) {
@@ -1277,7 +1371,7 @@ class MainActivity : ComponentActivity() {
                                         activeServer.tokenOrApiKey
                                     )
                                     // 任务构造与单首下载共用同一份实现 (DownloadRequestPlanner)
-                                    val serverTasks = distinctSongs.map {
+                                    val serverTasks = serverSongs.map {
                                         DownloadRequestPlanner.buildServerDownloadTask(it, quality)
                                     }
 
@@ -1290,7 +1384,7 @@ class MainActivity : ComponentActivity() {
 
                                     withContext(Dispatchers.Main) {
                                         if (successChunks > 0) {
-                                            Toast.makeText(this@MainActivity, "已批量提交 ${distinctSongs.size} 首歌曲至服务器缓存 [${quality.badge}]", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(this@MainActivity, "已批量提交 ${serverSongs.size} 首歌曲至服务器缓存 [${quality.badge}]", Toast.LENGTH_SHORT).show()
                                         } else {
                                             Toast.makeText(this@MainActivity, "批量提交服务器缓存失败", Toast.LENGTH_LONG).show()
                                         }
@@ -1298,7 +1392,7 @@ class MainActivity : ComponentActivity() {
 
                                     if (successChunks > 0) {
                                         val nowTs = System.currentTimeMillis()
-                                        val entities = distinctSongs.mapIndexed { idx, s ->
+                                        val entities = serverSongs.mapIndexed { idx, s ->
                                             val existingEntity = database.songDao().getSongById(s.id)
                                             SongEntity(
                                                 id = s.id,
@@ -1346,6 +1440,7 @@ class MainActivity : ComponentActivity() {
                         val safeFormat = quality.format.lowercase()
                         var enqueuedCount = 0
                         var skippedCount = 0
+                        var busyCount = 0
                         distinctSongs.forEach { songToDownload ->
                             val localPath = songToDownload.localFilePath
                             val hasLocalFile = !localPath.isNullOrBlank() &&
@@ -1363,21 +1458,28 @@ class MainActivity : ComponentActivity() {
                                 skippedCount++
                                 return@forEach
                             }
-                            enqueuedCount++
                             val preparedSong = songToDownload.copy(format = safeFormat, bitRate = quality.bitrate)
-                            if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
+                            val enqueued = if (DownloadRequestPlanner.hasRemoteSource(songToDownload)) {
                                 downloadEngine.startDownload(
                                     song = preparedSong,
-                                    urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) }
+                                    urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) },
+                                    fallbackResolver = { attempt ->
+                                        resolveDownloadFallbackFor(this@MainActivity, activeServer, songToDownload, quality, attempt)
+                                    }
                                 )
                             } else {
                                 downloadEngine.startDownload(preparedSong)
                             }
+                            if (enqueued) enqueuedCount++ else busyCount++
                         }
-                        val skipTip = if (skippedCount > 0) "，跳过 $skippedCount 首（已存在该音质）" else ""
+                        val skipParts = buildList {
+                            if (skippedCount > 0) add("$skippedCount 首已存在该音质")
+                            if (busyCount > 0) add("$busyCount 首正在下载中")
+                        }
+                        val skipTip = if (skipParts.isNotEmpty()) "，跳过 " + skipParts.joinToString("、") else ""
                         Toast.makeText(
                             this@MainActivity,
-                            if (enqueuedCount > 0) "已将 $enqueuedCount 首歌曲加入本地下载队列 [${quality.badge}]$skipTip" else "所选 $skippedCount 首歌曲均已下载至本地",
+                            if (enqueuedCount > 0) "已将 $enqueuedCount 首歌曲加入本地下载队列 [${quality.badge}]$skipTip" else "没有新增下载任务：$skipTip",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -2111,7 +2213,8 @@ class MainActivity : ComponentActivity() {
                                         isPlaying = isPlaying,
                                         locateSongTrigger = locateSongTrigger,
                                         scrollToTopTrigger = scrollToTopTrigger,
-                                        onScrollPositionChange = { isScrolledAwayFromTop = it },
+                                        callbacks = LocalLibraryCallbacks(
+onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onListScrollingChange = { isSongListScrolling = it },
                                         onSelectLocalServer = {
                                             switchToLocalLibraryMode("本地模式")
@@ -2428,6 +2531,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onSubViewActiveChange = { isChildSubViewActive = it },
+                                        ),
                                         contentPadding = innerPadding
                                     )
                                 }
@@ -2585,6 +2689,15 @@ class MainActivity : ComponentActivity() {
                                             currentOnlineSource = newSrc
                                             onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                         },
+                                        onSyncNow = {
+                                            val active = serversList.firstOrNull { it.isCurrentActive }
+                                            if (active != null) {
+                                                syncServerPlaylists(active)
+                                                syncServerSongsWithToast(active, true)
+                                            } else {
+                                                Toast.makeText(this@MainActivity, "请先连接柠檬音乐服务器", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
                                         onSelectServer = { server ->
                                             switchToOnlineServerMode(server)
                                         },
@@ -2597,7 +2710,7 @@ class MainActivity : ComponentActivity() {
                                                         type = serverConfig.type,
                                                         serverUrl = serverConfig.serverUrl,
                                                         username = serverConfig.username,
-                                                        tokenOrApiKey = serverConfig.tokenOrApiKey,
+                                                        tokenOrApiKeyEncrypted = com.lm.player.core.security.ServerTokenCipher.encrypt(serverConfig.tokenOrApiKey),
                                                         saltOrSecret = serverConfig.saltOrSecret,
                                                         syncMode = serverConfig.syncMode,
                                                         isCurrentActive = true
@@ -2613,6 +2726,7 @@ class MainActivity : ComponentActivity() {
                                                 database.serverDao().deleteServer(serverIdToDelete)
                                                 database.songDao().deleteSongsByServer(serverIdToDelete)
                                                 database.playlistDao().deletePlaylistsByServer(serverIdToDelete)
+                                                database.serverSourceDao().deleteSources(serverIdToDelete)
                                             }
                                             if (activeServerId == serverIdToDelete) {
                                                 switchToLocalLibraryMode("本地曲库")
@@ -3050,6 +3164,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    pendingCrashLog?.let { log ->
+                        CrashLogDialog(log = log, onDismiss = { pendingCrashLog = null })
+                    }
+
                     // 启动 Logo 过渡动画图层 (开屏丝滑淡出)
                     SplashScreenView(
                         visible = isSplashVisible,
@@ -3111,6 +3229,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun exitAppCompletely() {
         isUserExplicitExit = true
+        com.lm.player.core.source.SourceAccelerationController.stopAsync("exit")
         try {
             val currentPos = exoPlayer?.currentPosition?.takeIf { it > 0L }
             PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true, allowOffloadOnMain = false)
@@ -3290,6 +3409,7 @@ class MainActivity : ComponentActivity() {
     /** 已在 ACTION_DOWN 上处理过、正在等待配对 UP 的媒体键（见 dispatchKeyEvent） */
     private val pendingMediaDownKeyCodes = HashSet<Int>()
 
+    @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // DOWN 与配对的 UP 必须**成对**吞掉。
         // 此前只拦 DOWN，未被消费的 ACTION_UP 会继续下发到 MediaSession，由 Media3 默认处理
@@ -3354,6 +3474,7 @@ class MainActivity : ComponentActivity() {
         //     不归 onDestroy 管 —— 两处都读同一开关只会让行为难以推理。
         // 因此这里只看 isUserExplicitExit 这一个真值来源。
         if (isUserExplicitExit) {
+            CrashLogManager.markCleanExit(this)
             try {
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
@@ -3380,20 +3501,64 @@ private suspend fun resolveDownloadUrlFor(
     context: android.content.Context,
     server: com.lm.player.core.model.ServerConfig?,
     song: UnifiedSong,
-    quality: AudioQuality
+    quality: AudioQuality,
+    forceServerOnly: Boolean = false
 ): String? {
     return try {
         val protocol = if (server != null) {
+            // 下载取链单独用短超时客户端：音源不可用时最多等十几秒就回退服务器原文件，
+            // 不能沿用共享客户端 300s 的 callTimeout，否则下载会长时间停在 0%。
+            val resolverClient = NetworkClientFactory.createOkHttpClient(context).newBuilder()
+                .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+                .callTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
             LemonMusicProtocol(
-                NetworkClientFactory.createOkHttpClient(context),
+                resolverClient,
                 server.serverUrl,
                 server.username,
                 server.tokenOrApiKey
             )
         } else null
-        DownloadRequestPlanner.resolveStreamAtQuality(protocol, song, quality, context)?.url
+        DownloadRequestPlanner.resolveStreamAtQuality(
+            protocol = protocol,
+            song = song,
+            quality = quality,
+            context = context,
+            preferServerFile = true,
+            skipLocalAcceleration = forceServerOnly
+        )?.url
     } catch (e: Exception) {
         android.util.Log.w("MainActivity", "Resolve download stream failed for ${song.title}", e)
         null
     }
+}
+
+private fun downloadQualityLadder(requested: AudioQuality): List<AudioQuality> = when (requested) {
+    AudioQuality.Q_HIRES -> listOf(AudioQuality.Q_HIRES, AudioQuality.Q_FLAC, AudioQuality.Q_320K)
+    AudioQuality.Q_FLAC -> listOf(AudioQuality.Q_FLAC, AudioQuality.Q_320K)
+    AudioQuality.Q_320K -> listOf(AudioQuality.Q_320K, AudioQuality.Q_128K)
+    AudioQuality.Q_128K -> listOf(AudioQuality.Q_128K)
+}
+
+/**
+ * 下载失败（403/超时）后的降级候选。
+ * attempt 偶数 = 先强制服务器原文件；奇数 = 本地音源 + 服务器。
+ */
+private suspend fun resolveDownloadFallbackFor(
+    context: android.content.Context,
+    server: com.lm.player.core.model.ServerConfig?,
+    song: UnifiedSong,
+    requested: AudioQuality,
+    attempt: Int
+): String? {
+    val ladder = downloadQualityLadder(requested)
+    val target = ladder.getOrNull(attempt / 2) ?: return null
+    return resolveDownloadUrlFor(
+        context = context,
+        server = server,
+        song = song,
+        quality = target,
+        forceServerOnly = attempt % 2 == 0
+    )
 }

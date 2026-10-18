@@ -606,7 +606,11 @@ fun LocalMusicHomeScreen(
         }
     }
 
-    val isScrolledAway = listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
+    val isScrolledAway by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
+        }
+    }
     LaunchedEffect(isScrolledAway) {
         onScrollPositionChange(isScrolledAway)
     }

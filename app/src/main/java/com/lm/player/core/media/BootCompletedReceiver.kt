@@ -9,7 +9,6 @@ import android.os.Looper
 import android.os.UserManager
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.lm.player.MainActivity
 
 /**
  * 安卓系统开机自启动广播接收器
@@ -102,20 +101,9 @@ class BootCompletedReceiver : BroadcastReceiver() {
                     Log.w(TAG, "Start PlaybackService on boot failed", e)
                 }
 
-                try {
-                    val activityIntent = Intent(appContext, MainActivity::class.java).apply {
-                        addFlags(
-                            Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP
-                        )
-                        putExtra("from_boot_completed", true)
-                    }
-                    appContext.startActivity(activityIntent)
-                    Log.i(TAG, "Launched MainActivity on system boot completed")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Launch MainActivity on boot failed", e)
-                }
+                // Android 10+ 限制后台启动 Activity；开机只启动前台媒体服务，
+                // 用户点击通知/桌面图标后再进入界面，避免后台弹 Activity 的合规与失败风险。
+                Log.i(TAG, "Boot foreground service started; UI waits for user interaction")
             } finally {
                 try {
                     pendingResult.finish()

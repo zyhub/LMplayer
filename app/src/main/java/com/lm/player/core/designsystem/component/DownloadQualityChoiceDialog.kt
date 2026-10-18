@@ -59,6 +59,9 @@ fun DownloadQualityDropdownMenu(
             when {
                 hasServer && !hasLocal -> DownloadTarget.LOCAL
                 hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
+                // 双端都已有：服务器/双端按钮会置灰，选中目标必须回落到本地，
+                // 否则点音质时仍会把已置灰的 SERVER/BOTH 传给下载调度。
+                hasLocal && hasServer -> DownloadTarget.LOCAL
                 !isServerConnected -> DownloadTarget.LOCAL
                 else -> savedDefaultTarget
             }
@@ -126,6 +129,13 @@ fun DownloadQualityDropdownMenu(
                 // 当有一端已经下载时，仅显示未下载的那一端 + 保持灰色的「双端下载」
                 val targetOptions = remember(hasLocal, hasServer, isServerConnected, isOnlyOneDownloaded) {
                     when {
+                        // 服务器曲库已有：只允许重新下载本地音质，服务器/双端置灰。
+                        // 再次提交服务器下载只会生成一个永远等待确认的 await_exist 任务。
+                        hasLocal && hasServer -> listOf(
+                            Triple(DownloadTarget.LOCAL, "📱 本地下载", true),
+                            Triple(DownloadTarget.SERVER, "☁️ 服务器下载", false),
+                            Triple(DownloadTarget.BOTH, "🔄 双端下载", false)
+                        )
                         hasLocal && !hasServer -> listOf(
                             Triple(DownloadTarget.SERVER, "☁️ 服务器下载", isServerConnected),
                             Triple(DownloadTarget.BOTH, "🔄 双端下载", false)
@@ -306,6 +316,7 @@ fun DownloadQualityChoiceDialog(
             when {
                 hasServer && !hasLocal -> DownloadTarget.LOCAL
                 hasLocal && !hasServer && isServerConnected -> DownloadTarget.SERVER
+                hasLocal && hasServer -> DownloadTarget.LOCAL
                 !isServerConnected -> DownloadTarget.LOCAL
                 else -> savedDefaultTarget
             }
@@ -315,6 +326,9 @@ fun DownloadQualityChoiceDialog(
 
     val visibleTargets = remember(hasLocal, hasServer) {
         when {
+            // 双端都已存在时不再提供服务器/双端入口：服务器曲目重复提交会变成
+            // 服务端 await_exist 待确认任务。只保留「重新下载本地音质」。
+            hasLocal && hasServer -> listOf(DownloadTarget.LOCAL)
             hasLocal && !hasServer -> listOf(DownloadTarget.SERVER, DownloadTarget.BOTH)
             !hasLocal && hasServer -> listOf(DownloadTarget.LOCAL, DownloadTarget.BOTH)
             else -> DownloadTarget.entries.toList()

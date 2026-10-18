@@ -33,6 +33,15 @@ import java.util.concurrent.ConcurrentHashMap
  * 7. 本地与云端同步滚动 LRC 歌词解析 (/api/play/lyric)
  * 8. 全网多平台在线搜索与试听串流 (/api/search, /api/play/url)
  */
+/** 服务器曲库中与在线歌曲匹配到的一条本地文件记录（用于下载时优先走服务器原文件） */
+data class ServerLibraryTrack(
+    val filePath: String,
+    val trackId: String,
+    val title: String,
+    val artist: String,
+    val format: String
+)
+
 class LemonMusicProtocol(
     private val client: OkHttpClient,
     private val serverUrl: String,
@@ -149,6 +158,12 @@ class LemonMusicProtocol(
         private val songIdToPathMap = ConcurrentHashMap<String, String>()
         private val songIdToTrackIdMap = ConcurrentHashMap<String, String>()
         private val songIdToSongMap = ConcurrentHashMap<String, UnifiedSong>()
+        // 在线搜索歌曲 ID (lemon_online_*) 与服务器曲库物理路径的映射：
+        // 搜索结果的 streamUrl 是空的，而服务器同一首歌的 ID 是 lemon_<md5(path)>，
+        // 两者对不上。下载时按歌名/歌手查一次后缓存到这里，后续直接用服务器原文件。
+        private val onlineSongIdToPathMap = ConcurrentHashMap<String, String>()
+        private val onlineSongIdToTrackIdMap = ConcurrentHashMap<String, String>()
+        private val serverLibraryLookupCache = ConcurrentHashMap<String, ServerLibraryTrack>()
         // 记录服务器本地曲目是否包含内嵌封面 (来自 /api/library/tracks 或 /api/library/tracks/by-paths 的 hasPicture 字段)
         private val songIdHasEmbeddedCoverMap = ConcurrentHashMap<String, Boolean>()
         // 缓存已通过在线搜索或快照补齐的真实封面 URL，避免无内嵌封面的本地曲目重复请求或回退到 404 的 /api/tag/cover
@@ -197,6 +212,9 @@ class LemonMusicProtocol(
             songIdToPathMap.clear()
             songIdToTrackIdMap.clear()
             songIdToSongMap.clear()
+            onlineSongIdToPathMap.clear()
+            onlineSongIdToTrackIdMap.clear()
+            serverLibraryLookupCache.clear()
             songIdHasEmbeddedCoverMap.clear()
             songIdResolvedCoverMap.clear()
             discoverPlaylistsCache.clear()
@@ -227,7 +245,9 @@ class LemonMusicProtocol(
         }
 
         fun getServerFilePath(songId: String, streamUrl: String? = null, coverUrl: String? = null): String? {
-            if (!songId.startsWith("lemon_online_")) {
+            if (songId.startsWith("lemon_online_")) {
+                onlineSongIdToPathMap[songId]?.let { return it }
+            } else {
                 songIdToPathMap[songId]?.let { return it }
             }
             val song = if (!songId.startsWith("lemon_online_")) songIdToSongMap[songId] else null
@@ -249,14 +269,17 @@ class LemonMusicProtocol(
             return null
         }
 
-        fun getServerTrackId(songId: String): String? = songIdToTrackIdMap[songId]
+        fun getServerTrackId(songId: String): String? =
+            onlineSongIdToTrackIdMap[songId] ?: songIdToTrackIdMap[songId]
 
         fun registerServerFilePath(songId: String, filePath: String, trackId: String? = null) {
-            if (songId.isNotBlank() && filePath.isNotBlank() && !songId.startsWith("lemon_online_")) {
-                songIdToPathMap[songId] = filePath
-            }
-            if (songId.isNotBlank() && !trackId.isNullOrBlank() && !songId.startsWith("lemon_online_")) {
-                songIdToTrackIdMap[songId] = trackId
+            if (songId.isBlank()) return
+            if (songId.startsWith("lemon_online_")) {
+                if (filePath.isNotBlank()) onlineSongIdToPathMap[songId] = filePath
+                if (!trackId.isNullOrBlank()) onlineSongIdToTrackIdMap[songId] = trackId
+            } else {
+                if (filePath.isNotBlank()) songIdToPathMap[songId] = filePath
+                if (!trackId.isNullOrBlank()) songIdToTrackIdMap[songId] = trackId
             }
         }
 
@@ -330,6 +353,13 @@ class LemonMusicProtocol(
         /**
          * 逐档降级音质序列 (flac24bit -> flac -> 320k -> 128k)，避免首选音质不可用时直接跳降为 128k
          */
+        /** 服务端时间戳统一归一到毫秒：10 位以内按秒处理（unixepoch），13 位按毫秒 */
+        private fun normalizeEpochMillis(value: Long): Long = when {
+            value <= 0L -> 0L
+            value < 10_000_000_000L -> value * 1000L
+            else -> value
+        }
+
         fun getFallbackQualities(preferredQuality: String): List<String> {
             val order = listOf("flac24bit", "flac", "320k", "128k")
             val normalized = AudioQuality.fromKey(preferredQuality).key
@@ -996,6 +1026,77 @@ class LemonMusicProtocol(
             )
         }
         return null
+    }
+
+    /**
+     * 按歌名在服务器曲库中定位同一首歌的物理文件。
+     *
+     * 用途：在线搜索结果 (id=lemon_online_*) 与服务器曲库记录 (id=lemon_<md5(path)>)
+     * ID 不同，搜索结果又常常没有 streamUrl，导致下载时找不到服务器原文件，只能去
+     * 第三方音源取链。服务端代理大文件会严重限速，用户看到的就是下载卡 0%/失败。
+     * /api/library/tracks?q= 是**单曲查询**，实测 0.5s 返回，不会像 ?all=1 那样慢。
+     */
+    suspend fun findServerLibraryTrack(
+        title: String,
+        artist: String,
+        durationMs: Long = 0L,
+        album: String = ""
+    ): ServerLibraryTrack? = withContext(Dispatchers.IO) {
+        if (title.isBlank()) return@withContext null
+        val cacheKey = "${SongMatchingResolver.normalizeTrackTitle(title)}|||${SongMatchingResolver.normalizeArtist(artist)}|||${SongMatchingResolver.normalizeTrackTitle(album)}"
+        serverLibraryLookupCache[cacheKey]?.let { return@withContext it }
+
+        var found: ServerLibraryTrack? = null
+        try {
+            ensureAuthenticatedOrThrow()
+            val enc = URLEncoder.encode(title, "UTF-8")
+            val req = newAuthRequest("$cleanBase/api/library/tracks?q=$enc&limit=30").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use
+                val body = resp.body?.string() ?: ""
+                if (body.isBlank()) return@use
+                val json = JSONObject(body)
+                val arr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val filePath = obj.optString("filePath").trim()
+                    if (filePath.isBlank()) continue
+                    val itemTitle = obj.optString("title")
+                        .ifBlank { obj.optString("parsedTitle") }
+                        .ifBlank { filePath.substringAfterLast('/').substringBeforeLast('.') }
+                    val itemArtist = obj.optString("artist").ifBlank { obj.optString("parsedArtist") }
+                    if (!SongMatchingResolver.isSongMatch(
+                            title1 = title,
+                            artist1 = artist,
+                            durationMs1 = durationMs,
+                            title2 = itemTitle,
+                            artist2 = itemArtist,
+                            durationMs2 = 0L,
+                            album1 = album,
+                            album2 = obj.optString("album")
+                        )
+                    ) continue
+                    found = ServerLibraryTrack(
+                        filePath = filePath,
+                        trackId = obj.optString("trackId").ifBlank { obj.optString("id") },
+                        title = itemTitle,
+                        artist = itemArtist,
+                        format = obj.optString("format").lowercase()
+                    )
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "findServerLibraryTrack failed for $title: ${e.message}")
+            return@withContext null
+        }
+
+        found?.let { serverLibraryLookupCache[cacheKey] = it }
+        found
     }
 
     /**
@@ -3069,11 +3170,63 @@ class LemonMusicProtocol(
         skipDirectAttempt: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
+            val normalizedQuality = AudioQuality.fromKey(quality).key
+            val localSource = songId.removePrefix("lemon_online_").let {
+                if (it.contains("_")) it.substringBefore("_") else source
+            }
+
+            // 音源加速：外网或内网高延迟时，先让本地 QuickJS 解析；失败再走服务器。
+            // 任何本地异常都只记录并继续服务器，绝不阻断播放/下载。
+            if (!refresh && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate(serverHost)) {
+                val localInfo = buildLocalMusicInfo(songId, source, metaJson, fallbackTitle, fallbackArtist)
+                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
+                    source = localSource,
+                    quality = normalizedQuality,
+                    musicInfoJson = localInfo
+                )
+                local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let { localUrl ->
+                    Log.i(TAG, "Local source acceleration resolved: ${songId}/${normalizedQuality}")
+                    com.lm.player.core.source.ServerSourceRepository.cacheStream(
+                        host = serverHost,
+                        songId = songId,
+                        quality = normalizedQuality,
+                        url = localUrl,
+                        sourceId = "local_accel"
+                    )
+                    return@withContext Result.success(localUrl)
+                }
+                local.exceptionOrNull()?.let { Log.w(TAG, "Local source acceleration failed, fallback server: ${it.message}") }
+            }
+
+            // 服务器最近在线且延迟偏高时，优先用最近成功解析的直链（10 分钟 TTL）；
+            // 放在 ensureAuthenticated 之前，避免为了走缓存反而先发一次慢鉴权请求。
+            // 服务器长时间离线后 ServerLatencyMonitor 会判定不在线，缓存自动停用。
+            if (!refresh && com.lm.player.core.source.ServerSourceRepository.isLocalFallbackActive(serverHost)) {
+                val cached = com.lm.player.core.source.ServerSourceRepository.getCachedStream(
+                    host = serverHost,
+                    songId = songId,
+                    quality = normalizedQuality
+                )
+                if (cached != null) {
+                    Log.i(TAG, "Using locally cached stream fallback: $songId / $normalizedQuality")
+                    return@withContext Result.success(cached.url)
+                }
+            }
+
             ensureAuthenticatedOrThrow()
             val cleanId = songId.removePrefix("lemon_online_")
             val actualSource = if (cleanId.contains("_")) cleanId.substringBefore("_") else source
             val rawId = if (cleanId.contains("_")) cleanId.substringAfter("_") else cleanId
-            val normalizedQuality = AudioQuality.fromKey(quality).key
+
+            suspend fun cacheAndReturn(url: String): Result<String> {
+                com.lm.player.core.source.ServerSourceRepository.cacheStream(
+                    host = serverHost,
+                    songId = songId,
+                    quality = normalizedQuality,
+                    url = url
+                )
+                return Result.success(url)
+            }
 
             fun parsePlayUrlFromBody(body: String): String? {
                 if (body.isBlank()) return null
@@ -3227,7 +3380,7 @@ class LemonMusicProtocol(
                 firstCode = code
                 firstBody = body
                 if (code in 200..299) {
-                    parsePlayUrlFromBody(body)?.let { return@withContext Result.success(it) }
+                    parsePlayUrlFromBody(body)?.let { return@withContext cacheAndReturn(it) }
                 }
             }
 
@@ -3256,7 +3409,7 @@ class LemonMusicProtocol(
                             val candRawId = if (candCleanId.contains("_")) candCleanId.substringAfter("_") else candCleanId
                             val (retryCode, retryBody) = requestPlayUrlWithSourceFallback(candSrc, candRawId, bestMatch.rawMetaJson)
                             if (retryCode in 200..299) {
-                                parsePlayUrlFromBody(retryBody)?.let { return@withContext Result.success(it) }
+                                parsePlayUrlFromBody(retryBody)?.let { return@withContext cacheAndReturn(it) }
                             }
                         }
                     }
@@ -3297,10 +3450,16 @@ class LemonMusicProtocol(
         metaJson: String? = null,
         fallbackTitle: String? = null,
         fallbackArtist: String? = null,
-        refresh: Boolean = false
+        refresh: Boolean = false,
+        // 下载链路专用时间预算：0 表示不限制（播放链路保持原有完整降级/跨平台行为）。
+        // 服务器已下载的歌曲常常本地也有文件，若音源取链卡住，用户会看到下载永远停在 0%。
+        maxDurationMs: Long = 0L
     ): Result<ResolvedOnlineStream> = withContext(Dispatchers.IO) {
         val candidateQualities = getFallbackQualities(preferredQuality)
         var lastError: Throwable? = null
+        val startedAt = System.currentTimeMillis()
+        fun budgetExceeded(): Boolean =
+            maxDurationMs > 0L && System.currentTimeMillis() - startedAt >= maxDurationMs
 
         fun buildResolvedStream(url: String, qKey: String): ResolvedOnlineStream {
             val decodedUpstream = runCatching {
@@ -3338,6 +3497,10 @@ class LemonMusicProtocol(
 
         // 逐档下探：每一档都先走本平台，再走跨平台同档补源，本档彻底拿不到才降一档重来
         for ((index, qKey) in candidateQualities.withIndex()) {
+            if (budgetExceeded()) {
+                Log.w(TAG, "Download stream resolution budget exceeded [$songId] after $maxDurationMs ms")
+                break
+            }
             // 1) 本平台、本曲目自身 ID/metaJson 取链，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
             val directRes = resolveOnlineStreamUrl(
                 songId = songId,
@@ -3353,6 +3516,7 @@ class LemonMusicProtocol(
                 return@withContext Result.success(buildResolvedStream(it, qKey))
             }
             lastError = directRes.exceptionOrNull() ?: lastError
+            if (budgetExceeded()) break
 
             // 2) 同档跨平台补源：本平台没有这一档时，先去其它平台找同名同版本曲目，仍按当前这一档取链
             val crossRes = resolveOnlineStreamUrl(
@@ -3480,7 +3644,15 @@ class LemonMusicProtocol(
                     val status = obj.optString("status", "waiting")
                     val progress = obj.optInt("progress", if (status == "completed") 100 else 0)
                     val error = obj.optString("error", "")
-                    val createdAt = obj.optLong("created_at", obj.optLong("createdAt", obj.optLong("mtime", 0L)))
+                    // 服务端 download_tasks.created_at 是 SQLite unixepoch() 的**秒**，
+                    // 之前直接当毫秒塞给 Date，列表时间会显示成 1970-01-22，而且与
+                    // 新版任务混排时顺序错乱。这里统一归一到毫秒。
+                    val rawCreatedAt = obj.opt("created_at") ?: obj.opt("createdAt") ?: obj.opt("mtime")
+                    val createdAt = when (rawCreatedAt) {
+                        is Number -> normalizeEpochMillis(rawCreatedAt.toLong())
+                        is String -> rawCreatedAt.toLongOrNull()?.let { normalizeEpochMillis(it) } ?: 0L
+                        else -> 0L
+                    }
                     val filePath = obj.optString("filePath", obj.optString("path", ""))
                     val songId = obj.optString("songId", "")
                     val metaObj = obj.optJSONObject("meta")
@@ -3689,6 +3861,318 @@ class LemonMusicProtocol(
             Log.e(TAG, "Failed to fetch source list", e)
             Result.failure(e)
         }
+    }
+
+    /**
+     * 拉取服务端音源状态快照（/api/source/list + /api/settings 的 source.*）。
+     *
+     * 与旧的 fetchSourceList 不同：health 不再被 optString 成一段 JSON 字符串，
+     * 而是精确解析 level / badge / tip / platforms / sampleCount 等字段；
+     * sources 里同时解析每个平台的 qualitys / actions / enabled，供状态看板使用。
+     */
+    suspend fun fetchSourceSnapshot(): Result<ServerSourceSnapshot> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val startedAt = System.currentTimeMillis()
+            val req = newAuthRequest("$cleanBase/api/source/list").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("获取音源状态失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                val arr = when {
+                    trimmed.startsWith("[") -> JSONArray(trimmed)
+                    trimmed.startsWith("{") -> {
+                        val json = JSONObject(trimmed)
+                        json.optJSONArray("data") ?: json.optJSONArray("list") ?: json.optJSONArray("rows") ?: JSONArray()
+                    }
+                    else -> JSONArray()
+                }
+
+                val settingsObj = runCatching { getServerSettings().getOrNull() }.getOrNull()
+                val fallbackMode = settingsObj?.optString("source.fallbackMode")
+                    ?.takeIf { it.isNotBlank() } ?: "auto"
+                val srvPlatformsRaw = settingsObj?.optString("source.enabledPlatforms")
+                val srvPlatformsJson = srvPlatformsRaw?.takeIf { it.isNotBlank() }
+                    ?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+                val result = ArrayList<ServerSourceStatus>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val id = item.optString("id").ifBlank { (i + 1).toString() }
+                    val sourcesObj = item.optJSONObject("sources")
+                    val caps = mutableListOf<SourcePlatformCapability>()
+                    val disabled = mutableListOf<String>()
+                    if (sourcesObj != null) {
+                        val keys = sourcesObj.keys()
+                        while (keys.hasNext()) {
+                            val platform = keys.next()
+                            val v = sourcesObj.opt(platform)
+                            val enabled = when (v) {
+                                is Boolean -> v
+                                is JSONObject -> v.optBoolean("enabled", true)
+                                else -> true
+                            }
+                            val obj = v as? JSONObject
+                            val qualitys = mutableListOf<String>()
+                            val actions = mutableListOf<String>()
+                            obj?.optJSONArray("qualitys")?.let { qa ->
+                                for (qi in 0 until qa.length()) qa.optString(qi).takeIf { it.isNotBlank() }?.let { qualitys.add(it) }
+                            }
+                            obj?.optJSONArray("actions")?.let { aa ->
+                                for (ai in 0 until aa.length()) aa.optString(ai).takeIf { it.isNotBlank() }?.let { actions.add(it) }
+                            }
+                            caps.add(
+                                SourcePlatformCapability(
+                                    id = platform.lowercase(),
+                                    name = obj?.optString("name").orEmpty(),
+                                    qualitys = qualitys,
+                                    actions = actions,
+                                    enabled = enabled
+                                )
+                            )
+                            if (!enabled) disabled.add(platform.lowercase())
+                        }
+                    } else {
+                        // 兼容旧服务端：sources 是平台数组
+                        item.optJSONArray("sources")?.let { sa ->
+                            for (si in 0 until sa.length()) {
+                                val p = sa.optString(si)
+                                if (p.isNotBlank()) caps.add(SourcePlatformCapability(id = p.lowercase(), enabled = true))
+                            }
+                        }
+                    }
+                    val disabledArr = item.optJSONArray("disabledSources")
+                        ?: item.optJSONArray("disabledPlatforms")
+                        ?: item.optJSONArray("disabled_platforms")
+                    if (disabledArr != null) {
+                        for (di in 0 until disabledArr.length()) {
+                            val p = disabledArr.optString(di).lowercase()
+                            if (p.isNotBlank() && p !in disabled) disabled.add(p)
+                        }
+                    }
+                    if (srvPlatformsJson != null && srvPlatformsJson.has(id)) {
+                        val enabledSet = mutableSetOf<String>()
+                        srvPlatformsJson.optJSONArray(id)?.let { ea ->
+                            for (ei in 0 until ea.length()) enabledSet.add(ea.optString(ei).lowercase())
+                        }
+                        for (p in caps.map { it.id }) {
+                            if (p !in enabledSet && p !in disabled) disabled.add(p)
+                        }
+                    }
+
+                    val healthObj = item.optJSONObject("health")
+                    val healthPlatforms = mutableListOf<SourceHealthPlatform>()
+                    healthObj?.optJSONArray("platforms")?.let { hp ->
+                        for (hi in 0 until hp.length()) {
+                            val p = hp.optJSONObject(hi) ?: continue
+                            val pid = p.optString("id")
+                            if (pid.isBlank()) continue
+                            healthPlatforms.add(
+                                SourceHealthPlatform(
+                                    id = pid.lowercase(),
+                                    label = p.optString("label", pid),
+                                    level = p.optString("level", "unknown"),
+                                    sampleCount = p.optInt("sampleCount", 0),
+                                    previewCount = p.optInt("previewCount", 0),
+                                    ratio = p.optDouble("ratio", 0.0)
+                                )
+                            )
+                        }
+                    }
+                    val autoClosed = mutableListOf<String>()
+                    healthObj?.optJSONArray("autoClosedPlatforms")?.let { ac ->
+                        for (ai in 0 until ac.length()) ac.optString(ai).takeIf { it.isNotBlank() }?.let { autoClosed.add(it) }
+                    }
+                    val health = SourceHealthInfo(
+                        level = healthObj?.optString("level", "unknown") ?: "unknown",
+                        badge = healthObj?.optString("badge").orEmpty(),
+                        tip = healthObj?.optString("tip").orEmpty(),
+                        unhealthy = healthObj?.optBoolean("unhealthy", false) ?: false,
+                        sampleCount = healthObj?.optInt("sampleCount", 0) ?: 0,
+                        previewCount = healthObj?.optInt("previewCount", 0) ?: 0,
+                        ratio = healthObj?.optDouble("ratio", 0.0) ?: 0.0,
+                        platforms = healthPlatforms,
+                        autoClosedPlatforms = autoClosed,
+                        updatedAt = healthObj?.optString("updatedAt").orEmpty()
+                    )
+
+                    result.add(
+                        ServerSourceStatus(
+                            id = id,
+                            name = item.optString("name", "自定义音源"),
+                            description = item.optString("description").orEmpty(),
+                            author = item.optString("author").orEmpty(),
+                            version = item.optString("version").orEmpty(),
+                            homepage = item.optString("homepage").orEmpty(),
+                            isActive = item.optBoolean("active", false),
+                            health = health,
+                            platforms = caps,
+                            disabledPlatforms = disabled.distinct()
+                        )
+                    )
+                }
+
+                Result.success(
+                    ServerSourceSnapshot(
+                        serverId = "",
+                        serverName = "",
+                        sources = result,
+                        fallbackMode = fallbackMode,
+                        latencyMs = System.currentTimeMillis() - startedAt,
+                        online = true
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.e(TAG, "Failed to fetch source snapshot", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 拉取 active 音源脚本 bundle。
+     *
+     * 首选服务端 /api/source/active-bundle；旧部署没有该接口时，回退到
+     * /api/source/:id/raw 或音源 homepage（当前线上音源的 homepage 就是脚本地址）。
+     * 脚本只进入内存会话，不落盘。
+     */
+    suspend fun fetchActiveScriptBundle(): Result<SourceScriptBundle> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val direct = runCatching { fetchBundleEndpoint() }.getOrNull()
+            if (direct != null && direct.sources.isNotEmpty()) {
+                return@withContext Result.success(direct)
+            }
+
+            val snapshot = fetchSourceSnapshot().getOrElse {
+                return@withContext Result.failure(it)
+            }
+            val active = snapshot.sources.filter { it.isActive }
+            if (active.isEmpty()) {
+                return@withContext Result.failure(Exception("没有已激活的音源"))
+            }
+            val entries = ArrayList<SourceScriptEntry>()
+            for (source in active) {
+                var script = fetchRawScript(source.id).orEmpty()
+                if (!looksLikeSourceScript(script) && source.homepage.startsWith("http")) {
+                    script = fetchExternalScript(source.homepage).orEmpty()
+                }
+                if (!looksLikeSourceScript(script)) {
+                    Log.w(TAG, "No usable script for ${source.name} (${source.id})")
+                    continue
+                }
+                entries.add(
+                    SourceScriptEntry(
+                        id = source.id,
+                        name = source.name,
+                        version = source.version,
+                        script = script,
+                        homepage = source.homepage,
+                        sourcesJson = "{}"
+                    )
+                )
+            }
+            if (entries.isEmpty()) {
+                Result.failure(Exception("服务端脚本接口不可用，且 homepage 未返回有效脚本"))
+            } else {
+                Result.success(SourceScriptBundle(sources = entries))
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.e(TAG, "fetchActiveScriptBundle failed", e)
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun fetchBundleEndpoint(): SourceScriptBundle? {
+        val req = newAuthRequest("$cleanBase/api/source/active-bundle").get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            val obj = runCatching { JSONObject(body) }.getOrNull() ?: return null
+            val arr = obj.optJSONArray("sources") ?: return null
+            val list = ArrayList<SourceScriptEntry>(arr.length())
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val script = item.optString("script")
+                if (!looksLikeSourceScript(script)) continue
+                list.add(
+                    SourceScriptEntry(
+                        id = item.optString("id"),
+                        name = item.optString("name"),
+                        version = item.optString("version"),
+                        script = script,
+                        homepage = item.optString("homepage"),
+                        sourcesJson = item.optJSONObject("sources")?.toString() ?: "{}",
+                        hash = item.optString("hash")
+                    )
+                )
+            }
+            return SourceScriptBundle(
+                version = obj.optInt("version", 1),
+                generatedAt = obj.optString("generatedAt"),
+                sources = list
+            )
+        }
+    }
+
+    private suspend fun fetchRawScript(sourceId: String): String? {
+        if (sourceId.isBlank()) return null
+        val encoded = java.net.URLEncoder.encode(sourceId, "UTF-8")
+        val req = newAuthRequest("$cleanBase/api/source/$encoded/raw").get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            return body.takeIf { looksLikeSourceScript(it) }
+        }
+    }
+
+    private suspend fun fetchExternalScript(url: String): String? {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "LMPlayer/1.7.27")
+            .get()
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            return body.takeIf { looksLikeSourceScript(it) }
+        }
+    }
+
+    private fun looksLikeSourceScript(text: String): Boolean {
+        if (text.length < 50 || text.length > 5 * 1024 * 1024) return false
+        if (text.trimStart().startsWith("<")) return false
+        return text.contains("globalThis.lx") || text.contains("lx.EVENT_NAMES") ||
+            text.contains("EVENT_NAMES") && text.contains("musicUrl")
+    }
+
+    /** 构造 LX 音源要求的最小 musicInfo；空 hash/songmid 必须移除，否则脚本会优先取到空串。 */
+    private fun buildLocalMusicInfo(
+        songId: String,
+        source: String,
+        metaJson: String?,
+        fallbackTitle: String?,
+        fallbackArtist: String?
+    ): String {
+        val obj = runCatching { JSONObject(metaJson ?: "{}") }.getOrDefault(JSONObject())
+        val clean = songId.removePrefix("lemon_online_")
+        val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+        if (rawId.isNotBlank()) {
+            if (obj.optString("id").isBlank()) obj.put("id", rawId)
+            if (obj.optString("songId").isBlank()) obj.put("songId", rawId)
+        }
+        if (obj.optString("name").isBlank() && !fallbackTitle.isNullOrBlank()) obj.put("name", fallbackTitle)
+        if (obj.optString("singer").isBlank() && !fallbackArtist.isNullOrBlank()) obj.put("singer", fallbackArtist)
+        if (obj.optString("source").isBlank()) obj.put("source", source)
+        // LX 脚本常用 hash ?? songmid ?? id；空字符串不会触发 ??，必须删掉
+        listOf("hash", "songmid").forEach { key ->
+            if (obj.has(key) && obj.optString(key).isBlank()) obj.remove(key)
+        }
+        return obj.toString()
     }
 
     /**
@@ -4597,6 +5081,23 @@ class LemonMusicProtocol(
      * 获取柠檬音乐服务端全局与用户设置 (/api/settings)
      * 对齐服务端 server/routes/settings.js (包含 download.maxDownloadNum, download.isDownloadLrc 等)
      */
+    /** 轻量健康检查：10 秒总超时，只判断服务器是否可达，不解析业务。 */
+    suspend fun healthCheck(timeoutMs: Long = 10_000L): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val probeClient = client.newBuilder()
+                .callTimeout(timeoutMs.coerceIn(1_000L, 10_000L), java.util.concurrent.TimeUnit.MILLISECONDS)
+                .build()
+            val req = newAuthRequest("$cleanBase/api/settings").get().build()
+            probeClient.newCall(req).execute().use { resp ->
+                Result.success(resp.isSuccessful)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Result.failure(e)
+        }
+    }
+
     suspend fun getServerSettings(): Result<JSONObject> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()

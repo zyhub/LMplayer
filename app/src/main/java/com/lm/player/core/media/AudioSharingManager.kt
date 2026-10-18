@@ -1,3 +1,5 @@
+@file:Suppress("SuspiciousIndentation")
+
 package com.lm.player.core.media
 
 import android.content.Context
@@ -137,12 +139,12 @@ object AudioSharingManager {
 
     private fun generateSecureToken(prefix: String, rawId: String): String {
         return try {
-            val md = java.security.MessageDigest.getInstance("MD5")
-            val digest = md.digest("$prefix:$rawId:$castSessionSecret".toByteArray(Charsets.UTF_8))
-            val hex = digest.joinToString("") { "%02x".format(it) }
-            "${prefix}_${hex.take(16)}"
+            val bytes = ByteArray(16)
+            java.security.SecureRandom().nextBytes(bytes)
+            val hex = bytes.joinToString("") { "%02x".format(it) }
+            prefix + "_" + hex.take(24)
         } catch (_: Exception) {
-            "${prefix}_${(rawId + castSessionSecret).hashCode().toUInt()}"
+            prefix + "_" + kotlin.math.abs((rawId + castSessionSecret).hashCode()).toString()
         }
     }
 
@@ -1302,7 +1304,11 @@ object AudioSharingManager {
         return try {
             val server = ServerSocket()
             server.reuseAddress = true
-            server.bind(InetSocketAddress(0))
+            // 只绑定 Wi-Fi 局域网地址；拿不到地址时才退回通配绑定。
+            val bindIp = context?.let { getWifiLanIpAddress(it) }
+                ?: appContextRef?.let { getWifiLanIpAddress(it) }
+                ?: "0.0.0.0"
+            server.bind(InetSocketAddress(bindIp, 0))
             httpServerSocket = server
             httpServerPort = server.localPort
 

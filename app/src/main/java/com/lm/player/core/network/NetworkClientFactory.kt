@@ -53,14 +53,16 @@ object NetworkClientFactory {
      * 第三方音源或其它自建服务时，只要其接口路径以 /api/ 开头，就会收到本机的柠檬服务器令牌
      * —— 属于凭据外泄。现在只有登录成功过的那台服务器主机才会被注入。
      */
-    private val authTokenHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val authTokenHosts = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     fun setActiveAuthToken(token: String, host: String? = null) {
         if (token.isNotBlank()) {
             activeAuthToken = token.trim()
+            // Token 必须始终与唯一宿主绑定；host 为空时清空旧白名单，避免新 Token 发给旧主机。
+            authTokenHosts.clear()
             host?.trim()?.takeIf { it.isNotBlank() }?.let {
                 authTokenHosts.clear()
-                authTokenHosts.add(it.substringBefore(':').lowercase())
+                authTokenHosts[it.substringBefore(':').lowercase()] = true
             }
         }
     }
@@ -75,7 +77,7 @@ object NetworkClientFactory {
     /** 该主机是否被授权接收全局令牌（未登记任何主机时一律不注入） */
     private fun isTokenHostAllowed(host: String): Boolean {
         if (authTokenHosts.isEmpty()) return false
-        return authTokenHosts.contains(host.lowercase())
+        return authTokenHosts.containsKey(host.lowercase())
     }
 
     fun createOkHttpClient(context: Context): OkHttpClient {
@@ -164,7 +166,50 @@ object NetworkClientFactory {
                     reqBuilder.header("Authorization", "Bearer $activeAuthToken")
                 }
             }
-            chain.proceed(reqBuilder.build())
+            val sampleLatency = encodedPath.startsWith("/api/") &&
+                !encodedPath.contains("/api/play/local") &&
+                !encodedPath.contains("/api/play/proxy") &&
+                !encodedPath.contains("/api/play/local-ape") &&
+                !encodedPath.contains("/api/download/") &&
+                // 曲库全量/批量接口天然很慢（当前服务器 /api/library/tracks?all=1 可达 15s），
+                // 把它计入会污染「服务器控制面延迟」，让音源看板误报 15s 并误触发直链兜底。
+                !encodedPath.contains("/api/library/") &&
+                !encodedPath.contains("/api/source/health/") &&
+                !encodedPath.contains("/api/tag/")
+            val startedAt = System.currentTimeMillis()
+            try {
+                val response = chain.proceed(reqBuilder.build())
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (sampleLatency) {
+                    ServerLatencyMonitor.record(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = response.isSuccessful
+                    )
+                    // 4xx/5xx 也说明服务器可达；只有 IO 失败/超过 10s 才算 LOST
+                    com.lm.player.core.source.SourceAccelerationController.onServerSample(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = true
+                    )
+                }
+                response
+            } catch (e: java.io.IOException) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (sampleLatency) {
+                    ServerLatencyMonitor.record(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = false
+                    )
+                    com.lm.player.core.source.SourceAccelerationController.onServerSample(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = false
+                    )
+                }
+                throw e
+            }
         }
 
         // API 23~28 专属 SSLContext 配置
