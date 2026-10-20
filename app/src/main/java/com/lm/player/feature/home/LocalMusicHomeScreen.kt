@@ -291,7 +291,7 @@ fun SongListItemRow(
                     }
                 }
             )
-            .padding(horizontal = if (isMultiSelectMode || isCurrentPlaying) 6.dp else 0.dp, vertical = 5.dp),
+            .padding(horizontal = 6.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (isMultiSelectMode) {
@@ -885,6 +885,16 @@ fun LocalMusicHomeScreen(
             }
         }
     }
+
+    // 顶部渐进毛玻璃吸顶层 (当页面向上滚动穿过状态栏时平滑出现)
+    com.lm.player.core.designsystem.component.ProgressiveFrostedTopBar(
+        isScrolled = isScrolledAway,
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .height(18.dp)
+    ) {}
 
     if (showBatchDownloadDialog) {
         val selectedSongs = activeSongSource.filter { it.id in selectedSongIds }

@@ -89,6 +89,8 @@ class LMApplication : Application(), ImageLoaderFactory {
             com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
+            // 不等服务器同步：先用上次成功 bundle 恢复 QuickJS，冷启动离线也能本地取链。
+            com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
 
         }
 

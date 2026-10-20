@@ -24,6 +24,11 @@ class PlaybackRouter(
     private val downloadDao: DownloadDao,
     private val context: Context
 ) {
+    private companion object {
+        /** 播放链路单次本地加速预算；超过即回退服务器，避免点歌后卡 10~25 秒。 */
+        const val PLAYBACK_ACCEL_BUDGET_MS = 2_200L
+    }
+
     private val TAG = "PlaybackRouter"
 
     /** 构造 LX 音源最小 musicInfo；空 hash/songmid 必须删除，否则脚本会优先取到空串。 */
@@ -131,41 +136,74 @@ class PlaybackRouter(
                     if (active != null && active.type == ServerType.LEMON_MUSIC) {
                         val client = NetworkClientFactory.createOkHttpClient(context)
                         val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
-                        protocol.ensureAuthenticated()
 
                         // 1. 音源加速优先：外网/内网高延迟时，先本地解析；即使这首歌在服务端有原文件，
                         //    也允许用同曲目同音质直链加速。失败不报错，继续原有服务器路径。
+                        //
+                        // 注意：本地 QuickJS 不依赖服务器鉴权，必须先尝试加速、再 ensureAuthenticated()，
+                        // 否则服务器失联时鉴权会先阻塞，本地引擎根本没机会接管。
                         var accelerated = false
+                        var accelerationAttempted = false
+                        var localQuality: com.lm.player.core.model.AudioQuality? = null
                         // 服务端曲库曲目优先走 NAS 本地文件；只对真正的在线曲目做本地音源加速，
                         // 避免把 lemon_<hash> 误当成平台标识传给脚本。
-                        if (isOnlineId && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                        if (!forceRefresh && isOnlineId && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                            accelerationAttempted = true
                             val clean = song.id.removePrefix("lemon_online_")
                             val accelSource = if (clean.contains("_")) clean.substringBefore("_") else "kw"
                             val accelQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
-                            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
+                            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithQualityFallback(
                                 source = accelSource,
-                                quality = accelQuality,
-                                musicInfoJson = buildAccelerationInfo(song)
+                                preferredQuality = accelQuality,
+                                musicInfoJson = buildAccelerationInfo(song),
+                                budgetMs = PLAYBACK_ACCEL_BUDGET_MS
                             )
-                            local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let {
-                                finalStreamUrl = it
+                            val localResolution = local.getOrNull()
+                            val localUrl = localResolution?.url?.takeIf {
+                                it.startsWith("http://") || it.startsWith("https://")
+                            }
+                            if (localUrl != null && localResolution != null &&
+                                com.lm.player.core.network.CdnProbe.probe(localUrl)
+                            ) {
+                                finalStreamUrl = localUrl
                                 accelerated = true
+                                localQuality = com.lm.player.core.model.AudioQuality.fromKey(localResolution.qualityKey)
                                 Log.i(TAG, "Home/playback local acceleration resolved: ${song.title}")
+                            } else if (localUrl != null) {
+                                Log.w(TAG, "Home/playback local acceleration probe failed: ${song.title}")
                             }
                         } else if (isServerSong && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
                             // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；
-                            // 1.5 秒内未命中就直接播 NAS 文件。
+                            // 搜索与本地取链各有独立预算，超时直接回 NAS 文件。
+                            accelerationAttempted = true
                             val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
                                 protocol = protocol,
                                 serverId = active.id,
                                 song = song,
-                                overrideQuality = overrideQuality
+                                overrideQuality = overrideQuality,
+                                refresh = forceRefresh
                             ).getOrNull()
                             resolved?.let {
-                                finalStreamUrl = it.url
-                                accelerated = true
-                                Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
+                                if (com.lm.player.core.network.CdnProbe.probe(it.url)) {
+                                    finalStreamUrl = it.url
+                                    accelerated = true
+                                    localQuality = it.quality
+                                    Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
+                                } else {
+                                    Log.w(TAG, "Server library local acceleration probe failed: ${song.title}")
+                                    com.lm.player.core.source.ServerLibraryAccelerationResolver.invalidate(
+                                        serverId = active.id,
+                                        song = song,
+                                        qualityKey = it.requestedQuality.key
+                                    )
+                                }
                             }
+                        }
+
+                        // 只有没拿到本地直链、需要走服务器回退时才鉴权；本地加速成功时
+                        // 不再触碰服务器，避免服务器失联把已拿到的可播放直链又卡住。
+                        if (!accelerated) {
+                            protocol.ensureAuthenticated()
                         }
 
                         // 2. 若已有服务端本地流地址或属于服务端曲库曲目，优先刷新鉴权 Token 与标准流地址
@@ -205,6 +243,10 @@ class PlaybackRouter(
 
                         var resolvedFormat = song.format
                         var resolvedBitRate = song.bitRate
+                        localQuality?.let { q ->
+                            resolvedFormat = q.format.lowercase()
+                            resolvedBitRate = q.bitrate
+                        }
 
                         // 2. 若流地址仍为空或为待解析在线标识：通过柠檬服务端 /api/play/url 换取播放流
                         if (finalStreamUrl.isBlank() || finalStreamUrl.startsWith("lemon_online://")) {
@@ -221,7 +263,9 @@ class PlaybackRouter(
                                 metaJson = meta,
                                 fallbackTitle = song.title,
                                 fallbackArtist = song.artist,
-                                refresh = forceRefresh
+                                refresh = forceRefresh,
+                                // 上面已经试过一次本地加速；失败后不要在协议层再试一次。
+                                skipLocalAcceleration = accelerationAttempted
                             ).getOrNull()
 
                             if (resolvedStream != null && resolvedStream.url.isNotBlank()) {

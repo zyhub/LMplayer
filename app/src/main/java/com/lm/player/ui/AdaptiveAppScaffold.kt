@@ -15,6 +15,8 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import com.lm.player.core.designsystem.component.ExpandedMorphingBottomBar
 import com.lm.player.core.designsystem.component.MorphingFloatingBottomBar
+import com.lm.player.core.designsystem.component.ProgressiveBlurBottomScrim
+import com.lm.player.core.model.BottomBarAnimMode
 import com.lm.player.core.model.OnlineMusicSource
 import com.lm.player.core.model.Screen
 import com.lm.player.core.model.SearchContentType
@@ -45,6 +47,8 @@ fun AdaptiveAppScaffold(
     progressMs: Long = 0L,
     totalDurationMs: Long = 0L,
     blurAlpha: Float = 0.85f,
+    liquidGlassBlur: Float = 16f,
+    bottomBarAnimMode: BottomBarAnimMode = BottomBarAnimMode.SLIDE,
     enableBottomBarAnimation: Boolean = true,
     useLinearAnimation: Boolean = true,
     onNavigate: (Screen) -> Unit,
@@ -59,11 +63,11 @@ fun AdaptiveAppScaffold(
     // 悬浮导航栏展开状态 (未播放歌曲或处于弹出搜索模式时始终展开)
     var isNavExpanded by remember { mutableStateOf(false) }
 
-    // 智能滚动监听连接器：滑动歌曲列表或页面时，自动平滑收起展开栏 (搜索模式下保持展开)
-    val nestedScrollConnection = remember(currentPlayingSong, enableBottomBarAnimation, isSearchActive) {
+    // 智能滚动监听连接器：在点击模式下，滑动歌曲列表或页面时自动平滑收起展开栏 (搜索模式下保持展开)
+    val nestedScrollConnection = remember(currentPlayingSong, enableBottomBarAnimation, isSearchActive, bottomBarAnimMode) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (!isSearchActive && currentPlayingSong != null && enableBottomBarAnimation && abs(available.y) > 4f && isNavExpanded) {
+                if (bottomBarAnimMode == BottomBarAnimMode.CLICK && !isSearchActive && currentPlayingSong != null && enableBottomBarAnimation && abs(available.y) > 4f && isNavExpanded) {
                     isNavExpanded = false
                 }
                 return Offset.Zero
@@ -71,9 +75,10 @@ fun AdaptiveAppScaffold(
         }
     }
 
-    // 动态底部安全间距 (收缩状态下仅占用 100dp，最大化释放页面展示内容)
+    // 动态底部安全间距 (点击展开双排状态下占用 145dp，收缩与滑动单条模式占用 100dp)
+    val isDoubleLayer = bottomBarAnimMode == BottomBarAnimMode.CLICK && (currentPlayingSong == null || !enableBottomBarAnimation || isNavExpanded)
     val dynamicBottomPadding by animateDpAsState(
-        targetValue = if (currentPlayingSong == null || !enableBottomBarAnimation || isNavExpanded || isSearchActive) 145.dp else 100.dp,
+        targetValue = if (isDoubleLayer) 145.dp else 100.dp,
         label = "scaffold_bottom_padding"
     )
 
@@ -85,6 +90,12 @@ fun AdaptiveAppScaffold(
     ) {
         // 核心页面内容 (动态底部间距，最大化可视内容)
         content(PaddingValues(bottom = dynamicBottomPadding))
+
+        // 底部渐进虚化衬底 (向上柔和淡化，使滚动内容滑入底栏前平滑消融，解决生硬截断)
+        ProgressiveBlurBottomScrim(
+            modifier = Modifier.align(Alignment.BottomCenter),
+            height = 120.dp
+        )
 
         // 统一形态渐变悬浮底栏 (横屏大屏智能居中最大宽度 580dp，竖屏自适应满宽，搜索输入时自动避让软键盘)
         Box(
@@ -116,6 +127,7 @@ fun AdaptiveAppScaffold(
                         onSearchTypeChange = onSearchTypeChange,
                         showOnlineSourceSelector = showOnlineSourceSelector,
                         blurAlpha = blurAlpha,
+                        liquidGlassBlur = liquidGlassBlur,
                         onNavigate = { screen ->
                             onDismissSearch()
                             onNavigate(screen)
@@ -133,7 +145,7 @@ fun AdaptiveAppScaffold(
                     )
                 }
             } else {
-                // 有歌曲播放且开启过渡模式：支持滑动隐藏与点击展开，搜索激活时自动展开双层并滑出搜索框
+                // 有歌曲播放且开启过渡模式：支持滑动隐藏与点击展开，搜索激活时液态置换
                 MorphingFloatingBottomBar(
                     currentScreen = currentScreen,
                     currentSong = currentPlayingSong,
@@ -147,7 +159,11 @@ fun AdaptiveAppScaffold(
                     onSearchTypeChange = onSearchTypeChange,
                     showOnlineSourceSelector = showOnlineSourceSelector,
                     isNavExpanded = isNavExpanded,
+                    progressMs = progressMs,
+                    totalDurationMs = totalDurationMs,
                     blurAlpha = blurAlpha,
+                    liquidGlassBlur = liquidGlassBlur,
+                    bottomBarAnimMode = bottomBarAnimMode,
                     useLinearAnimation = useLinearAnimation,
                     onToggleNavExpanded = { isNavExpanded = it },
                     onDismissSearch = onDismissSearch,

@@ -916,7 +916,7 @@ fun LocalLibraryScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .statusBarsPadding()
-                            .padding(top = 8.dp)
+                            .padding(top = 16.dp)
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -1884,6 +1884,16 @@ fun LocalLibraryScreen(
                 }
             }
         }
+
+        // 顶部渐进毛玻璃吸顶层 (当页面向上滚动穿过状态栏时平滑出现)
+        com.lm.player.core.designsystem.component.ProgressiveFrostedTopBar(
+            isScrolled = isScrolledAway.value,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .height(18.dp)
+        ) {}
     }
 
         // 二级下钻详情视图 (页面内展示：歌单曲目、歌手曲目、专辑曲目，绝不遮挡底部播放栏)

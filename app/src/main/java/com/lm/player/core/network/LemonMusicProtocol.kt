@@ -77,6 +77,10 @@ class LemonMusicProtocol(
 
     companion object {
         private const val TAG = "LemonMusicProtocol"
+
+        /** 协议层单次本地加速预算；播放/下载已在更上层做过一次，这里只兜底直接调用方。 */
+        private const val LOCAL_ACCEL_BUDGET_MS = 2_500L
+
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         /** 内嵌歌词探测允许读入内存的最大响应体（512KB，约为探测 Range 的 1.3 倍余量） */
@@ -2920,15 +2924,25 @@ class LemonMusicProtocol(
         keyword: String,
         source: String = "kw",
         page: Int = 1,
-        limit: Int = 30
+        limit: Int = 30,
+        // 加速链路专用：搜索超时时必须让底层 OkHttp 也尽快结束，否则共享客户端
+        // 300s callTimeout 会让已超时的请求继续占用连接/IO 线程。
+        callTimeoutMs: Long = 0L
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val url = "$cleanBase/api/search?keyword=$encKw&source=$source&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
+            val searchClient = if (callTimeoutMs > 0L) {
+                client.newBuilder()
+                    .callTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .build()
+            } else {
+                client
+            }
 
-            client.newCall(req).execute().use { resp ->
+            searchClient.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("在线搜索失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
@@ -3169,7 +3183,10 @@ class LemonMusicProtocol(
         allowSearchFallback: Boolean = true,
         // 「跨平台同档补源」调用时置 true：调用方刚刚在本平台试过同一档，直接跳到搜索补源阶段，
         // 避免对同一个 songId 连发两次必然失败的取链请求。
-        skipDirectAttempt: Boolean = false
+        skipDirectAttempt: Boolean = false,
+        // 上层（PlaybackRouter/DownloadRequestPlanner）刚刚试过本地加速且失败时置 true，
+        // 避免在协议层对同一首歌重复发一次必然超时的本地请求。
+        skipLocalAcceleration: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
             val normalizedQuality = AudioQuality.fromKey(quality).key
@@ -3179,12 +3196,15 @@ class LemonMusicProtocol(
 
             // 音源加速：外网或内网高延迟时，先让本地 QuickJS 解析；失败再走服务器。
             // 任何本地异常都只记录并继续服务器，绝不阻断播放/下载。
-            if (!refresh && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate(serverHost)) {
+            if (!refresh && !skipLocalAcceleration &&
+                com.lm.player.core.source.SourceAccelerationController.shouldAccelerate(serverHost)
+            ) {
                 val localInfo = buildLocalMusicInfo(songId, source, metaJson, fallbackTitle, fallbackArtist)
-                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
+                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithBudget(
                     source = localSource,
                     quality = normalizedQuality,
-                    musicInfoJson = localInfo
+                    musicInfoJson = localInfo,
+                    budgetMs = LOCAL_ACCEL_BUDGET_MS
                 )
                 local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let { localUrl ->
                     Log.i(TAG, "Local source acceleration resolved: ${songId}/${normalizedQuality}")
@@ -3455,7 +3475,9 @@ class LemonMusicProtocol(
         refresh: Boolean = false,
         // 下载链路专用时间预算：0 表示不限制（播放链路保持原有完整降级/跨平台行为）。
         // 服务器已下载的歌曲常常本地也有文件，若音源取链卡住，用户会看到下载永远停在 0%。
-        maxDurationMs: Long = 0L
+        maxDurationMs: Long = 0L,
+        // 上层已尝试过本地加速时置 true，避免每个音质档都重复一次本地请求。
+        skipLocalAcceleration: Boolean = false
     ): Result<ResolvedOnlineStream> = withContext(Dispatchers.IO) {
         val candidateQualities = getFallbackQualities(preferredQuality)
         var lastError: Throwable? = null
@@ -3512,7 +3534,8 @@ class LemonMusicProtocol(
                 fallbackTitle = fallbackTitle,
                 fallbackArtist = fallbackArtist,
                 refresh = refresh || index > 0,
-                allowSearchFallback = false
+                allowSearchFallback = false,
+                skipLocalAcceleration = skipLocalAcceleration
             )
             directRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
                 return@withContext Result.success(buildResolvedStream(it, qKey))
@@ -3530,7 +3553,8 @@ class LemonMusicProtocol(
                 fallbackArtist = fallbackArtist,
                 refresh = true,
                 allowSearchFallback = true,
-                skipDirectAttempt = true
+                skipDirectAttempt = true,
+                skipLocalAcceleration = skipLocalAcceleration
             )
             crossRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
                 return@withContext Result.success(buildResolvedStream(it, qKey))
@@ -4135,7 +4159,7 @@ class LemonMusicProtocol(
     private suspend fun fetchExternalScript(url: String): String? {
         val req = Request.Builder()
             .url(url)
-            .header("User-Agent", "LMPlayer/1.7.28")
+            .header("User-Agent", "LMPlayer/1.7.29")
             .get()
             .build()
         client.newCall(req).execute().use { resp ->

@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.lm.player.core.model.BottomBarAnimMode
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerSourceEntity
 import com.lm.player.core.database.entity.ServerSourceMetaEntity
@@ -106,6 +107,11 @@ fun SettingsScreen(
     onScaleModeChange: (UiScaleMode) -> Unit,
     onBlurAlphaChange: (Float) -> Unit,
     onBlurAlphaChangeFinished: () -> Unit = {},
+    liquidGlassBlur: Float = 16f,
+    onLiquidGlassBlurChange: (Float) -> Unit = {},
+    onLiquidGlassBlurChangeFinished: () -> Unit = {},
+    bottomBarAnimMode: BottomBarAnimMode = BottomBarAnimMode.SLIDE,
+    onBottomBarAnimModeChange: (BottomBarAnimMode) -> Unit = {},
     onEnableBottomBarAnimationChange: (Boolean) -> Unit,
     onAutoPlayOnStartupChange: (Boolean) -> Unit = {},
     onAutoFallbackToLocalChange: (Boolean) -> Unit = {},
@@ -362,7 +368,7 @@ fun SettingsScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
         ) {
             Text(
                 text = "设置",
@@ -878,8 +884,17 @@ fun SettingsScreen(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("当前本地离线保存路径", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("当前本地离线保存路径", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        if (downloadSettings.customDownloadTreeUri.isNotBlank() || downloadSettings.customDownloadPath.isNotBlank()) {
+                                            Text("写入状态正常", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color(0xFF34C759))
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(3.dp))
                                     Text(
                                         text = downloadSettings.customDownloadPath.ifBlank { "默认应用私有目录 (/Music)" },
                                         fontSize = 13.sp,
@@ -1682,13 +1697,42 @@ fun SettingsScreen(
                             )
 
                             Spacer(modifier = Modifier.height(16.dp))
-                            Text("毛玻璃特效透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                            Text("播放栏透明度调节 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text("调节悬浮底栏各组件整体透光度与背景融合效果", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
                             Slider(
                                 value = blurAlpha,
                                 onValueChange = onBlurAlphaChange,
                                 onValueChangeFinished = onBlurAlphaChangeFinished,
-                                valueRange = 0.2f..1.0f,
+                                valueRange = 0.10f..1.0f,
                                 colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text("液态玻璃高斯模糊 (${liquidGlassBlur.toInt()} dp)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text("调节液态玻璃背景虚化强度与漫反射散射半径 (0 ~ 30 dp)", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
+                            Slider(
+                                value = liquidGlassBlur,
+                                onValueChange = onLiquidGlassBlurChange,
+                                onValueChangeFinished = onLiquidGlassBlurChangeFinished,
+                                valueRange = 0f..30f,
+                                colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "播放栏动画效果",
+                                subtitle = when (bottomBarAnimMode) {
+                                    BottomBarAnimMode.CLICK -> "点击展开：点击左侧图标展开双层导航栏，向上滚动页面自动收缩 (v1.7.28 经典模式)"
+                                    BottomBarAnimMode.SLIDE -> "滑动切换：按住左侧图标横向滑动物理跟随切页，歌曲缩圆位移 (v1.7.29 流体模式)"
+                                },
+                                icon = Icons.Default.Animation,
+                                selectedValue = bottomBarAnimMode,
+                                options = listOf(BottomBarAnimMode.CLICK, BottomBarAnimMode.SLIDE),
+                                getLabel = { it.label },
+                                getSubtitle = { it.subtitle },
+                                onSelect = { onBottomBarAnimModeChange(it) }
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))

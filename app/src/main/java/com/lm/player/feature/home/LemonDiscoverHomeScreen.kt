@@ -1243,6 +1243,16 @@ fun LemonDiscoverHomeScreen(
 }
 }
 
+        // 顶部渐进毛玻璃吸顶层 (当页面向上滚动穿过状态栏时平滑出现)
+        com.lm.player.core.designsystem.component.ProgressiveFrostedTopBar(
+            isScrolled = isScrolledAway,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .height(18.dp)
+        ) {}
+
         // 官方权威排行榜全景下钻层 (点击【权威排行榜】大卡时展开，减少主页重复列表)
         if (isToplistsOverviewOpen && activeCollectionTitle == null) {
             Column(

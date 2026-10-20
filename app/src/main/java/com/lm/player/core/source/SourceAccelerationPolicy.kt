@@ -42,7 +42,15 @@ object SourceAccelerationPolicy {
     private var scopeAt = 0L
     private var lastEnabledAt = 0L
     private var lowLatencySince = 0L
-    private var forceDisabled = false
+
+    /**
+     * 服务器是否处于 LOST。
+     *
+     * LOST 不再等于“关闭本地加速”：本地 QuickJS 已经加载在内存里，不依赖服务器控制面。
+     * 此时服务器优先策略已经没有意义，应让本地音源接管；只有明确退出/切换服务器时才关闭会话。
+     */
+    @Volatile
+    private var serverLost = false
 
     fun isEnabled(): Boolean = _state.value.enabled
 
@@ -50,13 +58,17 @@ object SourceAccelerationPolicy {
         mutex.withLock {
             val host = NetworkScopeDetector.hostOf(serverUrl)
             val now = System.currentTimeMillis()
+            // 无网络时本地脚本同样拿不到 CDN；提前判定可以避免播放/下载白等十几秒。
+            if (!NetworkScopeDetector.isOnline(context)) {
+                return@withLock publish(scope, false, ServerLatencyMonitor.latencyMs(host), "无网络连接")
+            }
             if (scope == NetworkScope.UNKNOWN || now - scopeAt >= SCOPE_CACHE_MS) {
                 scope = NetworkScopeDetector.detect(context, serverUrl)
                 scopeAt = now
             }
             val latency = ServerLatencyMonitor.latencyMs(host)
-            if (forceDisabled) {
-                return@withLock publish(scope, false, latency, "服务器超时，已停止加速")
+            if (serverLost) {
+                return@withLock publish(scope, true, latency, "服务器离线，本地音源接管")
             }
             val enabled = when (scope) {
                 NetworkScope.WAN -> true
@@ -72,21 +84,21 @@ object SourceAccelerationPolicy {
     }
 
     fun onServerLost() {
-        forceDisabled = true
+        serverLost = true
         _state.value = _state.value.copy(
-            enabled = false,
-            reason = "服务器超时，已停止加速",
+            enabled = true,
+            reason = "服务器离线，本地音源接管",
             updatedAt = System.currentTimeMillis()
         )
     }
 
     fun onServerRecovered() {
-        forceDisabled = false
+        serverLost = false
         lowLatencySince = 0L
     }
 
     fun reset() {
-        forceDisabled = false
+        serverLost = false
         scope = NetworkScope.UNKNOWN
         scopeAt = 0L
         lastEnabledAt = 0L

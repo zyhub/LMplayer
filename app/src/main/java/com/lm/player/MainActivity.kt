@@ -7,7 +7,10 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -171,6 +174,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Android 11+ 自定义公共目录需要“所有文件访问”才能直接写 File 路径。
+    private val manageStorageLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+            chooseDownloadDirectoryLauncher.launch(null)
+        } else {
+            Toast.makeText(this, "未授予所有文件访问权限，下载目录将保持在应用私有目录", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private var onImportFolderResult: ((android.net.Uri) -> Unit)? = null
     private val importFolderLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -238,7 +252,14 @@ class MainActivity : ComponentActivity() {
                 )
             }
             var blurAlpha by remember {
-                mutableStateOf(uiPrefs.getFloat("ui_blur_alpha", 0.85f).coerceIn(0.2f, 1.0f))
+                mutableStateOf(uiPrefs.getFloat("ui_blur_alpha", 0.85f).coerceIn(0.1f, 1.0f))
+            }
+            var liquidGlassBlur by remember {
+                mutableStateOf(uiPrefs.getFloat("ui_liquid_glass_blur", 16f).coerceIn(0f, 30f))
+            }
+            var bottomBarAnimMode by remember {
+                val savedMode = uiPrefs.getString("ui_bottom_bar_anim_mode", BottomBarAnimMode.SLIDE.name)
+                mutableStateOf(BottomBarAnimMode.fromName(savedMode))
             }
             var enableBottomBarAnimation by remember {
                 mutableStateOf(uiPrefs.getBoolean("enable_bottom_bar_anim", true))
@@ -1869,6 +1890,26 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        var appPlaybackProgressMs by remember { mutableLongStateOf(0L) }
+                        var appPlaybackDurationMs by remember { mutableLongStateOf(0L) }
+
+                        LaunchedEffect(currentSong?.id, isPlaying) {
+                            if (currentSong == null) {
+                                appPlaybackProgressMs = 0L
+                                appPlaybackDurationMs = 0L
+                                return@LaunchedEffect
+                            }
+                            lifecycle.whenStarted {
+                                while (isActive) {
+                                    val pos = exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                                    val dur = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
+                                    appPlaybackProgressMs = pos
+                                    if (dur > 0L) appPlaybackDurationMs = dur
+                                    delay(400)
+                                }
+                            }
+                        }
+
                         // 响应式脚手架 (横屏大屏与竖屏手机统一使用底部悬浮一体化播放导航栏 + 弹出式左滑搜索框)
                         AdaptiveAppScaffold(
                         windowSizeClass = windowSizeClass.widthSizeClass,
@@ -1888,7 +1929,11 @@ class MainActivity : ComponentActivity() {
                             currentSearchType = newType
                         },
                         showOnlineSourceSelector = useDiscoverHome,
+                        progressMs = appPlaybackProgressMs,
+                        totalDurationMs = appPlaybackDurationMs,
                         blurAlpha = blurAlpha,
+                        liquidGlassBlur = liquidGlassBlur,
+                        bottomBarAnimMode = bottomBarAnimMode,
                         enableBottomBarAnimation = enableBottomBarAnimation,
                         useLinearAnimation = true,
                         onNavigate = { targetNavScreen ->
@@ -2637,6 +2682,18 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onBlurAlphaChangeFinished = {
                                             uiPrefs.edit().putFloat("ui_blur_alpha", blurAlpha).apply()
                                         },
+                                        liquidGlassBlur = liquidGlassBlur,
+                                        onLiquidGlassBlurChange = { newBlur ->
+                                            liquidGlassBlur = newBlur
+                                        },
+                                        onLiquidGlassBlurChangeFinished = {
+                                            uiPrefs.edit().putFloat("ui_liquid_glass_blur", liquidGlassBlur).apply()
+                                        },
+                                        bottomBarAnimMode = bottomBarAnimMode,
+                                        onBottomBarAnimModeChange = { newMode ->
+                                            bottomBarAnimMode = newMode
+                                            uiPrefs.edit().putString("ui_bottom_bar_anim_mode", newMode.name).apply()
+                                        },
                                         enableBottomBarAnimation = enableBottomBarAnimation,
                                         onEnableBottomBarAnimationChange = { isEnabled ->
                                             enableBottomBarAnimation = isEnabled
@@ -2741,11 +2798,65 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onChooseDownloadDirectory = {
                                             onChooseDownloadFolderResult = { uri ->
                                                 val resolvedPath = DownloadEngine.resolveFilesystemPath(uri.toString())
-                                                val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = resolvedPath)
-                                                downloadEngine.updateSettings(updated)
-                                                Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
+                                                val treeUriStr = uri.toString()
+                                                val isWritable = downloadEngine.testDirectoryWritable(resolvedPath, treeUriStr)
+                                                if (isWritable) {
+                                                    val updated = downloadEngine.downloadSettings.value.copy(
+                                                        customDownloadPath = resolvedPath,
+                                                        customDownloadTreeUri = treeUriStr
+                                                    )
+                                                    downloadEngine.updateSettings(updated)
+                                                    Toast.makeText(this@MainActivity, "已成功设定并验证下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
+                                                    if (resolvedPath.isNotBlank()) {
+                                                        lifecycleScope.launch(Dispatchers.IO) {
+                                                            val scanned = LocalMediaScanner.scanCustomDirectory(this@MainActivity, resolvedPath, database)
+                                                            val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, java.io.File(resolvedPath))
+                                                            if (scanned > 0 || matched > 0) {
+                                                                withContext(Dispatchers.Main) {
+                                                                    Toast.makeText(this@MainActivity, "离线目录同步完成：扫描 $scanned 首，匹配 $matched 首", Toast.LENGTH_LONG).show()
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    Toast.makeText(this@MainActivity, "所选目录写入测试失败，系统限制写入此位置，请重新选择其他文件夹", Toast.LENGTH_LONG).show()
+                                                }
                                             }
-                                            chooseDownloadDirectoryLauncher.launch(null)
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                                                !Environment.isExternalStorageManager()
+                                            ) {
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "自定义公共目录需要“所有文件访问权限”，请在系统设置中允许后重试",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                                val intent = Intent(
+                                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                    Uri.parse("package:$packageName")
+                                                )
+                                                runCatching { manageStorageLauncher.launch(intent) }
+                                                    .onFailure {
+                                                        manageStorageLauncher.launch(
+                                                            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                                        )
+                                                    }
+                                            } else if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
+                                                ContextCompat.checkSelfPermission(
+                                                    this@MainActivity,
+                                                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                                                ) != PackageManager.PERMISSION_GRANTED
+                                            ) {
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "请先授予存储写入权限，再选择自定义下载目录",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                                permissionLauncher.launch(
+                                                    arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                                                )
+                                            } else {
+                                                chooseDownloadDirectoryLauncher.launch(null)
+                                            }
                                         },
                                         onImportCustomFolder = {
                                             onImportFolderResult = { uri ->
@@ -2782,7 +2893,7 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
                                 .padding(
-                                    end = 18.dp,
+                                    end = 16.dp,
                                     bottom = innerPadding.calculateBottomPadding() + 14.dp
                                 ),
                             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -2831,10 +2942,10 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                     },
                                     modifier = Modifier.size(40.dp),
                                     shape = CircleShape,
-                                    color = MaterialTheme.colorScheme.primary,
+                                    color = AppleRed.copy(alpha = 0.90f),
                                     shadowElevation = 5.dp,
                                     tonalElevation = 0.dp,
-                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.26f))
+                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
                                 ) {
                                     Box(
                                         modifier = Modifier.fillMaxSize(),
@@ -2866,10 +2977,10 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                     },
                                     modifier = Modifier.size(40.dp),
                                     shape = CircleShape,
-                                    color = if (isDark) Color(0xFF2C2C36) else Color.White,
+                                    color = if (isDark) Color(0xFF282832).copy(alpha = 0.88f) else Color.White.copy(alpha = 0.90f),
                                     shadowElevation = 5.dp,
                                     tonalElevation = 0.dp,
-                                    border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.20f) else Color.Black.copy(alpha = 0.12f))
+                                    border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.08f))
                                 ) {
                                     Box(
                                         modifier = Modifier.fillMaxSize(),
@@ -3449,6 +3560,11 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
             } else {
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                     permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                }
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 }
             }
 

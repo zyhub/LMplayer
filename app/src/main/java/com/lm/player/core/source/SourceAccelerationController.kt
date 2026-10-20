@@ -30,6 +30,7 @@ object SourceAccelerationController {
     @Volatile private var lost = false
     @Volatile private var consecutiveFailures = 0
     @Volatile private var lastPolicyEvalAt = 0L
+    @Volatile private var lastSessionStartAttemptAt = 0L
 
     val isLost: Boolean get() = lost
 
@@ -44,6 +45,7 @@ object SourceAccelerationController {
         serverHost = NetworkScopeDetector.hostOf(server.serverUrl)
         lost = false
         consecutiveFailures = 0
+        lastSessionStartAttemptAt = System.currentTimeMillis()
         SourceAccelerationPolicy.onServerRecovered()
         scope.launch {
             try {
@@ -53,10 +55,10 @@ object SourceAccelerationController {
                 Log.w(TAG, "start failed", e)
             }
         }
-        startHealthMonitor(server, protocol)
+        startHealthMonitor(protocol)
     }
 
-    private fun startHealthMonitor(server: ServerConfig, protocol: LemonMusicProtocol) {
+    private fun startHealthMonitor(protocol: LemonMusicProtocol) {
         monitorJob?.cancel()
         monitorJob = scope.launch {
             while (isActive) {
@@ -73,6 +75,48 @@ object SourceAccelerationController {
         }
     }
 
+    /**
+     * 冷启动离线恢复：从加密缓存加载上次成功脚本，不依赖服务器。
+     *
+     * 必须在 SourceAccelerationSession.init / Room 初始化之后调用。若网络会话已经就绪，
+     * 直接保留网络会话（网络脚本更新）。
+     */
+    fun restoreFromCache(context: Context) {
+        scope.launch {
+            if (SourceAccelerationSession.isReady()) return@launch
+            runCatching {
+                val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
+                val entity = db.serverDao().getActiveServer()
+                    ?: db.serverDao().getAllServers().firstOrNull {
+                        it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC
+                    }
+                    ?: return@launch
+                val server = ServerConfig(
+                    id = entity.id,
+                    name = entity.name,
+                    type = entity.type,
+                    serverUrl = entity.serverUrl,
+                    username = entity.username,
+                    tokenOrApiKey = entity.tokenOrApiKey,
+                    saltOrSecret = entity.saltOrSecret,
+                    syncMode = entity.syncMode,
+                    isCurrentActive = entity.isCurrentActive
+                )
+                val cached = SourceScriptStore.load(context) ?: return@launch
+                if (cached.serverId.isNotBlank() && cached.serverId != server.id) return@launch
+                this@SourceAccelerationController.context = context.applicationContext
+                this@SourceAccelerationController.server = server
+                serverHost = NetworkScopeDetector.hostOf(server.serverUrl)
+                SourceAccelerationPolicy.evaluate(context, server.serverUrl)
+                val result = SourceAccelerationSession.startFromCache(server, cached.bundle)
+                Log.i(
+                    TAG,
+                    "cache restore: success=${result.isSuccess} sources=${cached.bundle.sources.size}"
+                )
+            }.onFailure { Log.w(TAG, "cache restore failed", it) }
+        }
+    }
+
     suspend fun prepare(context: Context, server: ServerConfig, protocol: LemonMusicProtocol): Boolean {
         this.context = context.applicationContext
         this.server = server
@@ -84,9 +128,11 @@ object SourceAccelerationController {
     }
 
     fun shouldAccelerate(host: String = serverHost): Boolean {
-        if (lost) return false
+        // LOST 不再禁用本地加速：服务器控制面不可达时，本地 QuickJS 反而是唯一可用链路。
         if (!SourceAccelerationPolicy.isEnabled()) return false
         if (!SourceAccelerationSession.isReady()) return false
+        val ctx = context ?: return false
+        if (!NetworkScopeDetector.isOnline(ctx)) return false
         return host.isBlank() || NetworkScopeDetector.hostOf(host) == serverHost
     }
 
@@ -110,12 +156,16 @@ object SourceAccelerationController {
                 val p = protocol
                 val c = context
                 if (s != null && p != null && c != null) {
+                    lastSessionStartAttemptAt = now
                     scope.launch {
                         SourceAccelerationPolicy.evaluate(c, s.serverUrl)
-                        SourceAccelerationSession.start(s, p, force = true)
+                        // 服务器恢复时不要强制重拉脚本：会话仍就绪就继续用，避免恢复瞬间出现
+                        // “先关闭旧引擎、再等待新 bundle”的空窗。
+                        SourceAccelerationSession.start(s, p)
                     }
                 }
             }
+            ensureSessionReady(now)
             return
         }
         consecutiveFailures++
@@ -124,11 +174,28 @@ object SourceAccelerationController {
             if (!lost) {
                 lost = true
                 SourceAccelerationPolicy.onServerLost()
-                scope.launch {
-                    SourceAccelerationSession.stop("server_lost")
-                    Log.w(TAG, "server lost: control timeout/failures; acceleration stopped")
-                }
+                // 关键：只标记 LOST，不关闭本地 QuickJS。服务器控制面不可达时，
+                // 已加载的本地音源仍可从公网 CDN 取链，是最后的播放兜底。
+                Log.w(TAG, "server lost: keep local source session alive")
             }
+        }
+    }
+
+    /**
+     * 会话未就绪时按 60 秒节流重试。解决两类问题：
+     * 1. 启动时脚本接口偶发失败，后续没有任何重试；
+     * 2. 冷启动时服务器短暂不可达，恢复后需要自动补加载。
+     */
+    private fun ensureSessionReady(now: Long) {
+        if (lost) return
+        if (SourceAccelerationSession.isReady()) return
+        val s = server ?: return
+        val p = protocol ?: return
+        if (now - lastSessionStartAttemptAt < 60_000L) return
+        lastSessionStartAttemptAt = now
+        scope.launch {
+            runCatching { SourceAccelerationSession.start(s, p) }
+                .onFailure { Log.w(TAG, "session retry failed", it) }
         }
     }
 
@@ -139,6 +206,7 @@ object SourceAccelerationController {
         SourceAccelerationPolicy.reset()
         lost = false
         consecutiveFailures = 0
+        lastSessionStartAttemptAt = 0L
     }
 
     fun stopAsync(reason: String) {

@@ -146,7 +146,8 @@ data class DownloadSettings(
     val bitrate: String = "原始无损 (FLAC/高码率)",
     val wifiOnly: Boolean = false,
     val autoTagging: Boolean = true,
-    val customDownloadPath: String = ""
+    val customDownloadPath: String = "",
+    val customDownloadTreeUri: String = ""
 )
 
 @Immutable
@@ -218,6 +219,17 @@ enum class SearchContentType(val key: String, val displayName: String) {
     companion object {
         fun fromKey(key: String): SearchContentType {
             return entries.firstOrNull { it.key.equals(key, ignoreCase = true) } ?: SONG
+        }
+    }
+}
+
+enum class BottomBarAnimMode(val label: String, val subtitle: String) {
+    CLICK("点击", "点击展开：点击左侧图标展开双层导航栏，向上滚动页面自动收缩 (v1.7.28 经典模式)"),
+    SLIDE("滑动", "滑动切换：按住左侧图标横向滑动物理跟随切页，歌曲缩圆位移 (v1.7.29 流体模式)");
+
+    companion object {
+        fun fromName(name: String?): BottomBarAnimMode {
+            return entries.firstOrNull { it.name.equals(name, ignoreCase = true) || it.label == name } ?: SLIDE
         }
     }
 }

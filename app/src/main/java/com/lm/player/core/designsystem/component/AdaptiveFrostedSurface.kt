@@ -5,9 +5,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -63,6 +66,107 @@ fun AdaptiveFrostedSurface(
                 )
         ) {
             content()
+        }
+    }
+}
+
+/**
+ * 顶部渐进模糊吸顶栏 (当列表内容向上滚动穿过状态栏与标题区域时，动态淡入柔和毛玻璃与纵向渐变虚化)
+ */
+@Composable
+fun ProgressiveFrostedTopBar(
+    isScrolled: Boolean,
+    modifier: Modifier = Modifier,
+    backgroundColor: Color = MaterialTheme.colorScheme.background,
+    content: @Composable BoxScope.() -> Unit
+) {
+    val alphaAnim by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isScrolled) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 240),
+        label = "progressive_top_alpha"
+    )
+
+    Box(modifier = modifier) {
+        if (alphaAnim > 0.01f) {
+            val apiLevel = Build.VERSION.SDK_INT
+            val isLowRam = remember { isLowEndDevice() }
+            if (apiLevel >= Build.VERSION_CODES.S && !isLowRam) {
+                // Tier 1: 渐进 GPU 高斯模糊 + 纵向 Alpha 渐变羽化
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .blur(radius = 18.dp)
+                        .background(
+                            Brush.verticalGradient(
+                                0.0f to backgroundColor.copy(alpha = 0.88f * alphaAnim),
+                                0.75f to backgroundColor.copy(alpha = 0.75f * alphaAnim),
+                                1.0f to Color.Transparent
+                            )
+                        )
+                )
+            } else {
+                // Tier 2: 渐进双色微光亚克力层
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0.0f to backgroundColor.copy(alpha = 0.95f * alphaAnim),
+                                0.70f to backgroundColor.copy(alpha = 0.85f * alphaAnim),
+                                1.0f to Color.Transparent
+                            )
+                        )
+                )
+            }
+        }
+        content()
+    }
+}
+
+/**
+ * 底部渐进虚化衬底 (Progressive Scrim Layer：位于滚动内容上方、悬浮底栏下方，向上柔和淡化，解决内容生硬截断)
+ */
+@Composable
+fun ProgressiveBlurBottomScrim(
+    modifier: Modifier = Modifier,
+    height: Dp = 110.dp,
+    backgroundColor: Color = MaterialTheme.colorScheme.background
+) {
+    val apiLevel = Build.VERSION.SDK_INT
+    val isLowRam = remember { isLowEndDevice() }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(height)
+    ) {
+        if (apiLevel >= Build.VERSION_CODES.S && !isLowRam) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .blur(radius = 20.dp)
+                    .background(
+                        Brush.verticalGradient(
+                            0.0f to Color.Transparent,
+                            0.35f to backgroundColor.copy(alpha = 0.45f),
+                            0.75f to backgroundColor.copy(alpha = 0.85f),
+                            1.0f to backgroundColor.copy(alpha = 0.96f)
+                        )
+                    )
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0.0f to Color.Transparent,
+                            0.30f to backgroundColor.copy(alpha = 0.50f),
+                            0.70f to backgroundColor.copy(alpha = 0.88f),
+                            1.0f to backgroundColor.copy(alpha = 0.98f)
+                        )
+                    )
+            )
         }
     }
 }

@@ -50,13 +50,34 @@ object NetworkScopeDetector {
         return raw.substringAfter("://", raw).substringBefore('/').substringBefore('?').substringBefore(':')
     }
 
+    /**
+     * 当前是否存在可用公网连接。
+     *
+     * 只用于“要不要尝试本地音源加速”：无网络时本地脚本同样拿不到 CDN，
+     * 提前返回 false 可以避免播放/下载先白等 10~25 秒再回退。
+     */
+    fun isOnline(context: Context): Boolean = runCatching {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return@runCatching false
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return@runCatching false
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+    }.getOrDefault(false)
+
     fun isPrivate(address: InetAddress): Boolean {
         if (address.isLoopbackAddress || address.isLinkLocalAddress || address.isSiteLocalAddress) return true
         if (address is Inet4Address) {
             val b = address.address
             val v0 = b[0].toInt() and 0xff
             val v1 = b[1].toInt() and 0xff
-            return v0 == 10 || (v0 == 172 && v1 in 16..31) || (v0 == 192 && v1 == 168)
+            // 100.64.0.0/10：Carrier-Grade NAT，Tailscale/ZeroTier 等组网默认使用该网段。
+            return v0 == 10 ||
+                (v0 == 172 && v1 in 16..31) ||
+                (v0 == 192 && v1 == 168) ||
+                (v0 == 100 && v1 in 64..127)
         }
         if (address is Inet6Address) {
             val b = address.address

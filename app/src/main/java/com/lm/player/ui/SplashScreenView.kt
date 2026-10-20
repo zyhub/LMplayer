@@ -181,7 +181,7 @@ fun SplashScreenView(
                     .alpha(logoAlpha)
             ) {
                 Text(
-                    text = "v1.7.28 • Hi-Fi Automotive Edition",
+                    text = "v1.7.29 • Hi-Fi Automotive Edition",
                     style = TextStyle(
                         fontSize = 11.sp,
                         color = Color.White.copy(alpha = 0.35f),

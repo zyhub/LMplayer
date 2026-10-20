@@ -30,6 +30,9 @@ object DownloadRequestPlanner {
         val bitRate: Int
     )
 
+    /** 下载链路单次本地加速预算；本地失败必须尽快回服务器，不能让进度条停在 0%。 */
+    private const val DOWNLOAD_ACCEL_BUDGET_MS = 2_500L
+
     private val LOSSY_EXTS = setOf("mp3", "m4a", "aac", "ogg", "opus", "wma")
     private val LOSSLESS_EXTS = setOf("flac", "wav", "ape", "alac", "dsf", "dff")
 
@@ -136,10 +139,14 @@ object DownloadRequestPlanner {
         skipLocalAcceleration: Boolean = false
     ): ResolvedDownloadStream? {
         if (protocol == null) return null
-        protocol.ensureAuthenticated()
+
+        // 本地加速不需要服务器鉴权；先尝试本地，失败后再 ensureAuthenticated() 走服务器，
+        // 避免服务器失联时鉴权先阻塞、把本地直链的机会耗掉。
+        var accelerationAttempted = false
 
         // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；失败回 NAS。
         if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate() && isServerLibrarySong(song)) {
+            accelerationAttempted = true
             val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
                 protocol = protocol,
                 serverId = song.serverId,
@@ -148,8 +155,14 @@ object DownloadRequestPlanner {
             ).getOrNull()
             resolved?.let { r ->
                 if (probeLocalUrl(r.url)) {
-                    return ResolvedDownloadStream(r.url, quality.format.lowercase(), quality.bitrate)
+                    return ResolvedDownloadStream(r.url, r.quality.format.lowercase(), r.quality.bitrate)
                 }
+                // 探测失败说明缓存直链已失效，主动清掉，避免下一次下载继续拿到同一条。
+                com.lm.player.core.source.ServerLibraryAccelerationResolver.invalidate(
+                    serverId = song.serverId,
+                    song = song,
+                    qualityKey = quality.key
+                )
             }
         }
 
@@ -160,19 +173,28 @@ object DownloadRequestPlanner {
             if (accelSource.isBlank()) {
                 // 服务器曲库 ID 没有平台信息，无法安全匹配本地音源，直接走服务器。
             } else {
-            val accelInfo = buildAccelerationInfo(song)
-            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrl(
-                source = accelSource,
-                quality = quality.key,
-                musicInfoJson = accelInfo
-            )
-            local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let { url ->
-                if (probeLocalUrl(url)) {
-                    return ResolvedDownloadStream(url, quality.format.lowercase(), quality.bitrate)
+                accelerationAttempted = true
+                val accelInfo = buildAccelerationInfo(song)
+                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithQualityFallback(
+                    source = accelSource,
+                    preferredQuality = quality.key,
+                    musicInfoJson = accelInfo,
+                    budgetMs = DOWNLOAD_ACCEL_BUDGET_MS
+                )
+                val resolution = local.getOrNull()
+                if (resolution != null) {
+                    val url = resolution.url.takeIf {
+                        it.startsWith("http://") || it.startsWith("https://")
+                    }
+                    if (url != null && probeLocalUrl(url)) {
+                        val actual = AudioQuality.fromKey(resolution.qualityKey)
+                        return ResolvedDownloadStream(url, actual.format.lowercase(), actual.bitrate)
+                    }
                 }
             }
-            }
         }
+
+        protocol.ensureAuthenticated()
 
         var serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
             ?: song.relativeFolderPath?.trim()?.takeIf { it.looksLikeAudioPath() }
@@ -247,7 +269,9 @@ object DownloadRequestPlanner {
                     fallbackArtist = song.artist,
                     // 下载链路最多等 10 秒拿目标音质：服务器已有该文件时必须尽快回退到
                     // /api/play/local，而不是让进度条永远停在 0% 等音源逐档降级。
-                    maxDurationMs = 10_000L
+                    maxDurationMs = 10_000L,
+                    // 上面已经试过一次本地加速；失败后不要在协议层再试一次。
+                    skipLocalAcceleration = skipLocalAcceleration || accelerationAttempted
                 ).getOrNull()
             } catch (_: Exception) {
                 null
