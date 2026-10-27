@@ -502,6 +502,13 @@ class PlaybackService : MediaSessionService() {
             DynamicIslandManager.ensureInitialized(this)
 
             // 4. 挂载全品牌安卓灵动岛 MediaNotification.Provider 并注册 Session（方向盘与系统媒体控制入口）
+            // 注册官方防崩监听器，吸收任何由于后台启动前台服务受限引发的系统异常
+            setListener(object : MediaSessionService.Listener {
+                override fun onForegroundServiceStartNotAllowedException() {
+                    Log.w(TAG, "MediaSessionService: 成功捕获并拦截系统后台启动前台服务受限异常 (ForegroundServiceStartNotAllowedException)")
+                }
+            })
+
             setMediaNotificationProvider(DynamicIslandManager.createMediaNotificationProvider(this))
             addSession(session)
 
@@ -700,6 +707,16 @@ class PlaybackService : MediaSessionService() {
             } catch (_: Throwable) {}
         }
         super.onTaskRemoved(rootIntent)
+    }
+
+    /**
+     * 关键重写：拦截 Media3 内部自带的 MediaNotificationManager
+     * 绝不调用 super.onUpdateNotification(session, startInForegroundRequired)！
+     * 避免 Media3 内部在后台切歌/加载封面时调用 ContextCompat.startForegroundService() 抛出 ForegroundServiceStartNotAllowedException。
+     * 前台服务保活由 startImmediateForeground() 建立，灵动岛与通知刷新由 DynamicIslandManager / NotificationManager 统一管理。
+     */
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        // 静默拦截，完全由本服务与 DynamicIslandManager 自主管理
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {

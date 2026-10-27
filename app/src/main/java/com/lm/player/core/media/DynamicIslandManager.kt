@@ -681,9 +681,9 @@ object DynamicIslandManager {
                                     lastNotifiedSongId = targetSongId
                                     lastNotifiedPlaying = player.isPlaying
                                     lastNotifiedHasCustomArtwork = true
-                                    onNotificationChangedCallback.onNotificationChanged(
-                                        MediaNotification(PlaybackService.NOTIFICATION_ID, updatedNotif)
-                                    )
+                                    // 使用 NotificationManager 直接安全刷新，绝不调用 callback 触发 Media3 的 startForegroundService
+                                    val manager = service.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                                    manager.notify(PlaybackService.NOTIFICATION_ID, updatedNotif)
                                 }
                             } catch (e: Exception) {
                                 Log.d(TAG, "Callback notification update skipped: ${e.message}")
@@ -924,15 +924,10 @@ object DynamicIslandManager {
                 exoPlayer = player,
                 overrideBitmap = songId.takeIf { it.isNotEmpty() }?.let { bitmapCache.get(it) }
             )
-            val callback = activeNotificationCallback
-            if (_systemIslandEnabledFlow.value && callback != null) {
-                callback.onNotificationChanged(
-                    MediaNotification(PlaybackService.NOTIFICATION_ID, notification)
-                )
-            } else {
-                val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                manager.notify(PlaybackService.NOTIFICATION_ID, notification)
-            }
+            // 统一使用系统 NotificationManager 直接安全刷新前台通知与灵动岛
+            // 彻底切断 Media3 callback 试图在后台重新调用 startForegroundService 引发的 ForegroundServiceStartNotAllowedException
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(PlaybackService.NOTIFICATION_ID, notification)
         } catch (e: Throwable) {
             Log.e(TAG, "Error pushing island notification", e)
         }
