@@ -49,16 +49,45 @@ fun getGradientForId(id: String): List<Color> {
 private fun normalizeMusicCoverUrl(raw: String?): String? {
     if (raw.isNullOrBlank()) return null
     var url = raw.trim()
-    if (url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
+    if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
     if (com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(url)) return null
     if (url.startsWith("//")) {
         url = "https:$url"
     }
-    if (url.contains("{size}")) {
-        url = url.replace("{size}", "400")
+
+    // 酷我 kwcdn 替换为稳定的主 CDN (避免 HTTPS 下 514 限制)
+    if (url.contains("kwcdn.kuwo.cn", ignoreCase = true)) {
+        url = url.replace(Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn"""), "img1.kuwo.cn")
+        url = url.replace("img1.img1.kuwo.cn", "img1.kuwo.cn")
     }
+
+    // 酷我相对路径自动补全
+    if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("data:") && !url.startsWith("file:") && !url.startsWith("content:")) {
+        if (url.matches(Regex("^(120|150|240|300|500)/.*")) || url.contains("s3s") || url.contains("s4s") || url.contains("star/albumcover")) {
+            val upgraded = url.replaceFirst(Regex("^(120|150|240|300)/"), "500/")
+            url = "https://img1.kuwo.cn/star/albumcover/$upgraded"
+        }
+    }
+
+    // 酷狗与各大音源大尺寸占位符替换
+    if (url.contains("{size}")) {
+        url = url.replace("{size}", "300")
+    }
+
+    // 网易云 music.126.net 自动追加轻量级缩略图参数
+    if (url.contains("music.126.net") && !url.contains("param=")) {
+        url += if (url.contains("?")) "&param=300y300" else "?param=300y300"
+    }
+
+    // 酷我小图自动升阶
     if (url.contains("kuwo.cn/star/albumcover/120/")) {
         url = url.replace("kuwo.cn/star/albumcover/120/", "kuwo.cn/star/albumcover/500/")
+    }
+
+    if (url.startsWith("http://img1.kuwo.cn/")) {
+        url = "https://" + url.substring("http://".length)
+    } else if (url.startsWith("http://") && (url.contains("music.126.net") || url.contains("migu.cn") || url.contains("gtimg.cn") || url.contains("qq.com"))) {
+        url = "https://" + url.substring("http://".length)
     }
     return url
 }
@@ -74,6 +103,10 @@ private fun buildMusicImageRequest(
         .data(cleanUrl)
         .size(width, height)
         .crossfade(false)
+        .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
+        .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+        .networkCachePolicy(coil.request.CachePolicy.ENABLED)
+
     if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
         val headers = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(cleanUrl)
         for ((k, v) in headers) {
@@ -110,14 +143,13 @@ fun AlbumArtworkImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!cleanModel.isNullOrBlank() && !loadFailed) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
                 model = remember(cleanModel, targetSize) {
                     buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = contentScale,
-                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -151,14 +183,13 @@ fun PlaylistArtworkImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!cleanModel.isNullOrBlank() && !loadFailed) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
                 model = remember(cleanModel, targetSize) {
                     buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -195,14 +226,13 @@ fun ArtistAvatarImage(
             .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!cleanModel.isNullOrBlank() && !loadFailed) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
                 model = remember(cleanModel, targetSize) {
                     buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                onError = { loadFailed = true },
                 modifier = Modifier.fillMaxSize()
             )
         } else {

@@ -1,4 +1,7 @@
 package com.lm.player.feature.home
+import com.lm.player.core.network.LemonMusicProtocol
+import com.lm.player.core.model.*
+
 
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -31,6 +34,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -176,6 +180,25 @@ fun LemonDiscoverHomeScreen(
 
     // 换一批轮换种子 (保证今日推荐与列表每次点击呈现新曲目)
     var recommendSeed by remember { mutableStateOf(0) }
+
+    // 每日推荐换一批剩余额度状态 (对接服务端每日 20 次每日推荐额度，本地持久化与服务端动态同步)
+    val todayDateStr = remember { java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault()).format(java.util.Date()) }
+    val dailyMixPrefs = remember { context.getSharedPreferences("zds_daily_mix_prefs", android.content.Context.MODE_PRIVATE) }
+    var remainingRefreshes by rememberSaveable {
+        mutableIntStateOf(dailyMixPrefs.getInt("remaining_mix_$todayDateStr", 20))
+    }
+
+    LaunchedEffect(Unit) {
+        coroutineScope.launch(Dispatchers.IO) {
+            val state = com.lm.player.core.network.LemonMusicProtocol.fetchDailyMix(context, forceRefresh = false).getOrNull()
+            if (state != null && state.remainingRefreshes in 0..20 && state.remainingRefreshes != 18) {
+                withContext(Dispatchers.Main) {
+                    remainingRefreshes = state.remainingRefreshes
+                    dailyMixPrefs.edit().putInt("remaining_mix_$todayDateStr", state.remainingRefreshes).apply()
+                }
+            }
+        }
+    }
 
     // 私人漫游播放状态追踪 (仅当点击私人漫游触发的播放且正在播放漫游池中曲目时，才显示波形动画)
     var isRoamingPlaying by remember { mutableStateOf(false) }
@@ -623,7 +646,6 @@ fun LemonDiscoverHomeScreen(
             }
         }
 
-
         if (isLoading) {
             item {
                 Box(
@@ -658,13 +680,13 @@ fun LemonDiscoverHomeScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        // 大卡 1：今日推荐 (Ocean Cyan 动态液态流光大卡，展示至少 3 首推荐曲目)
+                        // 大卡 1：每日推荐 (Daily Mix 50%本地 + 50%探索，Ocean Cyan 动态液态流光大卡)
                         DiscoverLiquidCard(
                             modifier = Modifier
                                 .weight(1f)
                                 .height(196.dp),
-                            title = "今日推荐",
-                            badgeText = "精选 3首",
+                            title = "每日推荐",
+                            badgeText = "半曲半探索",
                             icon = Icons.Default.AutoAwesome,
                             iconColor = dynamicPalettes[0].iconColor,
                             gradientColors = dynamicPalettes[0].gradientColors,
@@ -991,7 +1013,28 @@ fun LemonDiscoverHomeScreen(
                                 secondaryGlowColor = dynamicPalettes[3].secondaryGlowColor,
                                 isAnimated = isLiquidAnimated,
                                 onClick = {
-                                    val pool = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }.shuffled()
+                                    // 优先构造具备高质量封面图的漫游候选池，对缺失封面的歌曲进行智能补齐
+                                    val allCandidates = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }
+                                    val enrichedPool = allCandidates.map { song ->
+                                        if (song.coverUrl.isBlank() || com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(song.coverUrl)) {
+                                            val fallbackCover = com.lm.player.core.network.LemonMusicProtocol.getResolvedCover(song.id)
+                                                ?: allCachedSongs.firstOrNull { cand ->
+                                                    cand.coverUrl.isNotBlank() &&
+                                                    !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(cand.coverUrl) &&
+                                                    com.lm.player.core.media.SongMatchingResolver.isSongMatch(
+                                                        song.title, song.artist, song.durationMs,
+                                                        cand.title, cand.artist, cand.durationMs,
+                                                        song.album, cand.album
+                                                    )
+                                                }?.coverUrl.orEmpty()
+                                            if (fallbackCover.isNotBlank()) song.copy(coverUrl = fallbackCover) else song
+                                        } else {
+                                            song
+                                        }
+                                    }
+                                    val pool = enrichedPool.filter { it.coverUrl.isNotBlank() && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it.coverUrl) }
+                                        .ifEmpty { enrichedPool }
+                                        .shuffled()
                                     if (pool.isNotEmpty()) {
                                         roamingSongIds = pool.map { it.id }.toSet()
                                         isRoamingPlaying = true
@@ -1000,14 +1043,14 @@ fun LemonDiscoverHomeScreen(
                                 }
                             )
 
-                            // 小长方形卡片 2：换一批
+                            // 小长方形卡片 2：换一批 (对接服务端每日 20 次每日推荐额度)
                             DiscoverLiquidSmallCard(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .weight(1f),
                                 title = "换一批",
-                                subtitle = "探索全网全新好歌",
-                                badgeText = "刷新",
+                                subtitle = "每日推荐 · 50%本地",
+                                badgeText = "剩 ${remainingRefreshes}/20 次",
                                 icon = Icons.Default.Refresh,
                                 iconColor = dynamicPalettes[4].iconColor,
                                 trailingIcon = Icons.Default.AutoAwesome,
@@ -1016,6 +1059,24 @@ fun LemonDiscoverHomeScreen(
                                 secondaryGlowColor = dynamicPalettes[4].secondaryGlowColor,
                                 isAnimated = isLiquidAnimated,
                                 onClick = {
+                                    if (remainingRefreshes <= 0) {
+                                        android.widget.Toast.makeText(context, "今日换一批次数已用尽 (0/20)", android.widget.Toast.LENGTH_SHORT).show()
+                                        return@DiscoverLiquidSmallCard
+                                    }
+                                    val newCount = remainingRefreshes - 1
+                                    remainingRefreshes = newCount
+                                    dailyMixPrefs.edit().putInt("remaining_mix_$todayDateStr", newCount).apply()
+                                    coroutineScope.launch(Dispatchers.IO) {
+                                        val res = com.lm.player.core.network.LemonMusicProtocol.fetchDailyMix(context, forceRefresh = true)
+                                        res.onSuccess { st ->
+                                            if (st.remainingRefreshes in 0..20 && st.remainingRefreshes != 18) {
+                                                withContext(Dispatchers.Main) {
+                                                    remainingRefreshes = st.remainingRefreshes
+                                                    dailyMixPrefs.edit().putInt("remaining_mix_$todayDateStr", st.remainingRefreshes).apply()
+                                                }
+                                            }
+                                        }
+                                    }
                                     com.lm.player.core.network.LemonMusicProtocol.clearDiscoverCache()
                                     recommendSeed++
                                     if (recommendPlaylists.size > 1) {
@@ -1031,7 +1092,7 @@ fun LemonDiscoverHomeScreen(
                                         newAlbums = newAlbums.shuffled()
                                     }
                                     reloadTrigger++
-                                    android.widget.Toast.makeText(context, "已为您换一批推荐内容", android.widget.Toast.LENGTH_SHORT).show()
+                                    android.widget.Toast.makeText(context, "已为您换一批推荐内容 (剩 ${newCount}/20 次)", android.widget.Toast.LENGTH_SHORT).show()
                                 }
                             )
                         }

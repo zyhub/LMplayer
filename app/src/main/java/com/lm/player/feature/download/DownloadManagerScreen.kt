@@ -94,6 +94,7 @@ fun DownloadManagerScreen(
     /** 服务器下载列表的错误信息（null 表示无错误），用于把「静默空白」变成可读提示 */
     var serverDownloadError by remember { mutableStateOf<String?>(null) }
     var taskPendingDelete by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
+    var taskPendingConfirm by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
 
     fun refreshServerDownloads() {
         isServerLoading = true
@@ -148,9 +149,16 @@ fun DownloadManagerScreen(
         refreshServerDownloads()
     }
 
-    LaunchedEffect(selectedTab) {
+    LaunchedEffect(selectedTab, serverDownloads) {
         if (selectedTab == 1) {
-            refreshServerDownloads()
+            val hasActiveTasks = serverDownloads.any {
+                val s = it.status.lowercase()
+                s == "downloading" || s == "pending" || s == "running"
+            }
+            if (hasActiveTasks) {
+                kotlinx.coroutines.delay(3000L)
+                refreshServerDownloads()
+            }
         }
     }
 
@@ -563,7 +571,8 @@ fun DownloadManagerScreen(
                     isLoading = isServerLoading,
                     errorMessage = serverDownloadError,
                     onRefresh = { refreshServerDownloads() },
-                    onDeleteTask = { taskPendingDelete = it }
+                    onDeleteTask = { taskPendingDelete = it },
+                    onHandleConfirm = { taskPendingConfirm = it }
                 )
             } else {
                 // ====== 已下载完成列表 (Tab 2) ======
@@ -1391,7 +1400,119 @@ fun DownloadManagerScreen(
         }
     }
 
-    if (taskPendingDelete != null) {
+
+    // 假无损拦截与降档换源半屏确认弹窗 (对齐手机端适配规范 Screen 04)
+    if (taskPendingConfirm != null) {
+        val targetTask = taskPendingConfirm!!
+        Dialog(onDismissRequest = { taskPendingConfirm = null }) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 6.dp,
+                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.25f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Shield,
+                        contentDescription = null,
+                        tint = AppleRed,
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "音质校验与换源决策",
+                        style = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "${targetTask.name} - ${targetTask.singer}",
+                        style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium, color = AppleRed),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "服务端检测到该曲目当前音源为假无损（由 128k 虚标插值上采样）或当前音源源文件失效，已智能暂停下载。请选择处理策略：",
+                        style = TextStyle(fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // 选项 1：确认降档
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                LemonMusicProtocol.confirmDownloadDowngrade(targetTask.id, "320k", context)
+                                    .onSuccess {
+                                        Toast.makeText(context, "已确认降档为 320K 极高品质", Toast.LENGTH_SHORT).show()
+                                        refreshServerDownloads()
+                                    }
+                                    .onFailure {
+                                        Toast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                            }
+                            taskPendingConfirm = null
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().height(42.dp)
+                    ) {
+                        Text("✔ 确认降档：下载可用标准 320K MP3", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // 选项 2：换源重试
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                LemonMusicProtocol.confirmDownloadSource(targetTask.id, "auto", context)
+                                    .onSuccess {
+                                        Toast.makeText(context, "已触发服务端自动切换备用音源", Toast.LENGTH_SHORT).show()
+                                        refreshServerDownloads()
+                                    }
+                                    .onFailure {
+                                        Toast.makeText(context, "换源重试失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                            }
+                            taskPendingConfirm = null
+                        },
+                        border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().height(42.dp)
+                    ) {
+                        Text("🔄 换源重试：自动切换至备用激活音源", fontSize = 13.sp, color = AppleRed, fontWeight = FontWeight.SemiBold)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // 选项 3：取消任务
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                LemonMusicProtocol.deleteServerDownloadTask(targetTask.id, context)
+                                refreshServerDownloads()
+                            }
+                            taskPendingConfirm = null
+                        },
+                        modifier = Modifier.fillMaxWidth().height(38.dp)
+                    ) {
+                        Text("✕ 取消并从下载队列移除", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+    }
+
+        if (taskPendingDelete != null) {
         val task = taskPendingDelete!!
         AlertDialog(
             onDismissRequest = { taskPendingDelete = null },
@@ -1709,7 +1830,8 @@ private fun ServerDownloadTasksContent(
     /** 拉取失败时的错误信息；null 表示「确实没有记录」而不是「请求失败」 */
     errorMessage: String?,
     onRefresh: () -> Unit,
-    onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit
+    onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit,
+    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null
 ) {
     if (isLoading && serverDownloads.isEmpty()) {
         Box(
@@ -1780,7 +1902,8 @@ private fun ServerDownloadTasksContent(
             ) { task ->
                 ServerDownloadTaskRow(
                     task = task,
-                    onDelete = { onDeleteTask(task) }
+                    onDelete = { onDeleteTask(task) },
+                    onHandleConfirm = onHandleConfirm
                 )
             }
         }
@@ -1790,7 +1913,8 @@ private fun ServerDownloadTasksContent(
 @Composable
 private fun ServerDownloadTaskRow(
     task: LemonServerDownloadTaskRecord,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null
 ) {
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.08f)
@@ -1925,6 +2049,22 @@ private fun ServerDownloadTaskRow(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
                         modifier = Modifier.size(20.dp)
                     )
+                }
+            }
+
+            // 若状态为待确认 (假无损或音源失效)，展示决策操作按键
+            if (task.status.lowercase() == "await_confirm") {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = { onHandleConfirm?.invoke(task) },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    modifier = Modifier.fillMaxWidth().height(36.dp)
+                ) {
+                    Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("假无损拦截 / 降档换源处理", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
             }
 

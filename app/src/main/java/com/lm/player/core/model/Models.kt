@@ -22,8 +22,17 @@ data class UnifiedSong(
     val isFavorite: Boolean = false,
     val relativeFolderPath: String? = null,
     val addedTimestamp: Long = 0L,
-    val rawMetaJson: String? = null
-)
+    val rawMetaJson: String? = null,
+    val trackId: String? = null,
+    val bitDepth: Int? = null,
+    val sampleRate: Int? = null
+) {
+    val isHiRes: Boolean
+        get() = (bitDepth != null && bitDepth >= 24) ||
+                (sampleRate != null && sampleRate >= 96000) ||
+                format.contains("24bit", ignoreCase = true) ||
+                (format.contains("flac", ignoreCase = true) && bitRate >= 1411)
+}
 
 @Immutable
 data class UnifiedAlbum(
@@ -471,4 +480,32 @@ data class LemonScanStatus(
     val cachedCount: Int = 0,
     val pendingCount: Int = 0,
     val total: Int = 0
+)
+
+@Immutable
+data class ServerDlnaDevice(
+    val id: String,
+    val name: String,
+    val host: String = "",
+    val isOnline: Boolean = true
+)
+
+@Immutable
+data class DailyMixState(
+    val remainingRefreshes: Int = 20,
+    val maxRefreshes: Int = 20,
+    val localRatio: Float = 0.5f,
+    val onlineRatio: Float = 0.5f,
+    val songs: List<UnifiedSong> = emptyList()
+)
+
+@Immutable
+data class DownloadDowngradePrompt(
+    val taskId: String,
+    val songTitle: String,
+    val artist: String,
+    val requestedQuality: String,
+    val suggestedQuality: String = "320k",
+    val reason: String = "假无损检测拦截 / 原音源不可用",
+    val alternativeSources: List<String> = emptyList()
 )

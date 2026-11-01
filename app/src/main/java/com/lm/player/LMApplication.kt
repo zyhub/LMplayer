@@ -110,7 +110,7 @@ class LMApplication : Application(), ImageLoaderFactory {
      * 针对车机与移动平台调优的高性能全局 Coil 图像加载器
      */
     override fun newImageLoader(): ImageLoader {
-        val okHttpClient = NetworkClientFactory.createOkHttpClient(this)
+        val okHttpClient = NetworkClientFactory.createImageOkHttpClient(this)
         return ImageLoader.Builder(this)
             .okHttpClient(okHttpClient)
             .crossfade(false) // 关闭多余淡入淡出动画，换取极致流畅与零掉帧

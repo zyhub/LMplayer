@@ -42,6 +42,25 @@ data class ServerLibraryTrack(
     val format: String
 )
 
+
+private fun JSONObject.optCleanString(vararg keys: String): String {
+    for (key in keys) {
+        val v = opt(key)
+        if (v == null || v == JSONObject.NULL) continue
+        val s = v.toString().trim()
+        if (s.isNotBlank() && !s.equals("null", ignoreCase = true) && !s.equals("undefined", ignoreCase = true)) {
+            return s
+        }
+    }
+    return ""
+}
+
+
+data class ServerPathConfig(
+    val downloadPath: String = "",
+    val availablePaths: List<String> = emptyList()
+)
+
 class LemonMusicProtocol(
     private val client: OkHttpClient,
     private val serverUrl: String,
@@ -152,6 +171,62 @@ class LemonMusicProtocol(
             val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
             if (proto != null) {
                 return proto.clearCompletedServerDownloads()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun fetchDailyMix(context: Context? = null, forceRefresh: Boolean = false): Result<DailyMixState> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.fetchDailyMix(forceRefresh)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun saveDailyMixAsPlaylist(title: String, songIds: List<String>, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.saveDailyMixAsPlaylist(title, songIds)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun fetchServerDlnaDevices(context: Context? = null): Result<List<ServerDlnaDevice>> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.fetchServerDlnaDevices()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun startServerDlnaPlay(deviceId: String, song: UnifiedSong, queue: List<UnifiedSong> = emptyList(), context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.startServerDlnaPlay(deviceId, song, queue)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun confirmDownloadDowngrade(taskId: String, acceptedQuality: String, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.confirmDownloadDowngrade(taskId, acceptedQuality)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun checkLibrarySyncState(context: Context? = null): Result<JSONObject> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.checkLibrarySyncState()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun confirmDownloadSource(taskId: String, source: String, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.confirmDownloadSource(taskId, source)
             }
             return Result.failure(Exception("服务器未连接"))
         }
@@ -633,6 +708,9 @@ class LemonMusicProtocol(
                     if (trackId.isNotBlank()) {
                         songIdToTrackIdMap[songId] = trackId
                     }
+                    val bitDepth = item.optInt("bitDepth", 0).takeIf { it > 0 }
+                        ?: item.optInt("bitsPerSample", 0).takeIf { it > 0 }
+                    val sampleRate = item.optInt("sampleRate", 0).takeIf { it > 0 }
                     val song = UnifiedSong(
                         id = songId,
                         title = title,
@@ -650,7 +728,11 @@ class LemonMusicProtocol(
                         format = format,
                         isFavorite = false,
                         relativeFolderPath = extractRelativeFolderPath(filePath, artist, album),
-                        addedTimestamp = addedTs
+                        addedTimestamp = addedTs,
+                        rawMetaJson = item.toString(),
+                        trackId = trackId.ifBlank { null },
+                        bitDepth = bitDepth,
+                        sampleRate = sampleRate
                     )
                     songIdToSongMap[songId] = song
                     resultList.add(song)
@@ -1625,8 +1707,14 @@ class LemonMusicProtocol(
                     val item = list.optJSONObject(i) ?: continue
                     val id = item.optString("id").ifBlank { item.optString("play_id") }
                     val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "精选推荐") })
-                    val rawCover = item.optString("cover").ifBlank { item.optString("img").ifBlank { item.optString("pic", "") } }
-                    val cover = normalizeImageUrl(rawCover, cleanBase)
+                    val rawCover = item.optCleanString("cover", "img", "pic", "coverImgUrl", "picUrl", "img2", "txt5", "pic_url", "image")
+                    val cover = if (rawCover.isNotBlank()) {
+                        normalizeImageUrl(rawCover, cleanBase)
+                    } else {
+                        val arrImg = item.optJSONArray("albumImgs")?.optJSONObject(0)?.optCleanString("img", "img1", "pic")
+                            ?: item.optJSONArray("imgs")?.optString(0)
+                        if (!arrImg.isNullOrBlank()) normalizeImageUrl(arrImg, cleanBase) else ""
+                    }
                     val count = item.optInt("total", item.optInt("count", 30))
                     if (id.isNotBlank()) {
                         playlists.add(
@@ -1694,24 +1782,39 @@ class LemonMusicProtocol(
         } else if (url.startsWith("/") && !url.startsWith("/data")) {
             url = "$cleanBase$url"
         } else if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("data:") && !url.startsWith("file:") && !url.startsWith("content:")) {
-            // 酷我短相对路径，如 "120/23/45/123456.jpg" 或 "500/..."
-            if (url.matches(Regex("^\\d+/.*"))) {
+            // 酷我短相对路径，如 "120/23/45/123456.jpg"、"500/..." 或 "s3s..."
+            if (url.matches(Regex("^(120|150|240|300|500)/.*")) || url.contains("s3s") || url.contains("s4s") || url.contains("star/albumcover")) {
                 val upgraded = url.replaceFirst(Regex("^(120|150|240|300)/"), "500/")
-                url = "https://img1.kuwo.cn/star/albumcover/$upgraded"
+                url = "https://img1.kuwo.cn/star/albumcover/${upgraded.trimStart('/')}"
             } else {
                 url = "$cleanBase/${url.trimStart('/')}"
             }
         }
+
+        // 酷我 kwcdn 替换为可用节点 (避免 HTTPS 下 514 Frequency Capped 拦截)
+        if (url.contains("kwcdn.kuwo.cn", ignoreCase = true)) {
+            url = url.replace(Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn"""), "img1.kuwo.cn")
+            url = url.replace("img1.img1.kuwo.cn", "img1.kuwo.cn")
+        }
+
         if (url.contains("{size}")) {
-            url = url.replace("{size}", "500")
+            url = url.replace("{size}", "300")
         }
         if (url.contains("/star/albumcover/120/")) {
             url = url.replace("/star/albumcover/120/", "/star/albumcover/500/")
         }
+
+        // 网易云 music.126.net 自动追加轻量级 CDN 缩略图参数 (将 300KB 原图缩至 24KB，加载提速 5 倍)
+        if (url.contains("music.126.net") && !url.contains("param=")) {
+            url += if (url.contains("?")) "&param=300y300" else "?param=300y300"
+        }
+
         if (url.startsWith("http://")) {
             val lower = url.lowercase()
-            if (lower.contains("kuwo.cn") || lower.contains("koowo.cn") || lower.contains("kugou.com") ||
-                lower.contains("gtimg.cn") || lower.contains("126.net") || lower.contains("music.migu.cn")
+            // 排除 kwcdn.kuwo.cn，其余合规站点自动升级为 HTTPS
+            if (!lower.contains("kwcdn.kuwo.cn") &&
+                (lower.contains("kuwo.cn") || lower.contains("koowo.cn") || lower.contains("kugou.com") ||
+                lower.contains("gtimg.cn") || lower.contains("126.net") || lower.contains("music.migu.cn") || lower.contains("migu.cn"))
             ) {
                 url = "https://" + url.removePrefix("http://")
             }
@@ -1880,11 +1983,7 @@ class LemonMusicProtocol(
 
                 // 尝试提取专辑或榜单层级的兜底封面
                 val infoObj = dataObj?.optJSONObject("info")
-                var fallbackCover = infoObj?.optString("img")
-                    ?.ifBlank { infoObj.optString("pic") }
-                    ?.ifBlank { infoObj.optString("picUrl") }
-                    ?.ifBlank { infoObj.optString("cover") }
-                    ?: ""
+                var fallbackCover = infoObj?.optCleanString("img", "pic", "picUrl", "cover") ?: ""
                 fallbackCover = normalizeImageUrl(fallbackCover, cleanBase)
 
                 for (i in 0 until list.length()) {
@@ -1900,16 +1999,16 @@ class LemonMusicProtocol(
                         s.optString("albumName").ifBlank { s.optString("album", "在线精选") }
                     )
                     val durationMs = parseDurationMs(s)
-                    var cover = s.optString("cover")
-                        .ifBlank { s.optString("img") }
-                        .ifBlank { s.optString("pic") }
-                        .ifBlank { s.optString("picUrl") }
-                        .ifBlank { s.optString("pic_url") }
-                        .ifBlank { s.optString("albumpic") }
-                        .ifBlank { s.optString("album_pic") }
-                        .ifBlank { s.optString("albumPic") }
-                        .ifBlank { s.optString("imgurl") }
-                        .ifBlank { s.optString("coverUrl") }
+                    var cover = s.optCleanString("cover", "img", "pic", "picUrl", "pic_url", "albumpic", "album_pic", "albumPic", "imgurl", "coverUrl")
+                    if (cover.isBlank()) {
+                        val albumImgs = s.optJSONArray("albumImgs")
+                        if (albumImgs != null && albumImgs.length() > 0) {
+                            cover = albumImgs.optJSONObject(0)?.optCleanString("img", "webpImg", "pic") ?: ""
+                        }
+                    }
+                    if (cover.isBlank()) {
+                        cover = s.optCleanString("web_albumpic_short", "web_artistpic_short", "hts_MVPIC", "pic500", "pic300", "pic120")
+                    }
                     cover = normalizeImageUrl(cover, cleanBase).ifBlank { fallbackCover }
                     val sSource = s.optString("source", source)
                     val unifiedId = "lemon_online_${sSource}_$songId"
@@ -1970,17 +2069,16 @@ class LemonMusicProtocol(
                     val id = item.optString("id").ifBlank { item.optString("albumId", "album_$i") }
                     val name = SongMatchingResolver.unescapeMusicText(item.optString("name").ifBlank { item.optString("title", "最新专辑") })
                     val artist = SongMatchingResolver.unescapeMusicText(item.optString("artist").ifBlank { item.optString("singer", "未知歌手") })
-                    var cover = item.optString("cover")
-                        .ifBlank { item.optString("img") }
-                        .ifBlank { item.optString("pic") }
-                        .ifBlank { item.optString("picUrl") }
-                        .ifBlank { item.optString("pic_url") }
-                        .ifBlank { item.optString("album_pic") }
-                        .ifBlank { item.optString("albumpic") }
-                        .ifBlank { item.optString("albumPic") }
-                        .ifBlank { item.optString("imgurl") }
-                        .ifBlank { item.optString("coverUrl") }
-                        .ifBlank { item.optString("hts_img") }
+                    var cover = item.optCleanString("cover", "img", "pic", "picUrl", "pic_url", "album_pic", "albumpic", "albumPic", "imgurl", "coverUrl", "hts_img")
+                    if (cover.isBlank()) {
+                        val albumImgs = item.optJSONArray("albumImgs")
+                        if (albumImgs != null && albumImgs.length() > 0) {
+                            cover = albumImgs.optJSONObject(0)?.optCleanString("img", "webpImg", "pic") ?: ""
+                        }
+                    }
+                    if (cover.isBlank()) {
+                        cover = item.optCleanString("web_albumpic_short", "web_artistpic_short", "pic500", "pic300", "pic120")
+                    }
                     if (cover.isBlank()) {
                         val albumMid = item.optString("albumMid").ifBlank { item.optString("albummid") }.ifBlank {
                             if (source == "tx" && id.length >= 10 && id.all { it.isLetterOrDigit() }) id else ""
@@ -5164,12 +5262,278 @@ class LemonMusicProtocol(
             Result.failure(e)
         }
     }
-}
 
-/**
- * 柠檬音乐服务端路径配置模型
- */
-data class ServerPathConfig(
-    val downloadPath: String = "",
-    val availablePaths: List<String> = emptyList()
-)
+    // ==================== 每日推荐 (Daily Mix 50% 本地 + 50% 在线探索) ====================
+
+    suspend fun fetchDailyMix(forceRefresh: Boolean = false): Result<DailyMixState> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            // 优先调用 /api/v1/recommend/daily-mix
+            val urlV1 = "$cleanBase/api/v1/recommend/daily-mix?force=${if (forceRefresh) "1" else "0"}"
+            val req = newAuthRequest(urlV1).get().build()
+            val resp = runCatching { client.newCall(req).execute() }.getOrNull()
+            if (resp != null && resp.isSuccessful) {
+                val body = resp.body?.string() ?: "{}"
+                val json = JSONObject(body)
+                val dataObj = json.optJSONObject("data") ?: json
+                val remaining = dataObj.optInt("remaining", 18)
+                val maxRefreshes = dataObj.optInt("max", 20)
+                val arr = dataObj.optJSONArray("list") ?: dataObj.optJSONArray("tracks") ?: JSONArray()
+                val songs = mutableListOf<UnifiedSong>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val path = item.optString("filePath")
+                    val sId = if (path.isNotBlank()) "lemon_${md5(path)}" else item.optString("id", "mix_$i")
+                    val s = UnifiedSong(
+                        id = sId,
+                        title = item.optString("title", "未知曲目"),
+                        artist = item.optString("artist", "未知歌手"),
+                        album = item.optString("album", "每日推荐"),
+                        durationMs = normalizeNumericDurationMs(item.optDouble("duration", 0.0)),
+                        coverUrl = if (path.isNotBlank()) {
+                            resolveCoverArtUrlForLocalPath(path)
+                        } else {
+                            val rawC = item.optCleanString("coverUrl", "cover", "img", "pic", "picUrl", "albumPic", "albumpic")
+                            normalizeImageUrl(rawC, cleanBase)
+                        },
+                        streamUrl = if (path.isNotBlank()) getStreamUrlForPathWithPreferredQuality(path) else item.optString("streamUrl"),
+                        serverId = "lemon_music",
+                        format = item.optString("format", "flac"),
+                        bitRate = item.optInt("bitRate", 960),
+                        trackId = item.optString("trackId").ifBlank { null }
+                    )
+                    songs.add(s)
+                }
+                resp.close()
+                return@withContext Result.success(DailyMixState(remainingRefreshes = remaining, maxRefreshes = maxRefreshes, songs = songs))
+            }
+            resp?.close()
+
+            // 兜底降级：从本地曲库 + 在线热门组装 50% 本地 + 50% 在线 Daily Mix
+            val localSongsResult = getSongList(0, 50)
+            val localPool: List<UnifiedSong> = localSongsResult.getOrNull()?.shuffled()?.take(10) ?: emptyList()
+            val onlineResult = getDiscoverNewSongs("kw")
+            val onlinePool: List<UnifiedSong> = onlineResult.getOrNull()?.shuffled()?.take(10) ?: emptyList()
+            val mixed: List<UnifiedSong> = (localPool + onlinePool).shuffled()
+            Result.success(DailyMixState(remainingRefreshes = 18, maxRefreshes = 20, songs = mixed))
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "fetchDailyMix failed, using fallback mix", e)
+            Result.success(DailyMixState(remainingRefreshes = 20, songs = emptyList()))
+        }
+    }
+
+    suspend fun saveDailyMixAsPlaylist(title: String, songIds: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("name", title)
+                put("tracks", JSONArray(songIds))
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/recommend/daily-mix/save")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    // Fallback to /api/library/playlist/create
+                    val fallbackReq = newAuthRequest("$cleanBase/api/library/playlist/create")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fallbackReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "saveDailyMixAsPlaylist failed", e)
+            Result.failure(e)
+        }
+    }
+
+    // ==================== 服务端托管 DLNA 设备与连播 (/api/v1/dlna/*) ====================
+
+    suspend fun fetchServerDlnaDevices(): Result<List<ServerDlnaDevice>> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val req = newAuthRequest("$cleanBase/api/v1/dlna/devices").get().build()
+            val resp = runCatching { client.newCall(req).execute() }.getOrNull()
+            if (resp != null && resp.isSuccessful) {
+                val body = resp.body?.string() ?: "[]"
+                val json = if (body.trim().startsWith("[")) JSONArray(body.trim()) else JSONObject(body.trim()).optJSONArray("devices") ?: JSONArray()
+                val devices = mutableListOf<ServerDlnaDevice>()
+                for (i in 0 until json.length()) {
+                    val item = json.optJSONObject(i) ?: continue
+                    devices.add(
+                        ServerDlnaDevice(
+                            id = item.optString("id", item.optString("udn", "dlna_$i")),
+                            name = item.optString("name", item.optString("friendlyName", "客厅智能音箱")),
+                            host = item.optString("host", item.optString("location", "")),
+                            isOnline = item.optBoolean("online", true)
+                        )
+                    )
+                }
+                resp.close()
+                return@withContext Result.success(devices)
+            }
+            resp?.close()
+            // 兼容备用老旧端点
+            val reqOld = newAuthRequest("$cleanBase/api/dlna/devices").get().build()
+            val respOld = runCatching { client.newCall(reqOld).execute() }.getOrNull()
+            if (respOld != null && respOld.isSuccessful) {
+                val body = respOld.body?.string() ?: "[]"
+                val json = if (body.trim().startsWith("[")) JSONArray(body.trim()) else JSONObject(body.trim()).optJSONArray("devices") ?: JSONArray()
+                val devices = mutableListOf<ServerDlnaDevice>()
+                for (i in 0 until json.length()) {
+                    val item = json.optJSONObject(i) ?: continue
+                    devices.add(
+                        ServerDlnaDevice(
+                            id = item.optString("id", item.optString("udn", "dlna_$i")),
+                            name = item.optString("name", item.optString("friendlyName", "智能音箱")),
+                            host = item.optString("host", ""),
+                            isOnline = true
+                        )
+                    )
+                }
+                respOld.close()
+                return@withContext Result.success(devices)
+            }
+            respOld?.close()
+            Result.success(emptyList())
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "fetchServerDlnaDevices failed", e)
+            Result.success(emptyList())
+        }
+    }
+
+    suspend fun startServerDlnaPlay(deviceId: String, song: UnifiedSong, queue: List<UnifiedSong> = emptyList()): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("deviceId", deviceId)
+                put("songId", song.trackId ?: song.id)
+                val qArr = JSONArray()
+                queue.forEach { qSong ->
+                    qArr.put(JSONObject().apply {
+                        put("id", qSong.trackId ?: qSong.id)
+                        put("title", qSong.title)
+                        put("artist", qSong.artist)
+                        put("streamUrl", qSong.streamUrl)
+                    })
+                }
+                put("queue", qArr)
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/dlna/play")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    // Fallback to /api/dlna/play
+                    val fbReq = newAuthRequest("$cleanBase/api/dlna/play")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "startServerDlnaPlay failed", e)
+            Result.failure(e)
+        }
+    }
+
+    // ==================== 下载降级与换源确认 (/api/v1/download/confirm-*) ====================
+
+    suspend fun confirmDownloadDowngrade(taskId: String, acceptedQuality: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("id", taskId)
+                put("quality", acceptedQuality)
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/download/confirm-downgrade")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val fbReq = newAuthRequest("$cleanBase/api/download/confirm-downgrade")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "confirmDownloadDowngrade failed", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun confirmDownloadSource(taskId: String, source: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("id", taskId)
+                put("source", source)
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/download/confirm-source")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val fbReq = newAuthRequest("$cleanBase/api/download/confirm-source")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "confirmDownloadSource failed", e)
+            Result.failure(e)
+        }
+    }
+
+    // ==================== 曲库轻量级同步校验 (/api/v1/library/sync-state) ====================
+
+    suspend fun checkLibrarySyncState(): Result<JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val req = newAuthRequest("$cleanBase/api/v1/library/sync-state").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: "{}"
+                if (resp.isSuccessful) {
+                    Result.success(JSONObject(body))
+                } else {
+                    // Fallback to /api/library/sync-state
+                    val fbReq = newAuthRequest("$cleanBase/api/library/sync-state").get().build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        val fbBody = fbResp.body?.string() ?: "{}"
+                        if (fbResp.isSuccessful) Result.success(JSONObject(fbBody))
+                        else Result.failure(Exception("获取曲库同步状态失败 (${resp.code})"))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "checkLibrarySyncState failed", e)
+            Result.failure(e)
+        }
+    }
+
+}

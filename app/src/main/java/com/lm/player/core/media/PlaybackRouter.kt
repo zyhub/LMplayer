@@ -341,27 +341,58 @@ class PlaybackRouter(
 
         val isOffline = uri.scheme == "file" || uri.scheme == "content"
 
-        var cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(song.id)
+        // 封面兜底回填：若歌曲本身 coverUrl 为空或指向已知的 404 嵌入封面，从内存协议缓存与数据库同曲目自动补全
+        val effectiveCover = if (song.coverUrl.isNotBlank() && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(song.coverUrl)) {
+            song.coverUrl
+        } else {
+            val fromProto = com.lm.player.core.network.LemonMusicProtocol.getResolvedCover(song.id)
+            if (!fromProto.isNullOrBlank()) {
+                fromProto
+            } else {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val db = com.lm.player.core.database.ZdsDatabase.getInstance(context)
+                        val candidates = db.songDao().findCandidatesForPlayback(song.id, song.title)
+                        candidates.firstOrNull {
+                            it.coverUrl.isNotBlank() &&
+                            !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it.coverUrl)
+                        }?.coverUrl.orEmpty()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                }
+            }
+        }
+
+        val effectiveSong = if (effectiveCover.isNotBlank() && effectiveCover != song.coverUrl) {
+            val songWithCover = song.copy(coverUrl = effectiveCover)
+            PlaybackQueueManager.updateCurrentSong(songWithCover)
+            songWithCover
+        } else {
+            song
+        }
+
+        var cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(effectiveSong.id)
         if (cachedArtworkBytes == null) {
             try {
                 withContext(Dispatchers.IO) {
                     kotlinx.coroutines.withTimeoutOrNull(700L) {
-                        DynamicIslandManager.loadSongArtworkBitmap(context, song)
+                        DynamicIslandManager.loadSongArtworkBitmap(context, effectiveSong)
                     }
                 }
-                cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(song.id)
+                cachedArtworkBytes = DynamicIslandManager.getCachedArtworkBytes(effectiveSong.id)
             } catch (_: Exception) {}
         }
 
         val metadataBuilder = MediaMetadata.Builder()
-            .setTitle(song.title)
-            .setDisplayTitle(song.title)
-            .setArtist(song.artist)
-            .setAlbumTitle(song.album)
+            .setTitle(effectiveSong.title)
+            .setDisplayTitle(effectiveSong.title)
+            .setArtist(effectiveSong.artist)
+            .setAlbumTitle(effectiveSong.album)
             .setIsBrowsable(false)
             .setIsPlayable(true)
             .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
-            .setArtworkUri(if (song.coverUrl.isNotEmpty()) Uri.parse(song.coverUrl) else null)
+            .setArtworkUri(if (effectiveSong.coverUrl.isNotEmpty()) Uri.parse(effectiveSong.coverUrl) else null)
             .setExtras(Bundle().apply {
                 putBoolean("KEY_IS_OFFLINE", isOffline)
                 putString("KEY_SONG_ID", song.id)

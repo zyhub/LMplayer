@@ -374,16 +374,33 @@ fun SongListItemRow(
                 }
             } else {
                 // 在线模式歌曲：括号内显示当前试听模式设置的对应音质
-                Text(
-                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($onlineStreamQualityTag)",
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = TextStyle(
-                        fontSize = dimensions.captionSize,
-                        fontWeight = FontWeight.Normal,
-                        color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (song.isHiRes) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = Color(0xFFFFB300).copy(alpha = 0.18f)
+                        ) {
+                            Text(
+                                text = "Hi-Res",
+                                color = Color(0xFFFFB300),
+                                fontSize = dimensions.badgeSize,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(5.dp))
+                    }
+                    Text(
+                        text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($onlineStreamQualityTag)",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = TextStyle(
+                            fontSize = dimensions.captionSize,
+                            fontWeight = FontWeight.Normal,
+                            color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     )
-                )
+                }
             }
         }
 
