@@ -638,6 +638,8 @@ object PlaybackQueueManager {
         _currentSongFlow.value = song
         _playlistFlow.value = _playlistFlow.value.map { if (it.id == song.id) song else it }
         savePlaybackState(song = song, commitSync = false)
+        // 收藏状态/元数据变化同步刷新桌面小部件
+        try { appContext?.let { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(it) } } catch (_: Throwable) {}
     }
 
     fun setShuffle(shuffle: Boolean) {
@@ -901,6 +903,8 @@ object PlaybackQueueManager {
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
+                // 播放/暂停状态同步刷新桌面小部件
+                try { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(appCtx) } catch (_: Throwable) {}
                 if (playing) {
                     _currentSongFlow.value?.id?.let { confirmOnlineSongReady(it) }
                     PlaybackService.startPlaybackService(appCtx)
@@ -1042,6 +1046,8 @@ object PlaybackQueueManager {
 
         PlaybackService.startPlaybackService(appCtx)
         _currentSongFlow.value = targetSong
+        // 切歌同步刷新桌面小部件
+        try { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(appCtx) } catch (_: Throwable) {}
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist
         } else if (_playlistFlow.value.isEmpty()) {
@@ -1272,6 +1278,9 @@ object PlaybackQueueManager {
                     db.playlistDao().removeSongFromPlaylist("lemon_favorites", target.id)
                 }
                 db.playlistDao().updateSongCount("lemon_favorites")
+
+                // 收藏状态落库后同步刷新桌面小部件
+                try { com.lm.player.core.widget.MusicWidgetController.notifyPlaybackStateChanged(appCtx) } catch (_: Throwable) {}
 
                 // 4. 同步至远端服务器
                 val activeServer = db.serverDao().getActiveServer()
