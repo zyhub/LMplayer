@@ -58,6 +58,8 @@ import com.lm.player.core.media.AudioSharingManager
 import com.lm.player.core.media.PlaybackQueueManager
 import com.lm.player.core.media.ShareProtocolType
 import com.lm.player.core.model.*
+import com.lm.player.feature.library.TagEditorDialog
+import com.lm.player.feature.library.TagSavedMetadata
 import java.io.File
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -97,6 +99,10 @@ fun FullscreenPlayerSheet(
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
     onCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { _, _ -> },
+    /** 在线修标签写回歌词成功后回调 (宿主据此清除歌词缓存并重新加载播放页歌词) */
+    onLyricsUpdated: () -> Unit = {},
+    /** 在线修标签写回成功后回调，携带本次写入的字段 (宿主同步播放队列/本地库/封面展示) */
+    onMetadataSaved: (TagSavedMetadata) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val configuration = LocalConfiguration.current
@@ -156,6 +162,7 @@ fun FullscreenPlayerSheet(
     var showPortraitAddToPlaylistMenu by remember { mutableStateOf(false) }
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
+    var showTagEditor by remember { mutableStateOf(false) }
     val activeTimerMinutes by PlaybackQueueManager.sleepTimerMinutesFlow.collectAsState()
     val sleepTimerRemainingSec by PlaybackQueueManager.sleepTimerRemainingSecFlow.collectAsState()
     var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
@@ -330,6 +337,8 @@ fun FullscreenPlayerSheet(
             onOffsetChange = updateOffset,
             onThemeChange = updateTheme,
             onSwitchPlayerTheme = updatePlayerThemeStyle,
+            onLyricsUpdated = onLyricsUpdated,
+            onMetadataSaved = onMetadataSaved,
             onOpenSleepTimer = { showSleepTimerPanel = true },
             onOpenAudioSpecs = { showAudioSpecsPanel = true },
             onDismiss = onDismiss
@@ -755,6 +764,22 @@ fun FullscreenPlayerSheet(
                                         tint = if (localIsFavorite) AppleRed else secondaryTextColor,
                                         modifier = Modifier.size(toolbarIconSize)
                                     )
+                                }
+                                if (song.isLemonServerSong) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(toolbarBtnSize)
+                                            .clip(CircleShape)
+                                            .clickable { showTagEditor = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Edit,
+                                            contentDescription = "在线修标签",
+                                            tint = secondaryTextColor,
+                                            modifier = Modifier.size(toolbarIconSize)
+                                        )
+                                    }
                                 }
                                 Box(
                                     modifier = Modifier
@@ -1531,7 +1556,7 @@ fun FullscreenPlayerSheet(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // 6. 底部功能工具栏: [ ♥ 喜欢收藏 ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
+                // 6. 底部功能工具栏: [ ♥ 喜欢收藏 ] [ ✎ 在线修标签(仅柠檬曲库) ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1549,6 +1574,17 @@ fun FullscreenPlayerSheet(
                             tint = if (localIsFavorite) AppleRed else secondaryTextColor,
                             modifier = Modifier.size(24.dp)
                         )
+                    }
+
+                    if (song.isLemonServerSong) {
+                        IconButton(onClick = { showTagEditor = true }) {
+                            Icon(
+                                imageVector = Icons.Filled.Edit,
+                                contentDescription = "在线修标签",
+                                tint = secondaryTextColor,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
 
                     IconButton(onClick = { showQueueSheet = true }) {
@@ -1686,6 +1722,16 @@ fun FullscreenPlayerSheet(
                     }
                 }
             }
+        }
+
+        // 5. 在线修标签弹窗 (仅服务器 lemon_music 曲库歌曲；竖屏/横屏入口共用)
+        if (showTagEditor) {
+            TagEditorDialog(
+                song = song,
+                onDismiss = { showTagEditor = false },
+                onLyricsUpdated = onLyricsUpdated,
+                onMetadataSaved = onMetadataSaved
+            )
         }
 
 

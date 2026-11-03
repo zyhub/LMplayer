@@ -640,6 +640,81 @@ object PlaybackQueueManager {
         savePlaybackState(song = song, commitSync = false)
     }
 
+    /**
+     * 在线修标签写回音频文件成功后，把新元数据就地同步到全部展示层内存对象。
+     *
+     * 安全性：currentSongFlow / playlistFlow / recentPlayedSongsFlow 的所有消费者
+     * (Compose 播放页、灵动岛通知构建、投屏待播) 均为只读展示，
+     * 不存在「flow 变化 → 重建 MediaItem / 重新 setMediaItem」的路径 —— ExoPlayer
+     * 只在 playSong() 中被写入，因此这里就地替换 UnifiedSong 绝不会打断当前播放。
+     *
+     * @param coverUrl 新封面的基础 URL；非空时自动追加时间戳参数 (已有查询参数则用 & 拼接)
+     *                 绕过 Coil 图片缓存，使新封面立即生效
+     */
+    fun updateSongMetadata(
+        songId: String,
+        title: String? = null,
+        artist: String? = null,
+        album: String? = null,
+        coverUrl: String? = null
+    ) {
+        if (songId.isBlank()) return
+        // 复用队列元数据重算专用串行池，避免与 updateMetadata 的合并任务竞争
+        metadataExecutor.execute {
+            val bustedCover = coverUrl?.takeIf { it.isNotBlank() }?.let { withCoverCacheBuster(it) }
+            val apply: (UnifiedSong) -> UnifiedSong = { song ->
+                if (song.id == songId) song.copy(
+                    title = title?.takeIf { it.isNotBlank() } ?: song.title,
+                    artist = artist?.takeIf { it.isNotBlank() } ?: song.artist,
+                    album = album?.takeIf { it.isNotBlank() } ?: song.album,
+                    coverUrl = bustedCover ?: song.coverUrl
+                ) else song
+            }
+            // 1. 就地更新队列中所有同 id 条目
+            _playlistFlow.update { current -> if (current.isEmpty()) current else current.map(apply) }
+            // 2. 最近播放足迹同步 (同为展示层内存对象)
+            _recentPlayedSongsFlow.update { current -> if (current.isEmpty()) current else current.map(apply) }
+            // 3. 当前曲目发出新值 → 播放页/灵动岛通知自动跟随刷新
+            val current = _currentSongFlow.value
+            if (current != null && current.id == songId) {
+                val updated = apply(current)
+                if (updated != current) {
+                    _currentSongFlow.value = updated
+                    savePlaybackState(song = updated, commitSync = false)
+                }
+            }
+            // 4. 异步落库 songs 表：资料库/收藏等列表重新组合时拿到新值，
+            //    也保证后续 invalidationTracker 触发的 updateMetadata 合并不会用旧库值回滚
+            val dbTitle = title?.takeIf { it.isNotBlank() }
+            val dbArtist = artist?.takeIf { it.isNotBlank() }
+            val dbAlbum = album?.takeIf { it.isNotBlank() }
+            if (dbTitle == null && dbArtist == null && dbAlbum == null && bustedCover == null) return@execute
+            val ctx = appContext ?: return@execute
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    val db = ZdsDatabase.getInstance(ctx)
+                    val existing = db.songDao().getSongById(songId) ?: return@launch
+                    db.songDao().updateSongMetadataById(
+                        songId = songId,
+                        title = dbTitle ?: existing.title,
+                        artist = dbArtist ?: existing.artist,
+                        album = dbAlbum ?: existing.album,
+                        coverUrl = bustedCover ?: existing.coverUrl
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to sync tag metadata into local songs table", e)
+                }
+            }
+        }
+    }
+
+    /** 给封面 URL 追加时间戳参数绕过 Coil 缓存 (已有查询参数用 & 拼接；先移除旧 t= 时间戳避免反复保存后无限叠加) */
+    private fun withCoverCacheBuster(url: String): String {
+        val base = url.replace(Regex("([?&])t=\\d+"), "$1")
+        val sep = if (base.contains("?")) "&" else "?"
+        return "$base${sep}t=${System.currentTimeMillis()}"
+    }
+
     fun setShuffle(shuffle: Boolean) {
         _isShuffleFlow.value = shuffle
         try {

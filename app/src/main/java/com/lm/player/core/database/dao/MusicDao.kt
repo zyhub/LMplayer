@@ -109,6 +109,10 @@ interface SongDao {
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :songId")
     suspend fun updateFavorite(songId: String, isFavorite: Boolean)
 
+    /** 在线修标签写回音频文件后，按 id 同步本地曲库缓存的展示元数据 (标题/歌手/专辑/封面) */
+    @Query("UPDATE songs SET title = :title, artist = :artist, album = :album, coverUrl = :coverUrl WHERE id = :songId")
+    suspend fun updateSongMetadataById(songId: String, title: String, artist: String, album: String, coverUrl: String)
+
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
     suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
 

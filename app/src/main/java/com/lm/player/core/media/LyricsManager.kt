@@ -894,6 +894,14 @@ object LyricsManager {
         return memoryCache[songId]
     }
 
+    /**
+     * 清除指定歌曲的歌词内存缓存 (如在线修标签写回歌词后，歌曲 id 不变但文件内容已变，
+     * 必须失效缓存才能让播放页下一次 loadLyrics 重新拉取新歌词)
+     */
+    fun invalidateLyrics(songId: String) {
+        memoryCache.remove(songId)
+    }
+
     suspend fun loadLyrics(
         song: UnifiedSong,
         context: Context,

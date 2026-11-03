@@ -231,6 +231,48 @@ class LemonMusicProtocol(
             return Result.failure(Exception("服务器未连接"))
         }
 
+        // ==================== 在线修标签 (/api/tag/*) ====================
+
+        suspend fun tagRead(filePath: String, context: Context? = null): Result<JSONObject> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.tagRead(filePath)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun tagMatch(
+            fileName: String = "",
+            keyword: String = "",
+            artist: String = "",
+            title: String = "",
+            album: String = "",
+            source: String = "wy",
+            context: Context? = null
+        ): Result<JSONArray> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.tagMatch(fileName, keyword, artist, title, album, source)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun tagMatchApply(match: JSONObject, source: String = "wy", context: Context? = null): Result<JSONObject> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.tagMatchApply(match, source)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun tagWrite(filePath: String, meta: JSONObject, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.tagWrite(filePath, meta)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
         // 跨实例共享的已认证 Bearer Token 缓存 (消除多组件并发实例化时的重复 /api/auth/login 请求)
         private val sharedAuthTokens = ConcurrentHashMap<String, String>()
 
@@ -2917,6 +2959,163 @@ class LemonMusicProtocol(
             return@withContext tagApiLyric
         } catch (_: Exception) {
             return@withContext null
+        }
+    }
+
+    // ==================== 在线修标签 (/api/tag/*) ====================
+
+    /**
+     * 读取服务器音频文件当前标签 (POST /api/tag/read)
+     * 响应信封兼容：{ data: {...} } 或裸对象；读取不到字段时返回空对象。
+     */
+    suspend fun tagRead(filePath: String): Result<JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply { put("filePath", filePath) }
+            val req = newAuthRequest("$cleanBase/api/tag/read")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("读取当前标签失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                if (!trimmed.startsWith("{")) {
+                    return@withContext Result.failure(Exception("读取当前标签响应格式异常"))
+                }
+                val json = JSONObject(trimmed)
+                Result.success(json.optJSONObject("data") ?: JSONObject())
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "tagRead failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 在线匹配候选列表 (POST /api/tag/match)
+     * source: wy(网易云) / kw(酷我) / kg(酷狗) / tx(QQ) / mg(咪咕)
+     * 响应信封兼容：data 数组 / data.list / data.results / data.songs / 裸数组。
+     */
+    suspend fun tagMatch(
+        fileName: String = "",
+        keyword: String = "",
+        artist: String = "",
+        title: String = "",
+        album: String = "",
+        source: String = "wy"
+    ): Result<JSONArray> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                if (fileName.isNotBlank()) put("fileName", fileName)
+                if (keyword.isNotBlank()) put("keyword", keyword)
+                if (artist.isNotBlank()) put("artist", artist)
+                if (title.isNotBlank()) put("title", title)
+                if (album.isNotBlank()) put("album", album)
+                put("source", source)
+            }
+            val req = newAuthRequest("$cleanBase/api/tag/match")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("在线匹配失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                val candidates: JSONArray = when {
+                    trimmed.startsWith("[") -> JSONArray(trimmed)
+                    trimmed.startsWith("{") -> {
+                        val json = JSONObject(trimmed)
+                        json.optJSONArray("data")
+                            ?: json.optJSONObject("data")?.optJSONArray("list")
+                            ?: json.optJSONObject("data")?.optJSONArray("results")
+                            ?: json.optJSONObject("data")?.optJSONArray("songs")
+                            ?: json.optJSONArray("list")
+                            ?: json.optJSONArray("results")
+                            ?: json.optJSONArray("songs")
+                            ?: JSONArray()
+                    }
+                    else -> return@withContext Result.failure(Exception("在线匹配响应格式异常"))
+                }
+                Result.success(candidates)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "tagMatch failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 应用在线匹配结果，获取全量元数据 (POST /api/tag/match-apply)
+     * 返回 { title, artist, album, year, genre, pic(base64/dataURI), lyric, ... }
+     */
+    suspend fun tagMatchApply(match: JSONObject, source: String = "wy"): Result<JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("match", match)
+                put("source", source)
+            }
+            val req = newAuthRequest("$cleanBase/api/tag/match-apply")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("获取匹配详情失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                if (!trimmed.startsWith("{")) {
+                    return@withContext Result.failure(Exception("匹配详情响应格式异常"))
+                }
+                val json = JSONObject(trimmed)
+                Result.success(json.optJSONObject("data") ?: json)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "tagMatchApply failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 将勾选的标签字段写回服务器音频文件 (POST /api/tag/write)
+     * 服务端写入成功后会自动刷新曲库缓存。meta 只携带调用方勾选的字段。
+     */
+    suspend fun tagWrite(filePath: String, meta: JSONObject): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("filePath", filePath)
+                put("meta", meta)
+            }
+            val req = newAuthRequest("$cleanBase/api/tag/write")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("写回标签失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                if (trimmed.startsWith("{")) {
+                    val json = JSONObject(trimmed)
+                    if (!json.optBoolean("success", true)) {
+                        val msg = json.optCleanString("message", "msg", "error")
+                        return@withContext Result.failure(Exception(msg.ifBlank { "服务器返回写入失败" }))
+                    }
+                }
+                Result.success(true)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "tagWrite failed", e)
+            Result.failure(e)
         }
     }
 

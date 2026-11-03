@@ -69,6 +69,8 @@ import com.lm.player.core.model.LyricLine
 import com.lm.player.core.model.LyricResult
 import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
+import com.lm.player.feature.library.TagEditorDialog
+import com.lm.player.feature.library.TagSavedMetadata
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -115,6 +117,9 @@ fun RetroCoverFlowPlayerView(
     onOffsetChange: (Long) -> Unit = {},
     onThemeChange: (LyricTheme) -> Unit = {},
     onSwitchPlayerTheme: (PlayerThemeStyle) -> Unit = {},
+    onLyricsUpdated: () -> Unit = {},
+    /** 在线修标签写回成功后回调，携带本次写入的字段 (宿主同步播放队列/本地库/封面展示) */
+    onMetadataSaved: (TagSavedMetadata) -> Unit = {},
     onOpenSleepTimer: () -> Unit = {},
     onOpenAudioSpecs: () -> Unit = {},
     onDismiss: () -> Unit
@@ -217,6 +222,7 @@ fun RetroCoverFlowPlayerView(
     var showAddToPlaylistMenu by remember { mutableStateOf(false) }
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showQueueSheet by remember { mutableStateOf(false) }
+    var showTagEditor by remember { mutableStateOf(false) }
 
     val activeCastDevice by AudioSharingManager.activeCastDevice.collectAsState()
     val sleepTimerRemainingSec by PlaybackQueueManager.sleepTimerRemainingSecFlow.collectAsState()
@@ -1409,6 +1415,18 @@ fun RetroCoverFlowPlayerView(
                             )
                         }
 
+                        // 1.5 在线修标签 (仅柠檬服务器曲库歌曲，与竖屏/横屏现代模式共用统一判定)
+                        if (song.isLemonServerSong) {
+                            IconButton(onClick = { showTagEditor = true }) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "在线修标签",
+                                    tint = secondaryTextColor,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        }
+
                         // 2. 待播队列
                         IconButton(onClick = { showQueueSheet = true }) {
                             Icon(
@@ -1562,10 +1580,21 @@ fun RetroCoverFlowPlayerView(
         }
     }
 
+    // 在线修标签弹窗 (仅服务器柠檬曲库歌曲)
+    if (showTagEditor) {
+        TagEditorDialog(
+            song = song,
+            onDismiss = { showTagEditor = false },
+            onLyricsUpdated = onLyricsUpdated,
+            onMetadataSaved = onMetadataSaved
+        )
+    }
+
     // 系统返回键分层适配：优先关闭内嵌弹窗与菜单，最后关闭播放页
     BackHandler(enabled = true) {
         when {
             showQueueSheet -> showQueueSheet = false
+            showTagEditor -> showTagEditor = false
             showSleepTimerMenu -> showSleepTimerMenu = false
             showAudioSpecsMenu -> showAudioSpecsMenu = false
             showAudioOutputMenu -> showAudioOutputMenu = false

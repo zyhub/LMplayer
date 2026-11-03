@@ -496,6 +496,8 @@ class MainActivity : ComponentActivity() {
             val currentQueue by PlaybackQueueManager.playlistFlow.collectAsState()
 
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
+            // 在线修标签写回歌词后的刷新计数：自增即触发播放页歌词重拉 (歌曲 id 不变但文件内容已变)
+            var lyricsRefreshTick by remember { mutableStateOf(0) }
             var isFullPlayerVisible by rememberSaveable { mutableStateOf(false) }
             var isLyricsMode by remember { mutableStateOf(false) }
             LaunchedEffect(currentSong) {
@@ -1810,7 +1812,8 @@ class MainActivity : ComponentActivity() {
             }
 
             // 歌曲切换时动态从音乐文件/NAS提取解析歌词 (支持秒级内存预载与防并发竞争)
-            LaunchedEffect(currentSong?.id) {
+            // lyricsRefreshTick 变化时 (在线修标签写回歌词后) 会先失效缓存再走到重新拉取分支
+            LaunchedEffect(currentSong?.id, lyricsRefreshTick) {
                 DynamicIslandManager.ensureInitialized(this@MainActivity)
                 DynamicIslandManager.clearLyrics()
                 val targetSong = currentSong ?: return@LaunchedEffect
@@ -3329,6 +3332,18 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                 onDownloadSongWithOptions = handleDownloadWithOptions,
                                 onAddToPlaylist = handleAddToPlaylist,
                                 onCreatePlaylistAndAddSong = handleCreatePlaylistAndAddSong,
+                                onLyricsUpdated = { lyricsRefreshTick++ },
+                                onMetadataSaved = { saved ->
+                                    // 在线修标签写回成功：就地同步播放队列/当前曲目/本地曲库缓存，
+                                    // 仅更新展示层内存对象，绝不触碰 ExoPlayer，当前播放不受影响
+                                    PlaybackQueueManager.updateSongMetadata(
+                                        songId = saved.songId,
+                                        title = saved.title,
+                                        artist = saved.artist,
+                                        album = saved.album,
+                                        coverUrl = if (saved.coverSaved) song.coverUrl else null
+                                    )
+                                },
                                 onDismiss = { isFullPlayerVisible = false }
                             )
                         }

@@ -32,6 +32,13 @@ data class UnifiedSong(
                 (sampleRate != null && sampleRate >= 96000) ||
                 format.contains("24bit", ignoreCase = true) ||
                 (format.contains("flac", ignoreCase = true) && bitRate >= 1411)
+
+    /**
+     * 是否为柠檬音乐服务器曲库歌曲 (在线修标签入口统一判定)
+     * serverId 实际格式可能是 srv_xxx，因此必须同时依靠 streamUrl 路径特征判断
+     */
+    val isLemonServerSong: Boolean
+        get() = serverId == "lemon_music" || streamUrl.contains("/api/play/local")
 }
 
 @Immutable
