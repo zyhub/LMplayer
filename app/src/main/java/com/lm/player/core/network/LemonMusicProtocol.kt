@@ -68,7 +68,9 @@ class LemonMusicProtocol(
     private var tokenOrPasswordPlain: String
 ) : NasMusicProtocol {
 
-    private val cleanBase = serverUrl.trim().trimEnd('/')
+    // scheme 大小写规范化：存量配置可能是大写 HTTPS://，所有基于 cleanBase 拼出的 API/流/封面
+    // 地址必须为小写 scheme，否则 ExoPlayer/Coil 与 startsWith("http") 判定全部失效。
+    private val cleanBase = ServerUrlPolicy.normalizeSchemeCase(serverUrl.trim().trimEnd('/'))
     private val urlPolicyError = ServerUrlPolicy.validate(cleanBase)
     private val authCacheKey = "${cleanBase}_${username.trim()}"
 

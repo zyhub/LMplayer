@@ -2175,7 +2175,8 @@ fun SettingsScreen(
             } else {
                 trimmed
             }
-            return withProto.trimEnd('/')
+            // scheme 统一规范为小写：大写 HTTPS:// 会导致封面/流地址的 scheme 匹配失效
+            return ServerUrlPolicy.normalizeSchemeCase(withProto.trimEnd('/'))
         }
 
         Dialog(onDismissRequest = { showAddServerDialog = false }) {

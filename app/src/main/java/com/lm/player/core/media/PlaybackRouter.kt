@@ -328,7 +328,11 @@ class PlaybackRouter(
         } else if (finalStreamUrl.startsWith("content://")) {
             Log.d(TAG, "Routing to SAF content uri: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.parse(finalStreamUrl)
-        } else if (finalStreamUrl.startsWith("http://") || finalStreamUrl.startsWith("https://")) {
+        } else if (
+            // ignoreCase：存量库歌曲的流地址可能以大写 HTTPS:// 开头（服务器地址配置为大写），
+            // 大小写敏感判定会误走本地文件分支导致播放失败
+            finalStreamUrl.startsWith("http://", ignoreCase = true) || finalStreamUrl.startsWith("https://", ignoreCase = true)
+        ) {
             Log.d(TAG, "Routing to remote stream: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.parse(finalStreamUrl)
         } else if (finalStreamUrl.startsWith("/") && File(finalStreamUrl).let { it.exists() && it.length() > 0 }) {

@@ -4,6 +4,22 @@ import java.net.URI
 
 /** 服务器地址安全策略：允许私网 HTTP，公网 HTTP 必须改为 HTTPS。 */
 object ServerUrlPolicy {
+    /**
+     * 将 URL 的 scheme 部分规范为小写，其余部分原样保留（避免破坏大小写敏感的路径/参数）。
+     *
+     * 用户配置服务器地址时可能输入大写 HTTPS://，由此拼出的封面与流地址 scheme 也为大写；
+     * 而 Coil 的 Fetcher 注册表按小写 "http"/"https" 精确匹配 scheme，客户端大量
+     * startsWith("http") 判定同样大小写敏感，大写 scheme 会导致封面零请求、播放链路误判。
+     * RFC 3986 规定 scheme 不区分大小写，统一归一为小写。
+     */
+    fun normalizeSchemeCase(raw: String): String {
+        val separator = raw.indexOf("://")
+        if (separator <= 0) return raw
+        val scheme = raw.substring(0, separator)
+        val lowered = scheme.lowercase()
+        return if (scheme == lowered) raw else lowered + raw.substring(separator)
+    }
+
     fun validate(raw: String): String? {
         val uri = runCatching { URI(raw.trim()) }.getOrNull()
             ?: return "服务器地址格式不正确"
