@@ -26,9 +26,12 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -2036,14 +2039,50 @@ class MainActivity : ComponentActivity() {
                         }
                     ) { innerPadding ->
                         Box(modifier = Modifier.fillMaxSize()) {
-                            AnimatedContent(
-                            targetState = currentScreen,
-                            transitionSpec = {
-                                fadeIn(animationSpec = tween(150, easing = FastOutSlowInEasing)) togetherWith
-                                        fadeOut(animationSpec = tween(120, easing = FastOutSlowInEasing))
-                            },
-                            label = "screen_transition"
-                        ) { targetScreen ->
+                            // 主标签：首页 / 资料库 / 设置 —— 支持左右滑动切换页面。
+                            // 页面内部的横向滑动（如首页歌单画廊 LazyRow）由子列表优先消费手势，
+                            // 只有横滑到子列表边界时 Pager 才接管翻页，两者互不冲突；
+                            // 列表区域的纵向滚动保持原功能不受影响。
+                            val mainTabs = remember { listOf(Screen.HOME, Screen.LIBRARY, Screen.SETTINGS) }
+                            val mainPagerState = rememberPagerState(
+                                initialPage = mainTabs.indexOf(currentScreen).coerceIn(0, mainTabs.lastIndex)
+                            ) { mainTabs.size }
+
+                            // 底栏/按钮导航 -> 驱动 Pager 翻页
+                            LaunchedEffect(currentScreen) {
+                                val idx = mainTabs.indexOf(currentScreen)
+                                if (idx >= 0 && idx != mainPagerState.currentPage) {
+                                    mainPagerState.animateScrollToPage(idx)
+                                }
+                            }
+                            // 手势滑动翻页 -> 同步全局 currentScreen（与底栏点击进入资料库执行相同的后台刷新）
+                            LaunchedEffect(mainPagerState) {
+                                snapshotFlow { mainPagerState.settledPage }
+                                    .distinctUntilChanged()
+                                    .collect { page ->
+                                        val target = mainTabs[page]
+                                        if (target != currentScreen) {
+                                            navigateToScreen(target)
+                                            if (target == Screen.LIBRARY) {
+                                                // 每次滑动到资料库时自动进行一次后台数据同步刷新
+                                                val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                                                val active = if (isLocalMode) null else serversList.firstOrNull { it.isCurrentActive }
+                                                if (active != null) {
+                                                    syncServerPlaylists(active)
+                                                    syncServerSongsWithToast(active, false)
+                                                } else {
+                                                    lifecycleScope.launch(Dispatchers.IO) {
+                                                        val dlDir = downloadEngine.getDownloadDir()
+                                                        LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                            }
+
+                            // 四个屏幕的内容统一渲染入口（下载管理不是标签页，以覆盖层方式显示在 Pager 之上）
+                            val renderScreen: @Composable (Screen) -> Unit = render@ { targetScreen ->
                             when (targetScreen) {
                                 Screen.HOME -> {
                                     val activeServer = activeOnlineServer
@@ -2945,7 +2984,35 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                     )
                                 }
                             }
-                        }
+                            }
+
+                            // 主标签页横滑容器（首页/资料库/设置）
+                            HorizontalPager(
+                                state = mainPagerState,
+                                modifier = Modifier.fillMaxSize(),
+                                beyondBoundsPageCount = 1
+                            ) { page ->
+                                renderScreen(mainTabs[page])
+                            }
+
+                            // 下载管理页（非标签页）：覆盖在 Pager 之上，带淡入淡出。
+                            // DownloadManagerScreen 自身不绘制背景（原版经 AnimatedContent 单页
+                            // 渲染时透出的是 scaffold 底色），作为覆盖层必须自备不透明背景，
+                            // 否则会透出下方 Pager 正在显示的主标签页内容
+                            AnimatedVisibility(
+                                visible = currentScreen == Screen.DOWNLOADS,
+                                enter = fadeIn(animationSpec = tween(180)),
+                                exit = fadeOut(animationSpec = tween(150)),
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.background)
+                                ) {
+                                    renderScreen(Screen.DOWNLOADS)
+                                }
+                            }
 
                         // 右下角浮动操作列：定位当前播放歌曲按钮 + 置顶按钮 (滑动不在顶端时出现，位置在定位歌曲按钮的下面)
                         Column(
