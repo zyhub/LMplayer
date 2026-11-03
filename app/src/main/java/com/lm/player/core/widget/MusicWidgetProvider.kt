@@ -289,10 +289,9 @@ object MusicWidgetController {
     }
 
     private fun downloadAndRoundCover(context: Context, url: String): Bitmap? {
-        val client = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
+        // 复用应用全局图片客户端：柠檬服务端封面 URL 不携带 query token，
+        // 鉴权依赖该客户端拦截器注入的 Bearer Token（与 App 内封面加载保持一致）
+        val client = com.lm.player.core.network.NetworkClientFactory.createImageOkHttpClient(context)
         val request = okhttp3.Request.Builder().url(url).build()
         client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) return null
