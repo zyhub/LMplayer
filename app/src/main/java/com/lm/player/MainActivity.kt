@@ -81,6 +81,7 @@ import com.lm.player.core.designsystem.theme.UiScaleMode
 import com.lm.player.core.designsystem.theme.ZDSPlayerTheme
 import com.lm.player.core.designsystem.theme.rememberAdaptiveDensity
 import com.lm.player.core.designsystem.theme.rememberAppDimensions
+import com.lm.player.core.media.AutoTagScraper
 import com.lm.player.core.media.DownloadEngine
 import com.lm.player.core.media.DownloadRequestPlanner
 import com.lm.player.core.media.DynamicIslandManager
@@ -540,6 +541,13 @@ class MainActivity : ComponentActivity() {
                 if (currentSong == null && isFullPlayerVisible) {
                     isFullPlayerVisible = false
                 }
+            }
+
+            // 播放时自动补全：服务器曲库中缺内嵌封面的歌曲，后台调用服务端匹配能力
+            // 写入封面/歌词/缺失标签（开关在设置页，失败静默，不阻塞播放）
+            LaunchedEffect(currentSong?.id) {
+                val playing = currentSong ?: return@LaunchedEffect
+                AutoTagScraper.maybeScrape(this@MainActivity, playing)
             }
 
             // 正在播放歌曲定位悬浮按钮状态（记录歌曲所属列表页面 + 仅在播放中且列表滑动时显示，播放界面不显示）
@@ -2475,17 +2483,18 @@ class MainActivity : ComponentActivity() {
                                     ) {
                                         when {
                                             serverFavoriteSongs.isEmpty() -> librarySongs.filter { it.isFavorite }.distinctBy { it.id }
-                                            !isLocalMode -> serverFavoriteSongs.map { fav ->
-                                                val matched = librarySongs.firstOrNull { it.id == fav.id }
-                                                if (matched != null) {
-                                                    matched.copy(
-                                                        coverUrl = matched.coverUrl.ifBlank { fav.coverUrl },
-                                                        isFavorite = true
-                                                    )
-                                                } else {
-                                                    fav.copy(isFavorite = true)
-                                                }
-                                            }.distinctBy { it.id }
+                                            !isLocalMode -> {
+                                                // 服务器收藏里存在「在线音源身份」的记录（serverId=lemon_online），
+                                                // 其 id 与服务器曲库文件 id 不同，只按 id 匹配永远落空；这里额外按
+                                                // 标题建索引，交给 resolveFavoriteSong 做元数据二次匹配
+                                                val serverLibraryByTitle = librarySongs
+                                                    .filter { it.isServerLibrarySong && it.title.isNotBlank() }
+                                                    .groupBy { SongMatchingResolver.normalizeTrackTitle(it.title) }
+                                                serverFavoriteSongs.map { fav ->
+                                                    resolveFavoriteSong(fav, librarySongs, serverLibraryByTitle)
+                                                        .copy(isFavorite = true)
+                                                }.distinctBy { it.id }
+                                            }
                                             else -> serverFavoriteSongs.mapNotNull { fav ->
                                                 completedDownloadedSongs.firstOrNull { local ->
                                                     local.id == fav.id || SongMatchingResolver.isSongMatch(
@@ -3707,12 +3716,21 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                 onLyricsUpdated = { lyricsRefreshTick++ },
                                 onMetadataSaved = { saved ->
                                     // 写回成功：就地同步播放队列 / 当前歌曲 / 本地曲库，不触碰播放器
+                                    // 封面场景需要额外两步，否则新封面要重启才显示：
+                                    //   1) 按文件路径重建 /api/tag/cover 地址（原 coverUrl 可能是空串/占位）
+                                    //   2) 清除「已知无内嵌封面」记忆，让封面占位逻辑重新发起加载
+                                    val coverPath = if (saved.coverSaved) {
+                                        LemonMusicProtocol.getServerFilePath(saved.songId, song.streamUrl, song.coverUrl)
+                                    } else null
+                                    if (coverPath != null) LemonMusicProtocol.markEmbeddedCoverWritten(coverPath)
                                     PlaybackQueueManager.updateSongMetadata(
                                         songId = saved.songId,
                                         title = saved.title,
                                         artist = saved.artist,
                                         album = saved.album,
-                                        coverUrl = if (saved.coverSaved) song.coverUrl else null
+                                        coverUrl = coverPath?.let { path ->
+                                            LemonMusicProtocol.activeInstance?.resolveCoverArtUrlForLocalPath(path)
+                                        } ?: if (saved.coverSaved) song.coverUrl else null
                                     )
                                 },
                                 onDismiss = { isFullPlayerVisible = false }
@@ -4129,6 +4147,39 @@ private fun downloadQualityLadder(requested: AudioQuality): List<AudioQuality> =
     AudioQuality.Q_FLAC -> listOf(AudioQuality.Q_FLAC, AudioQuality.Q_320K)
     AudioQuality.Q_320K -> listOf(AudioQuality.Q_320K, AudioQuality.Q_128K)
     AudioQuality.Q_128K -> listOf(AudioQuality.Q_128K)
+}
+
+/**
+ * 把一条服务器收藏解析成列表中实际展示的歌曲：
+ * 1. 曲库里有同 id 记录 → 用曲库记录（封面为空时沿用收藏记录的封面）；
+ * 2. 曲库里没有，且该收藏是在线音源身份（serverId=lemon_online）→ 按标题/歌手/时长在
+ *    服务器曲库中找同一首歌，命中则换用曲库记录。这样「仅服务器」徽标、在线修标签入口
+ *    与播放链路都会走服务器文件，而不是停留在在线音源；
+ * 3. 都没有 → 原样返回收藏记录。
+ */
+private fun resolveFavoriteSong(
+    favorite: UnifiedSong,
+    librarySongs: List<UnifiedSong>,
+    serverLibraryByTitle: Map<String, List<UnifiedSong>>
+): UnifiedSong {
+    librarySongs.firstOrNull { it.id == favorite.id }?.let { matched ->
+        return matched.copy(coverUrl = matched.coverUrl.ifBlank { favorite.coverUrl })
+    }
+    if (favorite.serverId != "lemon_online") return favorite
+    val matched = serverLibraryByTitle[SongMatchingResolver.normalizeTrackTitle(favorite.title)]
+        ?.firstOrNull { server ->
+            SongMatchingResolver.isSongMatch(
+                title1 = server.title,
+                artist1 = server.artist,
+                durationMs1 = server.durationMs,
+                title2 = favorite.title,
+                artist2 = favorite.artist,
+                durationMs2 = favorite.durationMs,
+                album1 = server.album,
+                album2 = favorite.album
+            )
+        }
+    return matched?.copy(coverUrl = matched.coverUrl.ifBlank { favorite.coverUrl }) ?: favorite
 }
 
 /**
