@@ -158,6 +158,9 @@ fun SettingsScreen(
     var autoCacheOnFavorite by remember {
         mutableStateOf(prefs.getBoolean("auto_cache_on_favorite", false) || prefs.getBoolean("auto_cache_to_server_on_favorite", false))
     }
+    var autoTagScrapeOnPlay by remember {
+        mutableStateOf(prefs.getBoolean("auto_tag_scrape_on_play", false))
+    }
     var offlineSyncAutoPush by remember {
         mutableStateOf(prefs.getBoolean("offline_sync_auto_push", false))
     }
@@ -1316,6 +1319,17 @@ fun SettingsScreen(
                                 onCheckedChange = {
                                     offlineSyncAutoPush = it
                                     prefs.edit().putBoolean("offline_sync_auto_push", it).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "播放时自动补全封面/歌词",
+                                subtitle = "播放到缺少内嵌封面的服务器歌曲时，自动在线匹配并把封面、歌词与缺失标签写入音频文件（匹配策略由服务端设置决定，刮错可用播放页修标签手动修正）",
+                                checked = autoTagScrapeOnPlay,
+                                onCheckedChange = {
+                                    autoTagScrapeOnPlay = it
+                                    prefs.edit().putBoolean("auto_tag_scrape_on_play", it).apply()
                                 }
                             )
                         }
