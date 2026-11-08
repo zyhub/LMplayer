@@ -416,8 +416,9 @@ fun SongListItemRow(
 
         // hasLocal 必须基于物理本地文件真实存在，避免 NAS 服务器曲库路径被误判为本地已有
         val hasLocal = hasPhysicalLocal || (song.serverId in listOf("local_storage", "local_folder", "local_saf"))
-        val hasServer = (song.serverId == "lemon_music" ||
-                (isServerConnected && song.serverId.isNotBlank() && song.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")))
+        // 「在不在服务器」是曲库数据事实，不能叠加 isServerConnected：外网抖动、服务器暂时
+        // 不可达时，徽标会错误地从「仅服务器」退化成「下载」
+        val hasServer = song.isServerLibrarySong
 
         if (onDownloadWithOptions != null) {
             com.lm.player.core.designsystem.component.SongSyncStatusTrailing(
