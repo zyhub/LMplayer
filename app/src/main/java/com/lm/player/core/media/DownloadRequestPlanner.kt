@@ -2,6 +2,7 @@ package com.lm.player.core.media
 
 import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.LemonServerDownloadTask
+import com.lm.player.core.model.NON_SERVER_LIBRARY_IDS
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.core.network.LemonMusicProtocol
 import org.json.JSONObject
@@ -35,9 +36,6 @@ object DownloadRequestPlanner {
 
     private val LOSSY_EXTS = setOf("mp3", "m4a", "aac", "ogg", "opus", "wma")
     private val LOSSLESS_EXTS = setOf("flac", "wav", "ape", "alac", "dsf", "dff")
-
-    /** 非"服务器曲库"的 serverId 标记：本地入库与全网在线占位 */
-    private val NON_SERVER_LIBRARY_IDS = setOf("local_storage", "local_folder", "local_saf", "lemon_online")
 
     /**
      * 该歌曲是否能"按指定音质重新获取"：全网在线曲目或柠檬服务器曲库曲目都行。
