@@ -23,4 +23,12 @@
     <string name="favorites">我喜欢</string>
     <string name="channel_name">音频播放</string>
     <string name="channel_desc">用于在通知栏展示音乐播放状态与控制按钮</string>
+    <string name="widget_2x1_desc">LMPlayer 播控小部件 (2×1)</string>
+    <string name="widget_2x2_desc">LMPlayer 歌词播控小部件 (2×2)</string>
+    <string name="widget_3x3_desc">LMPlayer 搜索 + 歌词小部件 (3×3)</string>
+    <string name="widget_4x2_desc">LMPlayer 歌词播控小部件 (4×2)</string>
+    <string name="widget_chart_4x2_desc">LMPlayer 热歌榜单小部件 (4×2)</string>
+    <string name="widget_chart_4x4_desc">LMPlayer 热歌总榜大部件 (4×4)</string>
+    <string name="widget_playlist_4x2_desc">LMPlayer 精选歌单小部件 (4×2)</string>
+    <string name="widget_playlist_4x4_desc">LMPlayer 歌单全景大部件 (4×4)</string>
 </resources>

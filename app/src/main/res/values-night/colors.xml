@@ -1,0 +1,22 @@
+<resources>
+    <!-- 桌面小部件 (深色模式，跟随系统) -->
+    <color name="widget_text_primary">#FFFFFFFF</color>
+    <color name="widget_text_secondary">#FF98989D</color>
+    <color name="widget_btn_bg">#FF5A5A5E</color>
+    <color name="widget_card_base">#FF1C1C1E</color>
+    <color name="widget_overlay">#C71C1C1E</color>
+    <color name="widget_border">#1FFFFFFF</color>
+    <color name="widget_icon">#FFE5E5EA</color>
+    <color name="widget_cover_placeholder">#FF2C2C2E</color>
+    <color name="widget_accent_red">#FA2D48</color>
+    <color name="widget_search_bar_bg">#1FFFFFFF</color>
+    <color name="widget_chip_bg">#14FFFFFF</color>
+    <color name="widget_gold">#FF9500</color>
+    <color name="widget_silver">#8E8E93</color>
+    <color name="widget_bronze">#FFCC00</color>
+    <color name="widget_trend_up">#34C759</color>
+    <color name="widget_tab_active">#FA2D48</color>
+    <color name="widget_tab_inactive">#98989D</color>
+    <!-- 主界面窗口底色（深色，与 Theme.kt 的 AppleDarkBg 一致） -->
+    <color name="app_window_bg">#101014</color>
+</resources>

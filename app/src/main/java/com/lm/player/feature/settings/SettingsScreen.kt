@@ -93,6 +93,8 @@ fun SettingsScreen(
     enableBottomBarAnimation: Boolean,
     dynamicCardEffects: Boolean = true,
     onDynamicCardEffectsChange: (Boolean) -> Unit = {},
+    enableMainTabSwipe: Boolean = false,
+    onEnableMainTabSwipeChange: (Boolean) -> Unit = {},
     autoPlayOnStartup: Boolean = true,
     autoFallbackToLocal: Boolean = true,
     autoLaunchOnBoot: Boolean = false,
@@ -272,6 +274,11 @@ fun SettingsScreen(
         mutableStateOf((prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths).toSet())
     }
     var isScanningLocalAndServer by remember { mutableStateOf(false) }
+    // 扫描状态来自进程级后台扫描引擎 (离开设置页再回来仍能看到进度)
+    val localScanState by com.lm.player.core.media.LocalScanEngine.state.collectAsState()
+    LaunchedEffect(localScanState?.isRunning) {
+        isScanningLocalAndServer = localScanState?.isRunning == true
+    }
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
     var newLocalPathInput by remember { mutableStateOf("") }
 
@@ -986,44 +993,15 @@ fun SettingsScreen(
 
                                 Button(
                                     onClick = {
+                                        // 扫描提速 (第二十节)：交给后台扫描引擎 (离开设置页不中断，进度显示在下方卡片)
                                         if (!isScanningLocalAndServer) {
-                                            isScanningLocalAndServer = true
-                                            coroutineScope.launch {
-                                                // try/finally 复位：扫描任意一环抛异常（无权限、目录不可读、DB 异常）时
-                                                // isScanningLocalAndServer 会永久为 true，按钮 enable=false 后再也无法扫描。
-                                                try {
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                    var totalScanned = 0
-                                                    // 1. 扫描配置目录
-                                                    for (path in localMusicPaths) {
-                                                        if (java.io.File(path).exists()) {
-                                                            totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
-                                                        }
-                                                    }
-                                                    // 2. 扫描系统媒体库
-                                                    totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
-
-                                                    // 3. 与服务器曲库智能比对与真实性校验
-                                                    val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
-                                                    val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
-                                                    LocalMediaScanner.matchAndMergeLocalWithServer(database)
-
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
-                                                        onLocalScanCompleted()
-                                                    }
-                                                } catch (e: kotlinx.coroutines.CancellationException) {
-                                                    throw e
-                                                } catch (e: Exception) {
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "本地扫描失败: ${e.message}", Toast.LENGTH_LONG).show()
-                                                    }
-                                                } finally {
-                                                    isScanningLocalAndServer = false
-                                                }
-                                            }
+                                            val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                            com.lm.player.core.media.LocalScanEngine.start(
+                                                context,
+                                                localMusicPaths.toList(),
+                                                includeMediaStore = true,
+                                                downloadDir = dlDir
+                                            )
                                         }
                                     },
                                     enabled = !isScanningLocalAndServer,
@@ -1034,7 +1012,7 @@ fun SettingsScreen(
                                     if (isScanningLocalAndServer) {
                                         CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                                         Spacer(modifier = Modifier.width(6.dp))
-                                        Text("比对中...", fontSize = 13.sp)
+                                        Text("扫描中...", fontSize = 13.sp)
                                     } else {
                                         Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(16.dp))
                                         Spacer(modifier = Modifier.width(4.dp))
@@ -1042,6 +1020,9 @@ fun SettingsScreen(
                                     }
                                 }
                             }
+
+                            // 扫描 / 比对进度卡片 (第二十节)
+                            LocalScanProgressCard()
                         }
                     }
 
@@ -1745,6 +1726,14 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
+                                title = "主页面左右滑动切换",
+                                subtitle = "开启后可在首页、资料库、设置之间左右滑动切换；打开歌单详情、搜索框和下载管理时不会触发",
+                                checked = enableMainTabSwipe,
+                                onCheckedChange = onEnableMainTabSwipeChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
                                 title = "首页与资料库动态光影特效",
                                 subtitle = if (dynamicCardEffects) "已开启液态光斑流动动效；退到后台或锁屏时自动暂停以省电" else "已关闭动态光影：使用零开销静态渐变与高光边框，彻底降低 CPU 占用与发热",
                                 checked = dynamicCardEffects,
@@ -2160,22 +2149,28 @@ fun SettingsScreen(
     if (showAddServerDialog) {
         var serverNameInput by remember { mutableStateOf(editingServer?.name ?: "") }
         val serverTypeInput = ServerType.LEMON_MUSIC
-        var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
+        // 地址与端口分两栏：编辑时把已保存的完整地址拆开；新建时端口预填柠檬默认端口 7983
+        val initialUrlSplit = remember { editingServer?.serverUrl?.let { ServerUrlPolicy.splitForEditing(it) } }
+        var serverUrlInput by remember { mutableStateOf(initialUrlSplit?.first ?: "") }
+        var portInput by remember {
+            mutableStateOf(if (editingServer != null) initialUrlSplit?.second.orEmpty() else ServerUrlPolicy.DEFAULT_PORT.toString())
+        }
         var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
         var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
         var isTestingConnection by remember { mutableStateOf(false) }
         var testResultMsg by remember { mutableStateOf<String?>(null) }
         var isTestSuccess by remember { mutableStateOf<Boolean?>(null) }
 
-        fun normalizeServerUrl(raw: String): String {
-            val trimmed = raw.trim()
-            if (trimmed.isBlank()) return ""
-            val withProto = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
-                "http://$trimmed"
-            } else {
-                trimmed
+        /** 拼出规范化的完整地址（协议/主机名转小写），并把两栏回填为规范形式；格式不对时提示并返回 null */
+        fun resolveServerUrl(): String? {
+            val composed = ServerUrlPolicy.compose(serverUrlInput, portInput).getOrElse {
+                Toast.makeText(context, it.message ?: "服务器地址格式不正确", Toast.LENGTH_LONG).show()
+                return null
             }
-            return withProto.trimEnd('/')
+            val (addr, port) = ServerUrlPolicy.splitForEditing(composed)
+            serverUrlInput = addr
+            portInput = port
+            return composed
         }
 
         Dialog(onDismissRequest = { showAddServerDialog = false }) {
@@ -2219,8 +2214,23 @@ fun SettingsScreen(
                             serverUrlInput = it
                             testResultMsg = null
                         },
-                        label = { Text("服务器地址 (支持内网IP如 192.168.1.100:3000)") },
+                        label = { Text("服务器地址 (如 192.168.1.100 或 https://域名)") },
                         singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = { v ->
+                            portInput = v.filter { it.isDigit() }.take(5)
+                            testResultMsg = null
+                        },
+                        label = { Text("端口 (默认 7983，反向代理域名可留空)") },
+                        singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        ),
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -2273,16 +2283,7 @@ fun SettingsScreen(
                         // 测试连接按钮
                         OutlinedButton(
                             onClick = {
-                                val cleanUrl = normalizeServerUrl(serverUrlInput)
-                                if (cleanUrl.isBlank()) {
-                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
-                                    return@OutlinedButton
-                                }
-                                ServerUrlPolicy.validate(cleanUrl)?.let { error ->
-                                    Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                                    return@OutlinedButton
-                                }
-                                serverUrlInput = cleanUrl
+                                val cleanUrl = resolveServerUrl() ?: return@OutlinedButton
                                 isTestingConnection = true
                                 testResultMsg = null
                                 isTestSuccess = null
@@ -2349,12 +2350,8 @@ fun SettingsScreen(
                         // 保存按钮 (不分行，文字为保存)
                         Button(
                             onClick = {
-                                val cleanUrl = normalizeServerUrl(serverUrlInput)
-                                if (cleanUrl.isNotBlank()) {
-                                    ServerUrlPolicy.validate(cleanUrl)?.let { error ->
-                                        Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                                        return@Button
-                                    }
+                                val cleanUrl = resolveServerUrl() ?: return@Button
+                                run {
                                     val newConfig = ServerConfig(
                                         id = editingServer?.id ?: "srv_${System.currentTimeMillis()}",
                                         name = serverNameInput.ifBlank { "我的音乐服务器" },
@@ -2366,8 +2363,6 @@ fun SettingsScreen(
                                     )
                                     onAddOrUpdateServer(newConfig)
                                     showAddServerDialog = false
-                                } else {
-                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = AppleRed),

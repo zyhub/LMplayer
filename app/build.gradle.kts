@@ -14,8 +14,10 @@ android {
         applicationId = "com.lm.player"
         minSdk = 23
         targetSdk = 34
-        versionCode = 66
-        versionName = "1.7.31"
+        // 版本号唯一来源：代码中通过 BuildConfig.VERSION_NAME / VERSION_CODE 读取，禁止再在 Kotlin 里硬编码
+        // 【版本号已锁定】按维护者要求固定为 1.7.32 (67)，编译出包时不要自动递增；如需变更请先征得维护者同意
+        versionCode = 67
+        versionName = "1.7.32"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -34,8 +36,13 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystoreFile = project.rootProject.file("keystore.jks")
-            val propsFile = project.rootProject.file("keystore.properties")
+            // S-01：签名文件统一放在上一级「项目根目录」（与 TV 端共用一个仓库根），
+            // 找不到时再回落到本工程目录下的旧位置，兼容旧的编译环境。
+            val signingRoot = project.rootProject.projectDir.parentFile
+            val keystoreFile = signingRoot.resolve("LMPlayer-release.jks").takeIf { it.exists() }
+                ?: project.rootProject.file("keystore.jks")
+            val propsFile = signingRoot.resolve("LMPlayer-keystore.properties").takeIf { it.exists() }
+                ?: project.rootProject.file("keystore.properties")
             if (!keystoreFile.exists()) {
                 throw GradleException("Release keystore.jks is required; refusing to fall back to debug signing.")
             }
@@ -87,6 +94,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 生成 BuildConfig.VERSION_NAME / VERSION_CODE，AppUpdateManager 由此读取版本号，避免与 defaultConfig 不一致
+        buildConfig = true
     }
 
     composeOptions {

@@ -33,6 +33,7 @@ private val RingGreen = Color(0xFF34C759)
 private val RingRed = Color(0xFFFF3B30)
 private val RingOrange = Color(0xFFFF9F0A)
 private val RingGray = Color(0xFF8E8E93)
+private val RingYellow = Color(0xFFFFCC00)
 
 /** 4 环极简看板：在线 / 延迟 / 激活源 / 音源加速。无列表、无详情、无说明文字。 */
 @Composable
@@ -57,10 +58,11 @@ fun ServerSourceStatusCard(
     val active = if (online) (meta?.activeSourceCount ?: sources.count { it.isActive }).coerceAtLeast(0) else 0
     val total = if (online) (meta?.totalSourceCount ?: sources.size).coerceAtLeast(0) else 0
     val accelReady = session.isReady
-    val accelLoading = session.state == SourceAccelerationSession.State.LOADING
+    // 拉取中（含已就绪后的后台刷新）一律黄色；拉取完成可用绿色；离线 / 未拉取 / 失败红色
+    val accelLoading = session.pulling || session.state == SourceAccelerationSession.State.LOADING
     val accelColor = when {
+        accelLoading -> RingYellow
         accelReady -> RingGreen
-        accelLoading -> RingGray
         else -> RingRed
     }
     val onlineColor = if (online) RingGreen else RingRed
@@ -78,7 +80,7 @@ fun ServerSourceStatusCard(
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
         modifier = Modifier.fillMaxWidth().semantics {
-            contentDescription = "在线:${if (online) "正常" else "未连接"}; 延迟:${if (latency > 0L) "${latency}毫秒" else "未知"}; 激活源:${active}/${total}; 音源加速:${if (accelReady) "正常" else "未加速"}" + (error?.let { "; ${it}" } ?: "")
+            contentDescription = "在线:${if (online) "正常" else "未连接"}; 延迟:${if (latency > 0L) "${latency}毫秒" else "未知"}; 激活源:${active}/${total}; 音源加速:${if (accelLoading) "拉取中" else if (accelReady) "正常" else "未拉取"}" + (error?.let { "; ${it}" } ?: "")
         }
     ) {
         Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
@@ -137,7 +139,7 @@ fun ServerSourceStatusCard(
                 }
                 StatusRingColumn(
                     label = "音源加速",
-                    progress = if (accelLoading) 0f else 1f,
+                    progress = if (accelLoading) session.pullProgress else 1f,
                     color = accelColor,
                     modifier = Modifier.weight(1f)
                 ) {

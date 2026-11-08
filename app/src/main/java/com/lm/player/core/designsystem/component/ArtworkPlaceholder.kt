@@ -51,6 +51,8 @@ private fun normalizeMusicCoverUrl(raw: String?): String? {
     var url = raw.trim()
     if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
     if (com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(url)) return null
+    // 歌曲表里可能存着大写 HTTPS:// 的旧封面地址，图片库按小写协议匹配加载器（PR #4）
+    url = com.lm.player.core.network.ServerUrlPolicy.normalizeSchemeCase(url)
     if (url.startsWith("//")) {
         url = "https:$url"
     }

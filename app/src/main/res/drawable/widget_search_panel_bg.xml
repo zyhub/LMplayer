@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 悬浮搜索面板卡片底：与小组件同一套卡片底色 + 细描边 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/widget_card_base" />
+    <corners android:radius="24dp" />
+    <stroke android:width="1dp" android:color="@color/widget_border" />
+</shape>

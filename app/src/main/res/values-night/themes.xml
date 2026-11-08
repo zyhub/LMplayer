@@ -1,0 +1,11 @@
+<resources>
+    <!-- 系统深色模式下的冷启动窗口：深色窗口底 + 浅色状态栏图标，避免启动瞬间顶部白条。
+         运行时再由 SystemBarsStyler 按应用内主题设置（跟随系统 / 深色 / 浅色）覆盖。 -->
+    <style name="Theme.LMPlayer" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/app_window_bg</item>
+        <item name="android:statusBarColor">@color/app_window_bg</item>
+        <item name="android:navigationBarColor">@color/app_window_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+    <style name="Theme.ZDSPlayer" parent="Theme.LMPlayer" />
+</resources>

@@ -187,7 +187,7 @@ fun CompactMorphingBottomBar(
     var hoveredNavIndex by remember {
         mutableIntStateOf(
             when (currentScreen) {
-                Screen.HOME -> 0
+                Screen.HOME, Screen.PODCASTS -> 0
                 Screen.LIBRARY, Screen.DOWNLOADS -> 1
                 Screen.SETTINGS -> 2
             }
@@ -196,7 +196,7 @@ fun CompactMorphingBottomBar(
 
     LaunchedEffect(currentScreen) {
         hoveredNavIndex = when (currentScreen) {
-            Screen.HOME -> 0
+            Screen.HOME, Screen.PODCASTS -> 0
             Screen.LIBRARY, Screen.DOWNLOADS -> 1
             Screen.SETTINGS -> 2
         }
@@ -261,7 +261,7 @@ fun CompactMorphingBottomBar(
     }
 
     val currentScreenIcon = when (currentScreen) {
-        Screen.HOME -> Icons.Filled.Home
+        Screen.HOME, Screen.PODCASTS -> Icons.Filled.Home
         Screen.LIBRARY, Screen.DOWNLOADS -> Icons.Filled.LibraryMusic
         Screen.SETTINGS -> Icons.Filled.Settings
     }
@@ -375,7 +375,7 @@ fun CompactMorphingBottomBar(
         val center2Px = padPx + slotWidthPx * 2.5f
 
         val currentScreenIndex = when (currentScreen) {
-            Screen.HOME -> 0
+            Screen.HOME, Screen.PODCASTS -> 0
             Screen.LIBRARY, Screen.DOWNLOADS -> 1
             Screen.SETTINGS -> 2
         }

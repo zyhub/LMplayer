@@ -1014,6 +1014,7 @@ fun LocalLibraryScreen(
                             glowColor = if (isServerOk) libPalettes[0].glowColor else Color(0xFFFF9500),
                             secondaryGlowColor = if (isServerOk) libPalettes[0].secondaryGlowColor else Color(0xFFFFB340),
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 val active = configuredServers.firstOrNull { it.isCurrentActive } ?: configuredServers.firstOrNull()
                                 if (active != null) onSelectServer(active) else onGoToSettings()
@@ -1134,6 +1135,7 @@ fun LocalLibraryScreen(
                             glowColor = libPalettes[1].glowColor,
                             secondaryGlowColor = libPalettes[1].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isFromAllAlbums = false
                                 activeSubViewTitle = "全部专辑"
@@ -1265,6 +1267,7 @@ fun LocalLibraryScreen(
                             glowColor = libPalettes[2].glowColor,
                             secondaryGlowColor = libPalettes[2].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "我喜欢的音乐"
@@ -1347,6 +1350,7 @@ fun LocalLibraryScreen(
                             glowColor = libPalettes[3].glowColor,
                             secondaryGlowColor = libPalettes[3].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 activeSubViewTitle = "全部歌曲"
                                 activeSubViewSubtitle = "资料库曲目 · 共 ${filteredSongs.size} 首"
@@ -1368,6 +1372,7 @@ fun LocalLibraryScreen(
                             glowColor = libPalettes[4].glowColor,
                             secondaryGlowColor = libPalettes[4].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "本地下载"
@@ -1391,6 +1396,7 @@ fun LocalLibraryScreen(
                             gradientColors = listOf(Color(0xFF6D28D9), Color(0xFF4C1D95)),
                             glowColor = Color(0xFFA78BFA),
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isFromAllPlaylists = false
                                 activeSubViewTitle = "最近播放"
@@ -1414,6 +1420,7 @@ fun LocalLibraryScreen(
                             gradientColors = listOf(Color(0xFFD97706), Color(0xFF78350F)),
                             glowColor = Color(0xFFFBBF24),
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isFromAllArtists = false
                                 activeSubViewTitle = "全部歌手"
@@ -3052,10 +3059,11 @@ private fun LibraryLiquidCard(
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(18.dp),
     isAnimated: Boolean = true,
+    isPaused: Boolean = false,
     onClick: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 8000)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 20_000, paused = isPaused)
     val path1 = remember { Path() }
     val path2 = remember { Path() }
     val ptsBuffer = remember { FloatArray(16) }
@@ -3182,9 +3190,10 @@ private fun LibraryLiquidSmallCard(
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(16.dp),
     isAnimated: Boolean = true,
+    isPaused: Boolean = false,
     onClick: () -> Unit
 ) {
-    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 7500)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 17_000, paused = isPaused)
     val path1 = remember { Path() }
     val path2 = remember { Path() }
     val ptsBuffer = remember { FloatArray(16) }

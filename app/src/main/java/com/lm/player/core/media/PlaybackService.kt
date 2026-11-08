@@ -87,7 +87,26 @@ class PlaybackService : MediaSessionService() {
         const val CMD_TOGGLE_FAVORITE = "CMD_TOGGLE_FAVORITE"
 
         const val INTERNAL_AUTH_TOKEN_EXTRA = "internal_auth_token"
-        internal val INTERNAL_COMMAND_SECRET = java.util.UUID.randomUUID().toString()
+
+        @Volatile
+        private var cachedInternalCommandSecret: String? = null
+
+        /**
+         * 内部服务命令（通知栏按钮、停止服务）的校验密钥。
+         *
+         * C-13：此前是进程级随机 UUID，进程被系统回收后重建，密钥变了，而通知栏 / 灵动岛上
+         * 已有的 PendingIntent 仍携带旧密钥 → 按钮点击被当成「未授权」静默丢弃。
+         * 现在首次生成后存进应用私有 SharedPreferences，跨进程重建保持不变（外部 App 仍无法读取）。
+         */
+        @Synchronized
+        internal fun internalCommandSecret(context: Context): String {
+            cachedInternalCommandSecret?.let { return it }
+            val prefs = context.applicationContext.getSharedPreferences("lm_internal_command", Context.MODE_PRIVATE)
+            val secret = prefs.getString("secret", null)?.takeIf { it.isNotBlank() }
+                ?: java.util.UUID.randomUUID().toString().also { prefs.edit().putString("secret", it).apply() }
+            cachedInternalCommandSecret = secret
+            return secret
+        }
 
         // 仅在手机端关闭「启用挂后台手机灵动岛」时屏蔽的手机系统通知中心/状态栏胶囊包名（不影响车机桌面与蓝牙播控）
         private val PHONE_SYSTEM_ISLAND_PACKAGES = setOf(
@@ -159,7 +178,7 @@ class PlaybackService : MediaSessionService() {
                 Media3Factory.releaseSharedPlayer()
                 val stopIntent = Intent(context, PlaybackService::class.java).apply {
                     action = ACTION_STOP_SERVICE
-                    putExtra(INTERNAL_AUTH_TOKEN_EXTRA, INTERNAL_COMMAND_SECRET)
+                    putExtra(INTERNAL_AUTH_TOKEN_EXTRA, internalCommandSecret(context))
                     setPackage(context.packageName)
                 }
                 context.startService(stopIntent)
@@ -349,14 +368,20 @@ class PlaybackService : MediaSessionService() {
                     session: MediaSession,
                     controller: MediaSession.ControllerInfo
                 ): MediaSession.ConnectionResult {
-                    val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
-                        .add(SessionCommand(CMD_NEXT, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PREV, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
-                        .build()
+                    // S-12：自定义命令（含「收藏」）只开放给本 App 自己的控制器；
+                    // 蓝牙/车机/系统媒体控件走标准播放命令（播放、暂停、切歌、拖动），不受影响。
+                    val sessionCommands = if (controller.packageName == packageName) {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                            .add(SessionCommand(CMD_NEXT, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PREV, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
+                            .build()
+                    } else {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                    }
                     val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
                         .add(Player.COMMAND_SEEK_TO_NEXT)
                         .add(Player.COMMAND_SEEK_TO_PREVIOUS)
@@ -382,6 +407,10 @@ class PlaybackService : MediaSessionService() {
                     customCommand: SessionCommand,
                     args: Bundle
                 ): ListenableFuture<SessionResult> {
+                    if (controller.packageName != packageName) {
+                        Log.w(TAG, "Rejected custom command ${customCommand.customAction} from ${controller.packageName}")
+                        return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_PERMISSION_DENIED))
+                    }
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
                             PlaybackQueueManager.playNext(this@PlaybackService)
@@ -614,7 +643,7 @@ class PlaybackService : MediaSessionService() {
         val action = intent?.action
         if (action == ACTION_STOP_SERVICE || action == ACTION_MEDIA_COMMAND) {
             val authToken = intent.getStringExtra(INTERNAL_AUTH_TOKEN_EXTRA)
-            if (authToken != INTERNAL_COMMAND_SECRET) {
+            if (authToken != internalCommandSecret(this)) {
                 Log.w(TAG, "Rejecting unauthorized intent call for action $action")
                 return START_NOT_STICKY
             }

@@ -109,6 +109,14 @@ interface SongDao {
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :songId")
     suspend fun updateFavorite(songId: String, isFavorite: Boolean)
 
+    /** 本地扫描「补封面」阶段使用 */
+    @Query("UPDATE songs SET coverUrl = :coverUrl WHERE id = :songId")
+    suspend fun updateCoverUrl(songId: String, coverUrl: String)
+
+    /** 在线修标签写回后，按 id 同步本地曲库缓存的展示元数据（PR #5） */
+    @Query("UPDATE songs SET title = :title, artist = :artist, album = :album, coverUrl = :coverUrl WHERE id = :songId")
+    suspend fun updateSongMetadataById(songId: String, title: String, artist: String, album: String, coverUrl: String)
+
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
     suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
 
@@ -292,6 +300,9 @@ interface ServerDao {
 
     @Query("UPDATE servers SET isCurrentActive = 0")
     suspend fun clearActiveServer()
+
+    @Query("UPDATE servers SET serverUrl = :url WHERE id = :serverId")
+    suspend fun updateServerUrl(serverId: String, url: String)
 
     @Query("DELETE FROM servers WHERE id = :serverId")
     suspend fun deleteServer(serverId: String)

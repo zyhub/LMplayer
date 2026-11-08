@@ -32,6 +32,14 @@ data class UnifiedSong(
                 (sampleRate != null && sampleRate >= 96000) ||
                 format.contains("24bit", ignoreCase = true) ||
                 (format.contains("flac", ignoreCase = true) && bitRate >= 1411)
+
+    /**
+     * 是否为柠檬服务器曲库歌曲（在线修标签入口判定，PR #5）。
+     * serverId 实际可能是服务器配置 id，所以同时按流地址 /api/play/local* 判断；在线歌曲不算。
+     */
+    val isLemonServerSong: Boolean
+        get() = !id.startsWith("lemon_online_") &&
+            (serverId == "lemon_music" || streamUrl.contains("/api/play/local"))
 }
 
 @Immutable
@@ -194,6 +202,8 @@ enum class Screen {
     HOME,
     LIBRARY,
     DOWNLOADS,
+    /** 播客（发现页入口进入，覆盖在标签页之上） */
+    PODCASTS,
     SETTINGS
 }
 
@@ -428,6 +438,13 @@ data class LemonServerDownloadTask(
     val raw: String = ""
 )
 
+/** 服务端下载任务「换源确认」可选的备用音源（对应 meta.sourceFallbackOffer.alternatives[]） */
+@Immutable
+data class LemonSourceAlternative(
+    val id: String,
+    val name: String
+)
+
 @Immutable
 data class LemonServerDownloadTaskRecord(
     val id: String,
@@ -435,13 +452,24 @@ data class LemonServerDownloadTaskRecord(
     val singer: String,
     val album: String = "",
     val quality: String = "320k",
-    val status: String = "waiting", // waiting, downloading, completed, error, paused, await_confirm
+    /** waiting, downloading, completed, error, paused, await_confirm(降档), await_source(换源), await_exist(同名文件) */
+    val status: String = "waiting",
+    /** 0~100 的整数百分比（服务端原始值为 0~1 小数，解析时已换算） */
     val progress: Int = 0,
     val error: String = "",
     val createdAt: Long = 0L,
     val filePath: String = "",
     val songId: String = "",
-    val coverUrl: String = ""
+    val coverUrl: String = "",
+    /** await_confirm：meta.downgradeOffer 的原音质 / 目标音质标签 */
+    val downgradeFromLabel: String = "",
+    val downgradeToLabel: String = "",
+    /** await_source：meta.sourceFallbackOffer 中失败的音源名与可切换的备用音源 */
+    val sourceFailedName: String = "",
+    val sourceAlternatives: List<LemonSourceAlternative> = emptyList(),
+    /** await_exist：meta.existFileOffer 中本地已有文件与本次请求的音质标签 */
+    val existLocalLabel: String = "",
+    val existRequestedLabel: String = ""
 )
 
 
@@ -480,14 +508,6 @@ data class LemonScanStatus(
     val cachedCount: Int = 0,
     val pendingCount: Int = 0,
     val total: Int = 0
-)
-
-@Immutable
-data class ServerDlnaDevice(
-    val id: String,
-    val name: String,
-    val host: String = "",
-    val isOnline: Boolean = true
 )
 
 @Immutable

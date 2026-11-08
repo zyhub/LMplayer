@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 歌单小部件封面占位：圆角底 + 音符（无封面 / 封面未加载完时显示） -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/widget_cover_placeholder" />
+            <corners android:radius="14dp" />
+        </shape>
+    </item>
+    <item
+        android:left="18dp"
+        android:top="18dp"
+        android:right="18dp"
+        android:bottom="18dp"
+        android:drawable="@drawable/ic_widget_note_muted" />
+</layer-list>

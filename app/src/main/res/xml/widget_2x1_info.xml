@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 2x1 播控：minWidth / minHeight 按「n 格 = 70n − 30 dp」取 2×1，竖屏手机与平板都默认占 2×1 -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="110dp"
+    android:minHeight="40dp"
+    android:targetCellWidth="2"
+    android:targetCellHeight="1"
+    android:minResizeWidth="110dp"
+    android:minResizeHeight="40dp"
+    android:maxResizeWidth="330dp"
+    android:maxResizeHeight="130dp"
+    android:resizeMode="horizontal|vertical"
+    android:updatePeriodMillis="0"
+    android:initialLayout="@layout/widget_2x1"
+    android:previewLayout="@layout/widget_2x1"
+    android:widgetCategory="home_screen"
+    android:description="@string/widget_2x1_desc" />

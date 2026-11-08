@@ -31,7 +31,7 @@ object DownloadRequestPlanner {
     )
 
     /** 下载链路单次本地加速预算；本地失败必须尽快回服务器，不能让进度条停在 0%。 */
-    private const val DOWNLOAD_ACCEL_BUDGET_MS = 2_500L
+    private const val DOWNLOAD_ACCEL_BUDGET_MS = 8_000L
 
     private val LOSSY_EXTS = setOf("mp3", "m4a", "aac", "ogg", "opus", "wma")
     private val LOSSLESS_EXTS = setOf("flac", "wav", "ape", "alac", "dsf", "dff")
@@ -138,35 +138,49 @@ object DownloadRequestPlanner {
         // 降级候选需要先尝试服务器原文件时，跳过本地音源解析，避免又拿回同一个 403 地址。
         skipLocalAcceleration: Boolean = false
     ): ResolvedDownloadStream? {
-        if (protocol == null) return null
+        val resolved = resolveStreamAtQualityInner(protocol, song, quality, preferServerFile, skipLocalAcceleration)
+        if (resolved != null) notifyIfDowngraded(context, song, quality, resolved)
+        return resolved
+    }
+
+    private suspend fun resolveStreamAtQualityInner(
+        protocol: LemonMusicProtocol?,
+        song: UnifiedSong,
+        quality: AudioQuality,
+        preferServerFile: Boolean,
+        skipLocalAcceleration: Boolean
+    ): ResolvedDownloadStream? {
+        val accelMode = com.lm.player.core.source.SourceAccelerationController.playbackMode()
+        val localOnly = protocol == null || accelMode == com.lm.player.core.source.SourceAccelerationController.Mode.LOCAL_ONLY
+
+        if (protocol == null) {
+            // 没有柠檬服务器（已删除/解绑）：在线曲目只能由本地音源取链——完整的「换音源 → 换平台 → 降音质」
+            if (skipLocalAcceleration || resolveAccelerationSource(song).isBlank() ||
+                !com.lm.player.core.source.SourceAccelerationController.canResolveLocally()
+            ) return null
+            return localFullLadder(song, quality)
+        }
 
         // 本地加速不需要服务器鉴权；先尝试本地，失败后再 ensureAuthenticated() 走服务器，
         // 避免服务器失联时鉴权先阻塞、把本地直链的机会耗掉。
         var accelerationAttempted = false
 
-        // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；失败回 NAS。
+        // 服务器曲库没有平台 ID：用本地目录服务搜索同曲目，再做本地取链（结果已经过 CDN 探活）；失败回 NAS。
         if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate() && isServerLibrarySong(song)) {
             accelerationAttempted = true
             val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
                 protocol = protocol,
                 serverId = song.serverId,
                 song = song,
-                overrideQuality = quality.key
+                overrideQuality = quality.key,
+                priority = com.lm.player.core.source.ResolvePriority.DOWNLOAD
             ).getOrNull()
             resolved?.let { r ->
-                if (probeLocalUrl(r.url)) {
-                    return ResolvedDownloadStream(r.url, r.quality.format.lowercase(), r.quality.bitrate)
-                }
-                // 探测失败说明缓存直链已失效，主动清掉，避免下一次下载继续拿到同一条。
-                com.lm.player.core.source.ServerLibraryAccelerationResolver.invalidate(
-                    serverId = song.serverId,
-                    song = song,
-                    qualityKey = quality.key
-                )
+                return ResolvedDownloadStream(r.url, r.quality.format.lowercase(), r.quality.bitrate)
             }
         }
 
-        // 在线曲目：外网/内网高延迟且会话就绪时，先本地解析同音质直链。
+        // 在线曲目：外网/内网高延迟/服务器离线且会话就绪时，先本地解析同音质直链（下载优先级，不挤占播放）。
         // 失败完全不报错，继续走原来的服务器/音源链路。
         if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
             val accelSource = resolveAccelerationSource(song)
@@ -174,21 +188,24 @@ object DownloadRequestPlanner {
                 // 服务器曲库 ID 没有平台信息，无法安全匹配本地音源，直接走服务器。
             } else {
                 accelerationAttempted = true
-                val accelInfo = buildAccelerationInfo(song)
-                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithQualityFallback(
-                    source = accelSource,
-                    preferredQuality = quality.key,
-                    musicInfoJson = accelInfo,
-                    budgetMs = DOWNLOAD_ACCEL_BUDGET_MS
-                )
-                val resolution = local.getOrNull()
-                if (resolution != null) {
-                    val url = resolution.url.takeIf {
-                        it.startsWith("http://") || it.startsWith("https://")
-                    }
-                    if (url != null && probeLocalUrl(url)) {
-                        val actual = AudioQuality.fromKey(resolution.qualityKey)
-                        return ResolvedDownloadStream(url, actual.format.lowercase(), actual.bitrate)
+                if (localOnly) {
+                    // 服务器离线：本地完整阶梯（各音源 → 各平台 → 逐级降音质）
+                    localFullLadder(song, quality)?.let { return it }
+                } else {
+                    // 服务器可用：本地只接受「目标音质」（含换音源、换平台），达不到就交给服务器的完整阶梯，
+                    // 不在本地直接降到 128K
+                    val hit = com.lm.player.core.source.PlaybackAccelerator.localResolve(
+                        song = song,
+                        requested = quality,
+                        priority = com.lm.player.core.source.ResolvePriority.DOWNLOAD,
+                        budgetMs = DOWNLOAD_ACCEL_BUDGET_MS,
+                        crossPlatform = true,
+                        refresh = false,
+                        lenientProbe = false,
+                        floorQuality = quality
+                    )
+                    if (hit != null) {
+                        return ResolvedDownloadStream(hit.url, hit.quality.format.lowercase(), hit.quality.bitrate)
                     }
                 }
             }
@@ -296,6 +313,13 @@ object DownloadRequestPlanner {
                 }
         }
 
+        // 服务器路径也没拿到：最后用本地完整阶梯兜底（服务器音源不可用、但本地脚本可能拿得到）
+        if (url.isNullOrBlank() && !skipLocalAcceleration && resolveAccelerationSource(song).isNotBlank() &&
+            com.lm.player.core.source.SourceAccelerationController.canResolveLocally()
+        ) {
+            localFullLadder(song, quality)?.let { return it }
+        }
+
         // 兜底：歌曲自带的直链。必须是 http(s) 绝对地址 ——
         // 已下载到本地的歌曲 streamUrl 会被改写成**本地文件路径**，那种地址交给引擎只会得
         // 到"未能解析或获取有效的音频直链"，不如在这里就返回 null 让调用方走本地分支；
@@ -304,6 +328,8 @@ object DownloadRequestPlanner {
             url = song.streamUrl
                 .takeIf { it.isNotBlank() && !it.startsWith("lemon_online://") }
                 ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                // 播放时可能被换成 local-smooth（AAC 128K 转码流，C-08）；下载必须取服务器原文件
+                ?.replace("/api/play/local-smooth?", "/api/play/local?")
                 ?.let { streamUrl ->
                     if (streamUrl.contains("/api/play/local") && !streamUrl.contains("quality=")) {
                         "$streamUrl&quality=${quality.key}"
@@ -315,6 +341,50 @@ object DownloadRequestPlanner {
 
         val finalUrl = url?.takeIf { it.isNotBlank() } ?: return null
         return ResolvedDownloadStream(finalUrl, format, bitRate)
+    }
+
+    /** 本地完整阶梯：每档先换音源、再换平台，本档都拿不到才降档；下载不赶时间，给足预算。 */
+    private suspend fun localFullLadder(song: UnifiedSong, quality: AudioQuality): ResolvedDownloadStream? {
+        val hit = com.lm.player.core.source.PlaybackAccelerator.localResolve(
+            song = song,
+            requested = quality,
+            priority = com.lm.player.core.source.ResolvePriority.DOWNLOAD,
+            budgetMs = DOWNLOAD_LOCAL_LADDER_BUDGET_MS,
+            crossPlatform = true,
+            refresh = false,
+            lenientProbe = true
+        ) ?: return null
+        return ResolvedDownloadStream(hit.url, hit.quality.format.lowercase(), hit.quality.bitrate)
+    }
+
+    private const val DOWNLOAD_LOCAL_LADDER_BUDGET_MS = 20_000L
+
+    private val downgradeNotified = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** 实际拿到的音质低于所选音质时，立即告诉用户（同一首歌 60 秒内只提示一次）。 */
+    private fun notifyIfDowngraded(context: android.content.Context?, song: UnifiedSong, requested: AudioQuality, got: ResolvedDownloadStream) {
+        val lossyGot = got.format.lowercase() !in LOSSLESS_EXTS
+        val requestedLossless = requested == AudioQuality.Q_FLAC || requested == AudioQuality.Q_HIRES
+        val downgraded = (requestedLossless && lossyGot) || got.bitRate in 1 until (requested.bitrate - 32)
+        if (!downgraded) return
+        val now = System.currentTimeMillis()
+        val last = downgradeNotified[song.id]
+        if (last != null && now - last < 60_000L) return
+        downgradeNotified[song.id] = now
+        val ctx = (context ?: com.lm.player.core.source.SourceAccelerationController.appContext())?.applicationContext ?: return
+        val actual = when {
+            !lossyGot && got.bitRate >= 1400 -> AudioQuality.Q_HIRES
+            !lossyGot -> AudioQuality.Q_FLAC
+            got.bitRate in 1..200 -> AudioQuality.Q_128K
+            else -> AudioQuality.Q_320K
+        }
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(
+                ctx,
+                "「${song.title}」暂无【${requested.label}】，已换源后降为【${actual.label}】下载",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     /** 下载前轻量探测，避免本地直链 403/过期导致整个下载失败；失败则无感回服务器。 */

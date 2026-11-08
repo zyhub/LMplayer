@@ -30,8 +30,9 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.7.31"
-    const val CURRENT_VERSION_CODE = 66
+    // 版本号锁定为 app/build.gradle.kts defaultConfig 的唯一来源（此前在这里硬编码，升级时容易漏改导致不一致）
+    const val CURRENT_VERSION_NAME = com.lm.player.BuildConfig.VERSION_NAME
+    const val CURRENT_VERSION_CODE = com.lm.player.BuildConfig.VERSION_CODE
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "专为车载大屏与移动设备量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动与车载方向盘物理按键硬件级适配。"

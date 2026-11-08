@@ -90,7 +90,7 @@ object SongMatchingResolver {
             " ($ver)"
         }
         t = t.replace(MULTI_SPACE_REGEX, " ").trim()
-        if (normalizedTitleCache.size > 8192) normalizedTitleCache.clear()
+        if (normalizedTitleCache.size > 32768) normalizedTitleCache.clear() // 大曲库比对时 8192 会反复清空导致重算
         normalizedTitleCache[title] = t
         return t
     }
@@ -164,7 +164,7 @@ object SongMatchingResolver {
         normalizedArtistCache[artist]?.let { return it }
         val a = unescapeMusicText(artist).lowercase()
         val result = if (a.contains("<unknown>") || a.contains("未知") || a == "local_storage" || a == "local_folder" || a == "local_saf") "" else a
-        if (normalizedArtistCache.size > 4096) normalizedArtistCache.clear()
+        if (normalizedArtistCache.size > 16384) normalizedArtistCache.clear()
         normalizedArtistCache[artist] = result
         return result
     }
@@ -174,6 +174,29 @@ object SongMatchingResolver {
      * 支持 "歌名"、"歌手 - 歌名"、"歌名 - 歌手"、"01. 歌名" 格式，
      * 严禁使用模糊子串 contains 导致 "我不难过.flac" 误匹配 "我不难过 (Live)" 或 "我不难过 (黑胶版)"
      */
+    /**
+     * 文件名可能推出的所有规范化歌名 (用于建索引)。
+     *
+     * [matchFileNameToTrack] 只有在目标歌名规范化后**等于**这里返回的某一项时才可能为 true：
+     * 整个文件名、或 "A - B" 两侧任一侧。因此按这些键查索引得到的候选，
+     * 与逐首调用 [matchFileNameToTrack] 遍历全部歌曲的结果完全一致，只是不再做无谓的比对。
+     */
+    fun fileNameTitleKeys(fileNameWithoutExt: String): Set<String> {
+        val rawClean = unescapeMusicText(fileNameWithoutExt).replace(TRACK_NUM_REGEX, "").trim()
+        if (rawClean.isBlank()) return emptySet()
+        val keys = LinkedHashSet<String>(3)
+        keys.add(normalizeTrackTitle(rawClean))
+        if (rawClean.contains(" - ")) {
+            val parts = rawClean.split(" - ", limit = 2)
+            if (parts.size == 2) {
+                keys.add(normalizeTrackTitle(parts[0]))
+                keys.add(normalizeTrackTitle(parts[1]))
+            }
+        }
+        keys.remove("")
+        return keys
+    }
+
     fun matchFileNameToTrack(
         fileNameWithoutExt: String,
         targetTitle: String,

@@ -27,6 +27,10 @@ class LMApplication : Application(), ImageLoaderFactory {
         super.onCreate()
         ServerTokenCipher.init(this)
         CrashLogManager.install(this)
+        // 柠檬服务端会话过期（401）时用本地保存的密码自动重登，避免只能删掉服务器重新添加
+        com.lm.player.core.network.LemonMusicProtocol.installSessionReauth(this)
+        // 播客收听进度记录（后台服务单独拉起进程时也要能记录 / 续播）
+        com.lm.player.core.podcast.PodcastController.init(this)
 
         // 1. 监听应用前后台切换，实现“应用内隐藏灵动岛，挂后台时手机顶部即时呈现概念版灵动岛”
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
@@ -86,6 +90,7 @@ class LMApplication : Application(), ImageLoaderFactory {
                     }
                 }
             }
+            migrateServerUrlCase(db)
             com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
@@ -96,6 +101,24 @@ class LMApplication : Application(), ImageLoaderFactory {
 
         // 3. 后台灵动岛引擎初始化（纯内存状态读取，无磁盘 IO）
         DynamicIslandManager.ensureInitialized(this)
+
+        // 4. 歌单小部件：本地歌单 / 收藏变化时刷新「我的歌单」（没放歌单小部件时只是空转监听）
+        com.lm.player.core.widget.PlaylistWidgetController.startObserving(this)
+    }
+
+    /**
+     * 一次性修正：旧版本允许保存 `HTTP://NAS.Local` 这类大写协议/主机名的地址，后续多处按小写前缀判断导致无法登录。
+     * 启动时把已保存的地址统一规范为小写协议和主机名（路径保持原样），用户无需删掉服务器重新添加。
+     */
+    private suspend fun migrateServerUrlCase(db: ZdsDatabase) {
+        runCatching {
+            db.serverDao().getAllServers().forEach { server ->
+                val canonical = com.lm.player.core.network.ServerUrlPolicy.canonicalize(server.serverUrl)
+                if (canonical.isNotBlank() && canonical != server.serverUrl) {
+                    db.serverDao().updateServerUrl(server.id, canonical)
+                }
+            }
+        }
     }
 
     override fun onTrimMemory(level: Int) {
@@ -105,6 +128,18 @@ class LMApplication : Application(), ImageLoaderFactory {
             DynamicIslandManager.onAppBackgroundStateChanged(this, inBackground = true)
         }
     }
+
+    private var lastWidgetOrientation = android.content.res.Configuration.ORIENTATION_UNDEFINED
+
+    /** 横竖屏切换（平板 / 车机常见）后桌面格子尺寸改变：桌面小部件按新尺寸重绘 */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (newConfig.orientation != lastWidgetOrientation) {
+            lastWidgetOrientation = newConfig.orientation
+            com.lm.player.core.widget.WidgetDataRepository.refreshAllForNewSize(this)
+        }
+    }
+
 
     /**
      * 针对车机与移动平台调优的高性能全局 Coil 图像加载器

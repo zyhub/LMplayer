@@ -31,6 +31,22 @@ class PlaybackRouter(
 
     private val TAG = "PlaybackRouter"
 
+    /**
+     * 下一首预取（切歌提速）：预取时不能改动「当前歌曲」状态、也不弹 Toast，
+     * 先把这些副作用记在这里，真正切到这首歌时再按原顺序回放。
+     */
+    class PrefetchCapture {
+        val songUpdates = mutableListOf<UnifiedSong>()
+        @Volatile var pendingToast: String? = null
+    }
+
+    private fun publishSongUpdate(updated: UnifiedSong, prefetch: PrefetchCapture?) {
+        if (prefetch != null) {
+            synchronized(prefetch.songUpdates) { prefetch.songUpdates.add(updated) }
+        } else {
+            PlaybackQueueManager.updateCurrentSong(updated)
+        }
+    }
     /** 构造 LX 音源最小 musicInfo；空 hash/songmid 必须删除，否则脚本会优先取到空串。 */
     private fun buildAccelerationInfo(song: UnifiedSong): String {
         val obj = runCatching { org.json.JSONObject(song.rawMetaJson ?: "{}") }.getOrDefault(org.json.JSONObject())
@@ -60,8 +76,14 @@ class PlaybackRouter(
     suspend fun resolveMediaItem(
         song: UnifiedSong,
         forceRefresh: Boolean = false,
-        overrideQuality: String? = null
+        overrideQuality: String? = null,
+        prefetch: PrefetchCapture? = null
     ): MediaItem {
+        // 播客单集：直接播 RSS 里的音频地址（失败时由 PlaybackQueueManager 改走服务器代理），
+        // 不参与本地曲库匹配、在线音源取链与音质降级
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(song)) {
+            return buildPodcastMediaItem(song)
+        }
         val resolvedLocalPath: String? = withContext(Dispatchers.IO) {
             try {
                 val downloadRecord = downloadDao.getDownloadRecord(song.id)
@@ -125,7 +147,7 @@ class PlaybackRouter(
                 streamUrl = resolvedLocalPath,
                 downloadStatus = DownloadStatus.DOWNLOADED
             )
-            PlaybackQueueManager.updateCurrentSong(updated)
+            publishSongUpdate(updated, prefetch)
         } else {
             withContext(Dispatchers.IO) {
                 try {
@@ -133,70 +155,114 @@ class PlaybackRouter(
                     val active = db.serverDao().getActiveServer()
                         ?: if (!isOnlineId) db.serverDao().getAllServers().firstOrNull { it.id == song.serverId } else null
 
+                    val accelPriority = if (prefetch != null) com.lm.player.core.source.ResolvePriority.PREFETCH
+                        else com.lm.player.core.source.ResolvePriority.PLAY
+                    val accelQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
+
+                    if ((active == null || active.type != ServerType.LEMON_MUSIC) && isOnlineId) {
+                        // 没有柠檬服务器（已删除/解绑）：在线曲目直接由本地音源取链（需求②）
+                        val hit = com.lm.player.core.source.PlaybackAccelerator.resolveOnline(
+                            song = song,
+                            preferredQuality = accelQuality,
+                            priority = accelPriority,
+                            refresh = forceRefresh,
+                            server = null
+                        ) as? com.lm.player.core.source.PlaybackAccelerator.Outcome.LocalHit
+                        if (hit != null) {
+                            finalStreamUrl = hit.url
+                            publishSongUpdate(song.copy(streamUrl = hit.url, format = hit.quality.format.lowercase(), bitRate = hit.quality.bitrate), prefetch)
+                            Log.i(TAG, "Detached local source resolved: ${song.title}")
+                        }
+                    }
+
                     if (active != null && active.type == ServerType.LEMON_MUSIC) {
                         val client = NetworkClientFactory.createOkHttpClient(context)
                         val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
 
-                        // 1. 音源加速优先：外网/内网高延迟时，先本地解析；即使这首歌在服务端有原文件，
-                        //    也允许用同曲目同音质直链加速。失败不报错，继续原有服务器路径。
+                        // 1. 取链调度（PlaybackAccelerator）：外网/内网高延迟 → 本地优先，1.2 秒没结果时与服务器并行竞速；
+                        //    服务器离线/删除 → 只走本地（10 秒预算，含跨平台同曲）；内网低延迟 → 服务器优先。
                         //
                         // 注意：本地 QuickJS 不依赖服务器鉴权，必须先尝试加速、再 ensureAuthenticated()，
                         // 否则服务器失联时鉴权会先阻塞，本地引擎根本没机会接管。
                         var accelerated = false
                         var accelerationAttempted = false
+                        var serverAlreadyTried = false
+                        var hedgedServerStream: com.lm.player.core.model.ResolvedOnlineStream? = null
                         var localQuality: com.lm.player.core.model.AudioQuality? = null
+                        val accelMode = com.lm.player.core.source.SourceAccelerationController.playbackMode()
                         // 服务端曲库曲目优先走 NAS 本地文件；只对真正的在线曲目做本地音源加速，
                         // 避免把 lemon_<hash> 误当成平台标识传给脚本。
-                        if (!forceRefresh && isOnlineId && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
-                            accelerationAttempted = true
+                        if (isOnlineId && (!forceRefresh || accelMode == com.lm.player.core.source.SourceAccelerationController.Mode.LOCAL_ONLY)) {
                             val clean = song.id.removePrefix("lemon_online_")
-                            val accelSource = if (clean.contains("_")) clean.substringBefore("_") else "kw"
-                            val accelQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
-                            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithQualityFallback(
-                                source = accelSource,
+                            val serverSource = if (clean.contains("_")) clean.substringBefore("_") else "kw"
+                            val serverMeta = song.rawMetaJson?.takeIf { it.trim().startsWith("{") }
+                                ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
+                            val outcome = com.lm.player.core.source.PlaybackAccelerator.resolveOnline(
+                                song = song,
                                 preferredQuality = accelQuality,
-                                musicInfoJson = buildAccelerationInfo(song),
-                                budgetMs = PLAYBACK_ACCEL_BUDGET_MS
+                                priority = accelPriority,
+                                refresh = forceRefresh,
+                                server = {
+                                    protocol.ensureAuthenticated()
+                                    protocol.resolveOnlineStreamWithQuality(
+                                        songId = song.id,
+                                        source = serverSource,
+                                        preferredQuality = accelQuality,
+                                        metaJson = serverMeta,
+                                        fallbackTitle = song.title,
+                                        fallbackArtist = song.artist,
+                                        refresh = forceRefresh,
+                                        skipLocalAcceleration = true
+                                    ).getOrNull()
+                                }
                             )
-                            val localResolution = local.getOrNull()
-                            val localUrl = localResolution?.url?.takeIf {
-                                it.startsWith("http://") || it.startsWith("https://")
-                            }
-                            if (localUrl != null && localResolution != null &&
-                                com.lm.player.core.network.CdnProbe.probe(localUrl)
-                            ) {
-                                finalStreamUrl = localUrl
-                                accelerated = true
-                                localQuality = com.lm.player.core.model.AudioQuality.fromKey(localResolution.qualityKey)
-                                Log.i(TAG, "Home/playback local acceleration resolved: ${song.title}")
-                            } else if (localUrl != null) {
-                                Log.w(TAG, "Home/playback local acceleration probe failed: ${song.title}")
+                            when (outcome) {
+                                is com.lm.player.core.source.PlaybackAccelerator.Outcome.LocalHit -> {
+                                    accelerationAttempted = true
+                                    finalStreamUrl = outcome.url
+                                    accelerated = true
+                                    localQuality = outcome.quality
+                                    if (outcome.downgraded) {
+                                        val msg = "已自动为您换源降至【${outcome.quality.label}】播放"
+                                        if (prefetch != null) {
+                                            prefetch.pendingToast = msg
+                                        } else {
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(context.applicationContext, msg, Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    }
+                                    Log.i(TAG, "Home/playback local acceleration resolved: ${song.title} (${outcome.platform}/${outcome.quality.key})")
+                                }
+                                is com.lm.player.core.source.PlaybackAccelerator.Outcome.ServerHit -> {
+                                    accelerationAttempted = true
+                                    hedgedServerStream = outcome.stream
+                                    finalStreamUrl = ""
+                                    Log.i(TAG, "Home/playback hedged server resolved first: ${song.title}")
+                                }
+                                is com.lm.player.core.source.PlaybackAccelerator.Outcome.Miss -> {
+                                    accelerationAttempted = outcome.localAttempted
+                                    serverAlreadyTried = outcome.serverAttempted
+                                    if (outcome.localAttempted && !song.streamUrl.startsWith("http", ignoreCase = true)) finalStreamUrl = ""
+                                }
                             }
                         } else if (isServerSong && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
-                            // 服务器曲库没有平台 ID：按音源健康度搜索同曲目，再做本地取链；
-                            // 搜索与本地取链各有独立预算，超时直接回 NAS 文件。
+                            // 服务器曲库没有平台 ID：用本地目录服务搜索同曲目再本地取链（不经服务器）；
+                            // 失败直接回 NAS 文件。结果已经过 CDN 探活。
                             accelerationAttempted = true
                             val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
                                 protocol = protocol,
                                 serverId = active.id,
                                 song = song,
                                 overrideQuality = overrideQuality,
-                                refresh = forceRefresh
+                                refresh = forceRefresh,
+                                priority = accelPriority
                             ).getOrNull()
                             resolved?.let {
-                                if (com.lm.player.core.network.CdnProbe.probe(it.url)) {
-                                    finalStreamUrl = it.url
-                                    accelerated = true
-                                    localQuality = it.quality
-                                    Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
-                                } else {
-                                    Log.w(TAG, "Server library local acceleration probe failed: ${song.title}")
-                                    com.lm.player.core.source.ServerLibraryAccelerationResolver.invalidate(
-                                        serverId = active.id,
-                                        song = song,
-                                        qualityKey = it.requestedQuality.key
-                                    )
-                                }
+                                finalStreamUrl = it.url
+                                accelerated = true
+                                localQuality = it.quality
+                                Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
                             }
                         }
 
@@ -237,7 +303,12 @@ class PlaybackRouter(
                                 }
                             }
                             if (!serverPath.isNullOrBlank()) {
-                                finalStreamUrl = protocol.getStreamUrlForPath(serverPath)
+                                // C-08：偏好「标准 128K」时服务器无损原文件改走 local-smooth（AAC 128K），
+                                // 不再无视音质设置照拉原文件；服务端无 ffmpeg 时自动回落原文件。
+                                finalStreamUrl = protocol.getPlaybackStreamUrlForPath(
+                                    serverPath,
+                                    overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
+                                )
                             }
                         }
 
@@ -256,7 +327,7 @@ class PlaybackRouter(
                                 ?: song.relativeFolderPath?.takeIf { it.trim().startsWith("{") }
                             val preferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
 
-                            val resolvedStream = protocol.resolveOnlineStreamWithQuality(
+                            val resolvedStream = hedgedServerStream ?: if (serverAlreadyTried) null else protocol.resolveOnlineStreamWithQuality(
                                 songId = song.id,
                                 source = source,
                                 preferredQuality = preferredQuality,
@@ -275,8 +346,14 @@ class PlaybackRouter(
                                 val globalPrefQ = LemonMusicProtocol.getPreferredStreamQuality(context)
                                 if (resolvedStream.isDowngraded || (overrideQuality != null && overrideQuality != globalPrefQ)) {
                                     val qLabel = com.lm.player.core.model.AudioQuality.fromKey(resolvedStream.qualityKey).label
-                                    withContext(Dispatchers.Main) {
-                                        Toast.makeText(context.applicationContext, "已自动为您换源降至【$qLabel】播放", Toast.LENGTH_SHORT).show()
+                                    val msg = "已自动为您换源降至【$qLabel】播放"
+                                    if (prefetch != null) {
+                                        // 预取阶段不打扰用户：真正切到这首歌时再提示
+                                        prefetch.pendingToast = msg
+                                    } else {
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context.applicationContext, msg, Toast.LENGTH_SHORT).show()
+                                        }
                                     }
                                 }
                             } else {
@@ -311,7 +388,7 @@ class PlaybackRouter(
                                 format = resolvedFormat,
                                 bitRate = resolvedBitRate
                             )
-                            PlaybackQueueManager.updateCurrentSong(updated)
+                            publishSongUpdate(updated, prefetch)
                         }
                     }
                     Unit
@@ -322,15 +399,36 @@ class PlaybackRouter(
             }
         }
 
+        // 服务器路径（内网服务器优先模式）也没拿到可播地址：最后用本地音源兜底一次
+        if (resolvedLocalPath == null && isOnlineId &&
+            !finalStreamUrl.startsWith("http://", ignoreCase = true) && !finalStreamUrl.startsWith("https://", ignoreCase = true) &&
+            !finalStreamUrl.startsWith("content://") && !(finalStreamUrl.startsWith("/") && File(finalStreamUrl).exists())
+        ) {
+            val fallback = com.lm.player.core.source.PlaybackAccelerator.fallbackLocal(
+                song,
+                overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context),
+                if (prefetch != null) com.lm.player.core.source.ResolvePriority.PREFETCH else com.lm.player.core.source.ResolvePriority.PLAY
+            )
+            if (fallback != null) {
+                finalStreamUrl = fallback.url
+                publishSongUpdate(song.copy(streamUrl = fallback.url, format = fallback.quality.format.lowercase(), bitRate = fallback.quality.bitrate), prefetch)
+                Log.i(TAG, "Server path failed, local source fallback resolved: ${song.title}")
+            }
+        }
+
         val uri: Uri = if (resolvedLocalPath != null) {
             Log.d(TAG, "Routing to local file: ${com.lm.player.core.security.LogRedactor.url(resolvedLocalPath)}")
             Uri.fromFile(File(resolvedLocalPath))
         } else if (finalStreamUrl.startsWith("content://")) {
             Log.d(TAG, "Routing to SAF content uri: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.parse(finalStreamUrl)
-        } else if (finalStreamUrl.startsWith("http://") || finalStreamUrl.startsWith("https://")) {
+        } else if (
+            // 歌曲表里可能存着大写 HTTPS:// 的旧流地址，区分大小写会误走本地文件分支（PR #4）
+            finalStreamUrl.startsWith("http://", ignoreCase = true) ||
+            finalStreamUrl.startsWith("https://", ignoreCase = true)
+        ) {
             Log.d(TAG, "Routing to remote stream: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
-            Uri.parse(finalStreamUrl)
+            Uri.parse(com.lm.player.core.network.ServerUrlPolicy.normalizeSchemeCase(finalStreamUrl))
         } else if (finalStreamUrl.startsWith("/") && File(finalStreamUrl).let { it.exists() && it.length() > 0 }) {
             Log.d(TAG, "Routing to direct file path: ${com.lm.player.core.security.LogRedactor.url(finalStreamUrl)}")
             Uri.fromFile(File(finalStreamUrl))
@@ -366,7 +464,7 @@ class PlaybackRouter(
 
         val effectiveSong = if (effectiveCover.isNotBlank() && effectiveCover != song.coverUrl) {
             val songWithCover = song.copy(coverUrl = effectiveCover)
-            PlaybackQueueManager.updateCurrentSong(songWithCover)
+            publishSongUpdate(songWithCover, prefetch)
             songWithCover
         } else {
             song
@@ -408,6 +506,44 @@ class PlaybackRouter(
             .setMediaId(song.id)
             .setUri(uri)
             .setMediaMetadata(metadataBuilder.build())
+            .build()
+    }
+
+    /** 播客单集的 MediaItem：流地址为 RSS 音频直链或服务器代理地址 */
+    private suspend fun buildPodcastMediaItem(song: UnifiedSong): MediaItem {
+        val url = song.streamUrl.trim()
+        if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+            throw IllegalStateException("播客单集没有可用的音频地址")
+        }
+        var artwork = DynamicIslandManager.getCachedArtworkBytes(song.id)
+        if (artwork == null && song.coverUrl.isNotBlank()) {
+            try {
+                withContext(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeoutOrNull(700L) { DynamicIslandManager.loadSongArtworkBitmap(context, song) }
+                }
+                artwork = DynamicIslandManager.getCachedArtworkBytes(song.id)
+            } catch (_: Exception) {}
+        }
+        val metadata = MediaMetadata.Builder()
+            .setTitle(song.title)
+            .setDisplayTitle(song.title)
+            .setArtist(song.artist)
+            .setAlbumTitle(song.album)
+            .setIsBrowsable(false)
+            .setIsPlayable(true)
+            .setMediaType(MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE)
+            .setArtworkUri(if (song.coverUrl.isNotEmpty()) Uri.parse(song.coverUrl) else null)
+            .setExtras(Bundle().apply {
+                putBoolean("KEY_IS_OFFLINE", false)
+                putString("KEY_SONG_ID", song.id)
+                putString("KEY_SERVER_ID", song.serverId)
+                putInt("KEY_BITRATE", song.bitRate)
+            })
+        if (artwork != null) metadata.setArtworkData(artwork, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        return MediaItem.Builder()
+            .setMediaId(song.id)
+            .setUri(Uri.parse(com.lm.player.core.network.ServerUrlPolicy.normalizeSchemeCase(url)))
+            .setMediaMetadata(metadata.build())
             .build()
     }
 }

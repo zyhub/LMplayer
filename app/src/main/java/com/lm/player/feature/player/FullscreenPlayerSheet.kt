@@ -80,8 +80,8 @@ fun FullscreenPlayerSheet(
     totalDurationMs: Long,
     lyrics: LyricResult,
     isLyricsMode: Boolean,
-    isShuffle: Boolean,
-    isRepeat: Boolean,
+    /** 三态播放模式（列表循环 / 单曲循环 / 随机播放） */
+    playMode: com.lm.player.core.media.PlayMode,
     allPlaylists: List<UnifiedPlaylist> = emptyList(),
     isServerConnected: Boolean = true,
     onTogglePlayPause: () -> Unit,
@@ -91,12 +91,16 @@ fun FullscreenPlayerSheet(
     onSelectSongFromQueue: (UnifiedSong) -> Unit = {},
     onToggleLyricsMode: (Boolean) -> Unit = {},
     onToggleFavorite: () -> Unit,
-    onToggleShuffle: () -> Unit,
-    onToggleRepeat: () -> Unit,
+    /** 点击三态按钮：切换到下一个播放模式 */
+    onCyclePlayMode: () -> Unit,
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
     onCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { _, _ -> },
+    /** 在线修标签写回歌词后回调（宿主重新加载播放页歌词） */
+    onLyricsUpdated: () -> Unit = {},
+    /** 在线修标签写回成功后回调，携带本次写入的字段（宿主同步播放队列 / 本地库 / 封面） */
+    onMetadataSaved: (com.lm.player.feature.library.TagSavedMetadata) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val configuration = LocalConfiguration.current
@@ -156,6 +160,16 @@ fun FullscreenPlayerSheet(
     var showPortraitAddToPlaylistMenu by remember { mutableStateOf(false) }
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
+    var showTagEditor by remember { mutableStateOf(false) }
+    // 在线修标签弹窗（独立窗口，竖屏 / 横屏入口共用）
+    if (showTagEditor) {
+        com.lm.player.feature.library.TagEditorDialog(
+            song = song,
+            onDismiss = { showTagEditor = false },
+            onLyricsUpdated = onLyricsUpdated,
+            onMetadataSaved = onMetadataSaved
+        )
+    }
     val activeTimerMinutes by PlaybackQueueManager.sleepTimerMinutesFlow.collectAsState()
     val sleepTimerRemainingSec by PlaybackQueueManager.sleepTimerRemainingSecFlow.collectAsState()
     var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
@@ -306,8 +320,7 @@ fun FullscreenPlayerSheet(
             progressMs = progressMs,
             totalDurationMs = totalDurationMs,
             lyrics = lyrics,
-            isShuffle = isShuffle,
-            isRepeat = isRepeat,
+            playMode = playMode,
             activeTimerMinutes = activeTimerMinutes,
             fontSizeSp = lyricsFontSize,
             lyricsOffsetMs = lyricsOffsetMs,
@@ -320,8 +333,7 @@ fun FullscreenPlayerSheet(
             onSeekTo = onSeekTo,
             onSelectSongFromQueue = onSelectSongFromQueue,
             onToggleFavorite = onToggleFavorite,
-            onToggleShuffle = onToggleShuffle,
-            onToggleRepeat = onToggleRepeat,
+            onCyclePlayMode = onCyclePlayMode,
             onAddToPlaylist = onAddToPlaylist,
             onCreatePlaylistAndAddSong = onCreatePlaylistAndAddSong,
             onDownloadSongWithOptions = onDownloadSongWithOptions,
@@ -330,12 +342,20 @@ fun FullscreenPlayerSheet(
             onOffsetChange = updateOffset,
             onThemeChange = updateTheme,
             onSwitchPlayerTheme = updatePlayerThemeStyle,
+            onLyricsUpdated = onLyricsUpdated,
+            onMetadataSaved = onMetadataSaved,
             onOpenSleepTimer = { showSleepTimerPanel = true },
             onOpenAudioSpecs = { showAudioSpecsPanel = true },
             onDismiss = onDismiss
         )
         return
     }
+
+    // 系统状态栏 / 导航栏与播放页背景渐变的首尾色一致（离开播放页自动恢复应用底色）
+    com.lm.player.core.designsystem.theme.SystemBarsColor(
+        statusBar = if (isDark) Color(0xFF14171A) else Color(0xFFFFFFFF),
+        navigationBar = if (isDark) Color(0xFF08090B) else Color(0xFFEDEDF2)
+    )
 
     Box(
         modifier = Modifier
@@ -446,6 +466,25 @@ fun FullscreenPlayerSheet(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(if (isCompactLandscape) 8.dp else 10.dp)
                             ) {
+                                // 在线修标签（PR #5，仅柠檬服务器曲库歌曲）：放在「加入歌单」左边
+                                if (song.isLemonServerSong) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(headerBtnSize)
+                                            .clip(CircleShape)
+                                            .background(circleButtonBg)
+                                            .clickable { showTagEditor = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Edit,
+                                            contentDescription = "在线修标签",
+                                            tint = primaryTextColor,
+                                            modifier = Modifier.size(headerIconSize)
+                                        )
+                                    }
+                                }
+
                                 // 加入歌单 (音频共享式展出)
                                 Box {
                                     Box(
@@ -672,15 +711,22 @@ fun FullscreenPlayerSheet(
                             horizontalArrangement = Arrangement.SpaceEvenly,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(modeBtnSize)
-                                    .clip(CircleShape)
-                                    .clickable(onClick = onToggleShuffle),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Default.Shuffle, contentDescription = "随机", tint = if (isShuffle) AppleRed else secondaryTextColor, modifier = Modifier.size(modeIconSize))
-                            }
+                            // 播放列表（原「随机」位置）：切换右侧面板为待播列表，再点切回歌词
+                            com.lm.player.feature.player.controls.QueueIconButton(
+                                onClick = {
+                                    if (!isLyricsVisible) {
+                                        landscapeLyricsRatio = 0.333f
+                                        lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
+                                        landscapeRightPaneMode = 1
+                                    } else {
+                                        landscapeRightPaneMode = if (landscapeRightPaneMode == 1) 0 else 1
+                                    }
+                                },
+                                tint = secondaryTextColor,
+                                isActive = isLyricsVisible && landscapeRightPaneMode == 1,
+                                buttonSize = modeBtnSize,
+                                iconSize = modeIconSize
+                            )
                             Box(
                                 modifier = Modifier
                                     .size(skipBtnSize)
@@ -714,15 +760,14 @@ fun FullscreenPlayerSheet(
                             ) {
                                 Icon(Icons.Default.SkipNext, contentDescription = "下一首", tint = primaryTextColor, modifier = Modifier.size(skipIconSize))
                             }
-                            Box(
-                                modifier = Modifier
-                                    .size(modeBtnSize)
-                                    .clip(CircleShape)
-                                    .clickable(onClick = onToggleRepeat),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Default.Repeat, contentDescription = "循环", tint = if (isRepeat) AppleRed else secondaryTextColor, modifier = Modifier.size(modeIconSize))
-                            }
+                            // 三态播放模式（原「循环」位置）
+                            com.lm.player.feature.player.controls.PlayModeIconButton(
+                                mode = playMode,
+                                onClick = onCyclePlayMode,
+                                tint = secondaryTextColor,
+                                buttonSize = modeBtnSize,
+                                iconSize = modeIconSize
+                            )
                         }
 
                         // 5. 底部功能工具栏 (自适应紧凑高度，完整露出)
@@ -753,28 +798,6 @@ fun FullscreenPlayerSheet(
                                         imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                                         contentDescription = "红心喜欢",
                                         tint = if (localIsFavorite) AppleRed else secondaryTextColor,
-                                        modifier = Modifier.size(toolbarIconSize)
-                                    )
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .size(toolbarBtnSize)
-                                        .clip(CircleShape)
-                                        .clickable {
-                                            if (!isLyricsVisible) {
-                                                landscapeLyricsRatio = 0.333f
-                                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
-                                                landscapeRightPaneMode = 1
-                                            } else {
-                                                landscapeRightPaneMode = if (landscapeRightPaneMode == 1) 0 else 1
-                                            }
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.QueueMusic,
-                                        contentDescription = "待播列表",
-                                        tint = if (isLyricsVisible && landscapeRightPaneMode == 1) AppleRed else secondaryTextColor,
                                         modifier = Modifier.size(toolbarIconSize)
                                     )
                                 }
@@ -1339,6 +1362,25 @@ fun FullscreenPlayerSheet(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // 在线修标签（PR #5，仅柠檬服务器曲库歌曲）：放在「加入歌单」左边
+                        if (song.isLemonServerSong) {
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(circleButtonBg)
+                                    .clickable { showTagEditor = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "在线修标签",
+                                    tint = primaryTextColor,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
                         // 加入歌单按钮 (音频共享式展出)
                         Box {
                             Box(
@@ -1475,14 +1517,11 @@ fun FullscreenPlayerSheet(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onToggleShuffle) {
-                        Icon(
-                            imageVector = Icons.Default.Shuffle,
-                            contentDescription = "随机播放",
-                            tint = if (isShuffle) AppleRed else primaryTextColor.copy(alpha = 0.8f),
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
+                    // 播放列表（原「随机」位置）
+                    com.lm.player.feature.player.controls.QueueIconButton(
+                        onClick = { showQueueSheet = true },
+                        tint = primaryTextColor.copy(alpha = 0.8f)
+                    )
 
                     IconButton(onClick = onPrevious) {
                         Icon(
@@ -1519,19 +1558,17 @@ fun FullscreenPlayerSheet(
                         )
                     }
 
-                    IconButton(onClick = onToggleRepeat) {
-                        Icon(
-                            imageVector = Icons.Default.Repeat,
-                            contentDescription = "单曲循环",
-                            tint = if (isRepeat) AppleRed else primaryTextColor.copy(alpha = 0.8f),
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
+                    // 三态播放模式（原「循环」位置）
+                    com.lm.player.feature.player.controls.PlayModeIconButton(
+                        mode = playMode,
+                        onClick = onCyclePlayMode,
+                        tint = primaryTextColor.copy(alpha = 0.8f)
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // 6. 底部功能工具栏: [ ♥ 喜欢收藏 ] [ ≡ 播放列表 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
+                // 6. 底部功能工具栏（播放列表已移到主控行左侧）: [ ♥ 喜欢收藏 ] [ ⏱ 定时关闭 ] [ 音频输出 ] [ ⓘ 参数详情 ]
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1547,15 +1584,6 @@ fun FullscreenPlayerSheet(
                             imageVector = if (localIsFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                             contentDescription = "红心喜欢",
                             tint = if (localIsFavorite) AppleRed else secondaryTextColor,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-
-                    IconButton(onClick = { showQueueSheet = true }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.QueueMusic,
-                            contentDescription = "播放列表",
-                            tint = secondaryTextColor,
                             modifier = Modifier.size(24.dp)
                         )
                     }

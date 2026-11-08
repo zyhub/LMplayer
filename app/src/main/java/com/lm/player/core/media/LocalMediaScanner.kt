@@ -14,6 +14,8 @@ import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.network.LemonMusicProtocol
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 object LocalMediaScanner {
@@ -25,7 +27,7 @@ object LocalMediaScanner {
      * "external_primary" 以及 "1234-5678" 这类 SD 卡 / U 盘卷标识。
      * 老系统（API < 29）没有该 API，回退到 EXTERNAL_CONTENT_URI。
      */
-    private fun resolveAudioContentUris(context: Context): List<Uri> {
+    internal fun resolveAudioContentUris(context: Context): List<Uri> {
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
             return listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
         }
@@ -37,7 +39,20 @@ object LocalMediaScanner {
     }
 
     private const val TAG = "LocalMediaScanner"
-    private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd")
+
+    /**
+     * 第二十二节：扫描 / 匹配写下载记录时用的「下载完成时间」。
+     * 原先一律写当前时间，一次扫描后上千首旧文件都变成"刚刚下载"，挤到下载管理最前面。
+     * 改用文件自身的修改时间 (文件落到磁盘的时间)，取不到时才用当前时间。
+     */
+    internal fun fileTimeOrNow(path: String?): Long {
+        if (!path.isNullOrBlank() && !path.startsWith("content://")) {
+            val t = try { File(path).lastModified() } catch (_: Exception) { 0L }
+            if (t > 0L) return t
+        }
+        return System.currentTimeMillis()
+    }
+    internal val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd")
 
     /**
      * 1. 一键全盘扫描系统 MediaStore 音频数据库
@@ -157,81 +172,21 @@ object LocalMediaScanner {
      * 2. 递归扫描指定本地文件夹路径中的所有音频文件
      */
     suspend fun scanCustomDirectory(context: Context, folderPath: String, database: ZdsDatabase): Int = withContext(Dispatchers.IO) {
-        var count = 0
+        // 扫描提速 (第二十节)：改走后台扫描引擎的增量模式 —— 只读取新增或改过的文件，
+        // FLAC 直接读文件头，3 线程并行，封面按内容去重保存。切换本地模式 / 同步下载目录时
+        // 不再每次把整个目录重读一遍。返回本次新读取的歌曲数。
         try {
-            val rootDir = File(folderPath)
-            if (!rootDir.exists() || !rootDir.isDirectory) return@withContext 0
-
-            val audioFiles = mutableListOf<File>()
-            fun collectAudioFiles(dir: File) {
-                val files = dir.listFiles() ?: return
-                for (file in files) {
-                    if (file.isDirectory && !file.name.startsWith(".")) {
-                        collectAudioFiles(file)
-                    } else if (file.isFile) {
-                        val ext = file.extension.lowercase()
-                        if (ext in AUDIO_EXTENSIONS && file.length() > 50 * 1024) { // 过滤小于50KB短音效
-                            audioFiles.add(file)
-                        }
-                    }
-                }
-            }
-
-            collectAudioFiles(rootDir)
-            if (audioFiles.isEmpty()) return@withContext 0
-
-            val retriever = MediaMetadataRetriever()
-            val entities = mutableListOf<SongEntity>()
-
-            for (file in audioFiles) {
-                try {
-                    retriever.setDataSource(file.absolutePath)
-                    val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.ifBlank { null } ?: file.nameWithoutExtension
-                    val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)?.ifBlank { null } ?: "本地音乐"
-                    val album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)?.ifBlank { null } ?: "本地文件夹"
-                    val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    val durationMs = durationStr?.toLongOrNull() ?: 0L
-                    val ext = file.extension.lowercase().ifBlank { "flac" }
-                    val songId = "local_dir_${LemonMusicProtocol.md5(file.absolutePath)}"
-
-                    // 提取并保存内嵌专辑封面
-                    val coverUrl = extractAndCacheArtwork(context, file.absolutePath, songId, retriever)
-
-                    entities.add(
-                        SongEntity(
-                            id = songId,
-                            title = title,
-                            artist = artist,
-                            artistId = "local_artist_${artist.hashCode()}",
-                            album = album,
-                            albumId = "local_album_${album.hashCode()}",
-                            durationMs = durationMs,
-                            coverUrl = coverUrl,
-                            streamUrl = file.absolutePath,
-                            serverId = "local_folder",
-                            localFilePath = file.absolutePath,
-                            downloadStatus = DownloadStatus.DOWNLOADED,
-                            bitRate = 320,
-                            format = ext,
-                            isFavorite = false,
-                            addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
-                        )
-                    )
-                    count++
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error parsing file ${file.name}: ${e.message}")
-                }
-            }
-            runCatching { retriever.release() }   // release 必须无条件执行：中途抛异常时原先会跳过，导致 native 解码器与 FD 泄漏
-
-            if (entities.isNotEmpty()) {
-                database.songDao().insertSongs(entities)
+            val count = LocalScanEngine.scanDirectoryQuietly(context, folderPath)
+            if (count > 0) {
                 matchAndMergeLocalWithServer(database)
             }
+            count
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Failed to scan custom directory: $folderPath", e)
+            0
         }
-        count
     }
 
     /**
@@ -464,7 +419,7 @@ object LocalMediaScanner {
                     bytesDownloaded = fileLength,
                     totalBytes = fileLength,
                     errorMessage = null,
-                    completedTimestamp = System.currentTimeMillis()
+                    completedTimestamp = fileTimeOrNow(s.localFilePath)
                 )
             }
             database.downloadDao().insertDownloads(downloadEntities)
@@ -615,7 +570,8 @@ object LocalMediaScanner {
     suspend fun matchAndMergeLocalWithServer(
         database: ZdsDatabase,
         providedServerSongs: List<SongEntity>? = null
-    ): Int = withContext(Dispatchers.IO) {
+    ): Int = LibraryMatchLock.mutex.withLock {
+        withContext(LocalScanDispatchers.background) {
         var matchCount = 0
         try {
             val allSongs = database.songDao().getAllSongsList()
@@ -630,7 +586,10 @@ object LocalMediaScanner {
             // 1. 构建服务器歌曲 O(1) 高速哈希索引表 (空间换时间，消除 O(N^2) 耗时)
             val serverExactMap = HashMap<String, SongEntity>(serverSongs.size)
             val serverTitleMap = HashMap<String, MutableList<SongEntity>>()
-            for (s in serverSongs) {
+            // 文件名兜底匹配也走索引：记录每个规范化标题对应的服务器歌曲**下标**，
+            // 候选按原列表顺序取第一个，结果与原先逐首遍历全部服务器歌曲完全一致
+            val serverTitleIndex = HashMap<String, MutableList<Int>>()
+            serverSongs.forEachIndexed { idx, s ->
                 val nTitle = normalizeTrackTitle(s.title)
                 val nArtist = normalizeArtist(s.artist)
                 if (nTitle.isNotBlank()) {
@@ -638,13 +597,20 @@ object LocalMediaScanner {
                         serverExactMap["$nTitle|||$nArtist"] = s
                     }
                     serverTitleMap.getOrPut(nTitle) { mutableListOf() }.add(s)
+                    serverTitleIndex.getOrPut(nTitle) { ArrayList(2) }.add(idx)
                 }
             }
 
             val localIdsToDelete = mutableListOf<String>()
             val downloadEntitiesToInsert = mutableListOf<DownloadEntity>()
+            // 所有写操作先攒起来，最后在一个事务里一次提交 —— 曲库界面只刷新一次
+            val writes = ArrayList<suspend () -> Unit>()
 
-            for (local in localSongs) {
+            for ((loopIndex, local) in localSongs.withIndex()) {
+                if (loopIndex % 100 == 0) {
+                    LocalScanEngine.reportMatchProgress("合并本地歌曲", loopIndex, localSongs.size)
+                    yield()
+                }
                 val localPath = local.localFilePath ?: continue
                 val localFile = File(localPath)
                 if (!localFile.exists() && !localPath.startsWith("content://")) continue
@@ -679,8 +645,15 @@ object LocalMediaScanner {
                 }
 
                 // 文件名结构化精确匹配兜底（绝不用包含子串避免把原版识别成 Live 版）
+                // matchFileNameToTrack 只可能在文件名推出的几个规范化歌名上命中，只查这些歌名下的服务器歌曲
                 if (matchedServerSong == null) {
-                    matchedServerSong = serverSongs.firstOrNull { server ->
+                    val keys = SongMatchingResolver.fileNameTitleKeys(localFile.nameWithoutExtension)
+                    val candidateIdx = if (keys.size == 1) {
+                        serverTitleIndex[keys.first()].orEmpty()
+                    } else {
+                        keys.flatMap { serverTitleIndex[it].orEmpty() }.distinct().sorted()
+                    }
+                    matchedServerSong = candidateIdx.asSequence().map { serverSongs[it] }.firstOrNull { server ->
                         if (server.id == local.id) return@firstOrNull false
                         val durationCompatible = !(server.durationMs > 0L && local.durationMs > 0L &&
                                 kotlin.math.abs(server.durationMs - local.durationMs) > 5000L)
@@ -694,54 +667,57 @@ object LocalMediaScanner {
                 }
 
                 if (matchedServerSong != null) {
-                    val cover = if (matchedServerSong.coverUrl.isBlank()) local.coverUrl else matchedServerSong.coverUrl
-                    val isFav = matchedServerSong.isFavorite || local.isFavorite
+                    val matched = matchedServerSong
+                    val cover = if (matched.coverUrl.isBlank()) local.coverUrl else matched.coverUrl
+                    val isFav = matched.isFavorite || local.isFavorite
                     val fileLength = try { if (localFile.exists()) localFile.length() else 1024L * 1024L } catch (_: Exception) { 1024L * 1024L }
 
                     val effectiveTimestamp = when {
-                        matchedServerSong.addedTimestamp > 0 -> matchedServerSong.addedTimestamp
+                        matched.addedTimestamp > 0 -> matched.addedTimestamp
                         local.addedTimestamp > 0 -> local.addedTimestamp
                         else -> System.currentTimeMillis()
                     }
 
-                    val localExt = localFile.extension.lowercase().ifBlank { local.format.ifBlank { matchedServerSong.format } }
+                    val localExt = localFile.extension.lowercase().ifBlank { local.format.ifBlank { matched.format } }
                     val localBitRate = if (localExt in listOf("flac", "wav", "ape", "alac")) {
-                        local.bitRate.coerceAtLeast(matchedServerSong.bitRate).coerceAtLeast(960)
+                        local.bitRate.coerceAtLeast(matched.bitRate).coerceAtLeast(960)
                     } else {
-                        if (local.bitRate > 0) local.bitRate else matchedServerSong.bitRate
+                        if (local.bitRate > 0) local.bitRate else matched.bitRate
                     }
 
-                    database.songDao().matchAndLinkLocalFile(
-                        songId = matchedServerSong.id,
-                        status = DownloadStatus.DOWNLOADED,
-                        localPath = localPath,
-                        coverUrl = cover
-                    )
-                    database.songDao().updateDownloadStatusSpecsAndTimestamp(
-                        songId = matchedServerSong.id,
-                        status = DownloadStatus.DOWNLOADED,
-                        localPath = localPath,
-                        format = localExt,
-                        bitRate = localBitRate,
-                        timestamp = effectiveTimestamp
-                    )
-                    if (isFav && !matchedServerSong.isFavorite) {
-                        database.songDao().updateFavorite(matchedServerSong.id, true)
+                    writes.add {
+                        database.songDao().matchAndLinkLocalFile(
+                            songId = matched.id,
+                            status = DownloadStatus.DOWNLOADED,
+                            localPath = localPath,
+                            coverUrl = cover
+                        )
+                        database.songDao().updateDownloadStatusSpecsAndTimestamp(
+                            songId = matched.id,
+                            status = DownloadStatus.DOWNLOADED,
+                            localPath = localPath,
+                            format = localExt,
+                            bitRate = localBitRate,
+                            timestamp = effectiveTimestamp
+                        )
+                        if (isFav && !matched.isFavorite) {
+                            database.songDao().updateFavorite(matched.id, true)
+                        }
                     }
 
                     downloadEntitiesToInsert.add(
                         DownloadEntity(
-                            songId = matchedServerSong.id,
-                            title = matchedServerSong.title,
-                            artist = matchedServerSong.artist,
+                            songId = matched.id,
+                            title = matched.title,
+                            artist = matched.artist,
                             coverUrl = cover,
                             localFilePath = localPath,
-                            remoteUrl = matchedServerSong.streamUrl,
+                            remoteUrl = matched.streamUrl,
                             status = DownloadStatus.DOWNLOADED,
                             bytesDownloaded = fileLength,
                             totalBytes = fileLength,
                             errorMessage = null,
-                            completedTimestamp = System.currentTimeMillis()
+                            completedTimestamp = fileTimeOrNow(localPath)
                         )
                     )
 
@@ -750,30 +726,40 @@ object LocalMediaScanner {
                 }
             }
 
-            if (localIdsToDelete.isNotEmpty()) {
-                localIdsToDelete.chunked(500).forEach { chunk ->
-                    database.songDao().deleteSongsByIds(chunk)
-                }
-                for (delId in localIdsToDelete) {
-                    database.downloadDao().deleteDownload(delId)
-                }
-                Log.i(TAG, "Cleaned up ${localIdsToDelete.size} redundant duplicate local song records from database.")
-            }
-
-            if (downloadEntitiesToInsert.isNotEmpty()) {
-                for (entity in downloadEntitiesToInsert) {
-                    entity.localFilePath?.takeIf { it.isNotBlank() }?.let { path ->
-                        database.downloadDao().deleteDownloadByLocalPath(path)
+            if (writes.isNotEmpty() || localIdsToDelete.isNotEmpty() || downloadEntitiesToInsert.isNotEmpty()) {
+                database.withTransaction {
+                    for (w in writes) w()
+                    if (localIdsToDelete.isNotEmpty()) {
+                        database.songDao().deleteSongsByIds(localIdsToDelete)
+                        for (delId in localIdsToDelete) {
+                            database.downloadDao().deleteDownload(delId)
+                        }
+                    }
+                    if (downloadEntitiesToInsert.isNotEmpty()) {
+                        for (entity in downloadEntitiesToInsert) {
+                            entity.localFilePath?.takeIf { it.isNotBlank() }?.let { path ->
+                                database.downloadDao().deleteDownloadByLocalPath(path)
+                            }
+                        }
+                        downloadEntitiesToInsert.chunked(500).forEach { chunk ->
+                            database.downloadDao().insertDownloads(chunk)
+                        }
                     }
                 }
-                downloadEntitiesToInsert.chunked(500).forEach { chunk ->
-                    database.downloadDao().insertDownloads(chunk)
+                if (localIdsToDelete.isNotEmpty()) {
+                    Log.i(TAG, "Cleaned up ${localIdsToDelete.size} redundant duplicate local song records from database.")
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error in matchAndMergeLocalWithServer", e)
+            matchCount = 0
+        } finally {
+            LocalScanEngine.reportMatchProgress(null, 0, 0)
         }
         matchCount
+        }
     }
 
     /**
@@ -781,11 +767,15 @@ object LocalMediaScanner {
      * 1. 检验所有已被标记为已下载的在线歌曲，若其 localFilePath 对应的物理文件不存在或长度为0，强制重置为 NOT_DOWNLOADED 并清空 localFilePath；
      * 2. 对所有未标记已下载的在线歌曲，与当前离线存储目录及本地扫描库比对；
      * 3. 若匹配成功则挂载 localFilePath 并更新为 DOWNLOADED；未匹配上的在线模式歌曲严格保持 NOT_DOWNLOADED（绝不误显已下载）。
+     *
+     * 扫描提速：下载目录文件、本地歌曲都按规范化歌名 / 路径建索引 (结果与逐首比对一致)；
+     * 此前每首服务器歌曲都要对全部本地歌曲各做一次磁盘 stat，大曲库下是主要耗时。
      */
     suspend fun verifyAndSyncAllServerSongDownloadStatus(
         database: ZdsDatabase,
         downloadDir: File? = null
-    ): Int = withContext(Dispatchers.IO) {
+    ): Int = LibraryMatchLock.mutex.withLock {
+        withContext(LocalScanDispatchers.background) {
         var updatedCount = 0
         try {
             val allSongs = database.songDao().getAllSongsList()
@@ -829,8 +819,33 @@ object LocalMediaScanner {
                 return ext to br
             }
 
+            // 同一次核对内同一条路径只 stat 一次
+            val existsMemo = HashMap<String, Boolean>(256)
+            fun existsMemoized(path: String): Boolean = existsMemo.getOrPut(path) {
+                try { File(path).exists() } catch (_: Exception) { false }
+            }
+
+            // 索引：路径 → 本地歌曲 (清理重复记录用)；规范化歌名 → 本地歌曲 / 下载目录文件 (候选查找用)
+            val localByPath = HashMap<String, MutableList<SongEntity>>()
+            val localByTitle = HashMap<String, MutableList<Int>>()
+            localSongs.forEachIndexed { idx, s ->
+                s.localFilePath?.let { p -> localByPath.getOrPut(p) { ArrayList(1) }.add(s) }
+                val k = normalizeTrackTitle(s.title)
+                if (k.isNotBlank()) localByTitle.getOrPut(k) { ArrayList(1) }.add(idx)
+            }
+            val fileIndex = HashMap<String, MutableList<Int>>()
+            localFiles.forEachIndexed { idx, f ->
+                val keys = SongMatchingResolver.fileNameTitleKeys(f.nameWithoutExtension).toMutableSet()
+                keys.add(normalizeTrackTitle(f.nameWithoutExtension))
+                for (k in keys) if (k.isNotBlank()) fileIndex.getOrPut(k) { ArrayList(1) }.add(idx)
+            }
+
             database.withTransaction {
-                for (server in serverSongs) {
+                for ((loopIndex, server) in serverSongs.withIndex()) {
+                    if (loopIndex % 200 == 0) {
+                        LocalScanEngine.reportMatchProgress("核对下载状态", loopIndex, serverSongs.size)
+                        yield()
+                    }
                     val downloadRec = downloadRecords[server.id]
                     val currentPath = server.localFilePath
                     val isCurrentFileValid = !currentPath.isNullOrBlank() && File(currentPath).let { it.exists() && it.length() > 0 }
@@ -844,7 +859,7 @@ object LocalMediaScanner {
                             updatedCount++
                         }
                         // 清理指向同一物理文件的冗余独立本地记录，避免已下载列表重复
-                        localSongs.filter { it.id != server.id && it.localFilePath == currentPath }.forEach { dup ->
+                        localByPath[currentPath].orEmpty().filter { it.id != server.id }.forEach { dup ->
                             database.songDao().deleteSongById(dup.id)
                             database.downloadDao().deleteDownload(dup.id)
                         }
@@ -861,7 +876,7 @@ object LocalMediaScanner {
                             database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, realFmt, realBr, finalTs)
                             updatedCount++
                         }
-                        localSongs.filter { it.id != server.id && it.localFilePath == recPath }.forEach { dup ->
+                        localByPath[recPath].orEmpty().filter { it.id != server.id }.forEach { dup ->
                             database.songDao().deleteSongById(dup.id)
                             database.downloadDao().deleteDownload(dup.id)
                         }
@@ -873,8 +888,9 @@ object LocalMediaScanner {
                     val normServerArtist = normalizeArtist(server.artist)
                     val normServerAlbum = normalizeArtist(server.album)
 
-                    // 1. 优先在离线下载目录中按路径层级与文件名精确匹配
-                    val matchedPhysicalFile = localFiles.firstOrNull { f ->
+                    // 1. 优先在离线下载目录中按路径层级与文件名精确匹配 (两种命中方式都要求歌名相同，只查索引候选)
+                    val fileCandidates = if (normServerTitle.isBlank()) emptyList() else fileIndex[normServerTitle].orEmpty()
+                    val matchedPhysicalFile = fileCandidates.asSequence().map { localFiles[it] }.firstOrNull { f ->
                         if (SongMatchingResolver.matchFileNameToTrack(f.nameWithoutExtension, server.title, server.artist, server.album)) {
                             return@firstOrNull true
                         }
@@ -895,7 +911,7 @@ object LocalMediaScanner {
                         val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else System.currentTimeMillis()
                         val (realFmt, realBr) = resolveLocalSpecs(filePath, server.format, server.bitRate, server.durationMs)
                         database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, filePath, realFmt, realBr, finalTs)
-                        localSongs.filter { it.id != server.id && it.localFilePath == filePath }.forEach { dup ->
+                        localByPath[filePath].orEmpty().filter { it.id != server.id }.forEach { dup ->
                             database.songDao().deleteSongById(dup.id)
                             database.downloadDao().deleteDownload(dup.id)
                         }
@@ -911,17 +927,18 @@ object LocalMediaScanner {
                                 status = DownloadStatus.DOWNLOADED,
                                 bytesDownloaded = matchedPhysicalFile.length(),
                                 totalBytes = matchedPhysicalFile.length(),
-                                completedTimestamp = System.currentTimeMillis()
+                                completedTimestamp = fileTimeOrNow(filePath)
                             )
                         )
                         updatedCount++
                         continue
                     }
 
-                    // 2. 在独立扫描的本地歌曲中比对
-                    val matchedLocalSong = localSongs.firstOrNull { local ->
+                    // 2. 在独立扫描的本地歌曲中比对 (isSongMatch 要求规范化歌名相同，只查同名候选)
+                    val localCandidates = if (normServerTitle.isBlank()) emptyList() else localByTitle[normServerTitle].orEmpty()
+                    val matchedLocalSong = localCandidates.asSequence().map { localSongs[it] }.firstOrNull { local ->
                         val lPath = local.localFilePath ?: return@firstOrNull false
-                        if (!File(lPath).exists()) return@firstOrNull false
+                        if (!existsMemoized(lPath)) return@firstOrNull false
                         SongMatchingResolver.isSongMatch(
                             local.title, local.artist, local.durationMs,
                             server.title, server.artist, server.durationMs,
@@ -950,7 +967,7 @@ object LocalMediaScanner {
                                 status = DownloadStatus.DOWNLOADED,
                                 bytesDownloaded = lFile.length(),
                                 totalBytes = lFile.length(),
-                                completedTimestamp = System.currentTimeMillis()
+                                completedTimestamp = fileTimeOrNow(matchedLocalSong.localFilePath)
                             )
                         )
                         updatedCount++
@@ -964,10 +981,15 @@ object LocalMediaScanner {
                     }
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error in verifyAndSyncAllServerSongDownloadStatus", e)
+        } finally {
+            LocalScanEngine.reportMatchProgress(null, 0, 0)
         }
         updatedCount
+        }
     }
 
     private fun normalizeTrackTitle(title: String): String = SongMatchingResolver.normalizeTrackTitle(title)

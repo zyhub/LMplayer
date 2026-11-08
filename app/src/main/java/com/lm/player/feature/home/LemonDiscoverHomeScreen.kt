@@ -136,6 +136,9 @@ fun LemonDiscoverHomeScreen(
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     onFetchCollectionSongs: suspend (id: String, source: OnlineMusicSource) -> List<UnifiedSong>,
     onSubViewActiveChange: (Boolean) -> Unit = {},
+    /** 「播客」入口卡片数据（替换原私人漫游卡片） */
+    podcastEntry: com.lm.player.core.podcast.PodcastEntryUi = com.lm.player.core.podcast.PodcastEntryUi(),
+    onOpenPodcasts: () -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp)
 ) {
     val context = LocalContext.current
@@ -200,19 +203,9 @@ fun LemonDiscoverHomeScreen(
         }
     }
 
-    // 私人漫游播放状态追踪 (仅当点击私人漫游触发的播放且正在播放漫游池中曲目时，才显示波形动画)
-    var isRoamingPlaying by remember { mutableStateOf(false) }
-    var roamingSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
-
+    // 原「私人漫游」已改为播客入口；歌曲点击直接交给宿主播放
     val playNonRoamingSong: (UnifiedSong, List<UnifiedSong>?) -> Unit = { song, list ->
-        isRoamingPlaying = false
         onSongClick(song, list)
-    }
-
-    LaunchedEffect(currentPlayingSong?.id) {
-        if (currentPlayingSong != null && !roamingSongIds.contains(currentPlayingSong.id)) {
-            isRoamingPlaying = false
-        }
     }
 
 
@@ -693,6 +686,7 @@ fun LemonDiscoverHomeScreen(
                             glowColor = dynamicPalettes[0].glowColor,
                             secondaryGlowColor = dynamicPalettes[0].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 todaySongs.firstOrNull()?.let {
                                     playNonRoamingSong(it, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
@@ -783,6 +777,7 @@ fun LemonDiscoverHomeScreen(
                             glowColor = dynamicPalettes[1].glowColor,
                             secondaryGlowColor = dynamicPalettes[1].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isAlbumsOverviewOpen = true
                             }
@@ -875,11 +870,11 @@ fun LemonDiscoverHomeScreen(
                         }
                     }
 
-                    // 第二行：【权威排行榜】(左侧卡片) + 【私人漫游】与【换一批】(右侧2张小长方形卡片)
+                    // 第二行：【权威排行榜】(左侧卡片) + 【播客】与【换一批】(右侧2张小长方形卡片)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(154.dp),
+                            .height(158.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         // 左侧：权威排行榜 (Royal Indigo 动态液态流光卡片)
@@ -895,6 +890,7 @@ fun LemonDiscoverHomeScreen(
                             glowColor = dynamicPalettes[2].glowColor,
                             secondaryGlowColor = dynamicPalettes[2].secondaryGlowColor,
                             isAnimated = isLiquidAnimated,
+                            isPaused = isAnyScrolling,
                             onClick = {
                                 isToplistsOverviewOpen = true
                             }
@@ -989,58 +985,48 @@ fun LemonDiscoverHomeScreen(
                             }
                         }
 
-                        // 右侧：垂直排列的 2 张小长方形卡片【私人漫游】+【换一批】
+                        // 右侧：垂直排列的 2 张小长方形卡片【播客】+【换一批】
                         Column(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxHeight(),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            // 小长方形卡片 1：私人漫游 (音乐播放时显示跳动动态波形)
+                            // 小长方形卡片 1：播客入口（替换原「私人漫游」；正在收听播客时显示跳动波形）
+                            // 文案与图标按 Antigravity 交接说明第 4 节的状态映射表
+                            val pe = podcastEntry
                             DiscoverLiquidSmallCard(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .weight(1f),
-                                title = "私人漫游",
-                                subtitle = "随心而动 · 智能雷达",
-                                badgeText = "心动",
-                                icon = Icons.Default.Shuffle,
+                                title = if (pe.isPodcastPlaying) "正在收听" else "播客",
+                                subtitle = when {
+                                    pe.isPodcastPlaying -> "点击回到播客"
+                                    pe.showCount < 0 -> "订阅 · 随时收听"
+                                    pe.showCount == 0 -> "添加你的第一个节目"
+                                    else -> "已订阅 ${pe.showCount} 个节目"
+                                },
+                                badgeText = when {
+                                    pe.isPodcastPlaying -> "" // 播放中右侧已有跳动波形动效，留出空间避免文字拥挤
+                                    pe.showCount < 0 -> "新功能"
+                                    pe.showCount == 0 -> "发现"
+                                    pe.newEpisodeCount > 0 -> "${pe.newEpisodeCount}期更新"
+                                    else -> "订阅"
+                                },
+                                icon = Icons.Default.Podcasts,
                                 iconColor = dynamicPalettes[3].iconColor,
-                                trailingIcon = Icons.Default.PlayArrow,
-                                isCurrentlyPlaying = isRoamingPlaying && isPlaying && currentPlayingSong != null && roamingSongIds.contains(currentPlayingSong.id),
+                                trailingIcon = when {
+                                    pe.isPodcastPlaying -> Icons.Default.PlayArrow
+                                    pe.showCount == 0 -> Icons.Default.Add
+                                    else -> Icons.Default.ChevronRight
+                                },
+                                isCurrentlyPlaying = pe.isPodcastPlaying,
                                 gradientColors = dynamicPalettes[3].gradientColors,
                                 glowColor = dynamicPalettes[3].glowColor,
                                 secondaryGlowColor = dynamicPalettes[3].secondaryGlowColor,
                                 isAnimated = isLiquidAnimated,
-                                onClick = {
-                                    // 优先构造具备高质量封面图的漫游候选池，对缺失封面的歌曲进行智能补齐
-                                    val allCandidates = (resolvedNewSongs + allCachedSongs).distinctBy { it.id }
-                                    val enrichedPool = allCandidates.map { song ->
-                                        if (song.coverUrl.isBlank() || com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(song.coverUrl)) {
-                                            val fallbackCover = com.lm.player.core.network.LemonMusicProtocol.getResolvedCover(song.id)
-                                                ?: allCachedSongs.firstOrNull { cand ->
-                                                    cand.coverUrl.isNotBlank() &&
-                                                    !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(cand.coverUrl) &&
-                                                    com.lm.player.core.media.SongMatchingResolver.isSongMatch(
-                                                        song.title, song.artist, song.durationMs,
-                                                        cand.title, cand.artist, cand.durationMs,
-                                                        song.album, cand.album
-                                                    )
-                                                }?.coverUrl.orEmpty()
-                                            if (fallbackCover.isNotBlank()) song.copy(coverUrl = fallbackCover) else song
-                                        } else {
-                                            song
-                                        }
-                                    }
-                                    val pool = enrichedPool.filter { it.coverUrl.isNotBlank() && !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it.coverUrl) }
-                                        .ifEmpty { enrichedPool }
-                                        .shuffled()
-                                    if (pool.isNotEmpty()) {
-                                        roamingSongIds = pool.map { it.id }.toSet()
-                                        isRoamingPlaying = true
-                                        onSongClick(pool.first(), pool)
-                                    }
-                                }
+                                isPaused = isAnyScrolling,
+                                onClick = onOpenPodcasts
                             )
 
                             // 小长方形卡片 2：换一批 (对接服务端每日 20 次每日推荐额度)
@@ -1050,7 +1036,7 @@ fun LemonDiscoverHomeScreen(
                                     .weight(1f),
                                 title = "换一批",
                                 subtitle = "每日推荐 · 50%本地",
-                                badgeText = "剩 ${remainingRefreshes}/20 次",
+                                badgeText = "${remainingRefreshes}/20",
                                 icon = Icons.Default.Refresh,
                                 iconColor = dynamicPalettes[4].iconColor,
                                 trailingIcon = Icons.Default.AutoAwesome,
@@ -1058,6 +1044,7 @@ fun LemonDiscoverHomeScreen(
                                 glowColor = dynamicPalettes[4].glowColor,
                                 secondaryGlowColor = dynamicPalettes[4].secondaryGlowColor,
                                 isAnimated = isLiquidAnimated,
+                                isPaused = isAnyScrolling,
                                 onClick = {
                                     if (remainingRefreshes <= 0) {
                                         android.widget.Toast.makeText(context, "今日换一批次数已用尽 (0/20)", android.widget.Toast.LENGTH_SHORT).show()
@@ -1977,10 +1964,11 @@ private fun DiscoverLiquidCard(
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(18.dp),
     isAnimated: Boolean = true,
+    isPaused: Boolean = false,
     onClick: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 8000)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 20_000, paused = isPaused)
     val path1 = remember { Path() }
     val path2 = remember { Path() }
     val ptsBuffer = remember { FloatArray(16) }
@@ -2151,9 +2139,10 @@ private fun DiscoverLiquidSmallCard(
     secondaryGlowColor: Color = Color.White.copy(alpha = 0.28f),
     shape: RoundedCornerShape = RoundedCornerShape(16.dp),
     isAnimated: Boolean = true,
+    isPaused: Boolean = false,
     onClick: () -> Unit
 ) {
-    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 7500)
+    val phaseState = rememberLiquidPhase(enabled = isAnimated, durationMillis = 17_000, paused = isPaused)
     val path1 = remember { Path() }
     val path2 = remember { Path() }
     val ptsBuffer = remember { FloatArray(16) }
@@ -2246,64 +2235,75 @@ private fun DiscoverLiquidSmallCard(
             Row(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
                 ) {
                     Surface(
                         shape = CircleShape,
                         color = Color.White.copy(alpha = 0.20f),
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(32.dp)
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
                                 imageVector = icon,
                                 contentDescription = null,
                                 tint = iconColor,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(16.dp)
                             )
                         }
                     }
-                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
                                 text = title,
-                                fontSize = 13.sp,
+                                fontSize = 12.5.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
                             )
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = Color.White.copy(alpha = 0.20f)
-                            ) {
-                                Text(
-                                    text = badgeText,
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color.White.copy(alpha = 0.92f),
-                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                )
+                            if (badgeText.isNotBlank()) {
+                                Surface(
+                                    shape = RoundedCornerShape(5.dp),
+                                    color = Color.White.copy(alpha = 0.22f)
+                                ) {
+                                    Text(
+                                        text = badgeText,
+                                        fontSize = 8.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.White.copy(alpha = 0.95f),
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(horizontal = 4.5.dp, vertical = 1.dp)
+                                    )
+                                }
                             }
                         }
                         Text(
                             text = subtitle,
-                            fontSize = 10.sp,
-                            color = Color.White.copy(alpha = 0.78f),
+                            fontSize = 9.5.sp,
+                            color = Color.White.copy(alpha = 0.80f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
+                Spacer(modifier = Modifier.width(4.dp))
                 if (isCurrentlyPlaying) {
                     com.lm.player.core.designsystem.component.NowPlayingWaveIndicator(
                         isPlaying = true,
@@ -2314,7 +2314,7 @@ private fun DiscoverLiquidSmallCard(
                         imageVector = trailingIcon,
                         contentDescription = null,
                         tint = Color.White.copy(alpha = 0.85f),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }

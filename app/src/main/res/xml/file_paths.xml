@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="external_files" path="." />
-    <external-cache-path name="external_cache" path="." />
-    <cache-path name="internal_cache" path="." />
-    <files-path name="internal_files" path="." />
+    <!-- S-13：只开放在线更新安装包所在的目录（cacheDir/updates/LMPlayer_update.apk），
+         不再暴露整个外部存储根目录和私有目录 -->
+    <cache-path name="app_update_cache" path="updates/" />
 </paths>

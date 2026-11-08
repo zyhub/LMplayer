@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /** 粗粒度网络范围：只用于决定「服务器优先」还是「音源加速优先」。 */
 enum class NetworkScope { WAN, LAN, UNKNOWN }
@@ -47,6 +48,10 @@ object NetworkScopeDetector {
 
     fun hostOf(serverUrl: String): String {
         val raw = serverUrl.trim()
+        // 优先按 URL 解析：IPv6 字面量（http://[fd00::1]:3000）若按「:」截断会得到「[fd00」，
+        // 与 OkHttp 的 request.url.host（fd00::1）对不上，链路状态 / 目录网关就认不出自己的服务器
+        val withScheme = if (raw.contains("://")) raw else "http://$raw"
+        withScheme.toHttpUrlOrNull()?.host?.let { return it }
         return raw.substringAfter("://", raw).substringBefore('/').substringBefore('?').substringBefore(':')
     }
 

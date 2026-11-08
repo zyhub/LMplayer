@@ -1,8 +1,21 @@
 <resources>
+    <!-- 冷启动窗口（浅色）；深色见 values-night/themes.xml。运行时由 SystemBarsStyler 按应用内主题覆盖 -->
     <style name="Theme.LMPlayer" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/app_window_bg</item>
+        <item name="android:statusBarColor">@color/app_window_bg</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">true</item>
     </style>
     <style name="Theme.ZDSPlayer" parent="Theme.LMPlayer" />
+    <!-- 桌面悬浮搜索面板：半透明窗口浮在桌面上（不带出 App 主界面），背后压暗 -->
+    <style name="Theme.LMPlayer.WidgetSearch" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:backgroundDimAmount">0.45</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation.Dialog</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:colorAccent">#FA2D48</item>
+    </style>
 </resources>

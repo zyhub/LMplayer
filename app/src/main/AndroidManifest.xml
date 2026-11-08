@@ -113,6 +113,149 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- 桌面小部件（移植自 PR #3，贡献者 527934973）。全部不对外导出：
+             小部件更新广播由系统发出，按钮命令只接收本 App 自己的显式 PendingIntent。 -->
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider4x2"
+            android:exported="false"
+            android:label="@string/widget_4x2_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_4x2_info" />
+        </receiver>
+
+
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider2x1"
+            android:exported="false"
+            android:label="@string/widget_2x1_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_2x1_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider2x2"
+            android:exported="false"
+            android:label="@string/widget_2x2_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_2x2_info" />
+        </receiver>
+
+
+        <receiver
+            android:name=".core.widget.MusicWidgetProvider3x3"
+            android:exported="false"
+            android:label="@string/widget_3x3_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_3x3_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.MusicWidgetActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.lm.player.action.WIDGET_TOGGLE" />
+                <action android:name="com.lm.player.action.WIDGET_NEXT" />
+                <action android:name="com.lm.player.action.WIDGET_PREV" />
+                <action android:name="com.lm.player.action.WIDGET_FAVORITE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 桌面悬浮搜索面板：直接在桌面上搜索并播放，不进入 App 主界面 -->
+        <activity
+            android:name=".core.widget.WidgetSearchActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LMPlayer.WidgetSearch"
+            android:taskAffinity="${applicationId}.widgetsearch"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:windowSoftInputMode="stateVisible|adjustResize" />
+
+        <receiver
+            android:name=".core.widget.ChartWidgetProvider4x2"
+            android:exported="false"
+            android:label="@string/widget_chart_4x2_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_chart_4x2_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.ChartWidgetProvider4x4"
+            android:exported="false"
+            android:label="@string/widget_chart_4x4_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_chart_4x4_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.ChartWidgetActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.lm.player.action.CHART_TAB_HOT" />
+                <action android:name="com.lm.player.action.CHART_TAB_SURGE" />
+                <action android:name="com.lm.player.action.CHART_TAB_NEW" />
+                <action android:name="com.lm.player.action.CHART_PLAY_ITEM" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.PlaylistWidgetProvider4x2"
+            android:exported="false"
+            android:label="@string/widget_playlist_4x2_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_playlist_4x2_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.PlaylistWidgetProvider4x4"
+            android:exported="false"
+            android:label="@string/widget_playlist_4x4_desc">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_playlist_4x4_info" />
+        </receiver>
+
+        <receiver
+            android:name=".core.widget.PlaylistWidgetActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.lm.player.action.PLAYLIST_TAB_MY" />
+                <action android:name="com.lm.player.action.PLAYLIST_TAB_REC" />
+                <action android:name="com.lm.player.action.PLAYLIST_OPEN" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>
+

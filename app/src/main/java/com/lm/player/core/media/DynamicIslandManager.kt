@@ -871,7 +871,7 @@ object DynamicIslandManager {
         val intent = Intent(context, PlaybackService::class.java).apply {
             action = PlaybackService.ACTION_MEDIA_COMMAND
             putExtra(PlaybackService.EXTRA_COMMAND, command)
-            putExtra(PlaybackService.INTERNAL_AUTH_TOKEN_EXTRA, PlaybackService.INTERNAL_COMMAND_SECRET)
+            putExtra(PlaybackService.INTERNAL_AUTH_TOKEN_EXTRA, PlaybackService.internalCommandSecret(context))
             setPackage(context.packageName)
         }
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT

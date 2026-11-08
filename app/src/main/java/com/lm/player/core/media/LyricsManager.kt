@@ -894,6 +894,11 @@ object LyricsManager {
         return memoryCache[songId]
     }
 
+    /** 清除指定歌曲的歌词内存缓存：在线修标签写回歌词后，歌曲 id 不变但文件内容已变（PR #5） */
+    fun invalidateLyrics(songId: String) {
+        memoryCache.remove(songId)
+    }
+
     suspend fun loadLyrics(
         song: UnifiedSong,
         context: Context,
@@ -983,6 +988,14 @@ object LyricsManager {
                 if (!rawResp.isNullOrBlank() && !rawResp.equals("null", ignoreCase = true)) {
                     return@withContext SmartCharsetDecoder.repairMojibakeIfNeeded(rawResp).trim()
                 }
+            }
+        } catch (_: Exception) {}
+
+        // 2.5 本地目录服务歌词：服务器离线 / 已删除时，在线曲目直接向平台取歌词（失败再走本地音源脚本 lyric 动作）
+        try {
+            val localLyric = com.lm.player.core.source.catalog.LocalCatalog.lyricForSong(song)
+            if (!localLyric.isNullOrBlank()) {
+                return@withContext SmartCharsetDecoder.repairMojibakeIfNeeded(localLyric).trim()
             }
         } catch (_: Exception) {}
 

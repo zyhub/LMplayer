@@ -11,4 +11,25 @@
     <color name="apple_text_secondary_dark">#98989D</color>
     <color name="apple_pill_bg">#E5E5EA</color>
     <color name="car_dock_bg">#1A1A1E</color>
+
+    <!-- 桌面小部件 (浅色模式) -->
+    <color name="widget_text_primary">#FF1C1C1E</color>
+    <color name="widget_text_secondary">#FF8E8E93</color>
+    <color name="widget_btn_bg">#FF6E6E73</color>
+    <color name="widget_card_base">#FFFFFFFF</color>
+    <color name="widget_overlay">#C7FFFFFF</color>
+    <color name="widget_border">#14000000</color>
+    <color name="widget_icon">#FF48484A</color>
+    <color name="widget_cover_placeholder">#FFE5E5EA</color>
+    <color name="widget_accent_red">#FA2D48</color>
+    <color name="widget_search_bar_bg">#0F000000</color>
+    <color name="widget_chip_bg">#0D000000</color>
+    <color name="widget_gold">#FF9500</color>
+    <color name="widget_silver">#8E8E93</color>
+    <color name="widget_bronze">#FFCC00</color>
+    <color name="widget_trend_up">#34C759</color>
+    <color name="widget_tab_active">#FA2D48</color>
+    <color name="widget_tab_inactive">#8E8E93</color>
+    <!-- 主界面窗口底色（与 Theme.kt 的 background 一致），系统栏底色同此 -->
+    <color name="app_window_bg">#F2F2F7</color>
 </resources>

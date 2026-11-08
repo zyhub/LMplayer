@@ -961,10 +961,6 @@ object AudioSharingManager {
             val client = NetworkClientFactory.createOkHttpClient(context)
             val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
             protocol.ensureAuthenticated()
-            val bearer = NetworkClientFactory.getActiveAuthToken()
-            if (bearer.isNotBlank()) {
-                authHeader = "Bearer $bearer"
-            }
 
             if (remoteUrl.isBlank() || remoteUrl.startsWith("lemon_online://") || !remoteUrl.startsWith("http")) {
                 val srvPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
@@ -993,6 +989,12 @@ object AudioSharingManager {
             } else if (remoteUrl.startsWith("/") && active.serverUrl.isNotBlank()) {
                 remoteUrl = "${active.serverUrl.trimEnd('/')}$remoteUrl"
             }
+            // S-03：只有上游就是当前柠檬服务器时才附带 Bearer；在线歌曲的第三方 CDN 直链不带 Token
+            val bearer = NetworkClientFactory.getActiveAuthToken()
+            if (bearer.isNotBlank() && isSameServerOrigin(remoteUrl, active.serverUrl)) {
+                authHeader = "Bearer $bearer"
+            }
+            lastActiveServerUrl = active.serverUrl
         }
 
         if (remoteUrl.startsWith("http://") || remoteUrl.startsWith("https://")) {
@@ -1018,6 +1020,25 @@ object AudioSharingManager {
         return null
     }
 
+    /** 最近一次解析投屏地址时的当前服务器地址，供封面代理判断是否同源 */
+    @Volatile
+    private var lastActiveServerUrl: String? = null
+
+    /** url 与柠檬服务器是否同源（协议 + 主机 + 端口一致）；任一无法解析视为不同源 */
+    private fun isSameServerOrigin(url: String?, serverUrl: String?): Boolean {
+        if (url.isNullOrBlank() || serverUrl.isNullOrBlank()) return false
+        val a = runCatching { java.net.URI(url.trim()) }.getOrNull() ?: return false
+        val b = runCatching {
+            java.net.URI(com.lm.player.core.network.ServerUrlPolicy.canonicalize(serverUrl))
+        }.getOrNull() ?: return false
+        val schemeA = a.scheme?.lowercase() ?: return false
+        val schemeB = b.scheme?.lowercase() ?: return false
+        val hostA = a.host?.lowercase() ?: return false
+        val hostB = b.host?.lowercase() ?: return false
+        fun port(scheme: String, p: Int) = if (p != -1) p else if (scheme == "https") 443 else 80
+        return schemeA == schemeB && hostA == hostB && port(schemeA, a.port) == port(schemeB, b.port)
+    }
+
     private fun resolveLanAccessibleCoverUrl(context: Context, song: UnifiedSong): String {
         val rawCoverUrl = song.coverUrl.trim()
         if (rawCoverUrl.isBlank()) return ""
@@ -1026,9 +1047,13 @@ object AudioSharingManager {
         if (port > 0 && (rawCoverUrl.startsWith("http://") || rawCoverUrl.startsWith("https://"))) {
             val bearer = NetworkClientFactory.getActiveAuthToken()
             val token = generateSecureToken("cover", song.id)
+            // S-03：封面主机不是当前柠檬服务器时（在线歌曲的第三方封面）不附带 Token
+            val coverAuth = bearer.takeIf {
+                it.isNotBlank() && isSameServerOrigin(rawCoverUrl, lastActiveServerUrl)
+            }?.let { "Bearer $it" }
             sharedCoverUrlRegistry[token] = RemoteStreamProxyEntry(
                 upstreamUrl = rawCoverUrl,
-                authHeader = bearer.takeIf { it.isNotBlank() }?.let { "Bearer $it" },
+                authHeader = coverAuth,
                 mimeType = "image/jpeg"
             )
             return "http://$localIp:$port/cover/$token.jpg"

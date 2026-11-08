@@ -1640,8 +1640,8 @@ class DownloadEngine(
                 val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
                 if (lrcFile.exists()) lrcFile.delete()
             }
-            val defaultDest = File(getDownloadDir(), "${song.id}.${song.format}")
-            if (defaultDest.exists()) defaultDest.delete()
+            val defaultDest = legacyDefaultDownloadFile(getDownloadDir(), song)
+            if (defaultDest != null && defaultDest.exists()) defaultDest.delete()
 
             downloadDao.deleteDownload(song.id)
             if (song.serverId == "local_storage" || song.id.startsWith("lemon_online_")) {
@@ -1654,6 +1654,21 @@ class DownloadEngine(
             withContext(Dispatchers.Main) {
                 Toast.makeText(context, "已删除本地离线歌曲: ${song.title}", Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    /**
+     * C-09：旧版默认文件名 `${id}.${format}` 的删除候选。
+     * id / format 来自服务端曲库数据，形如 `../../DCIM/x` 时会越出下载目录（App 有 MANAGE_EXTERNAL_STORAGE，
+     * 能删外部存储任意文件）。这里要求规范化后的路径必须直接位于下载根目录下，否则返回 null 不删。
+     */
+    private fun legacyDefaultDownloadFile(baseDir: File, song: UnifiedSong): File? {
+        return try {
+            val base = baseDir.canonicalFile
+            val target = File(base, "${song.id}.${song.format}").canonicalFile
+            if (target.parentFile?.path == base.path) target else null
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -1686,8 +1701,8 @@ class DownloadEngine(
                     val lrcFile = File(f.parentFile, "${f.nameWithoutExtension}.lrc")
                     if (lrcFile.exists()) lrcFile.delete()
                 }
-                val defaultDest = File(downloadDir, "${song.id}.${song.format}")
-                if (defaultDest.exists()) {
+                val defaultDest = legacyDefaultDownloadFile(downloadDir, song)
+                if (defaultDest != null && defaultDest.exists()) {
                     freedBytes += defaultDest.length()
                     defaultDest.delete()
                 }

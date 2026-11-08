@@ -91,8 +91,8 @@ fun RetroCoverFlowPlayerView(
     progressMs: Long,
     totalDurationMs: Long,
     lyrics: LyricResult,
-    isShuffle: Boolean,
-    isRepeat: Boolean,
+    /** 三态播放模式（列表循环 / 单曲循环 / 随机播放） */
+    playMode: com.lm.player.core.media.PlayMode,
     activeTimerMinutes: Int = 0,
     fontSizeSp: Float = 22f,
     lyricsOffsetMs: Long = 0L,
@@ -105,8 +105,8 @@ fun RetroCoverFlowPlayerView(
     onSeekTo: (Long) -> Unit,
     onSelectSongFromQueue: (UnifiedSong) -> Unit = {},
     onToggleFavorite: () -> Unit,
-    onToggleShuffle: () -> Unit,
-    onToggleRepeat: () -> Unit,
+    /** 点击三态按钮：切换到下一个播放模式 */
+    onCyclePlayMode: () -> Unit,
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
     onCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { _, _ -> },
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { _, _, _ -> },
@@ -115,6 +115,8 @@ fun RetroCoverFlowPlayerView(
     onOffsetChange: (Long) -> Unit = {},
     onThemeChange: (LyricTheme) -> Unit = {},
     onSwitchPlayerTheme: (PlayerThemeStyle) -> Unit = {},
+    onLyricsUpdated: () -> Unit = {},
+    onMetadataSaved: (com.lm.player.feature.library.TagSavedMetadata) -> Unit = {},
     onOpenSleepTimer: () -> Unit = {},
     onOpenAudioSpecs: () -> Unit = {},
     onDismiss: () -> Unit
@@ -217,6 +219,16 @@ fun RetroCoverFlowPlayerView(
     var showAddToPlaylistMenu by remember { mutableStateOf(false) }
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showQueueSheet by remember { mutableStateOf(false) }
+    var showTagEditor by remember { mutableStateOf(false) }
+    // 在线修标签弹窗（独立窗口）
+    if (showTagEditor) {
+        com.lm.player.feature.library.TagEditorDialog(
+            song = song,
+            onDismiss = { showTagEditor = false },
+            onLyricsUpdated = onLyricsUpdated,
+            onMetadataSaved = onMetadataSaved
+        )
+    }
 
     val activeCastDevice by AudioSharingManager.activeCastDevice.collectAsState()
     val sleepTimerRemainingSec by PlaybackQueueManager.sleepTimerRemainingSecFlow.collectAsState()
@@ -339,6 +351,12 @@ fun RetroCoverFlowPlayerView(
             )
         }
     }
+
+    // 系统状态栏 / 导航栏与怀旧播放页背景渐变的首尾色一致（离开播放页自动恢复应用底色）
+    com.lm.player.core.designsystem.theme.SystemBarsColor(
+        statusBar = if (isDark) Color(0xFF07080A) else Color(0xFFE2E0E6),
+        navigationBar = if (isDark) Color(0xFF040507) else Color(0xFFDAD7DE)
+    )
 
     Box(
         modifier = Modifier
@@ -653,31 +671,13 @@ fun RetroCoverFlowPlayerView(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isShuffle) AppleRed.copy(alpha = 0.18f) else if (isDark) Color(0x22FFFFFF) else Color(0x15000000),
-                                border = BorderStroke(0.6.dp, if (isShuffle) AppleRed.copy(alpha = 0.6f) else Color.Transparent),
-                                modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable(onClick = onToggleShuffle)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Shuffle,
-                                        contentDescription = "随机播放",
-                                        tint = if (isShuffle) AppleRed else secondaryTextColor,
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(3.dp))
-                                    Text(
-                                        text = if (isShuffle) "随机开启" else "随机",
-                                        fontSize = 11.sp,
-                                        fontWeight = if (isShuffle) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (isShuffle) AppleRed else secondaryTextColor
-                                    )
-                                }
-                            }
+                            // 播放列表胶囊（原「随机」位置），打开待播列表弹层
+                            com.lm.player.feature.player.controls.QueueChip(
+                                onClick = { showQueueSheet = true },
+                                isDark = isDark,
+                                secondaryTextColor = secondaryTextColor,
+                                isActive = showQueueSheet
+                            )
 
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Box {
@@ -742,31 +742,13 @@ fun RetroCoverFlowPlayerView(
                                 }
                             }
 
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isRepeat) AppleRed.copy(alpha = 0.18f) else if (isDark) Color(0x22FFFFFF) else Color(0x15000000),
-                                border = BorderStroke(0.6.dp, if (isRepeat) AppleRed.copy(alpha = 0.6f) else Color.Transparent),
-                                modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable(onClick = onToggleRepeat)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Repeat,
-                                        contentDescription = "单曲循环",
-                                        tint = if (isRepeat) AppleRed else secondaryTextColor,
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(3.dp))
-                                    Text(
-                                        text = if (isRepeat) "单曲循环" else "循环",
-                                        fontSize = 11.sp,
-                                        fontWeight = if (isRepeat) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (isRepeat) AppleRed else secondaryTextColor
-                                    )
-                                }
-                            }
+                            // 三态播放模式胶囊（原「循环」位置）
+                            com.lm.player.feature.player.controls.PlayModeChip(
+                                mode = playMode,
+                                onClick = onCyclePlayMode,
+                                isDark = isDark,
+                                secondaryTextColor = secondaryTextColor
+                            )
                         }
                     }
                 }
@@ -1146,6 +1128,25 @@ fun RetroCoverFlowPlayerView(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // 在线修标签（PR #5，仅柠檬服务器曲库歌曲）：放在「加入歌单」左边
+                        if (song.isLemonServerSong) {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .background(circleButtonBg)
+                                    .clickable { showTagEditor = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "在线修标签",
+                                    tint = primaryTextColor,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+
                         // 加入歌单按钮
                         Box {
                             Box(
@@ -1335,14 +1336,11 @@ fun RetroCoverFlowPlayerView(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        IconButton(onClick = onToggleShuffle) {
-                            Icon(
-                                imageVector = Icons.Default.Shuffle,
-                                contentDescription = "随机播放",
-                                tint = if (isShuffle) AppleRed else primaryTextColor.copy(alpha = 0.8f),
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
+                        // 播放列表（原「随机」位置）
+                        com.lm.player.feature.player.controls.QueueIconButton(
+                            onClick = { showQueueSheet = true },
+                            tint = primaryTextColor.copy(alpha = 0.8f)
+                        )
 
                         IconButton(onClick = onPrevious) {
                             Icon(
@@ -1379,19 +1377,17 @@ fun RetroCoverFlowPlayerView(
                             )
                         }
 
-                        IconButton(onClick = onToggleRepeat) {
-                            Icon(
-                                imageVector = Icons.Default.Repeat,
-                                contentDescription = "单曲循环",
-                                tint = if (isRepeat) AppleRed else primaryTextColor.copy(alpha = 0.8f),
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
+                        // 三态播放模式（原「循环」位置）
+                        com.lm.player.feature.player.controls.PlayModeIconButton(
+                            mode = playMode,
+                            onClick = onCyclePlayMode,
+                            tint = primaryTextColor.copy(alpha = 0.8f)
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    // 第三层: 底部 6 项现代功能工具栏: [喜欢] [待播队列] [定时] [音频输出] [参数] [切回现代]
+                    // 第三层: 底部 5 项现代功能工具栏: [喜欢] [定时] [音频输出] [参数] [切回现代]
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1409,17 +1405,7 @@ fun RetroCoverFlowPlayerView(
                             )
                         }
 
-                        // 2. 待播队列
-                        IconButton(onClick = { showQueueSheet = true }) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.QueueMusic,
-                                contentDescription = "待播队列",
-                                tint = secondaryTextColor,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
-
-                        // 3. 定时关闭
+                        // 2. 定时关闭（待播队列已移到主控行左侧）
                         Box {
                             IconButton(onClick = { showSleepTimerMenu = true }) {
                                 Icon(
@@ -1566,6 +1552,7 @@ fun RetroCoverFlowPlayerView(
     BackHandler(enabled = true) {
         when {
             showQueueSheet -> showQueueSheet = false
+            showTagEditor -> showTagEditor = false
             showSleepTimerMenu -> showSleepTimerMenu = false
             showAudioSpecsMenu -> showAudioSpecsMenu = false
             showAudioOutputMenu -> showAudioOutputMenu = false
