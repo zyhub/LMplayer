@@ -36,13 +36,13 @@
 
 <div align="center">
 
-| 1. 发现 · 在线云端推荐 | 2. 播放器 · 超大高清封面 |
+| 1. 发现 · 在线与播客推荐 | 2. 播放器 · 超大高清封面 |
 | :---: | :---: |
 | <img src="docs/screenshots/01_discover_home.png" width="360" /> | <img src="docs/screenshots/02_player_cover.png" width="360" /> |
 | **3. 歌词 · 浮层原位调节** | **4. 资料库 · 云端与本地曲库** |
 | <img src="docs/screenshots/03_lyrics_adjust.png" width="360" /> | <img src="docs/screenshots/04_library_screen.png" width="360" /> |
-| **5. 设置中心 · 轻奢下拉选择** | |
-| <img src="docs/screenshots/05_settings_screen.png" width="360" /> | |
+| **5. 播放器 · 复古 3D 封面流** | **6. 设置中心 · 轻奢下拉选择** |
+| <img src="docs/screenshots/05_cover_flow.png" width="360" /> | <img src="docs/screenshots/06_settings_screen.png" width="360" /> |
 
 </div>
 
@@ -126,7 +126,7 @@
 
 👉 **[前往下载最新发布版 APK](https://github.com/zyhub/LMplayer/releases)**
 
-- 最新版本：`v1.7.14`
+- 最新版本：`v1.7.32`
 - 架构支持：`armeabi-v7a`, `arm64-v8a` (主流 32/64 位移动与平板架构)
 - 最低系统要求：Android 8.0 (API Level 26) 及以上的平板或智能手机
 
