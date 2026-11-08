@@ -6,6 +6,7 @@ import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.DownloadTask
+import com.lm.player.core.model.NON_SERVER_LIBRARY_IDS
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -682,8 +683,93 @@ object SongMatchingResolver {
             }
         }
 
+        // 4.2 对账：本地库中残留的「在线音源身份」记录（serverId=lemon_online），
+        // 若同一首歌已在服务器曲库中，则把收藏/本地下载状态合并到服务器曲目并删除在线记录
+        if (!effectiveServerId.isNullOrBlank() && effectiveServerId !in NON_SERVER_LIBRARY_IDS) {
+            val onlineRecords = existingSongs.filter { it.serverId == "lemon_online" }
+            if (onlineRecords.isNotEmpty()) {
+                upgradeOnlineRecordsToServerSongs(
+                    database = database,
+                    serverSongs = preservedEntities,
+                    onlineRecords = onlineRecords,
+                    onlineDownloadPath = { songId ->
+                        existingDownloads[songId]?.localFilePath?.takeIf { checkFileExists(it) }
+                    },
+                    checkFileExists = { path -> checkFileExists(path) }
+                )
+            }
+        }
+
         // 5. 触发全局匹配与双向关联去重
         autoMatchAndSyncServer(database, downloadDir, preservedEntities)
+    }
+
+    /**
+     * 把「在线音源身份」记录（serverId=lemon_online）升级为服务器曲库曲目。
+     *
+     * 背景：收藏历史里有些条目是按在线音源登记的，id 与服务器文件 id 不同；当这首歌后来
+     * 下载/缓存进服务器曲库后，本地库里会同时存在在线记录与服务器曲目。在线记录不会被
+     * 列表识别为服务器歌曲，导致「明明在服务器却显示下载按钮」「修标签入口不出现」。
+     *
+     * 处理方式：按标题分组 + [isSongMatch] 元数据校验找到同一首歌，把在线记录上的收藏
+     * 状态与本地物理文件状态合并到服务器曲目，然后删除在线记录。
+     */
+    private suspend fun upgradeOnlineRecordsToServerSongs(
+        database: ZdsDatabase,
+        serverSongs: List<SongEntity>,
+        onlineRecords: List<SongEntity>,
+        onlineDownloadPath: (String) -> String?,
+        checkFileExists: (String?) -> Boolean
+    ) {
+        val serverSongsByTitle = HashMap<String, MutableList<SongEntity>>(serverSongs.size)
+        for (song in serverSongs) {
+            val normTitle = normalizeTrackTitle(song.title)
+            if (normTitle.isNotBlank()) serverSongsByTitle.getOrPut(normTitle) { ArrayList(2) }.add(song)
+        }
+
+        val upgradedSongs = ArrayList<SongEntity>()
+        val removedOnlineIds = ArrayList<String>()
+        for (online in onlineRecords) {
+            val normTitle = normalizeTrackTitle(online.title)
+            val matched = serverSongsByTitle[normTitle]?.firstOrNull { server ->
+                isSongMatch(
+                    title1 = online.title,
+                    artist1 = online.artist,
+                    durationMs1 = online.durationMs,
+                    title2 = server.title,
+                    artist2 = server.artist,
+                    durationMs2 = server.durationMs,
+                    album1 = online.album,
+                    album2 = server.album
+                )
+            } ?: continue
+
+            val mergedLocalPath = matched.localFilePath
+                ?: online.localFilePath?.takeIf { checkFileExists(it) }
+                ?: onlineDownloadPath(online.id)
+            val mergedFavorite = matched.isFavorite || online.isFavorite
+            val mergedStatus = if (mergedLocalPath != null) DownloadStatus.DOWNLOADED else matched.downloadStatus
+            if (mergedFavorite != matched.isFavorite ||
+                mergedLocalPath != matched.localFilePath ||
+                mergedStatus != matched.downloadStatus
+            ) {
+                upgradedSongs.add(
+                    matched.copy(
+                        isFavorite = mergedFavorite,
+                        localFilePath = mergedLocalPath,
+                        downloadStatus = mergedStatus
+                    )
+                )
+            }
+            removedOnlineIds.add(online.id)
+            database.downloadDao().deleteDownload(online.id)
+        }
+
+        if (upgradedSongs.isNotEmpty()) database.songDao().insertSongs(upgradedSongs)
+        if (removedOnlineIds.isNotEmpty()) {
+            database.songDao().deleteSongsByIds(removedOnlineIds)
+            Log.i(TAG, "Upgraded ${removedOnlineIds.size} lemon_online records already on server")
+        }
     }
 
     /**
