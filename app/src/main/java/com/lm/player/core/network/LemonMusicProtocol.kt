@@ -443,6 +443,16 @@ class LemonMusicProtocol(
             return songIdHasEmbeddedCoverMap[songId] == false
         }
 
+        /**
+         * 封面写入（在线修标签/自动补全）成功后调用，把该曲目从「已知无内嵌封面」中移除。
+         * 否则封面占位逻辑会一直跳过加载，必须重启并重新同步才显示新封面。
+         */
+        fun markEmbeddedCoverWritten(filePath: String) {
+            val clean = filePath.removePrefix("local:").trim()
+            if (clean.isBlank()) return
+            songIdHasEmbeddedCoverMap["lemon_${md5(clean)}"] = true
+        }
+
         // 发现页短期内存快取 (缓存 5 分钟，显著提速主页切换与展示)
         private val discoverPlaylistsCache = ConcurrentHashMap<String, Pair<Long, List<UnifiedPlaylist>>>()
         private val discoverToplistsCache = ConcurrentHashMap<String, Pair<Long, List<LemonToplist>>>()
