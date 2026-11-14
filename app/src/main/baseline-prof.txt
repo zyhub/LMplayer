@@ -1,0 +1,10 @@
+HSPLcom/lm/player/feature/player/**;->**(**)**
+HSPLcom/lm/player/core/designsystem/glass/**;->**(**)**
+HSPLcom/lm/player/core/designsystem/component/**;->**(**)**
+HSPLcom/lm/player/core/designsystem/theme/**;->**(**)**
+HSPLcom/lm/player/ui/**;->**(**)**
+HSPLcom/kyant/**;->**(**)**
+Lcom/lm/player/feature/player/**;
+Lcom/lm/player/core/designsystem/glass/**;
+Lcom/lm/player/core/designsystem/component/**;
+Lcom/kyant/**;

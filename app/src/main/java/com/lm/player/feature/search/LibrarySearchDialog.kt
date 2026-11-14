@@ -274,12 +274,26 @@ fun LibrarySearchDialog(
             ),
         contentAlignment = Alignment.BottomCenter
     ) {
+        // 液态玻璃模式（面板在上层）：卡片换成玻璃面板，跟随播放栏滑块，但保底一定底色与磨砂保证列表可读
+        val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+        Box {
+        if (glassOn) {
+            val panelStyle = com.lm.player.core.designsystem.glass.panelGlassStyle(isDark)
+            com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                modifier = Modifier.matchParentSize(),
+                cornerRadius = 24.dp,
+                tint = panelStyle.tint,
+                blurAmount = panelStyle.blurAmount,
+                dispersion = panelStyle.dispersion,
+                material = panelStyle.material
+            )
+        }
         Surface(
             modifier = Modifier
                 .widthIn(max = 580.dp)
                 .fillMaxWidth()
                 .fillMaxHeight(0.86f)
-                .shadow(18.dp, RoundedCornerShape(24.dp))
+                .shadow(if (glassOn) 0.dp else 18.dp, RoundedCornerShape(24.dp))
                 .clip(RoundedCornerShape(24.dp))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
@@ -287,8 +301,8 @@ fun LibrarySearchDialog(
                     onClick = {} // 拦截内部点击，防止穿透关闭
                 ),
             shape = RoundedCornerShape(24.dp),
-            color = cardBgColor,
-            border = BorderStroke(1.dp, cardBorderColor)
+            color = if (glassOn) Color.Transparent else cardBgColor,
+            border = BorderStroke(1.dp, if (glassOn) Color.White.copy(alpha = if (isDark) 0.10f else 0.35f) else cardBorderColor)
         ) {
             Column(
                 modifier = Modifier
@@ -752,6 +766,7 @@ fun LibrarySearchDialog(
                 }
             }
         }
+        } // Box（玻璃底 + 卡片）
     }
 }
 

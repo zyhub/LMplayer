@@ -152,7 +152,7 @@ fun PodcastEpisodeSheet(
                         }
                     }
                     Spacer(modifier = Modifier.height(4.dp))
-                    LinearProgressIndicator(
+                    com.lm.player.core.designsystem.component.ClassicLinearProgress(
                         progress = { episode.progress },
                         modifier = Modifier
                             .fillMaxWidth()

@@ -52,6 +52,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import com.lm.player.core.designsystem.glass.liquidGlass
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -342,16 +343,32 @@ fun TagEditorDialog(
         onDismissRequest = { if (!isSaving) onDismiss() },
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        // 液态玻璃：弹窗是独立窗口，按屏幕坐标采样主界面（播放页）做玻璃底，与播放页其它弹出面板同一套面板玻璃
+        val tagGlassBackdrop = if (com.lm.player.core.designsystem.glass.rememberLiquidGlassFull()) {
+            com.lm.player.core.designsystem.glass.rememberAppGlassBackdrop()
+        } else null
+        val tagGlassStyle = com.lm.player.core.designsystem.glass.panelGlassStyle(isDark)
         Surface(
             shape = RoundedCornerShape(24.dp),
-            color = surfaceBg,
-            border = BorderStroke(1.dp, borderColor),
-            shadowElevation = 24.dp,
+            color = if (tagGlassBackdrop != null) Color.Transparent else surfaceBg,
+            border = if (tagGlassBackdrop != null) null else BorderStroke(1.dp, borderColor),
+            shadowElevation = if (tagGlassBackdrop != null) 0.dp else 24.dp,
             modifier = Modifier
                 .fillMaxWidth(0.92f)
                 .widthIn(max = 520.dp)
                 .heightIn(max = 680.dp)
                 .padding(vertical = 12.dp)
+                .then(
+                    if (tagGlassBackdrop != null) Modifier.liquidGlass(
+                        backdrop = tagGlassBackdrop,
+                        shape = RoundedCornerShape(24.dp),
+                        tint = tagGlassStyle.tint,
+                        blurAmount = tagGlassStyle.blurAmount,
+                        dispersion = tagGlassStyle.dispersion,
+                        material = tagGlassStyle.material,
+                        shadow = true
+                    ) else Modifier
+                )
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
                 // 1. 顶部：标题 + 歌曲信息 + 关闭

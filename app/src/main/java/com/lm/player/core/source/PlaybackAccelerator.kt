@@ -43,7 +43,11 @@ object PlaybackAccelerator {
             val quality: AudioQuality,
             val platform: String,
             val requested: AudioQuality,
-            val matchedSong: UnifiedSong? = null
+            val matchedSong: UnifiedSong? = null,
+            /** 探活时拿到的文件大小（字节，0=未知）：播放缓存的固定缓存键带上它，不同文件不会拼进同一份缓存 */
+            val contentBytes: Long = 0L,
+            /** 链接实际对应的平台歌曲 ID（跨平台补源时是另一平台的 ID；空=未知） */
+            val sourceSongId: String = ""
         ) : Outcome {
             val downgraded: Boolean get() = quality.bitrate < requested.bitrate
         }
@@ -151,11 +155,18 @@ object PlaybackAccelerator {
         refresh: Boolean,
         server: (suspend () -> ResolvedOnlineStream?)?
     ): Outcome {
+        // TV 按需启动：取链即需要音源引擎。没有服务器可兜底时等引擎加载好（最多 8 秒）；
+        // 有服务器时不等，本次走服务器，引擎在后台加载好后下次本地优先
+        if (server == null) SourceAccelerationController.awaitEngines(8_000L)
+        else SourceAccelerationController.ensureEnginesForResolve()
         val mode = SourceAccelerationController.playbackMode()
         val requested = AudioQuality.fromKey(preferredQuality)
         return when (mode) {
             SourceAccelerationController.Mode.SERVER_ONLY,
-            SourceAccelerationController.Mode.SERVER_FIRST -> Outcome.Miss(localAttempted = false)
+            SourceAccelerationController.Mode.SERVER_FIRST -> {
+                PlaybackSourceTracker.record(song.id, PlaybackSourceTracker.Info("柠檬服务器", platformOf(song), viaLocal = false))
+                Outcome.Miss(localAttempted = false)
+            }
             SourceAccelerationController.Mode.LOCAL_ONLY -> {
                 val hit = localResolve(song, requested, priority, LOCAL_ONLY_BUDGET_MS, crossPlatform = true, refresh = refresh, lenientProbe = true)
                 hit ?: Outcome.Miss(localAttempted = true, serverAttempted = server == null)
@@ -166,6 +177,8 @@ object PlaybackAccelerator {
 
     /** 服务器路径失败后的本地兜底（SERVER_FIRST 模式）。 */
     suspend fun fallbackLocal(song: UnifiedSong, preferredQuality: String, priority: ResolvePriority): Outcome.LocalHit? {
+        // TV 按需启动：服务器路径已失败，本地是唯一兜底 —— 引擎还没加载就加载并等一下
+        SourceAccelerationController.awaitEngines(6_000L)
         if (!SourceAccelerationController.canResolveLocally()) return null
         return localResolve(song, AudioQuality.fromKey(preferredQuality), priority, FALLBACK_BUDGET_MS, crossPlatform = true, refresh = false, lenientProbe = false)
     }
@@ -196,6 +209,7 @@ object PlaybackAccelerator {
         }
         scope.launch {
             val s = runCatching { server() }.getOrNull()?.takeIf { it.url.isNotBlank() }
+            if (s != null) PlaybackSourceTracker.record(song.id, PlaybackSourceTracker.Info("柠檬服务器", platformOf(song), viaLocal = false))
             if (s != null) winner.complete(Outcome.ServerHit(s))
             if (remaining.decrementAndGet() == 0) winner.complete(null)
         }
@@ -222,13 +236,20 @@ object PlaybackAccelerator {
         lenientProbe: Boolean,
         floorQuality: AudioQuality = AudioQuality.Q_128K
     ): Outcome.LocalHit? {
-        if (!SourceAccelerationSession.isReady()) return null
+        // TV 按需启动：未加载则加载；有服务器可兜底时不等，没有时最多等 8 秒
+        if (!SourceAccelerationController.ensureEnginesForResolve()) return null
         val platform = platformOf(song)
         val songKey = rawIdOf(song)
         if (!refresh) {
             val cached = ResolvedUrlCache.get(platform, songKey, requested.key)
             if (cached != null && AudioQuality.fromKey(cached.qualityKey).bitrate >= floorQuality.bitrate) {
-                return Outcome.LocalHit(cached.url, AudioQuality.fromKey(cached.qualityKey), cached.platform, requested)
+                if (PlaybackSourceTracker.get(song.id)?.viaLocal != true) {
+                    PlaybackSourceTracker.record(song.id, PlaybackSourceTracker.Info("本地音源", cached.platform, viaLocal = true))
+                }
+                return Outcome.LocalHit(
+                    cached.url, AudioQuality.fromKey(cached.qualityKey), cached.platform, requested,
+                    contentBytes = cached.totalBytes, sourceSongId = cached.sourceSongId
+                )
             }
         } else {
             ResolvedUrlCache.invalidate(platform, songKey, requested.key)
@@ -247,7 +268,7 @@ object PlaybackAccelerator {
     }
 
     /** 校验过的候选链接：实际音质（估算） */
-    private class Checked(val url: String, val actual: AudioQuality, val platform: String, val matched: UnifiedSong?)
+    private class Checked(val url: String, val actual: AudioQuality, val platform: String, val matched: UnifiedSong?, val totalBytes: Long = 0L)
 
     private suspend fun doLocalResolve(
         song: UnifiedSong,
@@ -264,9 +285,14 @@ object PlaybackAccelerator {
         var alternatives: List<UnifiedSong>? = null
         var best: Checked? = null
 
-        fun hit(c: Checked): Outcome.LocalHit {
-            ResolvedUrlCache.put(platform, songKey, requested.key, c.url, c.actual.key, viaLocal = true)
-            return Outcome.LocalHit(c.url, c.actual, c.platform, requested, matchedSong = c.matched)
+        fun hit(c: Checked, sourceId: String? = null): Outcome.LocalHit {
+            PlaybackSourceTracker.record(
+                song.id,
+                PlaybackSourceTracker.Info(SourceAccelerationSession.sourceNameOf(sourceId) ?: "本地音源", c.platform, viaLocal = true)
+            )
+            val srcId = c.matched?.let { rawIdOf(it) } ?: songKey
+            ResolvedUrlCache.put(platform, songKey, requested.key, c.url, c.actual.key, viaLocal = true, totalBytes = c.totalBytes, sourceSongId = srcId)
+            return Outcome.LocalHit(c.url, c.actual, c.platform, requested, matchedSong = c.matched, contentBytes = c.totalBytes, sourceSongId = srcId)
         }
 
         val ladder = SourceAccelerationSession.qualitiesFrom(requested.key)
@@ -277,14 +303,14 @@ object PlaybackAccelerator {
             // 1) 本平台：所有脚本逐个尝试，结果必须达到本档真实音质
             if (SourceAccelerationSession.canResolve(platform)) {
                 var checked: Checked? = null
-                SourceAccelerationSession.resolveMusicUrl(platform, q.key, info, priority, deadline, accept = acc@{ url ->
+                val resolved = SourceAccelerationSession.resolveMusicUrl(platform, q.key, info, priority, deadline, accept = acc@{ url ->
                     val c = check(url, q, song.durationMs, lenientProbe, platform, null) ?: return@acc false
                     if (best == null || c.actual.bitrate > best!!.actual.bitrate) best = c
                     val ok = meets(c.actual, q)
                     if (ok) checked = c
                     ok
                 })
-                checked?.let { return hit(it) }
+                checked?.let { return hit(it, resolved.getOrNull()?.sourceId) }
             }
             // 2) 跨平台同曲同音质（对齐服务端 crossPlatformMatch：本档所有平台都拿不到才降档）
             if (crossPlatform && deadline - System.currentTimeMillis() > 1_000L) {
@@ -300,7 +326,7 @@ object PlaybackAccelerator {
                     val altInfo = buildMusicInfo(alt, altPlatform).toString()
                     var checked: Checked? = null
                     val duration = if (alt.durationMs > 0) alt.durationMs else song.durationMs
-                    SourceAccelerationSession.resolveMusicUrl(altPlatform, q.key, altInfo, priority, deadline, accept = acc@{ url ->
+                    val altResolved = SourceAccelerationSession.resolveMusicUrl(altPlatform, q.key, altInfo, priority, deadline, accept = acc@{ url ->
                         val c = check(url, q, duration, lenientProbe, altPlatform, alt) ?: return@acc false
                         if (best == null || c.actual.bitrate > best!!.actual.bitrate) best = c
                         val ok = meets(c.actual, q)
@@ -309,7 +335,7 @@ object PlaybackAccelerator {
                     })
                     checked?.let {
                         Log.i(TAG, "cross-platform local hit: ${song.title} $platform -> $altPlatform (${q.key})")
-                        return hit(it)
+                        return hit(it, altResolved.getOrNull()?.sourceId)
                     }
                 }
             }
@@ -340,7 +366,7 @@ object PlaybackAccelerator {
             CdnProbe.Result.UNKNOWN -> if (!lenient) return null
             CdnProbe.Result.OK -> Unit
         }
-        return Checked(url, estimateQuality(url, probe, durationMs, requestedQ), platform, matched)
+        return Checked(url, estimateQuality(url, probe, durationMs, requestedQ), platform, matched, probe.totalBytes)
     }
 
     fun estimateQuality(url: String, probe: CdnProbe.Info, durationMs: Long, requestedQ: AudioQuality): AudioQuality {

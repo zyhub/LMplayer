@@ -9,6 +9,11 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -20,6 +25,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PageSize
 import androidx.compose.foundation.pager.PagerDefaults
+import androidx.compose.foundation.pager.PagerSnapDistance
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,11 +41,19 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
@@ -49,6 +65,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -58,7 +75,6 @@ import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LyricTheme
-import com.lm.player.core.designsystem.theme.PlayerThemeStyle
 import com.lm.player.core.designsystem.theme.SystemFontManager
 import com.lm.player.core.media.AudioSharingManager
 import com.lm.player.core.media.PlaybackQueueManager
@@ -74,13 +90,14 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
- * 怀旧专辑 (iPod Cover Flow) 全屏播放界面主题
- * - 支持横屏下【左右拖动调节歌词与播放器展示区域】(歌词区域最大限制不超过 1/3，支持快速收起与无级拖动调节)；
- * - 纯物理线性连续 3D 动力学流 (20 预载池 + 16 核心展台 + 4 边缘透明冗余缓冲，彻底杜绝抽搐)；
- * - 下滑关闭手势支持 (顺畅退出全屏播放器)；
- * - 底部按键复用现代模式完整播放控制、进度条与 6 大功能栏（喜欢/队列/定时/投屏/参数/切回现代）。
+ * 怀旧专辑流 (iPod Cover Flow) —— 横屏时的全屏播放界面（竖屏统一用现代主题，不再提供主题切换）
+ * - 封面模糊氛围底图（切歌交叉淡化）+ 舞台聚光 / 光尘 + 3D 唱片架（smoothstep 缓动翻转、扫光、地面投影、倒影）；
+ * - 轻扫可连翻多张，停下柔和吸附；歌名 / 歌手顺着翻页方向滑入；
+ * - 播控行 [列表][定时] [上一首][播放][下一首] [播放模式]，细进度条按住加粗；
+ * - 右侧歌词 / 待播侧栏可拖动宽度（最大 1/3），点手柄收起 / 展开；下滑关闭。
  */
 @androidx.compose.foundation.ExperimentalFoundationApi
 @Composable
@@ -114,7 +131,10 @@ fun RetroCoverFlowPlayerView(
     onFontSizeChange: (Float) -> Unit = {},
     onOffsetChange: (Long) -> Unit = {},
     onThemeChange: (LyricTheme) -> Unit = {},
-    onSwitchPlayerTheme: (PlayerThemeStyle) -> Unit = {},
+    /** 点歌手名：跳转资料库歌手页 */
+    onOpenArtist: (String) -> Unit = {},
+    /** 点专辑名：跳转资料库专辑页（专辑名、歌手、专辑 ID） */
+    onOpenAlbum: (String, String, String) -> Unit = { _, _, _ -> },
     onLyricsUpdated: () -> Unit = {},
     onMetadataSaved: (com.lm.player.feature.library.TagSavedMetadata) -> Unit = {},
     onOpenSleepTimer: () -> Unit = {},
@@ -154,15 +174,15 @@ fun RetroCoverFlowPlayerView(
     var isDraggingSplitter by remember { mutableStateOf(false) }
 
     // 经典 iPod Cover Flow 物理动力学参数 (高线性弹簧阻尼，丝滑连贯如真实转轮)
+    // 程序切歌（外部切歌 / 点侧边封面 / 点待播）时的滑动：略带阻尼的柔和弹簧，多张跳转也不生硬
     val currentSpringSpec = remember {
-        spring<Float>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+        spring<Float>(dampingRatio = 0.88f, stiffness = 170f)
     }
+    // 手势：轻扫可以连翻多张（像真实唱片架），停下时柔和吸附
     val pagerFlingBehavior = PagerDefaults.flingBehavior(
         state = pagerState,
-        snapAnimationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessMediumLow
-        )
+        pagerSnapDistance = PagerSnapDistance.atMost(8),
+        snapAnimationSpec = spring(dampingRatio = 0.86f, stiffness = 190f)
     )
 
     // 用户在 Pager 滑动选歌标记，杜绝反向触发 animateScrollToPage 导致手势拉扯抽动
@@ -242,7 +262,21 @@ fun RetroCoverFlowPlayerView(
             runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
     }
     val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
-    val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
+    val isServerCached = song.isServerLibrarySong /* 与列表徽标同一口径（PR #7 合入时统一） */
+    // 音质标签（与现代主题同一套：未展开显示音质，点开显示音频参数）
+    val streamQualityVer by com.lm.player.core.network.LemonMusicProtocol.streamQualityConfigVersion.collectAsState()
+    val audioBadge = remember(
+        song.id,
+        song.localFilePath,
+        song.format,
+        song.bitRate,
+        song.durationMs,
+        song.downloadStatus,
+        totalDurationMs,
+        streamQualityVer
+    ) {
+        computeAudioBadgeInfo(context, song, totalDurationMs)
+    }
 
     // 向下滑动退出全屏播放器位移与弹性动画
     var dragOffsetY by remember { mutableFloatStateOf(0f) }
@@ -318,14 +352,6 @@ fun RetroCoverFlowPlayerView(
 
     val isPlayingState by com.lm.player.core.media.PlaybackQueueManager.isPlayingFlow.collectAsState()
     var frameTick by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isKaraokeEnabled, isPlayingState) {
-        if (isKaraokeEnabled && isPlayingState) {
-            while (true) {
-                withFrameMillis { frameTick = it }
-            }
-        }
-    }
-
     val activeLyricIdx = remember(cleanLyrics, effectiveTimeMs) {
         var low = 0
         var high = cleanLyrics.lastIndex
@@ -343,26 +369,21 @@ fun RetroCoverFlowPlayerView(
     }
     val lyricsListState = rememberLazyListState()
 
-    LaunchedEffect(activeLyricIdx) {
-        if (cleanLyrics.isNotEmpty() && activeLyricIdx in cleanLyrics.indices && !lyricsListState.isScrollInProgress) {
-            lyricsListState.animateScrollToItem(
-                index = (activeLyricIdx - 2).coerceAtLeast(0),
-                scrollOffset = 0
-            )
-        }
-    }
-
     // 系统状态栏 / 导航栏与怀旧播放页背景渐变的首尾色一致（离开播放页自动恢复应用底色）
     com.lm.player.core.designsystem.theme.SystemBarsColor(
         statusBar = if (isDark) Color(0xFF07080A) else Color(0xFFE2E0E6),
         navigationBar = if (isDark) Color(0xFF040507) else Color(0xFFDAD7DE)
     )
+    // 横屏播放页沉浸式：隐藏系统状态栏与导航栏，画面不再被一条纯色状态栏割开（从屏幕边缘滑动可临时呼出）
+    com.lm.player.core.designsystem.theme.ImmersiveSystemBars()
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .offset { IntOffset(0, animatedOffsetY.roundToInt().coerceAtLeast(0)) }
             .background(backdropBrush)
+            // 「词」歌词调节展开后，点外围任意位置收回（与竖屏一致）
+            .playerOutsideTapHost()
             .pointerInput(Unit) {
                 detectVerticalDragGestures(
                     onVerticalDrag = { _, dragAmount ->
@@ -382,555 +403,129 @@ fun RetroCoverFlowPlayerView(
                 )
             }
     ) {
-        if (isLandscape) {
-            // =========================================================================
-            // 横屏布局：支持左右拖拽调节比例 (左侧播放器 66.7%~100% + 中间调节手柄 + 右侧歌词 0%~33.3%)
-            // =========================================================================
-            val screenWidthPx = with(density) { screenWidth.dp.toPx() }
-            val effectiveLyricsRatio = landscapeLyricsRatio.coerceIn(0.0f, 0.333f)
-            val playerWeight = (1.0f - effectiveLyricsRatio).coerceIn(0.667f, 1.0f)
-            val isLyricsVisible = effectiveLyricsRatio > 0.04f
+        // =========================================================================
+        // 横屏专用：怀旧专辑流（Cover Flow）。竖屏统一走现代主题，这里不再有竖屏布局。
+        // 封面模糊氛围底图 + 舞台聚光 / 光尘 + 3D 唱片架（大封面）+ 歌名 + 液态玻璃小条（列表 / 进度 / 播放顺序）
+        // + 右侧歌词（与竖屏同一套 AMLL 歌词与「词」调节）/ 待播侧栏（可拖动宽度）
+        // =========================================================================
+        val screenWidthPx = with(density) { screenWidth.dp.toPx() }
+        val isCompactLandscape = screenHeight < 420
+        val isUltraCompactLandscape = screenHeight < 365
+        // 侧栏宽度：拖动时跟手，点击展开 / 收起时用弹簧过渡
+        val animatedLyricsRatio by animateFloatAsState(
+            targetValue = landscapeLyricsRatio.coerceIn(0.0f, 0.333f),
+            animationSpec = if (isDraggingSplitter) snap() else spring(dampingRatio = 0.86f, stiffness = 260f),
+            label = "retro_side_ratio"
+        )
+        val playerWeight = (1.0f - animatedLyricsRatio).coerceIn(0.667f, 1.0f)
+        val isSidePaneVisible = animatedLyricsRatio > 0.04f
+        // 进场：唱片架放大淡入，信息区 / 侧栏随后滑入
+        val enterAnim = remember { Animatable(0f) }
+        LaunchedEffect(Unit) {
+            enterAnim.animateTo(1f, tween(durationMillis = 760, easing = FastOutSlowInEasing))
+        }
+        val chipBg = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.06f)
 
-            Row(
+        // 液态玻璃：背景（封面模糊底图 + 聚光光尘）录成图层，玻璃小条与「词」按钮折射它
+        val retroGlassActive = com.lm.player.core.designsystem.glass.rememberLiquidGlassFull()
+        val retroCoverLayer = rememberLayerBackdrop()
+        val retroGlass: com.kyant.backdrop.Backdrop? = if (retroGlassActive) retroCoverLayer else null
+
+        // 1. 背景：当前封面的模糊大图（切歌交叉淡化）+ 舞台聚光、暗角与缓慢上浮的光尘（暂停时静止）
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .then(if (retroGlassActive) Modifier.layerBackdrop(retroCoverLayer) else Modifier)
+        ) {
+            Crossfade(
+                targetState = song.coverUrl to song.id,
+                animationSpec = tween(durationMillis = 900, easing = LinearOutSlowInEasing),
+                modifier = Modifier.fillMaxSize(),
+                label = "retro_ambient_cover"
+            ) { (cover, seed) ->
+                com.lm.player.core.designsystem.glass.CoverBackdrop(
+                    coverUrl = cover,
+                    seedId = seed,
+                    isDark = isDark,
+                    baseBottomColor = if (isDark) Color(0xFF040507) else Color(0xFFDAD7DE),
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            RetroAmbientLayer(
+                isPlaying = isPlaying,
+                isDark = isDark,
+                spotCenterX = playerWeight / 2f,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .systemBarsPadding()
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // ===================== 左：唱片架 + 歌名 + 玻璃小条 =====================
+            Column(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .systemBarsPadding()
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .weight(playerWeight)
+                    .fillMaxHeight(),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 左侧播放器区 (自适应占比 66.7% ~ 100%，高度自适应手机/平板横屏)
-                val isCompactLandscape = screenHeight < 420
-                val isUltraCompactLandscape = screenHeight < 365
-
-                Column(
+                // ---- 3D 唱片架（占满剩余高度，封面尽量大；左上角叠一个收起按钮） ----
+                BoxWithConstraints(
                     modifier = Modifier
-                        .weight(playerWeight)
-                        .fillMaxHeight(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    // 1. 顶部 Header (提升 zIndex 彻底避免被 3D 卡片遮挡)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .zIndex(150f)
-                            .padding(horizontal = 12.dp, vertical = if (isCompactLandscape) 0.dp else 2.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(if (isCompactLandscape) 30.dp else 36.dp)
-                                .clip(CircleShape)
-                                .background(if (isDark) Color(0x44FFFFFF) else Color(0x33000000))
-                                .clickable(onClick = onDismiss),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                Icons.Default.KeyboardArrowDown,
-                                contentDescription = "最小化",
-                                tint = primaryTextColor,
-                                modifier = Modifier.size(if (isCompactLandscape) 20.dp else 22.dp)
-                            )
-                        }
-                    }
-
-                    // 2. 3D Cover Flow 展台 (使用 weight(1f) + BoxWithConstraints 动态测算剩余高度，彻底消除手机横屏底部遮挡)
-                    BoxWithConstraints(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        val reflectionRatio = if (isCompactLandscape) 0.18f else 0.25f
-                        val cardSizeDp = ((maxHeight.value - 4f) / (1f + reflectionRatio))
-                            .coerceIn(88f, 245f)
-                            .dp
-                        val reflectionHeightDp = cardSizeDp * reflectionRatio
-                        val horizontalPaddingDp = ((maxWidth.value - cardSizeDp.value) / 2f).coerceAtLeast(0f).dp
-                        val beyondBoundsCount = 5
-                        val cardSizePx = with(density) { cardSizeDp.toPx() }
-                        HorizontalPager(
-                            state = pagerState,
-                            contentPadding = PaddingValues(horizontal = horizontalPaddingDp),
-                            pageSize = PageSize.Fixed(cardSizeDp),
-                            pageSpacing = 0.dp,
-                            beyondBoundsPageCount = beyondBoundsCount,
-                            flingBehavior = pagerFlingBehavior,
-                            key = { currentPlaylist.getOrNull(it)?.id ?: it.toString() },
-                            modifier = Modifier.fillMaxSize()
-                        ) { index ->
-                            val targetSong = currentPlaylist.getOrNull(index) ?: song
-                            val zIndexVal = (1000 - abs(pagerState.currentPage - index)).toFloat()
-                            val isCenter = pagerState.currentPage == index
-
-                            Column(
-                                modifier = Modifier
-                                    .width(cardSizeDp)
-                                    .zIndex(zIndexVal)
-                                    .graphicsLayer {
-                                        val pageOffset = (pagerState.currentPage - index) + pagerState.currentPageOffsetFraction
-                                        val absOffset = abs(pageOffset)
-                                        val sign = if (pageOffset > 0) 1f else -1f
-
-                                        // -------------------------------------------------------------
-                                        // 经典 iPod 专辑流连续线性过渡动力学 (黄金比例展开与平滑景深)
-                                        // -------------------------------------------------------------
-                                        // A. 绝对线性 3D 旋转翻折角 (在 [-1, 1] 内严格线性过渡，超出后严格恒定 62°)
-                                        val rotationYVal = (pageOffset * 62f).coerceIn(-62f, 62f)
-
-                                        // B. 线性分段位移 (中心 0.52W 展开，侧翼 0.22W 堆叠间隔)
-                                        val offsetCenter = 0.52f
-                                        val sideSpace = 0.22f
-                                        val visualDistFactor = (Math.min(absOffset, 1.0f) * offsetCenter + Math.max(0.0f, absOffset - 1.0f) * sideSpace)
-                                        val targetVisualX = -sign * visualDistFactor * cardSizePx
-
-                                        val naturalX = -pageOffset * cardSizePx
-                                        val translationXVal = targetVisualX - naturalX
-
-                                        // C. 线性外凸景深缩放
-                                        val scaleVal = (1.0f - Math.min(absOffset, 1.0f) * 0.16f - Math.max(0.0f, absOffset - 1.0f) * 0.015f).coerceIn(0.70f, 1.0f)
-
-                                        // D. 边缘平滑渐隐包络 (在 2.8 到 4.2 之间优雅平滑渐变至 0，绝不在视窗边缘突变抽搐)
-                                        val alphaVal = when {
-                                            absOffset <= 2.8f -> 1.0f
-                                            absOffset <= 4.2f -> ((4.2f - absOffset) / 1.4f).coerceIn(0f, 1.0f)
-                                            else -> 0f
-                                        }
-
-                                        this.translationX = translationXVal
-                                        this.rotationY = rotationYVal
-                                        this.scaleX = scaleVal
-                                        this.scaleY = scaleVal
-                                        this.alpha = alphaVal
-                                        this.transformOrigin = TransformOrigin(0.5f, 0.5f)
-                                        this.cameraDistance = 24f * density.density
-                                    },
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = Color(0xFF14161C),
-                                    shadowElevation = 14.dp,
-                                    border = BorderStroke(
-                                        width = 1.dp,
-                                        color = Color.White.copy(alpha = 0.25f)
-                                    ),
-                                    modifier = Modifier
-                                        .size(cardSizeDp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable {
-                                            if (pagerState.currentPage != index) {
-                                                coroutineScope.launch {
-                                                    pagerState.animateScrollToPage(
-                                                        index,
-                                                        animationSpec = currentSpringSpec
-                                                    )
-                                                }
-                                            } else {
-                                                showPlayOverlay = true
-                                                lastInteractionTime = System.currentTimeMillis()
-                                                onTogglePlayPause()
-                                            }
-                                        }
-                                ) {
-                                    Box(modifier = Modifier.fillMaxSize()) {
-                                        AlbumArtworkImage(
-                                            model = targetSong.coverUrl,
-                                            seedId = targetSong.id,
-                                            targetSize = 360,
-                                            modifier = Modifier.fillMaxSize(),
-                                            cornerRadius = 12.dp
-                                        )
-
-                                        // 中心活跃卡片毛玻璃高透播放/暂停图标 (静止时展示，滑动中隐藏避免闪现)
-                                        if (isCenter && !pagerState.isScrollInProgress) {
-                                            androidx.compose.animation.AnimatedVisibility(
-                                                visible = showPlayOverlay,
-                                                enter = fadeIn(animationSpec = tween(200)) + scaleIn(initialScale = 0.8f),
-                                                exit = fadeOut(animationSpec = tween(300)) + scaleOut(targetScale = 0.8f),
-                                                modifier = Modifier.align(Alignment.Center)
-                                            ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .size(if (isCompactLandscape) 44.dp else 54.dp)
-                                                        .clip(CircleShape)
-                                                        .background(Color.Black.copy(alpha = 0.45f))
-                                                        .border(
-                                                            width = 1.2.dp,
-                                                            brush = Brush.linearGradient(
-                                                                colors = listOf(
-                                                                    Color.White.copy(alpha = 0.65f),
-                                                                    Color.White.copy(alpha = 0.20f)
-                                                                )
-                                                            ),
-                                                            shape = CircleShape
-                                                        )
-                                                        .clickable {
-                                                            showPlayOverlay = true
-                                                            lastInteractionTime = System.currentTimeMillis()
-                                                            onTogglePlayPause()
-                                                        },
-                                                    contentAlignment = Alignment.Center
-                                                ) {
-                                                    Icon(
-                                                        imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                                        contentDescription = if (isPlaying) "暂停" else "播放",
-                                                        tint = Color.White,
-                                                        modifier = Modifier.size(if (isCompactLandscape) 24.dp else 28.dp)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 倒影
-                                Box(
-                                    modifier = Modifier
-                                        .width(cardSizeDp)
-                                        .height(reflectionHeightDp)
-                                        .graphicsLayer {
-                                            scaleY = -1f
-                                            this.alpha = 0.35f
-                                        }
-                                        .drawWithContent {
-                                            drawContent()
-                                            drawRect(brush = reflectionGradient)
-                                        }
-                                        .clip(RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
-                                ) {
-                                    AlbumArtworkImage(
-                                        model = targetSong.coverUrl,
-                                        seedId = targetSong.id,
-                                        modifier = Modifier.fillMaxSize(),
-                                        cornerRadius = 8.dp
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // 3. 歌曲标题与歌手
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = song.title,
-                            style = TextStyle(
-                                fontSize = if (isUltraCompactLandscape) 14.sp else if (isCompactLandscape) 15.sp else 16.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = primaryTextColor
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Spacer(modifier = Modifier.height(if (isCompactLandscape) 1.dp else 2.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选集"}",
-                                style = TextStyle(fontSize = if (isCompactLandscape) 11.sp else 12.sp, color = secondaryTextColor),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Surface(shape = RoundedCornerShape(4.dp), color = AppleRed.copy(alpha = 0.15f)) {
-                                Text(
-                                    text = "${song.format.uppercase()} ${song.bitRate}k",
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = AppleRed,
-                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                )
-                            }
-                        }
-                    }
-
-                    // 4. 精简底栏 (无遮挡，随机/循环按键精巧布局)
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        val progressRatio = if (totalDurationMs > 0) (progressMs.toFloat() / totalDurationMs).coerceIn(0f, 1f) else 0f
-                        Slider(
-                            value = progressRatio,
-                            onValueChange = { ratio -> onSeekTo((ratio * totalDurationMs).toLong()) },
-                            colors = SliderDefaults.colors(
-                                thumbColor = primaryTextColor,
-                                activeTrackColor = primaryTextColor,
-                                inactiveTrackColor = primaryTextColor.copy(alpha = 0.2f)
-                            ),
-                            modifier = Modifier.fillMaxWidth().height(14.dp)
-                        )
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(text = formatDuration(progressMs), fontSize = 11.sp, color = secondaryTextColor)
-                            Text(text = formatDuration(totalDurationMs), fontSize = 11.sp, color = secondaryTextColor)
-                        }
-
-                        Spacer(modifier = Modifier.height(2.dp))
-
-                        // 底栏工具条
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            // 播放列表胶囊（原「随机」位置），打开待播列表弹层
-                            com.lm.player.feature.player.controls.QueueChip(
-                                onClick = { showQueueSheet = true },
-                                isDark = isDark,
-                                secondaryTextColor = secondaryTextColor,
-                                isActive = showQueueSheet
-                            )
-
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Box {
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = if (activeTimerMinutes > 0) AppleRed.copy(alpha = 0.18f) else if (isDark) Color(0x22FFFFFF) else Color(0x15000000),
-                                        border = BorderStroke(0.6.dp, if (activeTimerMinutes > 0) AppleRed.copy(alpha = 0.6f) else Color.Transparent),
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .clickable { showSleepTimerMenu = true }
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(
-                                                Icons.Default.Timer,
-                                                contentDescription = null,
-                                                tint = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor,
-                                                modifier = Modifier.size(13.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(3.dp))
-                                            Text(
-                                                text = if (activeTimerMinutes > 0) "${activeTimerMinutes}分" else "定时",
-                                                fontSize = 11.sp,
-                                                fontWeight = if (activeTimerMinutes > 0) FontWeight.Bold else FontWeight.Normal,
-                                                color = if (activeTimerMinutes > 0) AppleRed else secondaryTextColor
-                                            )
-                                        }
-                                    }
-                                    SleepTimerDropdownMenu(
-                                        expanded = showSleepTimerMenu,
-                                        onDismissRequest = { showSleepTimerMenu = false },
-                                        activeTimerMinutes = activeTimerMinutes,
-                                        onSelectTimer = onSelectTimer
-                                    )
-                                }
-
-                                Box {
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = if (isDark) Color(0x22FFFFFF) else Color(0x15000000),
-                                        border = BorderStroke(0.6.dp, Color.Transparent),
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .clickable { showAudioSpecsMenu = true }
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(Icons.Outlined.Info, contentDescription = null, tint = secondaryTextColor, modifier = Modifier.size(13.dp))
-                                            Spacer(modifier = Modifier.width(3.dp))
-                                            Text("参数", fontSize = 11.sp, color = secondaryTextColor)
-                                        }
-                                    }
-                                    AudioSpecsDropdownMenu(
-                                        expanded = showAudioSpecsMenu,
-                                        onDismissRequest = { showAudioSpecsMenu = false },
-                                        song = song
-                                    )
-                                }
-                            }
-
-                            // 三态播放模式胶囊（原「循环」位置）
-                            com.lm.player.feature.player.controls.PlayModeChip(
-                                mode = playMode,
-                                onClick = onCyclePlayMode,
-                                isDark = isDark,
-                                secondaryTextColor = secondaryTextColor
-                            )
-                        }
-                    }
-                }
-
-                // 中间：可左右拖动手柄 (歌词区域最大限制不超过 1/3 屏幕)
-                Box(
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .width(18.dp)
-                        .pointerInput(Unit) {
-                            detectHorizontalDragGestures(
-                                onDragStart = { isDraggingSplitter = true },
-                                onDragEnd = { isDraggingSplitter = false },
-                                onDragCancel = { isDraggingSplitter = false },
-                                onHorizontalDrag = { _, dragAmount ->
-                                    // 向左拖动增加歌词宽度 (delta 为负)，向右拖动缩小歌词宽度
-                                    val deltaRatio = -dragAmount / screenWidthPx
-                                    val newRatio = (landscapeLyricsRatio + deltaRatio).coerceIn(0.0f, 0.333f)
-                                    landscapeLyricsRatio = newRatio
-                                    lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", newRatio).apply()
-                                }
-                            )
-                        }
-                        .clickable {
-                            val newRatio = if (landscapeLyricsRatio > 0.05f) 0.0f else 0.333f
-                            landscapeLyricsRatio = newRatio
-                            lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", newRatio).apply()
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .graphicsLayer {
+                            val p = enterAnim.value
+                            alpha = p
+                            val s = 0.86f + 0.14f * p
+                            scaleX = s
+                            scaleY = s
                         },
                     contentAlignment = Alignment.Center
                 ) {
+                    val reflectionRatio = if (isCompactLandscape) 0.12f else 0.16f
+                    val cardSizeDp = ((maxHeight.value - 4f) / (1f + reflectionRatio))
+                        .coerceAtMost(maxWidth.value * 0.52f)
+                        .coerceIn(96f, 320f)
+                        .dp
+                    val reflectionHeightDp = cardSizeDp * reflectionRatio
+                    val horizontalPaddingDp = ((maxWidth.value - cardSizeDp.value) / 2f).coerceAtLeast(0f).dp
+                    val cardSizePx = with(density) { cardSizeDp.toPx() }
+                    val floorShadow = if (isDark) Color.Black.copy(alpha = 0.55f) else Color.Black.copy(alpha = 0.16f)
+
+                    // 唱片架地面：中心封面脚下的椭圆投影，倒影落在上面像一块亮面地板
                     Box(
                         modifier = Modifier
-                            .width(1.dp)
-                            .fillMaxHeight(0.65f)
-                            .background(if (isDraggingSplitter) AppleRed else if (isDark) Color(0x33FFFFFF) else Color(0x22000000))
-                    )
-                    Surface(
-                        shape = RoundedCornerShape(2.dp),
-                        color = if (isDraggingSplitter) AppleRed else if (isDark) Color(0x88FFFFFF) else Color(0x66000000),
-                        shadowElevation = if (isDraggingSplitter) 4.dp else 0.dp,
-                        modifier = Modifier
-                            .width(if (isDraggingSplitter) 5.dp else 4.dp)
-                            .height(if (isDraggingSplitter) 44.dp else 36.dp)
-                    ) {}
-                }
-
-                // 右侧：歌词区 (自适应占比 0% ~ 33.3%)
-                if (isLyricsVisible) {
-                    Column(
-                        modifier = Modifier
-                            .weight(effectiveLyricsRatio)
-                            .fillMaxHeight(),
-                        verticalArrangement = Arrangement.Top
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("实时歌词", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = primaryTextColor)
-
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (isDark) Color(0x28FFFFFF) else Color(0x18000000),
-                                modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { showLyricsAdjustDialog = true }
-                            ) {
-                                Row(modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Tune, contentDescription = null, tint = AppleRed, modifier = Modifier.size(11.dp))
-                                    Spacer(modifier = Modifier.width(3.dp))
-                                    Text("调节", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = AppleRed)
-                                }
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        if (cleanLyrics.isEmpty()) {
-                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Text("♪ 纯音乐 / 暂无歌词 ♪", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight)
-                            }
-                        } else {
-                            LazyColumn(
-                                state = lyricsListState,
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(vertical = 16.dp),
-                                verticalArrangement = Arrangement.spacedBy((fontSizeSp * 0.75f).dp)
-                            ) {
-                                itemsIndexed(cleanLyrics, key = { index, item -> "${item.timestampMs}_$index" }) { index, item ->
-                                    val isActive = index == activeLyricIdx
-                                    RetroKaraokeLyricRow(
-                                        item = item,
-                                        index = index,
-                                        cleanLyrics = cleanLyrics,
-                                        isActive = isActive,
-                                        isKaraokeEnabled = isKaraokeEnabled,
-                                        effectiveTimeMs = effectiveTimeMs,
-                                        lastTickPos = lastTickPos,
-                                        lastTickUptime = lastTickUptime,
-                                        frameTick = frameTick,
-                                        fontSizeSp = fontSizeSp,
-                                        lyricFontFamily = lyricFontFamily,
-                                        activeColor = activeColor,
-                                        inactiveColor = inactiveColor,
-                                        karaokeBaseColor = karaokeBaseColor,
-                                        karaokeOverlayColor = karaokeOverlayColor,
-                                        lyricsOffsetMs = lyricsOffsetMs,
-                                        textAlign = TextAlign.Start,
-                                        alignment = Alignment.CenterStart,
-                                        onSeekTo = onSeekTo
+                            .matchParentSize()
+                            .drawBehind {
+                                val cardTop = (size.height - cardSizePx * (1f + reflectionRatio)) / 2f
+                                val floorY = cardTop + cardSizePx
+                                val r = cardSizePx * 0.95f
+                                val cx = size.width / 2f
+                                withTransform({ scale(1f, 0.16f, Offset(cx, floorY)) }) {
+                                    drawCircle(
+                                        brush = Brush.radialGradient(
+                                            colors = listOf(floorShadow, Color.Transparent),
+                                            center = Offset(cx, floorY),
+                                            radius = r
+                                        ),
+                                        radius = r,
+                                        center = Offset(cx, floorY)
                                     )
                                 }
                             }
-                        }
-                    }
-                } else {
-                    // 当歌词折叠时，右侧提供优雅的展开恢复小胶囊
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = if (isDark) Color(0x28FFFFFF) else Color(0x18000000),
-                        border = BorderStroke(0.6.dp, if (isDark) Color(0x33FFFFFF) else Color(0x22000000)),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable {
-                                landscapeLyricsRatio = 0.333f
-                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
-                            }
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(Icons.Default.Lyrics, contentDescription = "展开歌词", tint = AppleRed, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text("歌\n词", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = primaryTextColor, lineHeight = 12.sp)
-                        }
-                    }
-                }
-            }
-        } else {
-            // =========================================================================
-            // 竖屏布局：上半部大号 3D Cover Flow (【9 首歌曲】展台) + 下半部歌词 + 底部控制器
-            // =========================================================================
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .systemBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 6.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                // 1. 顶部 Header (仅保留返回按钮，顶栏留白沉浸)
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.size(34.dp).clip(CircleShape).background(if (isDark) Color(0x33FFFFFF) else Color(0x22000000))
-                    ) {
-                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "最小化", tint = primaryTextColor, modifier = Modifier.size(20.dp))
-                    }
-                }
+                    )
 
-                // 2. 竖屏大号 3D Cover Flow 舞台
-                val cardSizeDp = 240.dp
-                val reflectionHeightDp = cardSizeDp * 0.32f
-                val stageHeightDp = cardSizeDp + reflectionHeightDp + 6.dp
-                val horizontalPaddingDp = ((screenWidth - cardSizeDp.value) / 2).dp
-
-                Box(
-                    modifier = Modifier.fillMaxWidth().height(stageHeightDp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    val beyondBoundsCount = 5
-                    val cardSizePx = with(density) { cardSizeDp.toPx() }
                     HorizontalPager(
                         state = pagerState,
                         contentPadding = PaddingValues(horizontal = horizontalPaddingDp),
                         pageSize = PageSize.Fixed(cardSizeDp),
                         pageSpacing = 0.dp,
-                        beyondBoundsPageCount = beyondBoundsCount,
+                        beyondViewportPageCount = 5,
                         flingBehavior = pagerFlingBehavior,
                         key = { currentPlaylist.getOrNull(it)?.id ?: it.toString() },
                         modifier = Modifier.fillMaxSize()
@@ -938,6 +533,13 @@ fun RetroCoverFlowPlayerView(
                         val targetSong = currentPlaylist.getOrNull(index) ?: song
                         val zIndexVal = (1000 - abs(pagerState.currentPage - index)).toFloat()
                         val isCenter = pagerState.currentPage == index
+                        val cardInteraction = remember { MutableInteractionSource() }
+                        val cardPressed by cardInteraction.collectIsPressedAsState()
+                        val pressScale by animateFloatAsState(
+                            targetValue = if (cardPressed && isCenter) 0.965f else 1f,
+                            animationSpec = spring(dampingRatio = 0.6f, stiffness = 700f),
+                            label = "retro_card_press"
+                        )
 
                         Column(
                             modifier = Modifier
@@ -947,39 +549,27 @@ fun RetroCoverFlowPlayerView(
                                     val pageOffset = (pagerState.currentPage - index) + pagerState.currentPageOffsetFraction
                                     val absOffset = abs(pageOffset)
                                     val sign = if (pageOffset > 0) 1f else -1f
-
-                                    // -------------------------------------------------------------
-                                    // 竖屏经典 iPod 专辑流连续线性过渡动力学 (黄金比例展开与平滑景深)
-                                    // -------------------------------------------------------------
-                                    // A. 绝对线性 3D 旋转翻折角 (在 [-1, 1] 内严格线性过渡，超出后严格恒定 60°)
-                                    val rotationYVal = (pageOffset * 60f).coerceIn(-60f, 60f)
-
-                                    // B. 线性分段位移 (中心 0.55W 展开，侧翼 0.22W 堆叠间隔)
-                                    val offsetCenter = 0.55f
-                                    val sideSpace = 0.22f
-                                    val visualDistFactor = (Math.min(absOffset, 1.0f) * offsetCenter + Math.max(0.0f, absOffset - 1.0f) * sideSpace)
-                                    val targetVisualX = -sign * visualDistFactor * cardSizePx
-
+                                    // 中心一格内用 smoothstep 缓动：离开 / 回到中心时先慢后快再慢，翻转更像真实唱片架
+                                    val near = absOffset.coerceAtMost(1f)
+                                    val eased = near * near * (3f - 2f * near)
+                                    val far = (absOffset - 1f).coerceAtLeast(0f)
+                                    // 中心两侧先展开 0.54 张，再往外每张叠 0.21 张
+                                    val visualDist = eased * 0.54f + far * 0.21f
+                                    val targetVisualX = -sign * visualDist * cardSizePx
                                     val naturalX = -pageOffset * cardSizePx
-                                    val translationXVal = targetVisualX - naturalX
-
-                                    // C. 线性外凸景深缩放
-                                    val scaleVal = (1.0f - Math.min(absOffset, 1.0f) * 0.16f - Math.max(0.0f, absOffset - 1.0f) * 0.018f).coerceIn(0.72f, 1.0f)
-
-                                    // D. 边缘平滑渐隐包络 (在 2.8 到 4.2 之间优雅平滑渐变至 0，绝不在视窗边缘突变抽搐)
-                                    val alphaVal = when {
-                                        absOffset <= 2.8f -> 1.0f
-                                        absOffset <= 4.2f -> ((4.2f - absOffset) / 1.4f).coerceIn(0f, 1.0f)
+                                    translationX = targetVisualX - naturalX
+                                    rotationY = sign * eased * 60f
+                                    val s = (1f - eased * 0.15f - far * 0.018f).coerceIn(0.70f, 1f) * pressScale
+                                    scaleX = s
+                                    scaleY = s
+                                    // 边缘 2.8～4.2 张之间平滑渐隐，不在视窗边缘突变
+                                    alpha = when {
+                                        absOffset <= 2.8f -> 1f
+                                        absOffset <= 4.2f -> ((4.2f - absOffset) / 1.4f).coerceIn(0f, 1f)
                                         else -> 0f
                                     }
-
-                                    this.translationX = translationXVal
-                                    this.rotationY = rotationYVal
-                                    this.scaleX = scaleVal
-                                    this.scaleY = scaleVal
-                                    this.alpha = alphaVal
-                                    this.transformOrigin = TransformOrigin(0.5f, 0.5f)
-                                    this.cameraDistance = 24f * density.density
+                                    transformOrigin = TransformOrigin(0.5f, 0.5f)
+                                    cameraDistance = 24f * density.density
                                 },
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
@@ -987,20 +577,14 @@ fun RetroCoverFlowPlayerView(
                                 shape = RoundedCornerShape(12.dp),
                                 color = Color(0xFF14161C),
                                 shadowElevation = 14.dp,
-                                border = BorderStroke(
-                                    width = 1.dp,
-                                    color = Color.White.copy(alpha = 0.25f)
-                                ),
+                                border = BorderStroke(width = 1.dp, color = Color.White.copy(alpha = 0.22f)),
                                 modifier = Modifier
                                     .size(cardSizeDp)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
+                                    .clickable(interactionSource = cardInteraction, indication = null) {
                                         if (pagerState.currentPage != index) {
                                             coroutineScope.launch {
-                                                pagerState.animateScrollToPage(
-                                                    index,
-                                                    animationSpec = currentSpringSpec
-                                                )
+                                                pagerState.animateScrollToPage(index, animationSpec = currentSpringSpec)
                                             }
                                         } else {
                                             showPlayOverlay = true
@@ -1013,12 +597,32 @@ fun RetroCoverFlowPlayerView(
                                     AlbumArtworkImage(
                                         model = targetSong.coverUrl,
                                         seedId = targetSong.id,
-                                        targetSize = 360,
+                                        targetSize = 512,
                                         modifier = Modifier.fillMaxSize(),
                                         cornerRadius = 12.dp
                                     )
+                                    // 侧边封面随距离压暗；转动时一道高光从封面上扫过
+                                    Box(
+                                        modifier = Modifier
+                                            .matchParentSize()
+                                            .drawBehind {
+                                                val signed = (pagerState.currentPage - index) + pagerState.currentPageOffsetFraction
+                                                val off = abs(signed)
+                                                val dim = (off.coerceAtMost(1f) * 0.36f + (off - 1f).coerceAtLeast(0f) * 0.10f)
+                                                    .coerceAtMost(0.60f)
+                                                if (dim > 0.005f) drawRect(Color.Black.copy(alpha = dim))
+                                                val shift = signed.coerceIn(-1.5f, 1.5f) * size.width * 0.7f
+                                                drawRect(
+                                                    brush = Brush.linearGradient(
+                                                        colors = listOf(Color.White.copy(alpha = 0.20f), Color.Transparent),
+                                                        start = Offset(shift - size.width * 0.1f, 0f),
+                                                        end = Offset(shift + size.width * 0.55f, size.height * 0.6f)
+                                                    )
+                                                )
+                                            }
+                                    )
 
-                                    // 中心活跃卡片毛玻璃高透播放/暂停图标 (静止时展示，滑动中隐藏避免闪现)
+                                    // 中心封面：播放 / 暂停浮标（点封面后显示，2 秒后淡出；滑动中隐藏）
                                     if (isCenter && !pagerState.isScrollInProgress) {
                                         androidx.compose.animation.AnimatedVisibility(
                                             visible = showPlayOverlay,
@@ -1028,31 +632,31 @@ fun RetroCoverFlowPlayerView(
                                         ) {
                                             Box(
                                                 modifier = Modifier
-                                                    .size(56.dp)
+                                                    .size(if (isCompactLandscape) 48.dp else 58.dp)
                                                     .clip(CircleShape)
                                                     .background(Color.Black.copy(alpha = 0.45f))
-                                                .border(
-                                                    width = 1.2.dp,
-                                                    brush = Brush.linearGradient(
-                                                        colors = listOf(
-                                                            Color.White.copy(alpha = 0.65f),
-                                                            Color.White.copy(alpha = 0.20f)
-                                                        )
-                                                    ),
-                                                    shape = CircleShape
-                                                )
-                                                .clickable {
-                                                    showPlayOverlay = true
-                                                    lastInteractionTime = System.currentTimeMillis()
-                                                    onTogglePlayPause()
-                                                },
+                                                    .border(
+                                                        width = 1.2.dp,
+                                                        brush = Brush.linearGradient(
+                                                            colors = listOf(
+                                                                Color.White.copy(alpha = 0.65f),
+                                                                Color.White.copy(alpha = 0.20f)
+                                                            )
+                                                        ),
+                                                        shape = CircleShape
+                                                    )
+                                                    .clickable {
+                                                        showPlayOverlay = true
+                                                        lastInteractionTime = System.currentTimeMillis()
+                                                        onTogglePlayPause()
+                                                    },
                                                 contentAlignment = Alignment.Center
                                             ) {
                                                 Icon(
                                                     imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                                                     contentDescription = if (isPlaying) "暂停" else "播放",
                                                     tint = Color.White,
-                                                    modifier = Modifier.size(30.dp)
+                                                    modifier = Modifier.size(if (isCompactLandscape) 26.dp else 30.dp)
                                                 )
                                             }
                                         }
@@ -1073,405 +677,446 @@ fun RetroCoverFlowPlayerView(
                                         drawContent()
                                         drawRect(brush = reflectionGradient)
                                     }
-                                    .clip(RoundedCornerShape(bottomStart = 10.dp, bottomEnd = 10.dp))
+                                    .clip(RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
                             ) {
                                 AlbumArtworkImage(
                                     model = targetSong.coverUrl,
                                     seedId = targetSong.id,
                                     modifier = Modifier.fillMaxSize(),
-                                    cornerRadius = 10.dp
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // 3. 歌曲标题与歌手 + 加入歌单与下载功能键 (复用现代模式)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = song.title,
-                            style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Bold, color = primaryTextColor),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "${song.artist} — ${if (song.album.isNotBlank()) song.album else "精选集"}",
-                                style = TextStyle(fontSize = 12.sp, color = secondaryTextColor),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Surface(shape = RoundedCornerShape(4.dp), color = AppleRed.copy(alpha = 0.15f)) {
-                                Text(
-                                    text = "${song.format.uppercase()} ${song.bitRate}k",
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = AppleRed,
-                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                    cornerRadius = 8.dp
                                 )
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.width(10.dp))
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        // 在线修标签（PR #5，仅柠檬服务器曲库歌曲）：放在「加入歌单」左边
-                        if (song.isLemonServerSong) {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(circleButtonBg)
-                                    .clickable { showTagEditor = true },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Edit,
-                                    contentDescription = "在线修标签",
-                                    tint = primaryTextColor,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        }
-
-                        // 加入歌单按钮
-                        Box {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(circleButtonBg)
-                                    .clickable { showAddToPlaylistMenu = true },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
-                                    contentDescription = "加入歌单",
-                                    tint = primaryTextColor,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                            AddToPlaylistDropdownMenu(
-                                expanded = showAddToPlaylistMenu,
-                                onDismissRequest = { showAddToPlaylistMenu = false },
-                                song = song,
-                                playlists = allPlaylists,
-                                isServerConnected = isServerConnected,
-                                onSelectPlaylist = { pl, s ->
-                                    onAddToPlaylist(pl, s)
-                                    Toast.makeText(context, "已添加至歌单: ${pl.name}", Toast.LENGTH_SHORT).show()
-                                },
-                                onCreatePlaylistAndAdd = { name, s ->
-                                    onCreatePlaylistAndAddSong(name, s)
-                                    Toast.makeText(context, "已创建歌单 \"$name\" 并添加歌曲", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                        }
-
-                        // 下载按钮
-                        Box {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(circleButtonBg)
-                                    .clickable { showDownloadMenu = true },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (isDownloaded && isServerCached) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = "双端已同步",
-                                        tint = Color(0xFF34C759),
-                                        modifier = Modifier.size(19.dp)
-                                    )
-                                } else if (isDownloaded || isServerCached) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircleOutline,
-                                        contentDescription = "单端已缓存",
-                                        tint = Color(0xFF34C759),
-                                        modifier = Modifier.size(19.dp)
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = Icons.Default.FileDownload,
-                                        contentDescription = "下载",
-                                        tint = primaryTextColor,
-                                        modifier = Modifier.size(19.dp)
-                                    )
-                                }
-                            }
-
-                            DownloadQualityDropdownMenu(
-                                expanded = showDownloadMenu,
-                                onDismissRequest = { showDownloadMenu = false },
-                                song = song,
-                                isServerConnected = isServerConnected,
-                                hasLocal = hasPhysicalLocal,
-                                hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
-                                onConfirm = { target, quality ->
-                                    showDownloadMenu = false
-                                    onDownloadSongWithOptions(song, target, quality)
-                                }
-                            )
-                        }
-                    }
-                }
-
-                // 4. 竖屏无背景纯净滚动歌词
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .padding(vertical = 4.dp)
-                ) {
-                    if (cleanLyrics.isEmpty()) {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("♪ 纯音乐 / 暂无歌词 ♪", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight)
-                        }
-                    } else {
-                        LazyColumn(
-                            state = lyricsListState,
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(vertical = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy((fontSizeSp * 0.72f).dp)
-                        ) {
-                            itemsIndexed(cleanLyrics, key = { index, item -> "${item.timestampMs}_$index" }) { index, item ->
-                                val isActive = index == activeLyricIdx
-                                RetroKaraokeLyricRow(
-                                    item = item,
-                                    index = index,
-                                    cleanLyrics = cleanLyrics,
-                                    isActive = isActive,
-                                    isKaraokeEnabled = isKaraokeEnabled,
-                                    effectiveTimeMs = effectiveTimeMs,
-                                    lastTickPos = lastTickPos,
-                                    lastTickUptime = lastTickUptime,
-                                    frameTick = frameTick,
-                                    fontSizeSp = fontSizeSp,
-                                    lyricFontFamily = lyricFontFamily,
-                                    activeColor = activeColor,
-                                    inactiveColor = inactiveColor,
-                                    karaokeBaseColor = karaokeBaseColor,
-                                    karaokeOverlayColor = karaokeOverlayColor,
-                                    lyricsOffsetMs = lyricsOffsetMs,
-                                    textAlign = TextAlign.Center,
-                                    alignment = Alignment.Center,
-                                    onSeekTo = onSeekTo
-                                )
-                            }
-                        }
-                    }
-
-                    // 歌词调节悬浮小徽标
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (isDark) Color(0xFF22242C).copy(alpha = 0.85f) else Color(0xFFE5E5EA).copy(alpha = 0.85f),
-                        border = BorderStroke(0.6.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.1f)),
+                    // 收起（叠在唱片架左上角，不再单独占一行）
+                    RetroCircleButton(
+                        icon = Icons.Default.KeyboardArrowDown,
+                        description = "最小化",
+                        size = if (isCompactLandscape) 30.dp else 34.dp,
+                        background = chipBg,
+                        tint = primaryTextColor,
+                        iconSize = 22.dp,
                         modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 4.dp, end = 6.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable { showLyricsAdjustDialog = true }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.Tune, contentDescription = null, tint = AppleRed, modifier = Modifier.size(11.dp))
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text("歌词微调", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = AppleRed)
-                        }
-                    }
+                            .align(Alignment.TopStart)
+                            .zIndex(2000f),
+                        onClick = onDismiss
+                    )
                 }
 
-                // 5. 底部播放控制与进度条 (完全复用现代模式 3 层布局与功能)
+                // ---- 歌名 / 歌手 — 专辑 + 音质标签（进场时从下方滑入） ----
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 4.dp)
+                        .padding(top = 2.dp)
+                        .graphicsLayer {
+                            val p = enterAnim.value
+                            alpha = p
+                            translationY = (1f - p) * 26.dp.toPx()
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // 第一层: 进度条与播放时间
-                    val progressRatio = if (totalDurationMs > 0) (progressMs.toFloat() / totalDurationMs).coerceIn(0f, 1f) else 0f
-                    Slider(
-                        value = progressRatio,
-                        onValueChange = { ratio -> onSeekTo((ratio * totalDurationMs).toLong()) },
-                        colors = SliderDefaults.colors(
-                            thumbColor = primaryTextColor,
-                            activeTrackColor = primaryTextColor,
-                            inactiveTrackColor = primaryTextColor.copy(alpha = 0.2f)
-                        ),
-                        modifier = Modifier.fillMaxWidth().height(18.dp)
-                    )
+                    // 歌名：切歌时顺着翻页方向滑入
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 24.dp)
                     ) {
-                        Text(text = formatDuration(progressMs), style = TextStyle(fontSize = 12.sp, color = secondaryTextColor))
-                        Text(text = formatDuration(totalDurationMs), style = TextStyle(fontSize = 12.sp, color = secondaryTextColor))
+                        RetroEqualizerBars(isPlaying = isPlaying, color = AppleRed)
+                        Spacer(modifier = Modifier.width(7.dp))
+                        AnimatedContent(
+                            targetState = song,
+                            contentKey = { it.id },
+                            transitionSpec = {
+                                val from = currentPlaylist.indexOfFirst { it.id == initialState.id }
+                                val to = currentPlaylist.indexOfFirst { it.id == targetState.id }
+                                retroSwapTransform(if (to >= from) 1 else -1, 0)
+                            },
+                            modifier = Modifier.weight(1f, fill = false),
+                            label = "retro_title"
+                        ) { s ->
+                            Text(
+                                text = s.title,
+                                style = TextStyle(
+                                    fontSize = if (isUltraCompactLandscape) 15.sp else if (isCompactLandscape) 16.sp else 18.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = primaryTextColor
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    // 第二层: 核心 5 大主控播放按键 (复用现代模式 68dp 实心大按键)
+                    // 歌手 — 专辑（可点，跳资料库）+ 音质标签（点开音频参数）
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 4.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 2.dp, start = 16.dp, end = 16.dp)
                     ) {
-                        // 播放列表（原「随机」位置）
-                        com.lm.player.feature.player.controls.QueueIconButton(
-                            onClick = { showQueueSheet = true },
-                            tint = primaryTextColor.copy(alpha = 0.8f)
-                        )
-
-                        IconButton(onClick = onPrevious) {
-                            Icon(
-                                imageVector = Icons.Default.SkipPrevious,
-                                contentDescription = "上一首",
-                                tint = primaryTextColor,
-                                modifier = Modifier.size(38.dp)
+                        AnimatedContent(
+                            targetState = song,
+                            contentKey = { it.id },
+                            transitionSpec = {
+                                val from = currentPlaylist.indexOfFirst { it.id == initialState.id }
+                                val to = currentPlaylist.indexOfFirst { it.id == targetState.id }
+                                retroSwapTransform(if (to >= from) 1 else -1, 50)
+                            },
+                            modifier = Modifier.weight(1f, fill = false),
+                            label = "retro_artist"
+                        ) { s ->
+                            val metaStyle = TextStyle(
+                                fontSize = if (isCompactLandscape) 11.sp else 12.sp,
+                                color = secondaryTextColor
                             )
-                        }
-
-                        // 大号高对比实心主播放/暂停键 (68dp)
-                        Box(
-                            modifier = Modifier
-                                .size(68.dp)
-                                .clip(CircleShape)
-                                .background(primaryTextColor)
-                                .clickable(onClick = onTogglePlayPause),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                contentDescription = "播放/暂停",
-                                tint = if (isDark) Color.Black else Color.White,
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-
-                        IconButton(onClick = onNext) {
-                            Icon(
-                                imageVector = Icons.Default.SkipNext,
-                                contentDescription = "下一首",
-                                tint = primaryTextColor,
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-
-                        // 三态播放模式（原「循环」位置）
-                        com.lm.player.feature.player.controls.PlayModeIconButton(
-                            mode = playMode,
-                            onClick = onCyclePlayMode,
-                            tint = primaryTextColor.copy(alpha = 0.8f)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    // 第三层: 底部 5 项现代功能工具栏: [喜欢] [定时] [音频输出] [参数] [切回现代]
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 4.dp, vertical = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceAround,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        // 1. 喜欢收藏
-                        IconButton(onClick = onToggleFavorite) {
-                            Icon(
-                                imageVector = if (song.isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                contentDescription = "红心喜欢",
-                                tint = if (song.isFavorite) AppleRed else secondaryTextColor,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
-
-                        // 2. 定时关闭（待播队列已移到主控行左侧）
-                        Box {
-                            IconButton(onClick = { showSleepTimerMenu = true }) {
-                                Icon(
-                                    imageVector = Icons.Default.Timer,
-                                    contentDescription = "定时关闭",
-                                    tint = if (activeTimerMinutes != 0) AppleRed else secondaryTextColor,
-                                    modifier = Modifier.size(24.dp)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = s.artist.ifBlank { "未知歌手" },
+                                    style = metaStyle,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier
+                                        .weight(1f, fill = false)
+                                        .clip(RoundedCornerShape(7.dp))
+                                        .background(secondaryTextColor.copy(alpha = 0.14f))
+                                        .clickable(enabled = s.artist.isNotBlank()) { onOpenArtist(s.artist) }
+                                        .padding(horizontal = 7.dp, vertical = 1.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = s.album.ifBlank { "精选集" },
+                                    style = metaStyle,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier
+                                        .weight(1f, fill = false)
+                                        .clip(RoundedCornerShape(7.dp))
+                                        .background(secondaryTextColor.copy(alpha = 0.14f))
+                                        .clickable(enabled = s.album.isNotBlank()) { onOpenAlbum(s.album, s.artist, s.albumId) }
+                                        .padding(horizontal = 7.dp, vertical = 1.dp)
                                 )
                             }
-                            SleepTimerDropdownMenu(
-                                expanded = showSleepTimerMenu,
-                                onDismissRequest = { showSleepTimerMenu = false },
-                                activeTimerMinutes = activeTimerMinutes,
-                                remainingSeconds = sleepTimerRemainingSec,
-                                onSelectTimer = onSelectTimer
-                            )
                         }
-
-                        // 4. 音频输出 / 投屏
+                        Spacer(modifier = Modifier.width(8.dp))
                         Box {
-                            IconButton(onClick = {
-                                AudioSharingManager.refreshLocalAudioRoutes(context)
-                                AudioSharingManager.startLanDiscovery(context)
-                                showAudioOutputMenu = true
-                            }) {
-                                Icon(
-                                    imageVector = Icons.Default.Cast,
-                                    contentDescription = "AirPlay / DLNA / 音频输出",
-                                    tint = if (activeCastDevice != null || showAudioOutputMenu) AppleRed else secondaryTextColor,
-                                    modifier = Modifier.size(24.dp)
-                                )
-                            }
-                            AudioOutputDropdownMenu(
-                                expanded = showAudioOutputMenu,
-                                onDismissRequest = { showAudioOutputMenu = false },
-                                song = song,
-                                progressMs = progressMs
+                            AudioQualityTag(
+                                info = audioBadge,
+                                glassBackdrop = null,
+                                isDark = isDark,
+                                opened = showAudioSpecsMenu,
+                                compact = true,
+                                onClick = { showAudioSpecsMenu = !showAudioSpecsMenu }
                             )
-                        }
-
-                        // 5. 参数详情
-                        Box {
-                            IconButton(onClick = { showAudioSpecsMenu = true }) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Info,
-                                    contentDescription = "音频参数详情",
-                                    tint = secondaryTextColor,
-                                    modifier = Modifier.size(24.dp)
-                                )
-                            }
-                            AudioSpecsDropdownMenu(
+                            AudioSpecsGlassPanel(
                                 expanded = showAudioSpecsMenu,
                                 onDismissRequest = { showAudioSpecsMenu = false },
-                                song = song
+                                song = song,
+                                info = audioBadge
                             )
                         }
+                    }
+                }
 
-                        // 6. 主题切换 (切回现代模式)
-                        IconButton(onClick = { onSwitchPlayerTheme(PlayerThemeStyle.MODERN) }) {
-                            Icon(
-                                imageVector = Icons.Default.Style,
-                                contentDescription = "切回现代模式",
-                                tint = secondaryTextColor,
-                                modifier = Modifier.size(24.dp)
+                // ---- 液态玻璃小条：平时缩成一条进度胶囊；点一下展开 [待播列表] 0:32 ━●━ 3:45 [播放顺序]，3 秒无操作自动收回 ----
+                var miniBarExpanded by remember { mutableStateOf(false) }
+                var miniBarPoke by remember { mutableIntStateOf(0) }
+                LaunchedEffect(miniBarExpanded, miniBarPoke) {
+                    if (miniBarExpanded) {
+                        delay(3000L)
+                        miniBarExpanded = false
+                    }
+                }
+                val miniBarProgress by animateFloatAsState(
+                    targetValue = if (miniBarExpanded) 1f else 0f,
+                    animationSpec = spring(dampingRatio = 0.78f, stiffness = 320f),
+                    label = "retro_mini_bar"
+                )
+                val progressRatio = if (totalDurationMs > 0) (progressMs.toFloat() / totalDurationMs).coerceIn(0f, 1f) else 0f
+                // 拖动进度条时的预览位置（松手前不跳转，时间显示拖到的位置）
+                var seekPreview by remember { mutableStateOf<Float?>(null) }
+                val shownProgressMs = seekPreview?.let { (it * totalDurationMs).toLong() } ?: progressMs
+                val miniBarMaxHeight = if (isCompactLandscape) 40.dp else 44.dp
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .padding(top = if (isCompactLandscape) 4.dp else 8.dp, bottom = 2.dp)
+                        .widthIn(max = 560.dp)
+                        .fillMaxWidth(0.94f)
+                        .height(miniBarMaxHeight)
+                        .graphicsLayer {
+                            val p = enterAnim.value
+                            alpha = p
+                            translationY = (1f - p) * 32.dp.toPx()
+                        }
+                        // 收起时整块（含上下留白）都能点开，细胶囊本身太细不好点
+                        .then(
+                            if (!miniBarExpanded) Modifier.clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null
+                            ) {
+                                miniBarExpanded = true
+                                miniBarPoke++
+                            } else Modifier
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val p = miniBarProgress
+                    val collapsedWidth = minOf(maxWidth * 0.62f, 300.dp)
+                    val barWidth = androidx.compose.ui.unit.lerp(collapsedWidth, maxWidth, p)
+                    val barHeight = androidx.compose.ui.unit.lerp(24.dp, miniBarMaxHeight, p)
+                    Box(modifier = Modifier.size(barWidth, barHeight)) {
+                        if (retroGlass != null) {
+                            com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                                modifier = Modifier.matchParentSize(),
+                                cornerRadius = barHeight / 2,
+                                tint = if (isDark) Color(0xFF15151C).copy(alpha = 0.10f + 0.25f * com.lm.player.core.designsystem.glass.GlassStyleState.opacityLevel)
+                                else Color.White.copy(alpha = 0.18f + 0.35f * com.lm.player.core.designsystem.glass.GlassStyleState.opacityLevel),
+                                blurAmount = 0.12f + 0.30f * com.lm.player.core.designsystem.glass.GlassStyleState.blurLevel,
+                                dispersion = 0.16f,
+                                material = com.lm.player.core.designsystem.glass.GlassMaterial.REGULAR,
+                                backdropOverride = retroGlass
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .clip(RoundedCornerShape(barHeight / 2))
+                                    .background(chipBg)
                             )
                         }
+                        // 收起态：胶囊里「已播时间 ━━━ 总时长」
+                        if (p < 0.99f) {
+                            val miniTimeStyle = TextStyle(fontSize = 9.5.sp, color = secondaryTextColor, fontFeatureSettings = "tnum")
+                            Row(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .graphicsLayer { alpha = 1f - p }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(text = formatDuration(shownProgressMs), style = miniTimeStyle, maxLines = 1)
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                        .padding(horizontal = 8.dp)
+                                        .drawBehind {
+                                            val th = 3.dp.toPx()
+                                            val y = size.height / 2f
+                                            if (size.width > th) {
+                                                drawLine(primaryTextColor.copy(alpha = 0.25f), Offset(0f, y), Offset(size.width, y), strokeWidth = th, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                                                drawLine(primaryTextColor, Offset(0f, y), Offset(size.width * progressRatio, y), strokeWidth = th, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                                            }
+                                        }
+                                )
+                                Text(text = formatDuration(totalDurationMs), style = miniTimeStyle, maxLines = 1)
+                            }
+                        }
+                        // 展开态：待播 / 时间 / 液态玻璃进度条 / 播放顺序
+                        if (p > 0.01f) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer { alpha = p }
+                                    .padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RetroCircleButton(
+                                    icon = Icons.AutoMirrored.Filled.QueueMusic,
+                                    description = "待播列表",
+                                    size = 32.dp,
+                                    background = if (showQueueSheet) AppleRed.copy(alpha = 0.18f) else Color.Transparent,
+                                    tint = if (showQueueSheet) AppleRed else primaryTextColor,
+                                    iconSize = 19.dp,
+                                    onClick = {
+                                        miniBarPoke++
+                                        showQueueSheet = !showQueueSheet
+                                        if (showQueueSheet && landscapeLyricsRatio < 0.05f) landscapeLyricsRatio = 0.333f
+                                    }
+                                )
+                                val timeStyle = TextStyle(fontSize = 10.5.sp, color = secondaryTextColor, fontFeatureSettings = "tnum")
+                                Text(
+                                    text = formatDuration(shownProgressMs),
+                                    style = timeStyle,
+                                    textAlign = TextAlign.End,
+                                    maxLines = 1,
+                                    modifier = Modifier.width(38.dp)
+                                )
+                                com.lm.player.core.designsystem.component.LiquidSlider(
+                                    value = progressRatio,
+                                    onValueChange = { ratio ->
+                                        miniBarPoke++
+                                        onSeekTo((ratio * totalDurationMs).toLong())
+                                    },
+                                    commitOnRelease = true,
+                                    onPreview = { p ->
+                                        seekPreview = p
+                                        miniBarPoke++
+                                    },
+                                    accentColor = primaryTextColor,
+                                    trackColor = primaryTextColor.copy(alpha = 0.2f),
+                                    backdrop = retroGlass,
+                                    surfaceColor = if (isDark) Color(0xFF0D0F14) else Color(0xFFEFEFF3),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(28.dp)
+                                        .padding(horizontal = 16.dp)
+                                )
+                                Text(
+                                    text = formatDuration(totalDurationMs),
+                                    style = timeStyle,
+                                    maxLines = 1,
+                                    modifier = Modifier.width(38.dp)
+                                )
+                                // 播放顺序（列表循环 / 单曲循环 / 随机）
+                                com.lm.player.feature.player.controls.PlayModeIconButton(
+                                    mode = playMode,
+                                    onClick = {
+                                        miniBarPoke++
+                                        onCyclePlayMode()
+                                    },
+                                    tint = primaryTextColor,
+                                    buttonSize = 32.dp,
+                                    iconSize = 19.dp
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===================== 中：拖动手柄（点一下收起 / 展开侧栏） =====================
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .width(18.dp)
+                    .pointerInput(Unit) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { isDraggingSplitter = true },
+                            onDragEnd = {
+                                isDraggingSplitter = false
+                                // 拖得很窄时直接收起
+                                if (landscapeLyricsRatio < 0.08f) landscapeLyricsRatio = 0f
+                                lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", landscapeLyricsRatio).apply()
+                            },
+                            onDragCancel = { isDraggingSplitter = false },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                // 向左拖加宽侧栏，向右拖收窄
+                                val deltaRatio = -dragAmount / screenWidthPx
+                                landscapeLyricsRatio = (landscapeLyricsRatio + deltaRatio).coerceIn(0.0f, 0.333f)
+                            }
+                        )
+                    }
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                        val newRatio = if (landscapeLyricsRatio > 0.05f) 0.0f else 0.333f
+                        landscapeLyricsRatio = newRatio
+                        lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", newRatio).apply()
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                val handleHeight by animateDpAsState(
+                    targetValue = if (isDraggingSplitter) 52.dp else 34.dp,
+                    animationSpec = spring(dampingRatio = 0.6f, stiffness = 500f),
+                    label = "retro_handle_height"
+                )
+                Box(
+                    modifier = Modifier
+                        .width(if (isDraggingSplitter) 5.dp else 4.dp)
+                        .height(handleHeight)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(
+                            if (isDraggingSplitter) AppleRed
+                            else if (isDark) Color.White.copy(alpha = 0.45f)
+                            else Color.Black.copy(alpha = 0.30f)
+                        )
+                )
+            }
+
+            // ===================== 右：歌词（竖屏同款 AMLL 歌词 +「词」调节）/ 待播侧栏 =====================
+            if (isSidePaneVisible) {
+                Box(
+                    modifier = Modifier
+                        .weight(animatedLyricsRatio)
+                        .fillMaxHeight()
+                        .padding(vertical = 4.dp)
+                        .graphicsLayer {
+                            val p = enterAnim.value
+                            alpha = p
+                            translationX = (1f - p) * 40.dp.toPx()
+                        }
+                ) {
+                    AnimatedContent(
+                        targetState = showQueueSheet,
+                        transitionSpec = {
+                            val dir = if (targetState) 1 else -1
+                            (slideInVertically(tween(420, easing = FastOutSlowInEasing)) { h -> dir * h / 8 } +
+                                fadeIn(tween(320, delayMillis = 60)))
+                                .togetherWith(
+                                    slideOutVertically(tween(300, easing = FastOutSlowInEasing)) { h -> -dir * h / 8 } +
+                                        fadeOut(tween(200))
+                                )
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        label = "retro_side_pane"
+                    ) { queueMode ->
+                        if (queueMode) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(RoundedCornerShape(22.dp))
+                                    .background(if (isDark) Color.White.copy(alpha = 0.06f) else Color.White.copy(alpha = 0.45f))
+                                    .border(
+                                        0.6.dp,
+                                        if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.06f),
+                                        RoundedCornerShape(22.dp)
+                                    )
+                            ) {
+                                RetroQueuePane(
+                                    playlist = currentPlaylist,
+                                    currentSong = song,
+                                    isPlaying = isPlaying,
+                                    primaryTextColor = primaryTextColor,
+                                    secondaryTextColor = secondaryTextColor,
+                                    onSelect = onSelectSongFromQueue,
+                                    onClose = { showQueueSheet = false }
+                                )
+                            }
+                        } else {
+                            // 与竖屏歌词页同一个组件：同样的歌词样式、景深模糊，右上角「词」按钮调字号 / 快慢 / 主题与开关，设置互通
+                            LyricsScrollingView(
+                                lyrics = lyrics.lines,
+                                currentPositionMs = progressMs,
+                                onSeekToLyric = onSeekTo,
+                                fontSizeSp = fontSizeSp,
+                                lyricsOffsetMs = lyricsOffsetMs,
+                                lyricTheme = lyricTheme,
+                                onFontSizeChange = onFontSizeChange,
+                                onOffsetChange = onOffsetChange,
+                                onThemeChange = onThemeChange,
+                                showAdjustButton = true,
+                                modifier = Modifier.fillMaxSize(),
+                                glassBackdrop = retroGlass
+                            )
+                        }
+                    }
+                }
+            } else {
+                // 侧栏收起时，右侧留一个展开小胶囊
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = chipBg,
+                    border = BorderStroke(0.6.dp, if (isDark) Color(0x33FFFFFF) else Color(0x22000000)),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            landscapeLyricsRatio = 0.333f
+                            lyricsPrefs.edit().putFloat("landscape_lyrics_width_ratio", 0.333f).apply()
+                        }
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(Icons.Default.Lyrics, contentDescription = "展开歌词", tint = AppleRed, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text("歌\n词", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = primaryTextColor, lineHeight = 12.sp)
                     }
                 }
             }
@@ -1499,53 +1144,6 @@ fun RetroCoverFlowPlayerView(
             },
             onDismiss = { showLyricsAdjustDialog = false }
         )
-    }
-
-    // 待播队列半屏弹窗 (复用现代模式)
-    if (showQueueSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showQueueSheet = false },
-            containerColor = MaterialTheme.colorScheme.surface
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp)
-                    .padding(bottom = 32.dp)
-            ) {
-                Text(
-                    text = "待播队列 (${currentPlaylist.size} 首)",
-                    style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                LazyColumn(
-                    modifier = Modifier.fillMaxHeight(0.6f),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    itemsIndexed(currentPlaylist, key = { index, item -> "retro_queue_${item.id}_$index" }) { index, item ->
-                        val isCurrent = item.id == song.id
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (isCurrent) AppleRed.copy(alpha = 0.12f) else Color.Transparent)
-                                .clickable {
-                                    onSelectSongFromQueue(item)
-                                    showQueueSheet = false
-                                }
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("${index + 1}", color = if (isCurrent) AppleRed else secondaryTextColor, fontSize = 13.sp, modifier = Modifier.width(28.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(item.title, color = if (isCurrent) AppleRed else primaryTextColor, fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium, fontSize = 14.sp, maxLines = 1)
-                                Text(item.artist, color = secondaryTextColor, fontSize = 11.sp, maxLines = 1)
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // 系统返回键分层适配：优先关闭内嵌弹窗与菜单，最后关闭播放页
@@ -1578,6 +1176,8 @@ private fun RetroKaraokeLyricRow(
     index: Int,
     cleanLyrics: List<LyricLine>,
     isActive: Boolean,
+    /** 与当前行相隔几行：越远越淡（景深） */
+    distance: Int = 0,
     isKaraokeEnabled: Boolean,
     effectiveTimeMs: Long,
     lastTickPos: Long,
@@ -1594,7 +1194,20 @@ private fun RetroKaraokeLyricRow(
     alignment: Alignment,
     onSeekTo: (Long) -> Unit
 ) {
-    val currentFontSize = if (isActive) fontSizeSp.coerceIn(16f, 26f).sp else (fontSizeSp * 0.74f).coerceIn(12f, 18f).sp
+    // 当前行字号放大用缓动过渡，不是一下跳大
+    val targetFontSize = if (isActive) fontSizeSp.coerceIn(16f, 26f) else (fontSizeSp * 0.74f).coerceIn(12f, 18f)
+    val animatedFontSize by animateFloatAsState(
+        targetValue = targetFontSize,
+        animationSpec = tween(durationMillis = 380, easing = FastOutSlowInEasing),
+        label = "retro_lyric_size"
+    )
+    val currentFontSize = animatedFontSize.sp
+    // 离当前行越远越淡，像景深一样把视线聚到当前行
+    val depthAlpha by animateFloatAsState(
+        targetValue = if (isActive) 1f else (1f - distance.coerceAtMost(6) * 0.11f).coerceAtLeast(0.34f),
+        animationSpec = tween(durationMillis = 420),
+        label = "retro_lyric_depth"
+    )
     val currentLineHeight = (currentFontSize.value * 1.38f).sp
     val fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
 
@@ -1670,7 +1283,281 @@ private fun RetroKaraokeLyricRow(
             ),
             modifier = Modifier
                 .fillMaxWidth()
+                .graphicsLayer { alpha = depthAlpha }
                 .clickable { onSeekTo((item.timestampMs - lyricsOffsetMs).coerceAtLeast(0L)) }
         )
+    }
+}
+
+// =============================================================================
+// 怀旧专辑流（横屏）的小部件
+// =============================================================================
+
+/** 切歌时歌名 / 歌手顺着翻页方向滑入（direction：1 = 下一首，-1 = 上一首） */
+private fun retroSwapTransform(direction: Int, delayMs: Int): ContentTransform =
+    ContentTransform(
+        targetContentEnter = slideInHorizontally(tween(durationMillis = 440, delayMillis = delayMs, easing = FastOutSlowInEasing)) { w -> direction * w / 5 } +
+            fadeIn(tween(durationMillis = 360, delayMillis = delayMs + 60)),
+        initialContentExit = slideOutHorizontally(tween(durationMillis = 300, easing = FastOutSlowInEasing)) { w -> -direction * w / 5 } +
+            fadeOut(tween(durationMillis = 200)),
+        sizeTransform = SizeTransform(clip = false)
+    )
+
+/**
+ * 背景氛围层：唱片架背后的聚光（播放时轻微呼吸）、四周暗角、缓慢上浮的光尘。
+ * 时间只在播放时推进，暂停时画面静止；全部在绘制阶段读取，不触发重组。
+ */
+@Composable
+private fun RetroAmbientLayer(
+    isPlaying: Boolean,
+    isDark: Boolean,
+    spotCenterX: Float,
+    modifier: Modifier = Modifier
+) {
+    // 每颗光尘：x、y、半径(dp)、上浮速度(屏高/秒)、摆动相位、亮度
+    val particles = remember {
+        val rnd = java.util.Random(20261110L)
+        List(18) {
+            floatArrayOf(
+                rnd.nextFloat(),
+                rnd.nextFloat(),
+                0.8f + rnd.nextFloat() * 1.8f,
+                0.012f + rnd.nextFloat() * 0.022f,
+                rnd.nextFloat() * 6.2832f,
+                0.3f + rnd.nextFloat() * 0.7f
+            )
+        }
+    }
+    var time by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) return@LaunchedEffect
+        // 约 30 帧且与其它动效同帧更新：光尘 / 聚光移动很慢，30 帧足够顺滑；玻璃小条采样这一层，随之从每帧重绘降到每秒 30 次
+        com.lm.player.core.designsystem.component.runThrottledFrames { dt -> time += dt / 1_000_000_000f }
+    }
+    val spotColor = if (isDark) Color.White.copy(alpha = 0.11f) else Color.White.copy(alpha = 0.50f)
+    val vignette = if (isDark) Color.Black.copy(alpha = 0.50f) else Color.Black.copy(alpha = 0.08f)
+    val dustAlpha = if (isDark) 0.20f else 0.65f
+    Canvas(modifier = modifier) {
+        if (size.minDimension <= 0f) return@Canvas
+        val t = time
+        val breathe = 1f + 0.05f * sin(t * 1.3f)
+        drawRect(
+            brush = Brush.radialGradient(
+                colors = listOf(spotColor, Color.Transparent),
+                center = Offset(size.width * spotCenterX, size.height * 0.42f),
+                radius = size.height * 0.78f * breathe
+            )
+        )
+        drawRect(
+            brush = Brush.radialGradient(
+                colors = listOf(Color.Transparent, vignette),
+                center = Offset(size.width / 2f, size.height / 2f),
+                radius = size.maxDimension * 0.62f
+            )
+        )
+        for (p in particles) {
+            val y = (((p[1] - t * p[3]) % 1f) + 1f) % 1f
+            val x = p[0] + sin(t * 0.35f + p[4]) * 0.018f
+            // 靠近上下边缘时淡出
+            val edge = (minOf(y, 1f - y) / 0.18f).coerceIn(0f, 1f)
+            drawCircle(
+                color = Color.White.copy(alpha = dustAlpha * p[5] * edge),
+                radius = p[2] * 1.6f * density,
+                center = Offset(x * size.width, y * size.height)
+            )
+        }
+    }
+}
+
+private val RETRO_EQ_IDLE = floatArrayOf(0.35f, 0.6f, 0.25f)
+
+/** 「正在播放」三根跳动小竖条；暂停时停成静止的高低条 */
+@Composable
+private fun RetroEqualizerBars(isPlaying: Boolean, color: Color, modifier: Modifier = Modifier) {
+    if (isPlaying) {
+        val transition = rememberInfiniteTransition(label = "retro_eq")
+        val a by transition.animateFloat(
+            initialValue = 0.25f, targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(460, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "retro_eq_a"
+        )
+        val b by transition.animateFloat(
+            initialValue = 0.95f, targetValue = 0.30f,
+            animationSpec = infiniteRepeatable(tween(580, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "retro_eq_b"
+        )
+        val c by transition.animateFloat(
+            initialValue = 0.40f, targetValue = 0.90f,
+            animationSpec = infiniteRepeatable(tween(380, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "retro_eq_c"
+        )
+        RetroBarsCanvas(color, modifier) { floatArrayOf(a, b, c) }
+    } else {
+        RetroBarsCanvas(color, modifier) { RETRO_EQ_IDLE }
+    }
+}
+
+@Composable
+private fun RetroBarsCanvas(color: Color, modifier: Modifier, levels: () -> FloatArray) {
+    Canvas(modifier = modifier.size(width = 13.dp, height = 12.dp)) {
+        val lv = levels()
+        val barW = size.width / 5f
+        for (i in 0 until 3) {
+            val h = size.height * lv[i].coerceIn(0.15f, 1f)
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(i * 2f * barW, size.height - h),
+                size = Size(barW, h),
+                cornerRadius = CornerRadius(barW / 2f, barW / 2f)
+            )
+        }
+    }
+}
+
+/** 圆形按键：按下缩一下再弹回 */
+@Composable
+private fun RetroCircleButton(
+    icon: ImageVector,
+    description: String,
+    size: Dp,
+    background: Color,
+    tint: Color,
+    modifier: Modifier = Modifier,
+    iconSize: Dp = 20.dp,
+    onClick: () -> Unit
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.86f else 1f,
+        animationSpec = spring(dampingRatio = 0.55f, stiffness = 600f),
+        label = "retro_btn_press"
+    )
+    Box(
+        modifier = modifier
+            .size(size)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(CircleShape)
+            .background(background)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(imageVector = icon, contentDescription = description, tint = tint, modifier = Modifier.size(iconSize))
+    }
+}
+
+/** 侧栏里的待播列表：带小封面，当前曲目高亮并显示跳动竖条，打开时定位到当前曲目 */
+@Composable
+private fun RetroQueuePane(
+    playlist: List<UnifiedSong>,
+    currentSong: UnifiedSong,
+    isPlaying: Boolean,
+    primaryTextColor: Color,
+    secondaryTextColor: Color,
+    onSelect: (UnifiedSong) -> Unit,
+    onClose: () -> Unit
+) {
+    val currentIdx = remember(playlist, currentSong.id) {
+        playlist.indexOfFirst { it.id == currentSong.id }.coerceAtLeast(0)
+    }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = (currentIdx - 2).coerceAtLeast(0))
+    LaunchedEffect(currentIdx) {
+        val visible = listState.layoutInfo.visibleItemsInfo
+        if (visible.isNotEmpty() && visible.none { it.index == currentIdx }) {
+            listState.animateScrollToItem((currentIdx - 2).coerceAtLeast(0))
+        }
+    }
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("待播列表", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = primaryTextColor)
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("${playlist.size} 首", fontSize = 11.sp, color = secondaryTextColor, modifier = Modifier.weight(1f))
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable(onClick = onClose),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.Close, contentDescription = "返回歌词", tint = secondaryTextColor, modifier = Modifier.size(16.dp))
+            }
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            itemsIndexed(playlist, key = { i, item -> "retro_q_${item.id}_$i" }) { i, item ->
+                val isCurrent = item.id == currentSong.id
+                val rowBg by animateColorAsState(
+                    targetValue = if (isCurrent) AppleRed.copy(alpha = 0.16f) else Color.Transparent,
+                    animationSpec = tween(300),
+                    label = "retro_queue_row_bg"
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(rowBg)
+                        .clickable { onSelect(item) }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(modifier = Modifier.size(38.dp)) {
+                        AlbumArtworkImage(
+                            model = item.coverUrl,
+                            seedId = item.id,
+                            targetSize = 96,
+                            modifier = Modifier.fillMaxSize(),
+                            cornerRadius = 6.dp
+                        )
+                        if (isCurrent) {
+                            Box(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color.Black.copy(alpha = 0.40f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                RetroEqualizerBars(isPlaying = isPlaying, color = Color.White)
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = item.title,
+                            color = if (isCurrent) AppleRed else primaryTextColor,
+                            fontSize = 13.sp,
+                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = item.artist,
+                            color = secondaryTextColor,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Text(
+                        text = "${i + 1}",
+                        fontSize = 10.sp,
+                        color = secondaryTextColor.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(start = 6.dp)
+                    )
+                }
+            }
+        }
     }
 }

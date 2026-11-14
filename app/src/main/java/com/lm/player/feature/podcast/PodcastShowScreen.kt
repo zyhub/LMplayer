@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.sp
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.podcast.*
+import kotlinx.coroutines.launch
 
 /**
  * 节目详情页
@@ -84,11 +85,53 @@ fun PodcastShowScreen(
         )
     }
 
+    // 液态玻璃：顶栏放进上层玻璃（与资料库列表页同一套），单集列表从玻璃下面穿过，滚动后收成「返回 + 节目名 · 集数」小胶囊
+    val podcastGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+    val podcastTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+    val episodesListState = rememberLazyListState()
+    val podcastScope = rememberCoroutineScope()
+    val showCollapsed = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(episodesListState) {
+        episodesListState.firstVisibleItemIndex to episodesListState.firstVisibleItemScrollOffset
+    }
+    val showBarActions: @Composable RowScope.() -> Unit = {
+                    if (ui.show.isRefreshing) {
+                        CircularProgressIndicator(
+                            color = AppleRed,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier
+                                .size(20.dp)
+                                .padding(end = 4.dp)
+                        )
+                    } else {
+                        IconButton(onClick = { actions.onFetchShow(ui.show.id) }) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "拉取最新",
+                                tint = MaterialTheme.colorScheme.onBackground
+                            )
+                        }
+                    }
+                }
+    if (podcastGlass) {
+        com.lm.player.core.designsystem.glass.GlassListHeader(
+            key = "podcast_show:${ui.show.id}",
+            title = ui.show.title,
+            subtitle = listOf(ui.show.author, "共 ${ui.totalEpisodes} 集").filter { it.isNotBlank() }.joinToString(" · "),
+            onBack = actions.onBack,
+            collapsed = showCollapsed,
+            onTapCapsule = { podcastScope.launch { episodesListState.animateScrollToItem(0) } },
+            capsuleInfo = "${ui.totalEpisodes} 集",
+            actions = showBarActions
+        )
+    }
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
+        // 液态玻璃：顶栏在上层玻璃里，内容从屏幕最顶端开始（顶部不再让出状态栏）
+        contentWindowInsets = if (podcastGlass) ScaffoldDefaults.contentWindowInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
-            TopAppBar(
+            if (!podcastGlass) TopAppBar(
                 title = {
                     Text(
                         text = ui.show.title,
@@ -108,25 +151,7 @@ fun PodcastShowScreen(
                         )
                     }
                 },
-                actions = {
-                    if (ui.show.isRefreshing) {
-                        CircularProgressIndicator(
-                            color = AppleRed,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier
-                                .size(20.dp)
-                                .padding(end = 4.dp)
-                        )
-                    } else {
-                        IconButton(onClick = { actions.onFetchShow(ui.show.id) }) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "拉取最新",
-                                tint = MaterialTheme.colorScheme.onBackground
-                            )
-                        }
-                    }
-                },
+                actions = showBarActions,
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background
                 )
@@ -141,7 +166,9 @@ fun PodcastShowScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
-                contentPadding = contentPadding
+                contentPadding = contentPadding,
+                listState = episodesListState,
+                topInset = podcastTopInset
             )
         } else {
             PodcastShowPortraitLayout(
@@ -151,7 +178,9 @@ fun PodcastShowScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
-                contentPadding = contentPadding
+                contentPadding = contentPadding,
+                listState = episodesListState,
+                topInset = podcastTopInset
             )
         }
     }
@@ -166,10 +195,10 @@ private fun PodcastShowPortraitLayout(
     actions: PodcastActions,
     onConfirmUnsubscribe: () -> Unit,
     modifier: Modifier = Modifier,
-    contentPadding: PaddingValues
+    contentPadding: PaddingValues,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    topInset: androidx.compose.ui.unit.Dp
 ) {
-    val listState = rememberLazyListState()
-
     // 划动到底部自动分页加载
     val shouldLoadMore by remember {
         derivedStateOf {
@@ -189,7 +218,7 @@ private fun PodcastShowPortraitLayout(
         state = listState,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(
-            top = 8.dp,
+            top = 8.dp + topInset,
             bottom = contentPadding.calculateBottomPadding() + 80.dp,
             start = 16.dp,
             end = 16.dp
@@ -307,7 +336,9 @@ private fun PodcastShowLandscapeLayout(
     actions: PodcastActions,
     onConfirmUnsubscribe: () -> Unit,
     modifier: Modifier = Modifier,
-    contentPadding: PaddingValues
+    contentPadding: PaddingValues,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    topInset: androidx.compose.ui.unit.Dp
 ) {
     Row(
         modifier = modifier
@@ -320,7 +351,7 @@ private fun PodcastShowLandscapeLayout(
             modifier = Modifier
                 .weight(0.40f)
                 .fillMaxHeight(),
-            contentPadding = PaddingValues(top = 8.dp, bottom = contentPadding.calculateBottomPadding() + 20.dp),
+            contentPadding = PaddingValues(top = 8.dp + topInset, bottom = contentPadding.calculateBottomPadding() + 20.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
@@ -346,7 +377,6 @@ private fun PodcastShowLandscapeLayout(
         )
 
         // 右栏：单集列表与工具条 (60% 宽)
-        val listState = rememberLazyListState()
         val shouldLoadMore by remember {
             derivedStateOf {
                 val totalItemsCount = listState.layoutInfo.totalItemsCount
@@ -366,7 +396,7 @@ private fun PodcastShowLandscapeLayout(
             modifier = Modifier
                 .weight(0.60f)
                 .fillMaxHeight(),
-            contentPadding = PaddingValues(top = 8.dp, bottom = contentPadding.calculateBottomPadding() + 20.dp),
+            contentPadding = PaddingValues(top = 8.dp + topInset, bottom = contentPadding.calculateBottomPadding() + 20.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {

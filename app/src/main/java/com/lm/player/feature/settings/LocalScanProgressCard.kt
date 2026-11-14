@@ -43,7 +43,7 @@ fun LocalScanProgressCard() {
             Text("正在与服务器曲库比对：${m.stage}", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(6.dp))
             if (m.total > 0) {
-                LinearProgressIndicator(
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(
                     progress = { (m.processed.toFloat() / m.total).coerceIn(0f, 1f) },
                     color = AppleRed,
                     modifier = Modifier.fillMaxWidth()
@@ -51,7 +51,7 @@ fun LocalScanProgressCard() {
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("${m.processed} / ${m.total}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
-                LinearProgressIndicator(color = AppleRed, modifier = Modifier.fillMaxWidth())
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(color = AppleRed, modifier = Modifier.fillMaxWidth())
             }
         }
         return
@@ -79,7 +79,7 @@ fun LocalScanProgressCard() {
                 else -> s.processed to s.total
             }
             if (total > 0) {
-                LinearProgressIndicator(
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(
                     progress = { (done.toFloat() / total).coerceIn(0f, 1f) },
                     color = AppleRed,
                     modifier = Modifier.fillMaxWidth()
@@ -87,7 +87,7 @@ fun LocalScanProgressCard() {
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("$done / $total", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
-                LinearProgressIndicator(color = AppleRed, modifier = Modifier.fillMaxWidth())
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(color = AppleRed, modifier = Modifier.fillMaxWidth())
             }
             val detail = buildString {
                 if (s.newSongs > 0) append("已入库 ${s.newSongs} 首")

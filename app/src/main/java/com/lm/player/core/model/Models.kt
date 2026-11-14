@@ -2,6 +2,19 @@ package com.lm.player.core.model
 
 import androidx.compose.runtime.Immutable
 
+/**
+ * 非「服务器曲库」的 serverId 占位值：
+ * 本地目录入库（local_storage / local_folder / local_saf）与在线音源来源（lemon_online）。
+ * 除这些之外的 serverId 都代表某台柠檬服务器实例。
+ *
+ * Claude 补充（PR #7 合入时）：
+ * - "default"：UnifiedSong.serverId 的默认值，表示「未指明来源」，不能当成服务器曲库；
+ * - "lemon_podcast"：播客单集（core/podcast/PodcastSongs.SERVER_ID），音频来自 RSS，不是服务器文件。
+ */
+internal val NON_SERVER_LIBRARY_IDS = setOf(
+    "local_storage", "local_folder", "local_saf", "lemon_online", "default", "lemon_podcast"
+)
+
 @Immutable
 data class UnifiedSong(
     val id: String,
@@ -34,12 +47,23 @@ data class UnifiedSong(
                 (format.contains("flac", ignoreCase = true) && bitRate >= 1411)
 
     /**
+     * 这首歌当前是否属于远程服务器曲库（数据事实，与网络连接状态无关）。
+     *
+     * 只按 serverId 归属判断，不要用 streamUrl：播放加速命中后，整个播放链路会把当前
+     * 歌曲的 streamUrl 改写成在线 CDN 地址并持久化，用地址判断会出现「时有时无」。
+     */
+    val isServerLibrarySong: Boolean
+        get() = serverId.isNotBlank() && serverId !in NON_SERVER_LIBRARY_IDS
+
+    /**
      * 是否为柠檬服务器曲库歌曲（在线修标签入口判定，PR #5）。
-     * serverId 实际可能是服务器配置 id，所以同时按流地址 /api/play/local* 判断；在线歌曲不算。
+     * 与 [com.lm.player.core.media.DownloadRequestPlanner.isServerLibrarySong] 保持同一口径，
+     * 但额外排除 `lemon_online_` 开头的 id（Claude 补充）：「缓存到服务器」「收藏后自动缓存」会把
+     * 在线歌曲的 serverId 改成服务器 id，但 id 不变、流地址是代理地址，重启后定位不到服务器文件，
+     * 修标签会报「未能定位服务器文件路径」。等下次同步后它会被真正的服务器曲目取代。
      */
     val isLemonServerSong: Boolean
-        get() = !id.startsWith("lemon_online_") &&
-            (serverId == "lemon_music" || streamUrl.contains("/api/play/local"))
+        get() = isServerLibrarySong && !id.startsWith("lemon_online_")
 }
 
 @Immutable

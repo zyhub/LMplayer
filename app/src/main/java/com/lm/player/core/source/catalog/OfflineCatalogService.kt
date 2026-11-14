@@ -13,12 +13,22 @@ import com.lm.player.core.source.SourceAccelerationSession
  */
 object OfflineCatalogService {
 
-    /** 是否可以在没有服务器的情况下提供在线目录（本地音源脚本就绪才有意义：否则搜到也播不了）。 */
-    fun isAvailable(): Boolean = SourceAccelerationSession.isReady() || SourceAccelerationController.detached.value
+    /**
+     * 是否可以在没有服务器的情况下提供在线目录（本地音源可用才有意义：否则搜到也播不了）。
+     * TV 按需启动：目录本身不需要 JS 引擎，本机缓存了音源脚本即视为可用；播放时取链再按需加载引擎。
+     */
+    fun isAvailable(): Boolean = SourceAccelerationSession.isReady() || SourceAccelerationController.localSourceConfigured()
 
     suspend fun searchSongs(keyword: String, source: String, page: Int = 1, limit: Int = 30): List<UnifiedSong> {
         val res = LocalCatalogGateway.executeDetached(CatalogOp.Search(keyword, source, page, limit, "music")) ?: return emptyList()
         return OnlineCatalogParser.searchSongs(res.optJSONObject("data")?.optJSONArray("list"), source)
+    }
+
+    /** 同 searchSongs，另返回平台给的结果总数（data.total，没有为 0） */
+    suspend fun searchSongsPage(keyword: String, source: String, page: Int = 1, limit: Int = 30): Pair<List<UnifiedSong>, Int> {
+        val res = LocalCatalogGateway.executeDetached(CatalogOp.Search(keyword, source, page, limit, "music")) ?: return emptyList<UnifiedSong>() to 0
+        val data = res.optJSONObject("data")
+        return OnlineCatalogParser.searchSongs(data?.optJSONArray("list"), source) to (data?.optInt("total", 0) ?: 0)
     }
 
     suspend fun searchAlbums(keyword: String, source: String, page: Int = 1, limit: Int = 30): List<UnifiedAlbum> {

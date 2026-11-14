@@ -6,6 +6,7 @@ import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
 import com.lm.player.core.model.DownloadTask
+import com.lm.player.core.model.NON_SERVER_LIBRARY_IDS
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -620,8 +621,17 @@ object SongMatchingResolver {
             val candidateRelPath = incoming.relativeFolderPath ?: existing?.relativeFolderPath ?: existingMatch?.relativeFolderPath
             val finalRelPath = candidateRelPath?.takeIf { !it.startsWith("{") && !it.contains("\"") && !it.contains("_id__") && it.length <= 100 }
             val existingValidCover = listOfNotNull(existing?.coverUrl, existingMatch?.coverUrl)
-                .firstOrNull { it.isNotBlank() && !it.contains("/api/tag/cover") }
-            val finalCover = if (incoming.coverUrl.isNotBlank()) incoming.coverUrl else (existingValidCover ?: "")
+                .firstOrNull {
+                    it.isNotBlank() && (!it.contains("/api/tag/cover") ||
+                        com.lm.player.core.network.LemonMusicProtocol.isCoverWritten(incoming.id))
+                }
+            // 在线修标签写过封面的：保留写回时带时间戳的文件封面地址（换成不带时间戳的地址会命中旧图片缓存，显示回旧封面 / 无封面）
+            val writtenCover = existing?.coverUrl?.takeIf {
+                it.contains("/api/tag/cover") && it.contains("t=") &&
+                    com.lm.player.core.network.LemonMusicProtocol.isCoverWritten(incoming.id)
+            }
+            // 资料库以服务器为准：服务器没给封面（文件无内嵌封面）就留空，不保留以前在线搜来的封面
+            val finalCover = writtenCover ?: incoming.coverUrl.ifBlank { existingValidCover?.takeIf { it.contains("/api/tag/cover") } ?: "" }
 
             val localExt = validLocalPath?.takeIf { !it.startsWith("content://") }
                 ?.substringAfterLast('.', "")
@@ -649,6 +659,26 @@ object SongMatchingResolver {
         // 4. 安全覆盖写入数据库
         database.songDao().insertSongs(preservedEntities)
 
+        // 服务器曲目按规范化标题分桶，供 4.1 / 4.2 把旧记录对应到服务器曲目
+        val serverSongsByTitle = HashMap<String, MutableList<SongEntity>>(preservedEntities.size)
+        for (song in preservedEntities) {
+            val normTitle = normalizeTrackTitle(song.title)
+            if (normTitle.isNotBlank()) serverSongsByTitle.getOrPut(normTitle) { ArrayList(2) }.add(song)
+        }
+        fun findServerMatch(record: SongEntity): SongEntity? =
+            serverSongsByTitle[normalizeTrackTitle(record.title)]?.firstOrNull { server ->
+                server.id != record.id && isSongMatch(
+                    title1 = record.title,
+                    artist1 = record.artist,
+                    durationMs1 = record.durationMs,
+                    title2 = server.title,
+                    artist2 = server.artist,
+                    durationMs2 = server.durationMs,
+                    album1 = record.album,
+                    album2 = server.album
+                )
+            }
+
         // 4.1 差量审查与孤儿清理 (Pruning) - 解决服务端删歌/改名后客户端僵尸曲目残留导致曲目总数对不上的核心问题
         if (!effectiveServerId.isNullOrBlank() && effectiveServerId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")) {
             val incomingIds = preservedEntities.map { it.id }.toSet()
@@ -663,6 +693,8 @@ object SongMatchingResolver {
             if (orphanedSongs.isNotEmpty()) {
                 val claimedLocalPaths = preservedEntities.mapNotNull { it.localFilePath?.takeIf { p -> p.isNotBlank() } }.toSet()
                 val toDeleteIds = ArrayList<String>()
+                // 被删孤儿上的收藏标记要并入对应的服务器曲目（Claude，PR #7 合入时补充）
+                val favoriteCarryOver = LinkedHashMap<String, SongEntity>()
                 for (orphan in orphanedSongs) {
                     val localPath = orphan.localFilePath
                     val hasValidLocalFile = !localPath.isNullOrBlank() && File(localPath).let { it.exists() && it.length() > 0 }
@@ -670,10 +702,21 @@ object SongMatchingResolver {
                         // 本地已有有效物理下载文件且未被新同步的服务器曲目认领：降级归属为 local_storage，保留本地离线播放
                         database.songDao().updateServerId(orphan.id, "local_storage")
                     } else {
-                        // 本地无实体文件，或该物理文件已被新服务器曲目认领：彻底从数据库物理删除，防止已下载列表重复显示
+                        // 本地无实体文件，或该物理文件已被新服务器曲目认领：彻底从数据库物理删除，防止已下载列表重复显示。
+                        // Claude 补充：删除前若能对应到服务器曲目（如「缓存到服务器」的在线记录、服务端改名后的新文件），
+                        // 先把歌单引用改指过去，否则用户歌单里这首歌会直接消失。
+                        findServerMatch(orphan)?.let { target ->
+                            database.playlistDao().migratePlaylistSongRefs(orphan.id, target.id)
+                            if (orphan.isFavorite && !target.isFavorite) {
+                                favoriteCarryOver[target.id] = target.copy(isFavorite = true)
+                            }
+                        }
                         toDeleteIds.add(orphan.id)
                         database.downloadDao().deleteDownload(orphan.id)
                     }
+                }
+                if (favoriteCarryOver.isNotEmpty()) {
+                    database.songDao().insertSongs(favoriteCarryOver.values.toList())
                 }
                 if (toDeleteIds.isNotEmpty()) {
                     database.songDao().deleteSongsByIds(toDeleteIds)
@@ -682,8 +725,83 @@ object SongMatchingResolver {
             }
         }
 
+        // 4.2 对账（PR #7）：本地库中残留的「在线音源身份」记录（serverId=lemon_online），
+        // 若同一首歌已在服务器曲库中，则把收藏/本地下载状态合并到服务器曲目并删除在线记录
+        if (!effectiveServerId.isNullOrBlank() && effectiveServerId !in NON_SERVER_LIBRARY_IDS) {
+            val onlineRecords = existingSongs.filter { it.serverId == "lemon_online" }
+            if (onlineRecords.isNotEmpty()) {
+                upgradeOnlineRecordsToServerSongs(
+                    database = database,
+                    onlineRecords = onlineRecords,
+                    findServerMatch = ::findServerMatch,
+                    currentServerSong = { id -> database.songDao().getSongById(id) },
+                    onlineDownloadPath = { songId ->
+                        existingDownloads[songId]?.localFilePath?.takeIf { checkFileExists(it) }
+                    },
+                    checkFileExists = { path -> checkFileExists(path) }
+                )
+            }
+        }
+
         // 5. 触发全局匹配与双向关联去重
         autoMatchAndSyncServer(database, downloadDir, preservedEntities)
+    }
+
+    /**
+     * 把「在线音源身份」记录（serverId=lemon_online）升级为服务器曲库曲目（PR #7）。
+     *
+     * 背景：收藏历史里有些条目是按在线音源登记的，id 与服务器文件 id 不同；当这首歌后来
+     * 下载/缓存进服务器曲库后，本地库里会同时存在在线记录与服务器曲目。在线记录不会被
+     * 列表识别为服务器歌曲，导致「明明在服务器却显示下载按钮」「修标签入口不出现」。
+     *
+     * 处理方式：按标题分组 + [isSongMatch] 元数据校验找到同一首歌，把在线记录上的收藏
+     * 状态与本地物理文件状态合并到服务器曲目，然后删除在线记录。
+     *
+     * Claude 修正（合入时）：
+     * - 多条在线记录对应同一首服务器曲目时按目标累积合并（原实现各自从原始曲目合并，后一条会覆盖前一条，丢本地文件路径）；
+     * - 合并基准取数据库当前值（4.1 可能刚并入过收藏）；
+     * - 删除在线记录前把歌单引用改指服务器曲目（playlist_songs 无外键级联，否则歌单丢歌）。
+     */
+    private suspend fun upgradeOnlineRecordsToServerSongs(
+        database: ZdsDatabase,
+        onlineRecords: List<SongEntity>,
+        findServerMatch: (SongEntity) -> SongEntity?,
+        currentServerSong: suspend (String) -> SongEntity?,
+        onlineDownloadPath: (String) -> String?,
+        checkFileExists: (String?) -> Boolean
+    ) {
+        // 目标服务器曲目 id → 累积合并后的实体
+        val merged = LinkedHashMap<String, SongEntity>()
+        val changed = HashSet<String>()
+        val removedOnlineIds = ArrayList<String>()
+        for (online in onlineRecords) {
+            val matched = findServerMatch(online) ?: continue
+            val base = merged[matched.id] ?: currentServerSong(matched.id) ?: matched
+
+            val mergedLocalPath = base.localFilePath?.takeIf { checkFileExists(it) }
+                ?: online.localFilePath?.takeIf { checkFileExists(it) }
+                ?: onlineDownloadPath(online.id)
+            val mergedFavorite = base.isFavorite || online.isFavorite
+            val mergedStatus = if (mergedLocalPath != null) DownloadStatus.DOWNLOADED else base.downloadStatus
+            val next = base.copy(
+                isFavorite = mergedFavorite,
+                localFilePath = mergedLocalPath,
+                downloadStatus = mergedStatus
+            )
+            merged[matched.id] = next
+            if (next != base) changed.add(matched.id)
+
+            database.playlistDao().migratePlaylistSongRefs(online.id, matched.id)
+            removedOnlineIds.add(online.id)
+            database.downloadDao().deleteDownload(online.id)
+        }
+
+        val upgradedSongs = merged.filterKeys { it in changed }.values.toList()
+        if (upgradedSongs.isNotEmpty()) database.songDao().insertSongs(upgradedSongs)
+        if (removedOnlineIds.isNotEmpty()) {
+            database.songDao().deleteSongsByIds(removedOnlineIds)
+            Log.i(TAG, "Upgraded ${removedOnlineIds.size} lemon_online records already on server")
+        }
     }
 
     /**

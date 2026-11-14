@@ -34,6 +34,8 @@ fun PullToRefreshLayout(
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
     refreshThresholdDp: Float = 70f,
+    /** 指示器额外下移（上方有玻璃顶栏盖着时让开它） */
+    indicatorTopPadding: androidx.compose.ui.unit.Dp = 0.dp,
     content: @Composable () -> Unit
 ) {
     val density = LocalDensity.current
@@ -109,6 +111,7 @@ fun PullToRefreshLayout(
                 shadowElevation = 6.dp,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
+                    .padding(top = indicatorTopPadding)
                     .offset(y = with(density) { (animatedOffset * 0.5f - 16f).coerceAtLeast(12f).toDp() })
                     .size(36.dp)
             ) {

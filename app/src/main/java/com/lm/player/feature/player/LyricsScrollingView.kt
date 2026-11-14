@@ -39,6 +39,10 @@ import com.lm.player.core.designsystem.theme.LyricTheme
 import com.lm.player.core.designsystem.theme.SystemFontManager
 import com.lm.player.core.model.LyricLine
 
+/**
+ * 歌词页滚动歌词：AMLL 风格实现见 [AmllLyricsView]（同字号粗体、景深模糊、弹簧波浪滚动、柔边逐字流光），
+ * 调节入口为右上角玻璃小胶囊（Aa 字号 / ⏱ 快慢 / ⋯ 配色与开关）。
+ */
 @Composable
 fun LyricsScrollingView(
     lyrics: List<LyricLine>,
@@ -51,268 +55,26 @@ fun LyricsScrollingView(
     onOffsetChange: (Long) -> Unit = {},
     onThemeChange: (LyricTheme) -> Unit = {},
     showAdjustButton: Boolean = true,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** 液态玻璃模式下播放页的封面底图（调节胶囊 / 面板的玻璃折射它），未开启时为 null */
+    glassBackdrop: com.kyant.backdrop.Backdrop? = null,
+    /** 当前句锚点（占视图高度的比例）上限；null = 按歌词样式默认（竖屏歌词页传较小值，让歌词置顶） */
+    topAnchor: Float? = null
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
-    var isKaraokeEnabled by remember {
-        mutableStateOf(prefs.getBoolean("lyric_karaoke_enabled", true))
-    }
-    var useSystemFont by remember {
-        mutableStateOf(prefs.getBoolean("lyric_use_system_font", true))
-    }
-    val lyricFontFamily = remember(useSystemFont) {
-        SystemFontManager.getSystemFontFamily(useSystemFont)
-    }
-
-    val cleanLyrics = remember(lyrics) {
-        lyrics.filter { it.text.isNotBlank() && !it.text.trim().equals("null", ignoreCase = true) }
-    }
-
-    var showAdjustDialog by remember { mutableStateOf(false) }
-    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-
-    val activeColor = if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
-    val inactiveColor = if (isDark) lyricTheme.inactiveColorDark else lyricTheme.inactiveColorLight
-    val karaokeBaseColor = lyricTheme.getKaraokeBaseColor(isDark)
-    val karaokeOverlayColor = lyricTheme.getKaraokeOverlayColor(isDark)
-
-    if (cleanLyrics.isEmpty()) {
-        Box(
-            modifier = modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = "♪ 纯音乐 / 暂无歌词 ♪",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = activeColor
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = "享受纯净无损音乐时光",
-                    fontSize = 12.sp,
-                    color = inactiveColor
-                )
-            }
-        }
-        return
-    }
-
-    val listState = rememberLazyListState()
-
-    // 结合用户快慢偏置时间计算有效播放时间戳
-    val effectivePositionMs = (currentPositionMs + lyricsOffsetMs).coerceAtLeast(0L)
-
-    // 逐字歌词高刷帧级平滑时间插值，消除 400ms 刷新周期产生的逐字流光顿挫跳跃
-    var lastTickPos by remember { mutableLongStateOf(effectivePositionMs) }
-    var lastTickUptime by remember { mutableLongStateOf(android.os.SystemClock.uptimeMillis()) }
-
-    LaunchedEffect(effectivePositionMs) {
-        lastTickPos = effectivePositionMs
-        lastTickUptime = android.os.SystemClock.uptimeMillis()
-    }
-
-    val isPlaying by com.lm.player.core.media.PlaybackQueueManager.isPlayingFlow.collectAsState()
-    var frameTick by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isKaraokeEnabled, isPlaying) {
-        if (isKaraokeEnabled && isPlaying) {
-            while (true) {
-                withFrameMillis { frameTick = it }
-            }
-        }
-    }
-
-    // 计算当前处于哪一行歌词 (采用 O(log N) 二分查找匹配对应行，降低每 400ms 进度刷新的 CPU 开销)
-    val activeIndex = remember(cleanLyrics, effectivePositionMs) {
-        var low = 0
-        var high = cleanLyrics.lastIndex
-        var best = 0
-        while (low <= high) {
-            val mid = (low + high) ushr 1
-            if (cleanLyrics[mid].timestampMs <= effectivePositionMs) {
-                best = mid
-                low = mid + 1
-            } else {
-                high = mid - 1
-            }
-        }
-        best
-    }
-
-    // 伴随播放进度自动丝滑居中滚动至当前歌词 (用户手动拖动歌词时不抢夺手势)
-    LaunchedEffect(activeIndex) {
-        if (cleanLyrics.isNotEmpty() && activeIndex in cleanLyrics.indices && !listState.isScrollInProgress) {
-            listState.animateScrollToItem(
-                index = (activeIndex - 1).coerceAtLeast(0),
-                scrollOffset = 0
-            )
-        }
-    }
-
-    val activeFontSize = remember(fontSizeSp) { fontSizeSp.sp }
-    val inactiveFontSize = remember(fontSizeSp) { (fontSizeSp * 0.74f).sp }
-    val activeLineHeight = remember(fontSizeSp) { (fontSizeSp * 1.38f).sp }
-    val inactiveLineHeight = remember(fontSizeSp) { (fontSizeSp * 0.74f * 1.38f).sp }
-
-    Box(modifier = modifier.fillMaxSize()) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            contentPadding = PaddingValues(vertical = 36.dp),
-            verticalArrangement = Arrangement.spacedBy((fontSizeSp * 0.95f).dp)
-        ) {
-            itemsIndexed(
-                items = cleanLyrics,
-                key = { index, item -> "${item.timestampMs}_$index" },
-                contentType = { _, _ -> "lyric_item" }
-            ) { index, item ->
-                val isActive = index == activeIndex
-                val isNearActive = kotlin.math.abs(index - activeIndex) <= 1
-                val textColor = if (isNearActive) {
-                    val animated by animateColorAsState(
-                        targetValue = if (isActive) activeColor else inactiveColor,
-                        animationSpec = tween(durationMillis = 260),
-                        label = "lyric_color"
-                    )
-                    animated
-                } else {
-                    inactiveColor
-                }
-                val currentSize = if (isActive) activeFontSize else inactiveFontSize
-                val currentLineHeight = if (isActive) activeLineHeight else inactiveLineHeight
-                val fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
-
-                if (isActive && isKaraokeEnabled) {
-                    val nextItemTime = cleanLyrics.getOrNull(index + 1)?.timestampMs ?: (item.timestampMs + 4000L)
-                    val lineDuration = (nextItemTime - item.timestampMs).coerceIn(1000L, 12000L)
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSeekToLyric((item.timestampMs - lyricsOffsetMs).coerceAtLeast(0L)) }
-                    ) {
-                        Box(modifier = Modifier.wrapContentWidth()) {
-                            Text(
-                                text = item.text,
-                                style = TextStyle(
-                                    fontSize = currentSize,
-                                    fontWeight = fontWeight,
-                                    fontFamily = lyricFontFamily,
-                                    color = karaokeBaseColor,
-                                    lineHeight = currentLineHeight
-                                )
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .matchParentSize()
-                                    .drawWithContent {
-                                        // 建立对高刷帧时钟的绘制阶段依赖，平滑自增且无重组开销
-                                        val _tick = frameTick
-                                        val elapsed = (android.os.SystemClock.uptimeMillis() - lastTickUptime).coerceIn(0L, 600L)
-                                        val smoothPos = lastTickPos + elapsed
-                                        val lineProgress = ((smoothPos - item.timestampMs).toFloat() / lineDuration.toFloat()).coerceIn(0f, 1f)
-
-                                        if (lineProgress > 0f) {
-                                            clipRect(right = size.width * lineProgress) {
-                                                this@drawWithContent.drawContent()
-                                            }
-                                        }
-                                    }
-                            ) {
-                                Text(
-                                    text = item.text,
-                                    style = TextStyle(
-                                        fontSize = currentSize,
-                                        fontWeight = fontWeight,
-                                        fontFamily = lyricFontFamily,
-                                        color = karaokeOverlayColor,
-                                        lineHeight = currentLineHeight
-                                    )
-                                )
-                            }
-                        }
-                    }
-                } else {
-                    Text(
-                        text = item.text,
-                        style = TextStyle(
-                            fontSize = currentSize,
-                            fontWeight = fontWeight,
-                            fontFamily = lyricFontFamily,
-                            color = textColor,
-                            lineHeight = currentLineHeight
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSeekToLyric((item.timestampMs - lyricsOffsetMs).coerceAtLeast(0L)) }
-                    )
-                }
-            }
-        }
-
-        // 右上角歌词悬浮调节按键 (Aa ⏱) - 音频共享式展出
-        if (showAdjustButton) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 10.dp, end = 12.dp)
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (isDark) Color(0xFF1E1E24).copy(alpha = 0.85f) else Color(0xFFE5E5EA).copy(alpha = 0.85f),
-                    border = BorderStroke(1.dp, if (isDark) Color.White.copy(alpha = 0.15f) else Color.Black.copy(alpha = 0.08f)),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(12.dp))
-                        .clickable { showAdjustDialog = true }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Tune,
-                            contentDescription = "歌词微调",
-                            tint = activeColor,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "歌词调节",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = activeColor
-                        )
-                    }
-                }
-
-                // 原位浮层音频共享展出卡片
-                LyricsAdjustDropdownMenu(
-                    expanded = showAdjustDialog,
-                    onDismissRequest = { showAdjustDialog = false },
-                    fontSizeSp = fontSizeSp,
-                    lyricsOffsetMs = lyricsOffsetMs,
-                    lyricTheme = lyricTheme,
-                    isKaraokeEnabled = isKaraokeEnabled,
-                    useSystemFont = useSystemFont,
-                    onFontSizeChange = onFontSizeChange,
-                    onOffsetChange = onOffsetChange,
-                    onThemeChange = onThemeChange,
-                    onKaraokeChange = {
-                        isKaraokeEnabled = it
-                        prefs.edit().putBoolean("lyric_karaoke_enabled", it).apply()
-                    },
-                    onFontModeChange = {
-                        useSystemFont = it
-                        prefs.edit().putBoolean("lyric_use_system_font", it).apply()
-                    }
-                )
-            }
-        }
-    }
+    AmllLyricsView(
+        lyrics = lyrics,
+        currentPositionMs = currentPositionMs,
+        onSeekToLyric = onSeekToLyric,
+        fontSizeSp = fontSizeSp,
+        lyricsOffsetMs = lyricsOffsetMs,
+        lyricTheme = lyricTheme,
+        onFontSizeChange = onFontSizeChange,
+        onOffsetChange = onOffsetChange,
+        showAdjustButton = showAdjustButton,
+        glassBackdrop = glassBackdrop,
+        modifier = modifier,
+        topAnchor = topAnchor
+    )
 }
 
 /**
@@ -401,12 +163,12 @@ fun LyricsAdjustDropdownMenu(
                 ) {
                     Text("A-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = primaryText)
                 }
-                Slider(
+                com.lm.player.core.designsystem.component.LiquidSlider(
                     value = fontSizeSp,
                     onValueChange = { onFontSizeChange(it) },
                     valueRange = 16f..36f,
                     steps = 9,
-                    colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed),
+                    accentColor = AppleRed,
                     modifier = Modifier.weight(1f).height(24.dp)
                 )
                 IconButton(
@@ -702,12 +464,12 @@ fun LyricsAdjustDialog(
                         ) {
                             Text("A-", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = primaryText)
                         }
-                        Slider(
+                        com.lm.player.core.designsystem.component.LiquidSlider(
                             value = fontSizeSp,
                             onValueChange = { onFontSizeChange(it) },
                             valueRange = 16f..36f,
                             steps = 9,
-                            colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed),
+                            accentColor = AppleRed,
                             modifier = Modifier.weight(1f)
                         )
                         IconButton(
@@ -948,19 +710,10 @@ fun CoverFiveLineGradientLyrics(
     }
 
     val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
-    var useSystemFont by remember { mutableStateOf(prefs.getBoolean("lyric_use_system_font", true)) }
-    DisposableEffect(prefs) {
-        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
-            if (key == "lyric_use_system_font") {
-                useSystemFont = sp.getBoolean(key, true)
-            }
-        }
-        prefs.registerOnSharedPreferenceChangeListener(listener)
-        onDispose {
-            prefs.unregisterOnSharedPreferenceChangeListener(listener)
-        }
-    }
+    // 与歌词页共用同一份显示设置（「词」按钮里切换后这里立刻同步：系统字体、景深模糊）
+    remember { LyricDisplaySettings.ensureLoaded(context) }
+    val useSystemFont = LyricDisplaySettings.systemFont
+    val depthBlurEnabled = LyricDisplaySettings.depthBlur && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
     val lyricFontFamily = remember(useSystemFont) {
         SystemFontManager.getSystemFontFamily(useSystemFont)
     }
@@ -1109,6 +862,11 @@ fun CoverFiveLineGradientLyrics(
                             alpha = lineAlpha
                             scaleX = lineScale
                             scaleY = lineScale
+                            // 景深模糊：离当前行越远越模糊（与歌词页同一开关；Android 12 及以上）
+                            val blurPx = if (depthBlurEnabled) ((absDelta - 0.35f).coerceIn(0f, 2f) * 1.6f).dp.toPx() else 0f
+                            renderEffect = if (blurPx > 0.3f) {
+                                androidx.compose.ui.graphics.BlurEffect(blurPx, blurPx, androidx.compose.ui.graphics.TileMode.Decal)
+                            } else null
                         }
                 )
             }

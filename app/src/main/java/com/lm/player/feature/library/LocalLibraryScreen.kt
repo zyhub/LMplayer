@@ -96,13 +96,27 @@ data class LocalLibraryCallbacks(
     val onBatchDownloadSongsWithOptions: (List<UnifiedSong>, DownloadTarget, AudioQuality) -> Unit = { _, _, _ -> },
     val onOpenDownloads: () -> Unit = {},
     val onRefreshPlaylists: () -> Unit = {},
+    /** 进入资料库 / 切换服务器时的自动刷新（静默）；null = 用 onRefreshPlaylists */
+    val onAutoRefreshPlaylists: (() -> Unit)? = null,
     val onCreatePlaylist: (name: String, isOnline: Boolean) -> Unit = { _, _ -> },
     val onDeletePlaylist: (playlistId: String) -> Unit = {},
     val onToggleFavorite: ((UnifiedSong) -> Unit)? = null,
     val onFetchPlaylistSongs: (suspend (playlistId: String, isOnline: Boolean) -> List<UnifiedSong>)? = null,
+    /**
+     * 把歌曲移出歌单（与 TV 一致）：服务器歌单同步写回服务器，本地歌单只改本机。
+     * 返回实际移出的条数；失败时返回 failure（界面不动、提示原因）
+     */
+    val onRemoveSongsFromPlaylist: (suspend (playlistId: String, isOnline: Boolean, songs: List<UnifiedSong>, onProgress: (Float, String) -> Unit) -> Result<Int>)? = null,
     val onFetchServerFolders: (suspend (parentId: String?) -> List<ServerFolderItem>)? = null,
     val onFetchServerFolderSongs: (suspend (folderId: String) -> List<UnifiedSong>)? = null,
     val onFetchServerGenres: (suspend () -> List<UnifiedGenre>)? = null,
+    /** 歌手 / 专辑页在线搜索：本地音源加速优先、服务器兜底；isArtist=false 时按专辑名 + 歌手搜专辑 */
+    /** 歌手 / 专辑页在线结果：按页取（page 从 1 开始，每页 HERO_ONLINE_PAGE_SIZE 首） */
+    val onSearchOnlineForHero: (suspend (isArtist: Boolean, title: String, artist: String, source: OnlineMusicSource, onlineAlbumId: String, page: Int) -> HeroOnlinePage)? = null,
+    /** 歌手专辑页在线搜索：按歌手名搜专辑，只留该歌手的 */
+    val onSearchOnlineArtistAlbums: (suspend (artist: String, source: OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
+    /** 在线搜索默认平台（与全局搜索当前平台一致） */
+    val defaultOnlineSource: OnlineMusicSource = OnlineMusicSource.KUWO,
     val onFetchServerScanStatus: (suspend () -> LemonScanStatus?)? = null,
     val onTriggerServerScan: (suspend () -> Unit)? = null,
     val onDeleteLocalFilePath: (suspend (String) -> Unit)? = null,
@@ -148,6 +162,7 @@ fun LocalLibraryScreen(
     val onBatchDownloadSongsWithOptions = callbacks.onBatchDownloadSongsWithOptions
     val onOpenDownloads = callbacks.onOpenDownloads
     val onRefreshPlaylists = callbacks.onRefreshPlaylists
+    val onAutoRefreshPlaylists = callbacks.onAutoRefreshPlaylists ?: callbacks.onRefreshPlaylists
     val onCreatePlaylist = callbacks.onCreatePlaylist
     val onDeletePlaylist = callbacks.onDeletePlaylist
     val onToggleFavorite = callbacks.onToggleFavorite
@@ -213,16 +228,69 @@ fun LocalLibraryScreen(
     var isFromAllFolders by remember { mutableStateOf(false) }
     var isFromAllArtists by remember { mutableStateOf(false) }
     var isFromAllAlbums by remember { mutableStateOf(false) }
+    // 歌手 / 专辑详情页的大图头部（从歌手 / 专辑网格进入，或播放页点歌手 / 专辑跳转时设置）
+    var subViewHero by remember { mutableStateOf<LibraryHero?>(null) }
+    // 二级页右上角小放大镜：展开后只过滤当前列表
+    var subSearchOpen by remember { mutableStateOf(false) }
+    var subSearchQuery by remember { mutableStateOf("") }
+    // 文件夹 / 歌单歌曲排序（默认按日期，最新在上；再点同一方式切换方向）
+    var subSortMode by remember { mutableStateOf(SubSongSort.DATE) }
+    var subSortReversed by remember { mutableStateOf(false) }
+    // 当前二级页实际显示的顺序（排序 / 搜索后），供「定位正在播放」使用
+    val shownSongsHolder = remember { arrayOfNulls<List<UnifiedSong>>(1) }
 
     // 资料库主列表与二级子列表多选下载状态
     var isMainSongsMultiSelect by remember { mutableStateOf(false) }
     var selectedMainSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isSubViewMultiSelect by remember { mutableStateOf(false) }
     var selectedSubViewSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    /** 等待确认移出歌单的歌曲（多选） */
+    var songsPendingRemoval by remember { mutableStateOf<List<UnifiedSong>?>(null) }
+    var isRemovingFromPlaylist by remember { mutableStateOf(false) }
+    var removalProgress by remember { mutableStateOf(0f) }
+    var removalStep by remember { mutableStateOf("") }
     var songsForBatchDownloadChoice by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
 
     val libraryListState = rememberLazyListState()
     val subViewListState = rememberLazyListState()
+
+    // 歌手 / 专辑页：数据来源（资料库 / 在线）与在线平台；资料库没有这位歌手 / 这张专辑的歌时自动切到在线
+    var heroSource by remember { mutableStateOf(HeroDataSource.LIBRARY) }
+    var heroPlatform by remember { mutableStateOf(callbacks.defaultOnlineSource) }
+    var heroLibrarySongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    var heroOnlineLoading by remember { mutableStateOf(false) }
+    // 在线结果（进页面就在后台搜，切换开关时即时显示，开关上也能显示在线数量）；null = 还没搜完
+    var heroOnlineSongs by remember { mutableStateOf<List<UnifiedSong>?>(null) }
+    // 在线分页：平台给的总数（-1 = 不知道）、已取到第几页、是否还有下一页、是否正在加载下一页
+    var heroOnlineTotal by remember { mutableIntStateOf(-1) }
+    var heroOnlinePage by remember { mutableIntStateOf(0) }
+    var heroOnlineHasMore by remember { mutableStateOf(false) }
+    var heroOnlineMoreLoading by remember { mutableStateOf(false) }
+    // 每次打开歌手 / 专辑页 +1：同一个歌手重新打开（如从歌手专辑页返回）也要重新取数
+    var heroOpenNonce by remember { mutableIntStateOf(0) }
+    val heroKey = subViewHero?.let { "${it.kind}|${it.title}|${it.artist}|${it.onlineAlbumId}|$heroOpenNonce" }
+
+    // 双端下载完成后刷新当前页面：把页面里的歌曲换成数据库重读后的最新数据（本地路径 / 服务器归属 / 音质）
+    val pageRefreshTick = com.lm.player.core.media.SongStatusStore.pageRefreshTick.intValue
+    val latestAllSongs by rememberUpdatedState(allSongs)
+    LaunchedEffect(pageRefreshTick) {
+        if (pageRefreshTick == 0) return@LaunchedEffect
+        val byId = latestAllSongs.associateBy { it.id }
+        fun fresh(list: List<UnifiedSong>): List<UnifiedSong> = list.map { byId[it.id] ?: it }
+        activeSubViewSongs = fresh(activeSubViewSongs)
+        heroLibrarySongs = fresh(heroLibrarySongs)
+        heroOnlineSongs = heroOnlineSongs?.let { fresh(it) }
+    }
+
+    // 歌手专辑页（歌手页「N 张专辑」进入）：资料库 / 在线两种来源，点专辑进入专辑页
+    var artistAlbumsFor by remember { mutableStateOf<String?>(null) }
+    var artistAlbumsFromAll by remember { mutableStateOf(false) }
+    var isFromArtistAlbums by remember { mutableStateOf(false) }
+    var artistAlbumsSource by remember { mutableStateOf(HeroDataSource.LIBRARY) }
+    var artistOnlineAlbums by remember { mutableStateOf<List<UnifiedAlbum>?>(null) }
+    var artistAlbumsLoading by remember { mutableStateOf(false) }
+    var artistLibraryAlbums by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
+    var reopenArtistRequest by remember { mutableStateOf<String?>(null) }
     val isAnyScrolling = libraryListState.isScrollInProgress || subViewListState.isScrollInProgress
     LaunchedEffect(isAnyScrolling) {
         onListScrollingChange(isAnyScrolling)
@@ -256,6 +324,9 @@ fun LocalLibraryScreen(
     LaunchedEffect(activeSubViewTitle) {
         isSubViewMultiSelect = false
         selectedSubViewSongIds = emptySet()
+        subSearchOpen = false
+        subSearchQuery = ""
+        if (subViewHero?.title != activeSubViewTitle) subViewHero = null
         if (activeSubViewTitle != null && activeSubViewTitle !in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")) {
             lastSubViewTitle = activeSubViewTitle
             lastSubViewSubtitle = activeSubViewSubtitle
@@ -683,11 +754,105 @@ fun LocalLibraryScreen(
         isSubViewMultiSelect = false
         selectedSubViewSongIds = emptySet()
         if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
-            onRefreshPlaylists()
+            onAutoRefreshPlaylists()
         }
     }
 
     // 层级返回调度器：如果从「全部歌单」、「全部文件夹」、「全部歌手」或「全部专辑」进入下级详情，先返回上层网格，再返回资料库首页
+    LaunchedEffect(heroKey) {
+        val hero = subViewHero ?: return@LaunchedEffect
+        heroLibrarySongs = activeSubViewSongs
+        heroOnlineSongs = null
+        // 从在线专辑进入：平台跟着那张专辑
+        hero.onlineAlbumId.removePrefix("lemon_discover_album_").substringBefore('_', "")
+            .takeIf { hero.onlineAlbumId.isNotBlank() && it.isNotBlank() }
+            ?.let { heroPlatform = OnlineMusicSource.fromKey(it) }
+        heroSource = if (activeSubViewSongs.isEmpty() && callbacks.onSearchOnlineForHero != null) HeroDataSource.ONLINE else HeroDataSource.LIBRARY
+    }
+    // 在线结果：进页面只取第一页（99 首 + 平台给的总数），往下滑到底部附近再一页一页加载，最多 999 首
+    LaunchedEffect(heroKey, heroPlatform) {
+        val hero = subViewHero ?: return@LaunchedEffect
+        val search = callbacks.onSearchOnlineForHero ?: return@LaunchedEffect
+        heroOnlineSongs = null
+        heroOnlineTotal = -1
+        heroOnlinePage = 0
+        heroOnlineHasMore = false
+        heroOnlineMoreLoading = false
+        heroOnlineLoading = true
+        val first = try {
+            search(hero.kind == LibraryHero.Kind.ARTIST, hero.title, hero.artist, heroPlatform, hero.onlineAlbumId, 1)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            HeroOnlinePage(emptyList(), 0, false)
+        }
+        heroOnlineLoading = false
+        if (subViewHero !== hero) return@LaunchedEffect
+        heroOnlineSongs = first.songs.distinctBy { it.id }.take(HERO_ONLINE_MAX)
+        heroOnlineTotal = first.total
+        heroOnlinePage = 1
+        heroOnlineHasMore = first.hasMore && heroOnlineSongs!!.size < HERO_ONLINE_MAX
+    }
+    // 滑动分批加载：在线模式下列表滑到倒数 15 行以内就取下一页（一次只取一页，取完若仍在底部会接着取）
+    LaunchedEffect(heroKey, heroPlatform, heroSource) {
+        val hero = subViewHero ?: return@LaunchedEffect
+        val search = callbacks.onSearchOnlineForHero ?: return@LaunchedEffect
+        if (heroSource != HeroDataSource.ONLINE) return@LaunchedEffect
+        androidx.compose.runtime.snapshotFlow {
+            val info = subViewListState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val nearEnd = info.totalItemsCount > 0 && last >= info.totalItemsCount - 15
+            Triple(nearEnd && heroOnlineHasMore && !heroOnlineLoading, heroOnlinePage, heroOnlineSongs?.size ?: -1)
+        }.collect { (shouldLoad, page, _) ->
+            if (!shouldLoad || page <= 0 || subViewHero !== hero) return@collect
+            heroOnlineMoreLoading = true
+            val next = try {
+                search(hero.kind == LibraryHero.Kind.ARTIST, hero.title, hero.artist, heroPlatform, hero.onlineAlbumId, page + 1)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                heroOnlineMoreLoading = false
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            heroOnlineMoreLoading = false
+            if (subViewHero !== hero) return@collect
+            if (next == null) {
+                heroOnlineHasMore = false
+                return@collect
+            }
+            val old = heroOnlineSongs.orEmpty()
+            val seen = old.mapTo(HashSet()) { it.id }
+            val merged = old + next.songs.filter { seen.add(it.id) }
+            heroOnlineSongs = merged.take(HERO_ONLINE_MAX)
+            if (next.total > 0) heroOnlineTotal = next.total
+            heroOnlinePage = page + 1
+            heroOnlineHasMore = next.hasMore && merged.size < HERO_ONLINE_MAX
+        }
+    }
+    // 显示的列表跟着开关走（只在仍停留在这一页时写，离开后到达的结果不会写到别的列表上）
+    LaunchedEffect(heroKey, heroSource, heroOnlineSongs) {
+        val hero = subViewHero ?: return@LaunchedEffect
+        if (activeSubViewTitle != hero.title) return@LaunchedEffect
+        val target = if (heroSource == HeroDataSource.ONLINE) heroOnlineSongs.orEmpty() else heroLibrarySongs
+        if (activeSubViewSongs !== target) activeSubViewSongs = target
+    }
+    // 歌手专辑页：在线专辑后台预取
+    LaunchedEffect(artistAlbumsFor, heroPlatform) {
+        val name = artistAlbumsFor ?: return@LaunchedEffect
+        val search = callbacks.onSearchOnlineArtistAlbums ?: return@LaunchedEffect
+        artistOnlineAlbums = null
+        artistAlbumsLoading = true
+        val found = try {
+            search(name, heroPlatform)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+        artistAlbumsLoading = false
+        if (artistAlbumsFor == name) artistOnlineAlbums = found.take(999)
+    }
+
     val handleSubViewBack: () -> Unit = {
         if (isDownloadManagementMode) {
             isDownloadManagementMode = false
@@ -695,6 +860,15 @@ fun LocalLibraryScreen(
         } else if (isSubViewMultiSelect) {
             isSubViewMultiSelect = false
             selectedSubViewSongIds = emptySet()
+        } else if (isFromArtistAlbums && artistAlbumsFor != null && activeSubViewTitle != "${artistAlbumsFor} · 专辑") {
+            // 专辑页 → 回到歌手专辑页
+            activeSubViewTitle = "${artistAlbumsFor} · 专辑"
+            activeSubViewSubtitle = "歌手专辑"
+            isFromArtistAlbums = false
+        } else if (artistAlbumsFor != null && activeSubViewTitle == "${artistAlbumsFor} · 专辑") {
+            // 歌手专辑页 → 回到歌手页
+            reopenArtistRequest = artistAlbumsFor
+            artistAlbumsFor = null
         } else if (activeSubViewTitle != "全部歌单" && isFromAllPlaylists) {
             activeSubViewTitle = "全部歌单"
             activeSubViewSubtitle = "共 ${playlists.size + 3} 个歌单"
@@ -718,7 +892,113 @@ fun LocalLibraryScreen(
             isFromAllFolders = false
             isFromAllArtists = false
             isFromAllAlbums = false
+            artistAlbumsFor = null
+            isFromArtistAlbums = false
         }
+    }
+
+    // 歌手名匹配：完全一致，或多人合唱（A / B、A、B）里包含该歌手
+    fun artistMatches(songArtist: String, name: String): Boolean {
+        val a = songArtist.ifBlank { "未知歌手" }
+        if (a == name) return true
+        return a.split('/', '、', ',', '，', '&', ';', '；').any { it.trim().equals(name, ignoreCase = true) }
+    }
+
+    // 打开歌手详情页（大图 + 简介 + 歌曲列表）
+    val openArtistPage: (String, Boolean) -> Unit = { rawName, fromAll ->
+        val name = rawName.ifBlank { "未知歌手" }
+        val exact = allSongs.filter { it.artist.ifBlank { "未知歌手" } == name }
+        val songs = exact.ifEmpty { allSongs.filter { artistMatches(it.artist, name) } }
+        val artist = artists.firstOrNull { it.name == name }
+        val albumCount = songs.map { it.album.trim() }.filter { it.isNotBlank() }.distinct().size
+        isFromAllArtists = fromAll
+        activePlaylistId = null
+        subViewHero = LibraryHero(
+            kind = LibraryHero.Kind.ARTIST,
+            title = name,
+            imageUrl = artist?.avatarUrl?.ifBlank { null } ?: songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl.orEmpty(),
+            subtitle = "${songs.size} 首歌曲 · $albumCount 张专辑",
+            intro = buildArtistIntro(name, songs),
+            artist = name
+        )
+        heroOpenNonce++
+        activeSubViewTitle = name
+        activeSubViewSubtitle = "歌手 · 共 ${songs.size} 首歌曲"
+        activeSubViewSongs = songs
+    }
+
+    // 打开专辑详情页（专辑大图 + 简介 + 曲目列表）
+    val openAlbumPage: (String, String, String, Boolean) -> Unit = { rawTitle, artistName, albumId, fromAll ->
+        val title = rawTitle.ifBlank { "单曲精选" }
+        val album = albums.firstOrNull { (albumId.isNotBlank() && it.id == albumId) || it.title == title }
+        val songs = allSongs.filter {
+            it.album == title ||
+                (albumId.isNotBlank() && it.albumId == albumId) ||
+                (album != null && album.id.isNotBlank() && it.albumId == album.id) ||
+                (title in listOf("未知专辑", "单曲精选") && it.album.isBlank())
+        }
+        val artist = album?.artist?.ifBlank { null } ?: artistName.ifBlank { songs.firstOrNull()?.artist.orEmpty() }
+        isFromAllAlbums = fromAll
+        activePlaylistId = null
+        subViewHero = LibraryHero(
+            kind = LibraryHero.Kind.ALBUM,
+            title = title,
+            imageUrl = album?.coverUrl?.ifBlank { null } ?: songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl.orEmpty(),
+            subtitle = listOfNotNull(artist.ifBlank { null }, album?.year?.takeIf { it > 0 }?.let { "$it 年" }).joinToString(" · "),
+            intro = buildAlbumIntro(title, artist, songs, album?.year),
+            artist = artist
+        )
+        heroOpenNonce++
+        activeSubViewTitle = title
+        activeSubViewSubtitle = "$artist · 共 ${maxOf(album?.songCount ?: 0, songs.size)} 首"
+        activeSubViewSongs = songs
+    }
+
+    // 歌手专辑页：资料库里该歌手的专辑（按歌曲的专辑分组，封面 / id 优先取资料库专辑）
+    val openArtistAlbums: (String) -> Unit = { name ->
+        val artistSongs = allSongs.filter { artistMatches(it.artist, name) }
+        artistLibraryAlbums = artistSongs.filter { it.album.isNotBlank() }
+            .groupBy { it.album.trim() }
+            .map { (title, songs) ->
+                val known = albums.firstOrNull { it.title == title }
+                UnifiedAlbum(
+                    id = known?.id ?: songs.first().albumId.ifBlank { "local_album_${title.hashCode()}" },
+                    title = title,
+                    artist = known?.artist?.ifBlank { null } ?: name,
+                    coverUrl = known?.coverUrl?.ifBlank { null } ?: songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl.orEmpty(),
+                    songCount = songs.size
+                )
+            }
+            .sortedByDescending { it.songCount }
+        artistAlbumsFromAll = isFromAllArtists
+        artistAlbumsFor = name
+        artistOnlineAlbums = null
+        artistAlbumsSource = if (artistLibraryAlbums.isEmpty() && callbacks.onSearchOnlineArtistAlbums != null) HeroDataSource.ONLINE else HeroDataSource.LIBRARY
+        activePlaylistId = null
+        activeSubViewTitle = "$name · 专辑"
+        activeSubViewSubtitle = "歌手专辑"
+        activeSubViewSongs = emptyList()
+    }
+    LaunchedEffect(reopenArtistRequest) {
+        val name = reopenArtistRequest ?: return@LaunchedEffect
+        reopenArtistRequest = null
+        openArtistPage(name, artistAlbumsFromAll)
+    }
+
+    // 其它页面（播放页点歌手 / 专辑）请求打开详情页：放在「切换服务器复位」之后，首次进入资料库时不会被复位清掉
+    LaunchedEffect(LibraryNavigator.pending) {
+        val request = LibraryNavigator.pending ?: return@LaunchedEffect
+        isFromAllPlaylists = false
+        isFromAllFolders = false
+        isFromAllArtists = false
+        isFromAllAlbums = false
+        isMainSongsMultiSelect = false
+        when (request) {
+            is LibraryNavigator.Request.Artist -> openArtistPage(request.name, false)
+            is LibraryNavigator.Request.Album -> openAlbumPage(request.title, request.artist, request.albumId, false)
+        }
+        LibraryNavigator.pending = null
+        runCatching { subViewListState.scrollToItem(0) }
     }
 
     // 触屏滑动返回或物理按键退出下钻视图与多选模式
@@ -847,10 +1127,10 @@ fun LocalLibraryScreen(
     LaunchedEffect(locateSongTrigger) {
         if (locateSongTrigger > 0 && currentPlayingSong != null) {
             val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")
-            val subIdx = activeSubViewSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
+            val subIdx = (shownSongsHolder[0]?.takeIf { activeSubViewTitle != null } ?: activeSubViewSongs).indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             val mainIdx = filteredSongs.indexOfFirst { isSamePlayingSong(it, currentPlayingSong) }
             if (activeSubViewTitle != null && !isGridSubView && subIdx >= 0) {
-                runCatching { subViewListState.scrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx + (if (subViewHero != null && subViewHero?.title == activeSubViewTitle) 2 else 0)) }
             } else if (mainIdx >= 0) {
                 if (activeSubViewTitle != null) {
                     activeSubViewTitle = null
@@ -873,8 +1153,36 @@ fun LocalLibraryScreen(
                 activeSubViewTitle = lastSubViewTitle
                 activeSubViewSubtitle = lastSubViewSubtitle
                 delay(80)
-                runCatching { subViewListState.scrollToItem(subIdx) }
+                runCatching { subViewListState.scrollToItem(subIdx + (if (subViewHero != null && subViewHero?.title == activeSubViewTitle) 2 else 0)) }
             }
+        }
+    }
+
+    // 头部右侧「下载管理 + 服务器切换」：普通模式画在头部；液态玻璃模式登记到上层固定显示
+    val pinnedHeaderActions: @Composable () -> Unit = {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(if (isUltraCompactHeader) 4.dp else 6.dp)
+        ) {
+            com.lm.player.core.designsystem.component.HeaderDownloadPill(
+                activeDownloadCount = activeDownloadCount,
+                onClick = onOpenDownloads,
+                isCompactHeader = isCompactHeader,
+                horizontalPad = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp,
+                verticalPad = if (isCompactHeader) 5.dp else 6.dp,
+                surfaceColor = surfaceColor,
+                borderColor = borderColor,
+                blurAlpha = blurAlpha
+            )
+            ServerSwitchDropdownButton(
+                currentServer = currentServerName,
+                configuredServers = configuredServers,
+                blurAlpha = blurAlpha,
+                onSelectLocal = onSelectLocalServer,
+                onSelectServer = onSelectServer,
+                onSyncNow = onSyncNow,
+                onGoToSettings = onGoToSettings
+            )
         }
     }
 
@@ -949,56 +1257,7 @@ fun LocalLibraryScreen(
                                 )
                             }
 
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(buttonGap)
-                            ) {
-                                // 下载管理胶囊按键 (与首页风格统一)
-                                Surface(
-                                    shape = RoundedCornerShape(20.dp),
-                                    color = surfaceColor,
-                                    shadowElevation = 2.dp,
-                                    border = BorderStroke(1.dp, borderColor),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(20.dp))
-                                        .clickable(onClick = onOpenDownloads)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
-                                            contentDescription = "下载管理",
-                                            tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
-                                            modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
-                                        )
-                                        if (activeDownloadCount > 0) {
-                                            Spacer(modifier = Modifier.width(3.dp))
-                                            Text(
-                                                text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
-                                                color = AppleRed,
-                                                fontSize = dimensions.captionSize,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1,
-                                                softWrap = false
-                                            )
-                                        }
-                                    }
-                                }
-
-                                // 类似首页的本地/服务器切换按钮
-                                ServerSwitchDropdownButton(
-                                    currentServer = currentServerName,
-                                    configuredServers = configuredServers,
-                                    blurAlpha = blurAlpha,
-                                    onSelectLocal = onSelectLocalServer,
-                                    onSelectServer = onSelectServer,
-                                    onSyncNow = onSyncNow,
-                                    onGoToSettings = onGoToSettings
-                                )
-                            }
-                        }
+ pinnedHeaderActions()                         }
                     }
                 }
 
@@ -1892,145 +2151,50 @@ fun LocalLibraryScreen(
             }
         }
 
-        // 顶部渐进毛玻璃吸顶层 (当页面向上滚动穿过状态栏时平滑出现)
-        com.lm.player.core.designsystem.component.ProgressiveFrostedTopBar(
-            isScrolled = isScrolledAway.value,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .height(18.dp)
-        ) {}
+        // 顶部渐进毛玻璃条已删除：应用不是 edge-to-edge，它只会在状态栏下方形成一条白 / 灰条
     }
 
         // 二级下钻详情视图 (页面内展示：歌单曲目、歌手曲目、专辑曲目，绝不遮挡底部播放栏)
         if (activeSubViewTitle != null) {
-            val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑")
+            val isArtistAlbumsPage = artistAlbumsFor != null && activeSubViewTitle == "${artistAlbumsFor} · 专辑"
+            val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑") || isArtistAlbumsPage
+            val heroMode = subViewHero != null && subViewHero?.title == activeSubViewTitle && !isGridSubView
+            val searchQ = subSearchQuery.trim()
+            // 文件夹 / 歌单（含「我喜欢的音乐」）支持排序，默认按日期最新在上
+            val sortableSubView = !isGridSubView && !heroMode &&
+                (activePlaylistId != null || activeSubViewTitle?.startsWith("文件夹 · ") == true || activeSubViewTitle == "我喜欢的音乐" || activeSubViewTitle == "本地下载")
+            val sizeSortActive = sortableSubView && subSortMode == SubSongSort.SIZE
+            val subSongSizes by androidx.compose.runtime.produceState(emptyMap<String, Long>(), activeSubViewSongs, sizeSortActive) {
+                value = if (sizeSortActive) {
+                    withContext(Dispatchers.IO) { activeSubViewSongs.associate { it.id to estimateSongBytes(it) } }
+                } else emptyMap()
+            }
+            val sortedSubViewSongs = remember(activeSubViewSongs, sortableSubView, subSortMode, subSortReversed, subSongSizes) {
+                if (sortableSubView) sortSubViewSongs(activeSubViewSongs, subSortMode, subSortReversed, subSongSizes) else activeSubViewSongs
+            }
+            val shownSubViewSongs = if (searchQ.isEmpty()) sortedSubViewSongs else sortedSubViewSongs.filter { it.matchesQuery(searchQ) }
+            shownSongsHolder[0] = shownSubViewSongs
+            // 液态玻璃：标题栏在上层玻璃里，列表铺满到屏幕顶部，顶部留出玻璃顶栏的高度
+            val subGlassBars = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+            val subTopInset = if (subGlassBars) {
+                with(androidx.compose.ui.platform.LocalDensity.current) { com.lm.player.core.designsystem.glass.GlassTopBars.expandedHeightPx.toDp() } + 4.dp
+            } else 0.dp
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
-                    .statusBarsPadding()
+                    .then(if (subGlassBars) Modifier else Modifier.statusBarsPadding())
                     .padding(horizontal = 16.dp)
             ) {
-                // 顶部返回与标题栏
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = handleSubViewBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                            tint = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = activeSubViewTitle ?: "",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = activeSubViewSubtitle,
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    // 特殊页面头部按键（全部歌单新建 / 本地下载管理与播放全部）
-                    if (activeSubViewTitle == "全部歌单") {
-                        Button(
-                            onClick = { isCreatePlaylistDialogOpen = true },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("新建歌单", fontSize = 12.sp)
-                        }
-                    } else if (activeSubViewTitle == "本地下载" && activeSubViewSongs.isNotEmpty()) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (!isDownloadManagementMode) {
-                                OutlinedButton(
-                                    onClick = { isDownloadManagementMode = true },
-                                    shape = RoundedCornerShape(12.dp),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                    border = BorderStroke(1.dp, borderColor)
-                                ) {
-                                    Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("管理", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
-                                }
-                                Button(
-                                    onClick = {
-                                        activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
-                                    },
-                                    shape = RoundedCornerShape(16.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("播放全部", fontSize = 12.sp)
-                                }
-                            } else {
-                                TextButton(
-                                    onClick = {
-                                        isDownloadManagementMode = false
-                                        selectedDownloadSongIds.clear()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
-                                    Text("完成", fontSize = 13.sp, color = AppleRed, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
-                    } else if (activePlaylistId != null) {
-                        var showDeleteConfirm by remember { mutableStateOf(false) }
-                        IconButton(onClick = { showDeleteConfirm = true }) {
-                            Icon(Icons.Default.DeleteOutline, contentDescription = "删除歌单", tint = Color(0xFFFF3B30))
-                        }
-                        if (showDeleteConfirm) {
-                            AlertDialog(
-                                onDismissRequest = { showDeleteConfirm = false },
-                                title = { Text("删除歌单") },
-                                text = { Text("确定要删除歌单「$activeSubViewTitle」吗？此操作无法撤销。") },
-                                confirmButton = {
-                                    TextButton(onClick = {
-                                        showDeleteConfirm = false
-                                        val plId = activePlaylistId
-                                        activePlaylistId = null
-                                        activeSubViewTitle = null
-                                        if (plId != null) onDeletePlaylist(plId)
-                                    }) { Text("删除", color = Color(0xFFFF3B30)) }
-                                },
-                                dismissButton = {
-                                    TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
-                                }
-                            )
-                        }
-                    }
-                }
-
                 // 普通歌曲子列表：播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
-                if (!isGridSubView && activeSubViewTitle != "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                val playBatchBar: @Composable () -> Unit = {
                     SongListPlayAndBatchDownloadBar(
                         totalCount = activeSubViewSongs.size,
                         isMultiSelectMode = isSubViewMultiSelect,
                         selectedCount = selectedSubViewSongIds.size,
                         isAllSelected = activeSubViewSongs.isNotEmpty() && selectedSubViewSongIds.size == activeSubViewSongs.size,
                         onPlayAll = {
-                            activeSubViewSongs.firstOrNull()?.let { onSongClick(it, activeSubViewSongs) }
+                            shownSubViewSongs.firstOrNull()?.let { onSongClick(it, shownSubViewSongs) }
                         },
                         onEnterMultiSelect = {
                             isSubViewMultiSelect = true
@@ -2057,109 +2221,307 @@ fun LocalLibraryScreen(
                     )
                 }
 
-                if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                        border = BorderStroke(1.dp, borderColor),
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            val isAllSelected = selectedDownloadSongIds.size == activeSubViewSongs.size && activeSubViewSongs.isNotEmpty()
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.clickable {
-                                    if (isAllSelected) {
-                                        selectedDownloadSongIds.clear()
-                                    } else {
-                                        selectedDownloadSongIds.clear()
-                                        selectedDownloadSongIds.addAll(activeSubViewSongs.map { it.id })
-                                    }
-                                }
-                            ) {
-                                Checkbox(
-                                    checked = isAllSelected,
-                                    onCheckedChange = { checked ->
-                                        if (checked) {
-                                            selectedDownloadSongIds.clear()
-                                            selectedDownloadSongIds.addAll(activeSubViewSongs.map { it.id })
-                                        } else {
-                                            selectedDownloadSongIds.clear()
-                                        }
+                // 网格页（全部歌单 / 歌手 / 专辑 / 文件夹）的滚动状态：每个网格页各用一个
+                val subGridState = remember(activeSubViewTitle) { androidx.compose.foundation.lazy.grid.LazyGridState() }
+                // 液态玻璃顶栏滚动收缩（与歌手页一致）：往下滚过一小段收成「返回 + 标题 · 数量」小胶囊，回到顶部才展开
+                val listCollapsePx = with(androidx.compose.ui.platform.LocalDensity.current) { 56.dp.toPx() }
+                val listExpandPx = with(androidx.compose.ui.platform.LocalDensity.current) { 8.dp.toPx() }
+                var listCollapsed by remember(activeSubViewTitle) { mutableStateOf(false) }
+                LaunchedEffect(activeSubViewTitle, isGridSubView, subGridState) {
+                    snapshotFlow {
+                        if (isGridSubView) subGridState.firstVisibleItemIndex to subGridState.firstVisibleItemScrollOffset
+                        else subViewListState.firstVisibleItemIndex to subViewListState.firstVisibleItemScrollOffset
+                    }.collect { (idx, off) ->
+                        if (!listCollapsed && (idx > 0 || off > listCollapsePx)) listCollapsed = true
+                        else if (listCollapsed && idx == 0 && off < listExpandPx) listCollapsed = false
+                    }
+                }
+                val showCompactBar = !heroMode && listCollapsed &&
+                    !subSearchOpen && !isSubViewMultiSelect && !isDownloadManagementMode
+
+                // 固定头部（标题栏 / 播放全部 / 管理条）：液态玻璃模式下放进上层的玻璃顶栏，列表从它下面穿过
+                val subHeaderBlock: @Composable ColumnScope.() -> Unit = {
+                AnimatedVisibility(
+                    visible = showCompactBar,
+                    enter = fadeIn(tween(220)) + androidx.compose.animation.expandVertically(tween(260)),
+                    exit = fadeOut(tween(160)) + androidx.compose.animation.shrinkVertically(tween(240))
+                ) {
+                    val scrollSubViewToTop: () -> Unit = {
+                        coroutineScope.launch {
+                            if (isGridSubView) subGridState.animateScrollToItem(0) else subViewListState.animateScrollToItem(0)
+                        }
+                    }
+                    if (heroMode) {
+                        // 歌手 / 专辑页：收起后胶囊带头像 / 封面
+                        LibraryHeroTopBar(
+                            hero = subViewHero!!,
+                            songCount = activeSubViewSongs.size,
+                            collapse = { 1f },
+                            onBack = handleSubViewBack,
+                            onTapCapsule = scrollSubViewToTop
+                        )
+                    } else {
+                        LibraryListCompactBar(
+                            title = activeSubViewTitle ?: "",
+                            info = activeSubViewSubtitle.substringAfterLast("·").trim(),
+                            onBack = handleSubViewBack,
+                            onTapCapsule = scrollSubViewToTop
+                        )
+                    }
+                }
+                AnimatedVisibility(
+                    visible = !showCompactBar,
+                    enter = fadeIn(tween(220)) + androidx.compose.animation.expandVertically(tween(260)),
+                    exit = fadeOut(tween(160)) + androidx.compose.animation.shrinkVertically(tween(240))
+                ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                // 歌手 / 专辑页：返回键 + 头部滑走后出现的小胶囊（图 + 名称 + 歌曲数），右侧空白处是「资料库 / 在线」与平台选择
+                if (heroMode) {
+                    val heroCollapsePx = with(androidx.compose.ui.platform.LocalDensity.current) { 110.dp.toPx() }
+                    val heroCollapse = remember(heroCollapsePx) {
+                        derivedStateOf {
+                            if (subViewListState.firstVisibleItemIndex > 0) 1f
+                            else (subViewListState.firstVisibleItemScrollOffset / heroCollapsePx).coerceIn(0f, 1f)
+                        }
+                    }
+                    val heroCenterVisible by remember(heroCollapse) { derivedStateOf { heroCollapse.value < 0.6f } }
+                    LibraryHeroTopBar(
+                        hero = subViewHero!!,
+                        songCount = activeSubViewSongs.size,
+                        collapse = { heroCollapse.value },
+                        onBack = handleSubViewBack,
+                        onTapCapsule = { coroutineScope.launch { subViewListState.animateScrollToItem(0) } },
+                        trailing = if (heroSource == HeroDataSource.ONLINE && callbacks.onSearchOnlineForHero != null) {
+                            { HeroPlatformPicker(platform = heroPlatform, loading = heroOnlineLoading, onPlatformChange = { heroPlatform = it }) }
+                        } else null,
+                        center = if (callbacks.onSearchOnlineForHero != null) {
+                            {
+                                HeroSourceToggle(
+                                    source = heroSource,
+                                    libraryLabel = "资料库 ${heroLibrarySongs.size}",
+                                    onlineLabel = when {
+                                        heroOnlineSongs == null -> "在线 …"
+                                        heroOnlineHasMore && heroOnlineTotal > 0 -> "在线 ${minOf(heroOnlineTotal, HERO_ONLINE_MAX)}"
+                                        heroOnlineHasMore -> "在线 ${heroOnlineSongs!!.size}+"
+                                        else -> "在线 ${heroOnlineSongs!!.size}"
                                     },
-                                    colors = CheckboxDefaults.colors(checkedColor = AppleRed)
-                                )
-                                Text(
-                                    text = if (isAllSelected) "取消全选" else "全选",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "已选 ${selectedDownloadSongIds.size} 首",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    onSelect = { heroSource = it }
                                 )
                             }
+                        } else null,
+                        showCenter = heroCenterVisible
+                    )
+                }
+                // 顶部返回与标题栏（歌手 / 专辑大图页由上面的顶栏 + 列表顶部的大图头部代替）
+                if (!heroMode) Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = handleSubViewBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    if (subSearchOpen) {
+                        LibrarySubViewSearchField(
+                            query = subSearchQuery,
+                            onQueryChange = { subSearchQuery = it },
+                            onClose = {
+                                subSearchOpen = false
+                                subSearchQuery = ""
+                            },
+                            placeholder = when (activeSubViewTitle) {
+                                "全部歌单" -> "搜索歌单"
+                                "全部歌手" -> "搜索歌手"
+                                "全部文件夹" -> "搜索文件夹"
+                                "全部专辑" -> "搜索专辑或歌手"
+                                else -> "搜索歌名、歌手、专辑"
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    } else {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = activeSubViewTitle ?: "",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = activeSubViewSubtitle,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
 
-                            Button(
-                                onClick = { showBatchDeleteLocalDialog = true },
-                                enabled = selectedDownloadSongIds.isNotEmpty(),
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                            ) {
-                                Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("删除 (${selectedDownloadSongIds.size})", fontSize = 12.sp)
+                    if (sortableSubView) {
+                        LibrarySortButton(
+                            mode = subSortMode,
+                            reversed = subSortReversed,
+                            onSelect = { m ->
+                                if (m == subSortMode) {
+                                    subSortReversed = !subSortReversed
+                                } else {
+                                    subSortMode = m
+                                    subSortReversed = false
+                                }
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                    }
+                    LibrarySearchIconButton { subSearchOpen = true }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    }
+
+                    // 特殊页面头部按键（全部歌单新建 / 本地下载管理与播放全部）；搜索展开时让位给搜索框
+                    if (!subSearchOpen && activeSubViewTitle == "全部歌单") {
+                        Button(
+                            onClick = { isCreatePlaylistDialogOpen = true },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("新建歌单", fontSize = 12.sp)
+                        }
+                    } else if (!subSearchOpen && activePlaylistId != null) {
+                        var showDeleteConfirm by remember { mutableStateOf(false) }
+                        IconButton(onClick = { showDeleteConfirm = true }) {
+                            Icon(Icons.Default.DeleteOutline, contentDescription = "删除歌单", tint = Color(0xFFFF3B30))
+                        }
+                        if (showDeleteConfirm) {
+                            AlertDialog(
+                                onDismissRequest = { showDeleteConfirm = false },
+                                title = { Text("删除歌单") },
+                                text = { Text("确定要删除歌单「$activeSubViewTitle」吗？此操作无法撤销。") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        showDeleteConfirm = false
+                                        val plId = activePlaylistId
+                                        activePlaylistId = null
+                                        activeSubViewTitle = null
+                                        if (plId != null) onDeletePlaylist(plId)
+                                    }) { Text("删除", color = Color(0xFFFF3B30)) }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
+                                }
+                            )
+                        }
+                    }
+                }
+
+                if (isArtistAlbumsPage && callbacks.onSearchOnlineArtistAlbums != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Spacer(Modifier.weight(1f))
+                        HeroSourceToggle(
+                            source = artistAlbumsSource,
+                            libraryLabel = "资料库 ${artistLibraryAlbums.size}",
+                            onlineLabel = if (artistOnlineAlbums == null) "在线 …" else "在线 ${artistOnlineAlbums!!.size}",
+                            onSelect = { artistAlbumsSource = it }
+                        )
+                        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                            if (artistAlbumsSource == HeroDataSource.ONLINE) {
+                                HeroPlatformPicker(platform = heroPlatform, loading = artistAlbumsLoading, onPlatformChange = { heroPlatform = it })
                             }
                         }
                     }
+                }
+                if (!heroMode && !isGridSubView && activeSubViewTitle != "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                    playBatchBar()
+                }
+
+                // 本地下载：与「全部歌曲」同样布局的操作条（播放全部 + 管理；管理中 全选 / 删除 / 完成）
+                if (activeSubViewTitle == "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                    DownloadedSongsActionBar(
+                        totalCount = shownSubViewSongs.size,
+                        managing = isDownloadManagementMode,
+                        selectedCount = selectedDownloadSongIds.size,
+                        allSelected = shownSubViewSongs.isNotEmpty() && selectedDownloadSongIds.size == shownSubViewSongs.size,
+                        onPlayAll = { shownSubViewSongs.firstOrNull()?.let { onSongClick(it, shownSubViewSongs) } },
+                        onEnterManage = { isDownloadManagementMode = true },
+                        onToggleSelectAll = {
+                            if (selectedDownloadSongIds.size == shownSubViewSongs.size) {
+                                selectedDownloadSongIds.clear()
+                            } else {
+                                selectedDownloadSongIds.clear()
+                                selectedDownloadSongIds.addAll(shownSubViewSongs.map { it.id })
+                            }
+                        },
+                        onDelete = { showBatchDeleteLocalDialog = true },
+                        onExitManage = {
+                            isDownloadManagementMode = false
+                            selectedDownloadSongIds.clear()
+                        },
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
+                }
+
+                }
+                }
+                }
+                if (subGlassBars) {
+                    com.lm.player.core.designsystem.glass.RegisterGlassTopBar(key = activeSubViewTitle ?: "", content = subHeaderBlock)
+                } else {
+                    subHeaderBlock()
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
                 if (activeSubViewTitle == "全部歌单") {
+                    val shownPlaylists = sortedPlaylists.filter { searchQ.isEmpty() || it.name.contains(searchQ, ignoreCase = true) }
+                    val showFav = searchQ.isEmpty() || "我喜欢的音乐".contains(searchQ, ignoreCase = true)
+                    val showRecent = searchQ.isEmpty() || "最近播放".contains(searchQ, ignoreCase = true)
+                    val showDownloads = searchQ.isEmpty() || "本地下载".contains(searchQ, ignoreCase = true)
+                    val fullSpan: (androidx.compose.foundation.lazy.grid.LazyGridItemSpanScope) -> androidx.compose.foundation.lazy.grid.GridItemSpan =
+                        { androidx.compose.foundation.lazy.grid.GridItemSpan(it.maxLineSpan) }
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 136.dp),
+                        state = subGridState,
+                        columns = GridCells.Adaptive(minSize = 150.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            top = 8.dp,
+                            top = 8.dp + subTopInset,
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
                         ),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        // A. 我喜欢的音乐
-                        item {
-                            PlaylistSpecialCard(
+                        // A. 我的收藏：我喜欢 / 最近播放 / 本地下载
+                        if (showFav || showRecent || showDownloads) item(key = "pl_sec_mine", span = fullSpan) {
+                            PlaylistSectionHeader("我的收藏")
+                        }
+                        if (showFav) item(key = "pl_fav") {
+                            PlaylistTile(
                                 title = "我喜欢的音乐",
-                                subtitle = "${favSongs.size} 首歌曲",
-                                icon = Icons.Default.Favorite,
-                                gradient = listOf(Color(0xFFFA233B), Color(0xFFFF5E3A)),
+                                subtitle = "${favSongs.size} 首",
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = "我喜欢的音乐"
                                     activeSubViewSubtitle = "我的专属珍藏 · 共 ${favSongs.size} 首"
                                     activeSubViewSongs = favSongs
                                 },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
+                                modifier = Modifier.fillMaxWidth()
+                            ) { SpecialPlaylistArtwork(Icons.Default.Favorite, listOf(Color(0xFFFA233B), Color(0xFFFF5E3A))) }
                         }
-
-                        // B. 最近播放
-                        item {
-                            PlaylistSpecialCard(
+                        if (showRecent) item(key = "pl_recent") {
+                            PlaylistTile(
                                 title = "最近播放",
-                                subtitle = "${recentPlaySongs.size} 首歌曲",
-                                icon = Icons.Default.History,
-                                gradient = listOf(Color(0xFF5856D6), Color(0xFFAF52DE)),
+                                subtitle = "${recentPlaySongs.size} 首",
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = "最近播放"
@@ -2168,19 +2530,13 @@ fun LocalLibraryScreen(
                                     isDownloadManagementMode = false
                                     selectedDownloadSongIds.clear()
                                 },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
+                                modifier = Modifier.fillMaxWidth()
+                            ) { SpecialPlaylistArtwork(Icons.Default.History, listOf(Color(0xFF5856D6), Color(0xFFAF52DE))) }
                         }
-
-                        // C. 本地下载
-                        item {
-                            PlaylistSpecialCard(
+                        if (showDownloads) item(key = "pl_downloads") {
+                            PlaylistTile(
                                 title = "本地下载",
-                                subtitle = "${finalDownloadedSongs.size} 首歌曲",
-                                icon = Icons.Default.Folder,
-                                gradient = listOf(Color(0xFF007AFF), Color(0xFF5AC8FA)),
+                                subtitle = "${finalDownloadedSongs.size} 首",
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = "本地下载"
@@ -2189,17 +2545,18 @@ fun LocalLibraryScreen(
                                     isDownloadManagementMode = false
                                     selectedDownloadSongIds.clear()
                                 },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
+                                modifier = Modifier.fillMaxWidth()
+                            ) { SpecialPlaylistArtwork(Icons.Default.DownloadForOffline, listOf(Color(0xFF007AFF), Color(0xFF5AC8FA))) }
                         }
 
-                        // D. 自建与服务端歌单（最新加入数据的歌单在最前，依次递减显示）
-                        items(sortedPlaylists, key = { it.id }) { pl ->
-                            PlaylistCardItem(
-                                playlist = pl,
-                                covers = localPlaylistCovers[pl.id] ?: pl.previewCovers,
+                        // B. 自建与云端歌单（最新加入数据的歌单在最前）+ 新建入口
+                        item(key = "pl_sec_lists", span = fullSpan) {
+                            PlaylistSectionHeader("我的歌单", shownPlaylists.size)
+                        }
+                        items(shownPlaylists, key = { it.id }) { pl ->
+                            PlaylistTile(
+                                title = pl.name,
+                                subtitle = if (pl.songCount > 0) "${pl.songCount} 首" else "空歌单",
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = pl.name
@@ -2225,31 +2582,30 @@ fun LocalLibraryScreen(
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
-                            )
+                            ) { PlaylistGridArtwork(pl, localPlaylistCovers[pl.id] ?: pl.previewCovers) }
                         }
-
-                        // E. 新建歌单快捷卡片 (放置在最后面)
-                        item {
-                            CreatePlaylistActionCard(
+                        if (searchQ.isEmpty()) item(key = "pl_create") {
+                            PlaylistTile(
+                                title = "新建歌单",
+                                subtitle = "本地或云端",
                                 onClick = { isCreatePlaylistDialogOpen = true },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
+                                modifier = Modifier.fillMaxWidth()
+                            ) { CreatePlaylistArtwork() }
                         }
                     }
                 } else if (activeSubViewTitle == "全部文件夹") {
                     LazyVerticalGrid(
+                        state = subGridState,
                         columns = GridCells.Adaptive(minSize = 160.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            top = 8.dp,
+                            top = 8.dp + subTopInset,
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
                         ),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        items(localFolders, key = { it.id }) { folder ->
+                        items(localFolders.filter { searchQ.isEmpty() || it.name.contains(searchQ, ignoreCase = true) }, key = { it.id }) { folder ->
                             FolderCardItem(
                                 folder = folder,
                                 onClick = {
@@ -2264,16 +2620,17 @@ fun LocalLibraryScreen(
                     }
                 } else if (activeSubViewTitle == "全部歌手") {
                     LazyVerticalGrid(
+                        state = subGridState,
                         columns = GridCells.Adaptive(minSize = 150.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            top = 8.dp,
+                            top = 8.dp + subTopInset,
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
                         ),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        items(artists, key = { it.id }) { artist ->
+                        items(artists.filter { searchQ.isEmpty() || it.name.contains(searchQ, ignoreCase = true) }, key = { it.id }) { artist ->
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
@@ -2281,13 +2638,7 @@ fun LocalLibraryScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(16.dp))
-                                    .clickable {
-                                        val artistSongs = allSongs.filter { it.artist == artist.name }
-                                        isFromAllArtists = true
-                                        activeSubViewTitle = artist.name
-                                        activeSubViewSubtitle = "歌手专栏 · 共 ${artistSongs.size} 首歌曲"
-                                        activeSubViewSongs = artistSongs
-                                    }
+                                    .clickable { openArtistPage(artist.name, true) }
                             ) {
                                 Row(
                                     modifier = Modifier.padding(12.dp),
@@ -2322,33 +2673,104 @@ fun LocalLibraryScreen(
                             }
                         }
                     }
-                } else if (activeSubViewTitle == "全部专辑") {
-                    LazyVerticalGrid(
+                } else if (isArtistAlbumsPage) {
+                    val shownAlbums = (if (artistAlbumsSource == HeroDataSource.ONLINE) artistOnlineAlbums.orEmpty() else artistLibraryAlbums)
+                        .filter { searchQ.isEmpty() || it.title.contains(searchQ, ignoreCase = true) }
+                    if (shownAlbums.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = 100.dp + subTopInset),
+                            contentAlignment = Alignment.TopCenter
+                        ) {
+                            Text(
+                                text = when {
+                                    artistAlbumsSource == HeroDataSource.ONLINE && artistOnlineAlbums == null -> "正在通过本地音源搜索 ${heroPlatform.displayName}…"
+                                    artistAlbumsSource == HeroDataSource.ONLINE -> "${heroPlatform.displayName}没有找到这位歌手的专辑，可换一个平台"
+                                    else -> "资料库里没有这位歌手的专辑，可切到「在线」"
+                                },
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 13.sp
+                            )
+                        }
+                    } else LazyVerticalGrid(
+                        state = subGridState,
                         columns = GridCells.Adaptive(minSize = 140.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            top = 8.dp,
+                            top = 8.dp + subTopInset,
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
                         ),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        items(recentAddedAlbums.ifEmpty { albums }, key = { it.id }) { album ->
+                        items(shownAlbums, key = { "artist_album_" + it.id }) { album ->
+                            val isOnlineAlbum = artistAlbumsSource == HeroDataSource.ONLINE
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(14.dp))
                                     .clickable {
-                                        val albumSongs = allSongs.filter {
-                                            it.album == album.title ||
-                                            (album.id.isNotBlank() && it.albumId == album.id) ||
-                                            (album.title in listOf("未知专辑", "单曲精选") && it.album.isBlank())
+                                        isFromArtistAlbums = true
+                                        if (isOnlineAlbum) {
+                                            openAlbumPage(album.title, album.artist, "", false)
+                                            val collectionId = if (album.id.startsWith("lemon_discover_album_")) album.id
+                                                else "lemon_discover_album_${heroPlatform.key}_${album.id}"
+                                            subViewHero = subViewHero?.copy(
+                                                onlineAlbumId = collectionId,
+                                                imageUrl = subViewHero?.imageUrl?.ifBlank { null } ?: album.coverUrl
+                                            )
+                                        } else {
+                                            openAlbumPage(album.title, album.artist, album.id, false)
                                         }
-                                        isFromAllAlbums = true
-                                        activeSubViewTitle = album.title
-                                        activeSubViewSubtitle = "${album.artist} · 共 ${maxOf(album.songCount, albumSongs.size)} 首"
-                                        activeSubViewSongs = albumSongs
                                     }
+                            ) {
+                                AlbumArtworkImage(
+                                    model = album.coverUrl,
+                                    seedId = album.title,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .shadow(2.dp, RoundedCornerShape(12.dp)),
+                                    cornerRadius = 12.dp
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = album.title,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (album.songCount > 0) "${album.artist} · ${album.songCount} 首" else album.artist,
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                } else if (activeSubViewTitle == "全部专辑") {
+                    LazyVerticalGrid(
+                        state = subGridState,
+                        columns = GridCells.Adaptive(minSize = 140.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = 8.dp + subTopInset,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        items(recentAddedAlbums.ifEmpty { albums }.filter { searchQ.isEmpty() || it.title.contains(searchQ, ignoreCase = true) || it.artist.contains(searchQ, ignoreCase = true) }, key = { it.id }) { album ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable { openAlbumPage(album.title, album.artist, album.id, true) }
                             ) {
                                 AlbumArtworkImage(
                                     model = album.coverUrl,
@@ -2382,16 +2804,16 @@ fun LocalLibraryScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(top = 100.dp),
+                            .padding(top = 100.dp + subTopInset),
                         contentAlignment = Alignment.TopCenter
                     ) {
                         CircularProgressIndicator(modifier = Modifier.size(36.dp), color = AppleRed)
                     }
-                } else if (activeSubViewSongs.isEmpty()) {
+                } else if (activeSubViewSongs.isEmpty() && !heroMode) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(top = 100.dp),
+                            .padding(top = 100.dp + subTopInset),
                         contentAlignment = Alignment.TopCenter
                     ) {
                         Text("暂无歌曲数据", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
@@ -2401,12 +2823,40 @@ fun LocalLibraryScreen(
                         state = subViewListState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
+                            top = subTopInset,
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        if (heroMode) {
+                            item(key = "lib_hero_header") {
+                                LibraryHeroHeader(
+                                    hero = subViewHero!!,
+                                    onArtistClick = { name -> openArtistPage(name, false) },
+                                    onAlbumsClick = if (subViewHero?.kind == LibraryHero.Kind.ARTIST) {
+                                        { subViewHero?.title?.let { openArtistAlbums(it) } }
+                                    } else null,
+                                    albumCount = heroLibrarySongs.map { it.album.trim() }.filter { it.isNotBlank() }.distinct().size
+                                )
+                            }
+                            if (activeSubViewSongs.isNotEmpty()) item(key = "lib_hero_bar") { playBatchBar() }
+                            if (shownSubViewSongs.isEmpty()) {
+                                item(key = "lib_hero_empty") {
+                                    Text(
+                                        text = when {
+                                            heroSource == HeroDataSource.ONLINE && heroOnlineLoading -> "正在通过本地音源搜索 ${heroPlatform.displayName}…"
+                                            heroSource == HeroDataSource.ONLINE -> "${heroPlatform.displayName}没有找到相关歌曲，可在右上角换一个平台"
+                                            else -> "资料库里暂无相关歌曲，可在右上角切到「在线」"
+                                        },
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 13.sp,
+                                        modifier = Modifier.padding(vertical = 24.dp)
+                                    )
+                                }
+                            }
+                        }
                         itemsIndexed(
-                            items = activeSubViewSongs,
+                            items = shownSubViewSongs,
                             key = { idx, song -> "${song.id}_$idx" },
                             contentType = { _, _ -> "subview_song_row" }
                         ) { _, song ->
@@ -2466,13 +2916,39 @@ fun LocalLibraryScreen(
                                             selectedSubViewSongIds + song.id
                                         }
                                     },
-                                    onClick = { onSongClick(song, activeSubViewSongs) },
+                                    onClick = { onSongClick(song, shownSubViewSongs) },
                                     onDownloadClick = { songForDownloadChoice = song },
                                     onDownloadWithOptions = { s, target, quality ->
                                         onDownloadSongWithOptions(s, target, quality)
                                     },
                                     onOpenDownloads = onOpenDownloads
                                 )
+                            }
+                        }
+                        if (heroMode && heroSource == HeroDataSource.ONLINE && !heroOnlineSongs.isNullOrEmpty()) {
+                            item(key = "lib_hero_more") {
+                                val loaded = heroOnlineSongs?.size ?: 0
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 16.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (heroOnlineMoreLoading) {
+                                        CircularProgressIndicator(color = AppleRed, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                    }
+                                    Text(
+                                        text = when {
+                                            heroOnlineMoreLoading -> "正在加载第 ${heroOnlinePage + 1} 页…"
+                                            heroOnlineHasMore -> "已加载 $loaded" + (if (heroOnlineTotal > 0) " / ${minOf(heroOnlineTotal, HERO_ONLINE_MAX)}" else "") + " 首 · 继续上滑加载下一页"
+                                            else -> "已全部加载 · 共 $loaded 首"
+                                        },
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         }
                     }
@@ -2573,84 +3049,166 @@ fun LocalLibraryScreen(
         )
     }
 
-    // 新建歌单弹窗
-    if (isCreatePlaylistDialogOpen) {
-        Dialog(onDismissRequest = { isCreatePlaylistDialogOpen = false }) {
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = if (isDark) Color(0xFF222228) else Color.White,
-                border = BorderStroke(1.dp, borderColor),
-                shadowElevation = 20.dp,
+    // ==================== 多选：底部悬浮操作条（下载 / 加入歌单 / 移出歌单，与 TV 同一套功能） ====================
+    // 放在页面顶层：列表头（播放全部 / 全选）滑出屏幕被回收时悬浮条也不会消失
+    val batchBarContext = LocalContext.current
+    val libIsLocalMode = activeServerConfig == null || currentServerName.contains("本地") || currentServerName.contains("已下载")
+    val activePlaylistIsOnline = playlists.firstOrNull { it.id == activePlaylistId }?.isOnline == true
+    // 歌单详情页才能「移出歌单」；服务器歌单要连着服务器才能改（本地模式下看到的是缓存，只读）
+    val canRemoveFromPlaylist = callbacks.onRemoveSongsFromPlaylist != null && activePlaylistId != null &&
+        (!activePlaylistIsOnline || !libIsLocalMode)
+    com.lm.player.core.designsystem.component.SongBatchFloatingBar(
+        key = "library_all_songs",
+        visible = isMainSongsMultiSelect && activeSubViewTitle == null,
+        selectedCount = selectedMainSongIds.size,
+        selectedSongs = { filteredSongs.filter { selectedMainSongIds.contains(it.id) } },
+        isServerConnected = isServerOk,
+        onDownload = { picked, target, quality ->
+            isMainSongsMultiSelect = false
+            selectedMainSongIds = emptySet()
+            onBatchDownloadSongsWithOptions(picked, target, quality)
+        },
+        onFinished = {
+            isMainSongsMultiSelect = false
+            selectedMainSongIds = emptySet()
+        }
+    )
+    com.lm.player.core.designsystem.component.SongBatchFloatingBar(
+        key = "library_sub_view",
+        visible = isSubViewMultiSelect && activeSubViewTitle != null,
+        selectedCount = selectedSubViewSongIds.size,
+        selectedSongs = { activeSubViewSongs.filter { selectedSubViewSongIds.contains(it.id) } },
+        isServerConnected = isServerOk,
+        onDownload = { picked, target, quality ->
+            isSubViewMultiSelect = false
+            selectedSubViewSongIds = emptySet()
+            onBatchDownloadSongsWithOptions(picked, target, quality)
+        },
+        onFinished = {
+            isSubViewMultiSelect = false
+            selectedSubViewSongIds = emptySet()
+        },
+        onRemoveFromPlaylist = if (canRemoveFromPlaylist) {
+            {
+                val picked = activeSubViewSongs.filter { selectedSubViewSongIds.contains(it.id) }
+                if (picked.isNotEmpty()) songsPendingRemoval = picked
+            }
+        } else null
+    )
+
+    // 移出歌单：确认 → 进度 → 完成（服务器歌单同步写回服务器；歌曲本身不会被删除）
+    val pendingRemoval = songsPendingRemoval
+    val removalPlaylistId = activePlaylistId
+    val removeHandler = callbacks.onRemoveSongsFromPlaylist
+    if (pendingRemoval != null && removalPlaylistId != null && removeHandler != null && isRemovingFromPlaylist) {
+        com.lm.player.core.designsystem.component.BatchProgressDialog(
+            title = "正在从「${activeSubViewTitle.orEmpty()}」移出 ${pendingRemoval.size} 首",
+            progress = removalProgress,
+            step = removalStep
+        )
+    } else if (pendingRemoval != null && removalPlaylistId != null && removeHandler != null) {
+        val removalIsOnline = playlists.firstOrNull { it.id == removalPlaylistId }?.isOnline == true
+        val playlistTitle = activeSubViewTitle.orEmpty()
+        androidx.compose.ui.window.Dialog(
+            onDismissRequest = { songsPendingRemoval = null },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            com.lm.player.core.designsystem.glass.GlassDialogPanel(
                 modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .padding(16.dp)
+                    .fillMaxWidth(0.86f)
+                    .widthIn(max = 380.dp),
+                cornerRadius = 22.dp
             ) {
-                Column(modifier = Modifier.padding(20.dp)) {
+                Column(modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 12.dp)) {
+                    Text("移出歌单", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.height(8.dp))
                     Text(
-                        text = "新建歌单",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = "确定把选中的 ${pendingRemoval.size} 首歌从「$playlistTitle」移出吗？" +
+                            (if (removalIsOnline) "服务器上的歌单会同步更新，" else "") + "歌曲本身不会被删除。",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    OutlinedTextField(
-                        value = newPlaylistName,
-                        onValueChange = { newPlaylistName = it },
-                        label = { Text("歌单名称") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column {
-                            Text("同步至服务端", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text(
-                                text = if (activeServerConfig != null) "与柠檬音乐/NAS曲库双向同步" else "未连接服务端，仅保存在本地",
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = newPlaylistIsOnline && activeServerConfig != null,
-                            onCheckedChange = { newPlaylistIsOnline = it },
-                            enabled = activeServerConfig != null
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(20.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = { isCreatePlaylistDialogOpen = false },
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
+                    Spacer(Modifier.height(16.dp))
+                    val btnBg = if (isDark) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.05f)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .clip(RoundedCornerShape(19.dp))
+                                .background(btnBg)
+                                .clickable { songsPendingRemoval = null },
+                            contentAlignment = Alignment.Center
                         ) {
-                            Text("取消")
+                            Text("取消", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Medium)
                         }
-                        Button(
-                            onClick = {
-                                if (newPlaylistName.isNotBlank()) {
-                                    onCreatePlaylist(newPlaylistName.trim(), newPlaylistIsOnline && activeServerConfig != null)
-                                    newPlaylistName = ""
-                                    isCreatePlaylistDialogOpen = false
-                                }
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            modifier = Modifier.weight(1f)
+                        Spacer(Modifier.width(10.dp))
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .clip(RoundedCornerShape(19.dp))
+                                .background(Color(0xFFFF3B30))
+                                .clickable {
+                                    val songsToRemove = pendingRemoval
+                                    coroutineScope.launch {
+                                        removalProgress = 0f
+                                        removalStep = "准备中…"
+                                        isRemovingFromPlaylist = true
+                                        val result = try {
+                                            removeHandler(removalPlaylistId, removalIsOnline, songsToRemove) { f, step ->
+                                                removalProgress = f
+                                                removalStep = step
+                                            }
+                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            Result.failure(e)
+                                        }
+                                        isRemovingFromPlaylist = false
+                                        songsPendingRemoval = null
+                                        result.onSuccess { _ ->
+                                            val ids = songsToRemove.map { it.id }.toSet()
+                                            if (activePlaylistId == removalPlaylistId) {
+                                                activeSubViewSongs = activeSubViewSongs.filter { it.id !in ids }
+                                                activeSubViewSubtitle = "${if (removalIsOnline) "云端歌单" else "本地歌单"} · ${activeSubViewSongs.size} 首"
+                                                com.lm.player.core.designsystem.component.PlaylistMembership.record(removalPlaylistId, activeSubViewSongs)
+                                            }
+                                            isSubViewMultiSelect = false
+                                            selectedSubViewSongIds = emptySet()
+                                            android.widget.Toast.makeText(batchBarContext, "已从「$playlistTitle」移出 ${songsToRemove.size} 首", android.widget.Toast.LENGTH_SHORT).show()
+                                        }.onFailure { e ->
+                                            android.widget.Toast.makeText(batchBarContext, "移出失败：${e.message ?: "未知错误"}", android.widget.Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                },
+                            contentAlignment = Alignment.Center
                         ) {
-                            Text("创建")
+                            Text("移出", fontSize = 14.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
             }
         }
+    }
+
+    // 新建歌单弹窗
+    if (isCreatePlaylistDialogOpen) {
+        CreatePlaylistDialog(
+            name = newPlaylistName,
+            onNameChange = { newPlaylistName = it },
+            online = newPlaylistIsOnline,
+            onOnlineChange = { newPlaylistIsOnline = it },
+            serverAvailable = activeServerConfig != null,
+            onDismiss = { isCreatePlaylistDialogOpen = false },
+            onCreate = {
+                if (newPlaylistName.isNotBlank()) {
+                    onCreatePlaylist(newPlaylistName.trim(), newPlaylistIsOnline && activeServerConfig != null)
+                    newPlaylistName = ""
+                    isCreatePlaylistDialogOpen = false
+                }
+            }
+        )
     }
 }
 

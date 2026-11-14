@@ -97,6 +97,8 @@ sealed class CatalogOp {
                     buf.readUtf8()
                 }.getOrNull() ?: return null
                 val body = runCatching { JSONObject(text) }.getOrNull() ?: return null
+                // 资料库（服务器曲库文件）的歌词以服务器为准，不走本地音源加速
+                if (body.optString("filePath").isNotBlank() || body.optString("path").isNotBlank()) return null
                 return Lyric(body)
             }
             if (method != "GET") return null

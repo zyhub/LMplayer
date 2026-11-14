@@ -8,6 +8,7 @@ import com.lm.player.core.database.entity.ResolvedStreamCacheEntity
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.ServerSourceEntity
 import com.lm.player.core.database.entity.ServerSourceMetaEntity
+import com.lm.player.core.database.entity.ServerTrackAccelEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
 import kotlinx.coroutines.flow.Flow
@@ -110,6 +111,10 @@ interface SongDao {
     suspend fun updateFavorite(songId: String, isFavorite: Boolean)
 
     /** 本地扫描「补封面」阶段使用 */
+    /** 补存服务器元数据（老库同步时没存，下载弹窗按需向服务器取到后写回） */
+    @Query("UPDATE songs SET rawMetaJson = :meta WHERE id = :songId")
+    suspend fun updateRawMetaJson(songId: String, meta: String)
+
     @Query("UPDATE songs SET coverUrl = :coverUrl WHERE id = :songId")
     suspend fun updateCoverUrl(songId: String, coverUrl: String)
 
@@ -180,6 +185,14 @@ interface SongDao {
 
     @Query("SELECT id FROM songs WHERE serverId = :serverId")
     suspend fun getSongIdsByServer(serverId: String): List<String>
+
+    /** 服务器歌曲加速（预匹配 / 旧匹配并入）用的轻量列：只取服务器曲库歌曲，不含在线收藏曲目 */
+    @Query(
+        "SELECT id, title, artist, album, durationMs, coverUrl, streamUrl, localFilePath, downloadStatus, " +
+            "isFavorite, lastPlayedTimestamp, rawMetaJson, format, bitRate, serverId FROM songs " +
+            "WHERE serverId IN (:serverIds) AND id NOT LIKE 'lemon_online_%'"
+    )
+    suspend fun getAccelCandidates(serverIds: List<String>): List<AccelCandidateRow>
 
     @Query("UPDATE songs SET serverId = :newServerId WHERE id = :songId")
     suspend fun updateServerId(songId: String, newServerId: String)
@@ -343,6 +356,14 @@ interface PlaylistDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun addSongToPlaylist(playlistSong: PlaylistSongEntity)
 
+    /** 所有歌单里出现过的歌曲 ID（服务器歌曲预匹配排序用） */
+    @Query("SELECT DISTINCT songId FROM playlist_songs")
+    suspend fun getAllPlaylistSongIds(): List<String>
+
+    /** 已收录某首歌的歌单 id：「加入歌单」里把已加入的歌单置灰并标「已加入」 */
+    @Query("SELECT DISTINCT playlistId FROM playlist_songs WHERE songId = :songId")
+    fun getPlaylistIdsContainingSongFlow(songId: String): Flow<List<String>>
+
     @Query("DELETE FROM playlist_songs WHERE playlistId = :playlistId AND songId = :songId")
     suspend fun removeSongFromPlaylist(playlistId: String, songId: String)
 
@@ -351,6 +372,22 @@ interface PlaylistDao {
 
     @Query("DELETE FROM playlist_songs WHERE songId = :songId")
     suspend fun removeSongFromAllPlaylists(songId: String)
+
+    /** 把歌单里对 [oldSongId] 的引用改指 [newSongId]；同一歌单已有 newSongId 时该行保持不动（OR IGNORE） */
+    @Query("UPDATE OR IGNORE playlist_songs SET songId = :newSongId WHERE songId = :oldSongId")
+    suspend fun repointPlaylistSongsRaw(oldSongId: String, newSongId: String)
+
+    /**
+     * 歌曲记录被另一条记录取代（如在线记录并入服务器曲目）时迁移歌单引用。
+     * playlist_songs 没有外键级联，直接删除歌曲会让歌单里这首歌「消失」（Claude，PR #7 合入时补充）。
+     */
+    @androidx.room.Transaction
+    suspend fun migratePlaylistSongRefs(oldSongId: String, newSongId: String) {
+        if (oldSongId.isBlank() || newSongId.isBlank() || oldSongId == newSongId) return
+        repointPlaylistSongsRaw(oldSongId, newSongId)
+        // OR IGNORE 跳过的行（歌单里本来就有新曲目）还挂着旧 id，去重删除
+        removeSongFromAllPlaylists(oldSongId)
+    }
 
     @Query("SELECT s.* FROM songs s INNER JOIN playlist_songs ps ON s.id = ps.songId WHERE ps.playlistId = :playlistId ORDER BY ps.orderIndex ASC")
     fun getSongsForPlaylistFlow(playlistId: String): Flow<List<SongEntity>>
@@ -373,3 +410,100 @@ interface PlaylistDao {
     @Query("DELETE FROM playlists")
     suspend fun clearAllPlaylists()
 }
+
+@Dao
+interface ServerTrackAccelDao {
+    @Query("SELECT * FROM server_track_accel WHERE songId = :songId LIMIT 1")
+    suspend fun get(songId: String): ServerTrackAccelEntity?
+
+    @Query("SELECT * FROM server_track_accel WHERE songId IN (:songIds)")
+    suspend fun getMany(songIds: List<String>): List<ServerTrackAccelEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entity: ServerTrackAccelEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(items: List<ServerTrackAccelEntity>)
+
+    @Query("SELECT songId FROM server_track_accel WHERE serverId = :serverId AND matchStatus = 1")
+    suspend fun matchedIds(serverId: String): List<String>
+
+    @Query("SELECT songId, fileKey, matchStatus, lastTriedAt FROM server_track_accel WHERE serverId = :serverId")
+    suspend fun statusRows(serverId: String): List<ServerTrackAccelStatusRow>
+
+    @Query("SELECT COUNT(*) FROM server_track_accel WHERE serverId = :serverId AND matchStatus = :status")
+    fun observeCount(serverId: String, status: Int): Flow<Int>
+
+    @Query("SELECT COUNT(*) FROM server_track_accel WHERE serverId = :serverId AND matchStatus = :status")
+    suspend fun count(serverId: String, status: Int): Int
+
+    @Query("SELECT COUNT(*) FROM server_track_accel WHERE lyricAt > 0")
+    suspend fun lyricCount(): Int
+
+    /** 歌词缓存超出上限时清掉最久没更新的那批（只清歌词，匹配数据保留） */
+    @Query(
+        "UPDATE server_track_accel SET lyricText = '', lyricSource = '', lyricAt = 0 WHERE songId IN (" +
+            "SELECT songId FROM server_track_accel WHERE lyricAt > 0 ORDER BY lyricAt ASC LIMIT :n)"
+    )
+    suspend fun dropOldestLyrics(n: Int)
+
+    /** 有平台封面的行（图片加载时按服务器文件路径查平台封面用） */
+    @Query("SELECT fileKey, platformCoverUrl FROM server_track_accel WHERE platformCoverUrl != ''")
+    suspend fun coverRows(): List<AccelCoverRow>
+
+    @Query("DELETE FROM server_track_accel WHERE serverId = :serverId")
+    suspend fun deleteForServer(serverId: String)
+
+    @Query("DELETE FROM server_track_accel WHERE serverId NOT IN (:serverIds)")
+    suspend fun deleteExceptServers(serverIds: List<String>)
+}
+
+/** 预匹配排队用的轻量行（不读歌词、匹配 JSON 等大字段） */
+data class ServerTrackAccelStatusRow(
+    val songId: String,
+    val fileKey: String,
+    val matchStatus: Int,
+    val lastTriedAt: Long
+)
+
+/** [SongDao.getAccelCandidates] 的结果行 */
+data class AccelCandidateRow(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val durationMs: Long,
+    val coverUrl: String,
+    val streamUrl: String,
+    val localFilePath: String?,
+    val downloadStatus: String,
+    val isFavorite: Boolean,
+    val lastPlayedTimestamp: Long,
+    val rawMetaJson: String?,
+    val format: String,
+    val bitRate: Int,
+    val serverId: String
+) {
+    fun toUnifiedSong(): com.lm.player.core.model.UnifiedSong = com.lm.player.core.model.UnifiedSong(
+        id = id,
+        title = title,
+        artist = artist,
+        album = album,
+        durationMs = durationMs,
+        coverUrl = coverUrl,
+        streamUrl = streamUrl,
+        serverId = serverId,
+        localFilePath = localFilePath,
+        downloadStatus = runCatching { DownloadStatus.valueOf(downloadStatus) }.getOrDefault(DownloadStatus.NOT_DOWNLOADED),
+        bitRate = bitRate,
+        format = format,
+        isFavorite = isFavorite,
+        rawMetaJson = rawMetaJson
+    )
+}
+
+/** [ServerTrackAccelDao.coverRows] 的结果行 */
+data class AccelCoverRow(
+    val fileKey: String,
+    val platformCoverUrl: String
+)

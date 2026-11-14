@@ -21,7 +21,11 @@ object ResolvedUrlCache {
         val qualityKey: String,
         val platform: String,
         val expiresAt: Long,
-        val viaLocal: Boolean
+        val viaLocal: Boolean,
+        /** 探活拿到的文件大小（0=未知），用于播放缓存的固定缓存键 */
+        val totalBytes: Long = 0L,
+        /** 链接实际对应的平台歌曲 ID（跨平台补源时不同于请求的 ID） */
+        val sourceSongId: String = ""
     )
 
     private val map = ConcurrentHashMap<String, Entry>()
@@ -39,10 +43,13 @@ object ResolvedUrlCache {
         return e
     }
 
-    fun put(platform: String, songKey: String, requestedQuality: String, url: String, actualQuality: String, viaLocal: Boolean) {
+    fun put(
+        platform: String, songKey: String, requestedQuality: String, url: String, actualQuality: String, viaLocal: Boolean,
+        totalBytes: Long = 0L, sourceSongId: String = ""
+    ) {
         if (url.isBlank()) return
         val now = System.currentTimeMillis()
-        map[key(platform, songKey, requestedQuality)] = Entry(url, actualQuality, platform, now + ttlFor(url, now), viaLocal)
+        map[key(platform, songKey, requestedQuality)] = Entry(url, actualQuality, platform, now + ttlFor(url, now), viaLocal, totalBytes, sourceSongId)
         if (map.size > MAX_ENTRIES) prune(now)
     }
 

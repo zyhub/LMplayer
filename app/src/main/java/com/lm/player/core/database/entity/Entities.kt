@@ -218,3 +218,46 @@ fun SongEntity.toUnifiedSong(): com.lm.player.core.model.UnifiedSong = com.lm.pl
     addedTimestamp = addedTimestamp,
     rawMetaJson = rawMetaJson
 )
+
+/**
+ * 服务器歌曲加速表（2026-11-13，数据库第 7 版）：每首服务器曲库歌曲一行，按服务器歌曲 ID 对应。
+ *
+ * 只存「本地音源加速要用的数据」，不改资料库（songs 表）里的歌曲列表、封面和元数据（11-11 规则）：
+ * - 平台对应：这首服务器歌在酷我 / 酷狗 / QQ 等平台上对应哪一首（播放时跳过现搜，直接本地取链）；
+ * - 平台封面：服务器封面慢或失败时与之竞速；
+ * - 歌词缓存：第二次播放起直接从本地读。
+ *
+ * [fileKey] 是服务器文件指纹（路径 + 大小 + 时长）：服务器上换了文件就让这一行的匹配、歌词作废重来。
+ */
+@Entity(
+    tableName = "server_track_accel",
+    indices = [
+        Index(value = ["serverId"]),
+        Index(value = ["matchStatus"]),
+        Index(value = ["lyricAt"])
+    ]
+)
+data class ServerTrackAccelEntity(
+    @PrimaryKey val songId: String,
+    val serverId: String,
+    val fileKey: String,
+    val title: String,
+    val artist: String,
+    val durationMs: Long,
+    /** 0 = 待匹配，1 = 已匹配，2 = 未找到 */
+    val matchStatus: Int = 0,
+    val platform: String = "",
+    val platformSongId: String = "",
+    /** 匹配到的平台曲目（id / title / artist / album / durationMs / coverUrl / raw） */
+    val matchJson: String = "",
+    val matchScore: Int = 0,
+    val platformCoverUrl: String = "",
+    val attempts: Int = 0,
+    val lastTriedAt: Long = 0L,
+    val matchedAt: Long = 0L,
+    /** 歌词原文（LRC，含翻译时为合并后的文本） */
+    val lyricText: String = "",
+    /** server / platform / kugou */
+    val lyricSource: String = "",
+    val lyricAt: Long = 0L
+)

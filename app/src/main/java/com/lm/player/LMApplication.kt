@@ -94,8 +94,12 @@ class LMApplication : Application(), ImageLoaderFactory {
             com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
-            // 不等服务器同步：先用上次成功 bundle 恢复 QuickJS，冷启动离线也能本地取链。
+            // 冷启动：上次下载好的待用版音源转正、记保留期；引擎按需加载（第一次要取链 / 打开音源页 / 服务器断线时才装载，与 TV 一致）
+            com.lm.player.core.source.SourceAccelerationController.recordProcessStart(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            // 服务器歌曲加速表：旧匹配文件并入（只做一次），再启动后台预匹配（登录、曲库同步后也会再触发）
+            com.lm.player.core.source.ServerTrackAccelStore.ensureLegacyImported()
+            com.lm.player.core.source.ServerTrackPrematcher.init(this@LMApplication)
 
         }
 
@@ -166,6 +170,8 @@ class LMApplication : Application(), ImageLoaderFactory {
             .bitmapConfig(Bitmap.Config.RGB_565)
             .allowHardware(Build.VERSION.SDK_INT >= 29)
             .allowRgb565(true)
+            // 服务器歌曲封面：加速表里有平台封面时与服务器竞速，弱网直接先用平台封面（与 TV 一致）
+            .components { add(com.lm.player.core.media.ServerCoverRaceInterceptor) }
             .respectCacheHeaders(false)
             .build()
     }

@@ -21,6 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -241,9 +242,22 @@ class DownloadEngine(
 
     // 活跃下载任务映射 Map<SongId, DownloadTask> - 线程安全反应式 StateFlow
     private val _activeTasksMap = MutableStateFlow<Map<String, DownloadTask>>(emptyMap())
-    val activeTasksFlow: StateFlow<List<DownloadTask>> = _activeTasksMap
-        .map { it.values.toList() }
-        .stateIn(coroutineScope, SharingStarted.Eagerly, emptyList())
+    // 对外的任务列表：增删任务（开始 / 完成 / 取消）立即发出；只有进度变化时最多每 400ms 发一次。
+    // 批量下载时几十个任务各自每 300ms 报一次进度，以前每次都让整个主界面和所有列表行重组。
+    val activeTasksFlow: StateFlow<List<DownloadTask>> = kotlinx.coroutines.flow.channelFlow {
+        var lastKeys: Set<String>? = null
+        var lastEmitAt = 0L
+        _activeTasksMap.collectLatest { map ->
+            if (map.keys != lastKeys) {
+                lastKeys = map.keys
+            } else {
+                val wait = 400L - (System.currentTimeMillis() - lastEmitAt)
+                if (wait > 0) delay(wait)
+            }
+            lastEmitAt = System.currentTimeMillis()
+            send(map.values.toList())
+        }
+    }.stateIn(coroutineScope, SharingStarted.Eagerly, emptyList())
 
     private val jobMap = ConcurrentHashMap<String, Job>()
     private val urlResolverMap = ConcurrentHashMap<String, suspend () -> String?>()
@@ -599,6 +613,9 @@ class DownloadEngine(
         val existingByPath = songDao.getSongByLocalPath(localFilePath)
         val existingById = songDao.getSongById(song.id)
         val isExistingPathServerLinked = existingByPath != null && isServerLibraryId(existingByPath.serverId)
+        // 先通知界面（在 removeTask 之前）：列表行 / 播放页立刻显示「已下载」，不等数据库重读
+        SongStatusStore.markDownloaded(song.id, localFilePath)
+        if (existingByPath != null && existingByPath.id != song.id) SongStatusStore.markDownloaded(existingByPath.id, localFilePath)
 
         // 若数据库中已有另一条不同 ID 的记录指向同一物理文件：
         // 优先保留**已关联服务器**的曲目记录，清理冗余的本地/在线临时 ID 记录，防止
@@ -687,6 +704,8 @@ class DownloadEngine(
             var initialEntityRef: DownloadEntity? = null
             try {
             Log.i(TAG, "Download job started: ${song.title} (id=${song.id})")
+            // 下载菜单里选了「升级音质」：不按「本地已有」拦截，落盘成功后替换掉旧文件
+            val upgradeFromPath = LocalUpgradeRequests.take(song.id)
             val dbRelativePath = if (song.relativeFolderPath.isNullOrBlank()) {
                 try {
                     songDao.getSongById(song.id)?.relativeFolderPath
@@ -737,7 +756,7 @@ class DownloadEngine(
             val isRecordDownloaded = record?.status == DownloadStatus.DOWNLOADED && isExistingFileCompatible(record.localFilePath)
             val isLocalPathValid = isExistingFileCompatible(song.localFilePath)
 
-            if (isDestFileValid || isRecordDownloaded || isLocalPathValid) {
+            if (upgradeFromPath == null && (isDestFileValid || isRecordDownloaded || isLocalPathValid)) {
                 val validPath = when {
                     isDestFileValid -> destFile.absolutePath
                     isRecordDownloaded -> record!!.localFilePath!!
@@ -1169,6 +1188,18 @@ class DownloadEngine(
                         throw Exception("音频文件落盘失败：目标下载目录无法写入，请在设置中重新指定目录或授予权限")
                     }
 
+                    // 升级音质：新文件已就位，删掉旧的低音质文件（同名时上面已直接覆盖）
+                    if (upgradeFromPath != null) {
+                        runCatching {
+                            val old = File(upgradeFromPath)
+                            if (old.exists() && old.canonicalPath != actualDestFile.canonicalPath) {
+                                old.delete()
+                                downloadDao.deleteDownloadByLocalPath(upgradeFromPath)
+                                Log.i(TAG, "Quality upgrade replaced $upgradeFromPath -> ${actualDestFile.absolutePath}")
+                            }
+                        }
+                    }
+
                     val finalExt = actualDestFile.extension.lowercase().ifBlank { song.format.lowercase() }
                     val probedBitRate = readAudioBitRate(actualDestFile)
                     val actualBitRate = probedBitRate.takeIf { it > 0 } ?: when {
@@ -1400,6 +1431,7 @@ class DownloadEngine(
                 songDao.updateDownloadStatus(songId, DownloadStatus.NOT_DOWNLOADED, null)
             }
             downloadDao.deleteDownload(songId)
+            SongStatusStore.markRemoved(listOf(songId))
             task?.let {
                 val f = getTargetDownloadFile(it.song)
                 if (f.exists()) f.delete()
@@ -1470,8 +1502,9 @@ class DownloadEngine(
         song: UnifiedSong
     ): String? = withContext(Dispatchers.IO) {
         val lemonPrefs = context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE)
-        // 封面固定嵌入音频标签；不再依赖旧设置，也不在目录生成 cover.jpg。
-        val embedCover = true
+        // 内嵌封面 / 内嵌歌词 / .lrc 都按设置页「下载时一并保存」的勾选执行（默认封面、歌词都内嵌）；
+        // 不在目录生成 cover.jpg，封面只保存在音频标签内。
+        val embedCover = lemonPrefs.getBoolean("download_embed_cover", true)
         val embedLyric = lemonPrefs.getBoolean("download_embed_lyric", true)
         val downloadLrc = lemonPrefs.getBoolean("download_lrc_file_v2", false)
 
@@ -1569,6 +1602,81 @@ class DownloadEngine(
             songDao.updateDownloadStatusAndTimestamp(song.id, DownloadStatus.DOWNLOADED, file.absolutePath, System.currentTimeMillis())
         }
         true
+    }
+
+    /** 多选补全标签的统计 */
+    data class TagFillResult(val filled: Int, val noMatch: Int, val failed: Int, val serverUnavailable: Boolean)
+
+    /**
+     * 下载管理多选「补全标签」：先用服务端的标签匹配取封面 / 歌词 / 缺失的歌手专辑，写进**本机文件**；
+     * 服务端没有可靠匹配或暂时不可用时，退回原来的本地补全（现有封面地址 + 歌词服务）。
+     */
+    suspend fun fillTagsFromServer(songs: List<UnifiedSong>): TagFillResult = withContext(Dispatchers.IO) {
+        var filled = 0
+        var noMatch = 0
+        var failed = 0
+        var serverDownCount = 0
+        for (song in songs) {
+            val path = song.localFilePath ?: downloadDao.getDownloadRecord(song.id)?.localFilePath
+            val file = path?.takeIf { it.isNotBlank() && !it.startsWith("content://") }?.let { File(it) }
+            if (file == null || !file.exists() || file.length() < 32) {
+                failed++
+                continue
+            }
+            val result = runCatching { AutoTagScraper.fetchTagMetaForLocal(context, song) }.getOrNull()
+            val meta = result?.meta
+            if (meta == null) {
+                // 没有可靠匹配 / 服务端不可用：退回本地补全（现有封面地址 + 歌词服务）
+                val serverDown = result == null || result.serverDown
+                val localOk = runCatching { reEmbedSongMetadata(song.copy(localFilePath = file.absolutePath)) }.getOrDefault(false)
+                when {
+                    !localOk -> failed++
+                    serverDown -> {
+                        serverDownCount++
+                        filled++
+                    }
+                    else -> noMatch++
+                }
+                continue
+            }
+            // 封面：服务端给的 base64 优先，其次封面地址，最后用歌曲现有封面
+            var coverBytes: ByteArray? = meta.coverBase64?.let { b64 ->
+                runCatching { android.util.Base64.decode(b64.substringAfter("base64,"), android.util.Base64.DEFAULT) }.getOrNull()
+            }
+            val coverUrl = meta.coverUrl ?: song.coverUrl.takeIf { it.startsWith("http") }
+            if (coverBytes == null && !coverUrl.isNullOrBlank()) {
+                coverBytes = runCatching {
+                    okHttpClient.newCall(Request.Builder().url(coverUrl).build()).execute().use { resp ->
+                        if (resp.isSuccessful) resp.body?.bytes() else null
+                    }
+                }.getOrNull()
+            }
+            val lyric = meta.lyric ?: runCatching { LyricsManager.fetchRawLyrics(song, context) }.getOrNull()
+            val artist = meta.artist ?: song.artist
+            val album = meta.album ?: song.album
+            val ok = runCatching {
+                AudioMetadataEmbedder.embedMetadata(
+                    file = file,
+                    title = song.title,
+                    artist = artist,
+                    album = album,
+                    coverBytes = coverBytes,
+                    lyrics = lyric
+                )
+            }.getOrDefault(false)
+            if (ok) {
+                filled++
+                if (meta.artist != null || meta.album != null) {
+                    runCatching {
+                        songDao.updateSongMetadataById(song.id, song.title, artist, album, song.coverUrl)
+                    }
+                }
+                if (meta.lyric != null) LyricsManager.invalidateLyrics(song.id)
+            } else {
+                failed++
+            }
+        }
+        TagFillResult(filled, noMatch, failed, serverUnavailable = serverDownCount > 0 && serverDownCount == songs.size)
     }
 
     /**
@@ -1727,6 +1835,7 @@ class DownloadEngine(
             }
         }
     }
+
 
     private fun updateTask(task: DownloadTask) {
         _activeTasksMap.update { it + (task.song.id to task) }

@@ -562,6 +562,7 @@ object PlaybackQueueManager {
      */
     fun onSongsDownloadDeleted(songIds: Set<String>) {
         if (songIds.isEmpty()) return
+        SongStatusStore.markRemoved(songIds)
         val current = _currentSongFlow.value
         if (current != null && current.id in songIds) {
             val updated = current.copy(

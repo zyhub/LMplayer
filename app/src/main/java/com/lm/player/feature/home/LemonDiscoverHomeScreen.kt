@@ -37,6 +37,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
@@ -129,10 +130,13 @@ fun LemonDiscoverHomeScreen(
     onOpenDownloads: () -> Unit = {},
     onGoToSettings: () -> Unit = {},
     onSearchClick: () -> Unit = {},
-    onFetchDiscoverPlaylists: suspend (OnlineMusicSource) -> List<UnifiedPlaylist>,
+    /** 第二个参数是页码：「换一批」时翻到下一页（1..5 循环） */
+    onFetchDiscoverPlaylists: suspend (OnlineMusicSource, Int) -> List<UnifiedPlaylist>,
     onFetchDiscoverToplists: suspend (OnlineMusicSource) -> List<LemonToplist>,
-    onFetchDiscoverNewSongs: suspend (OnlineMusicSource) -> List<UnifiedSong>,
-    onFetchDiscoverNewAlbums: (suspend (OnlineMusicSource) -> List<UnifiedAlbum>)? = null,
+    /** 第二个参数是条数：一次拉一个大池，「换一批」时换下一段 */
+    onFetchDiscoverNewSongs: suspend (OnlineMusicSource, Int) -> List<UnifiedSong>,
+    /** 第二个参数是页码 */
+    onFetchDiscoverNewAlbums: (suspend (OnlineMusicSource, Int) -> List<UnifiedAlbum>)? = null,
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     onFetchCollectionSongs: suspend (id: String, source: OnlineMusicSource) -> List<UnifiedSong>,
     onSubViewActiveChange: (Boolean) -> Unit = {},
@@ -171,6 +175,10 @@ fun LemonDiscoverHomeScreen(
     var toplists by remember { mutableStateOf<List<LemonToplist>>(emptyList()) }
     var newSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var newAlbums by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
+    // 新歌首发：一次拉一个大池（约 100 首），每次「换一批」换下一段 30 首 —— 是新的歌，而不是同一批打乱顺序
+    var newSongPool by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    // 今日推荐：服务器曲库 50% + 在线新歌 50% 现组的每日推荐，每次「换一批」重新组一批
+    var dailyMixSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var reloadTrigger by remember { mutableStateOf(0) }
     var isPullRefreshing by remember { mutableStateOf(false) }
@@ -194,6 +202,9 @@ fun LemonDiscoverHomeScreen(
     LaunchedEffect(Unit) {
         coroutineScope.launch(Dispatchers.IO) {
             val state = com.lm.player.core.network.LemonMusicProtocol.fetchDailyMix(context, forceRefresh = false).getOrNull()
+            if (state != null && state.songs.isNotEmpty()) {
+                withContext(Dispatchers.Main) { dailyMixSongs = state.songs }
+            }
             if (state != null && state.remainingRefreshes in 0..20 && state.remainingRefreshes != 18) {
                 withContext(Dispatchers.Main) {
                     remainingRefreshes = state.remainingRefreshes
@@ -352,11 +363,14 @@ fun LemonDiscoverHomeScreen(
         if (isModeChanged || (recommendPlaylists.isEmpty() && toplists.isEmpty() && newSongs.isEmpty() && newAlbums.isEmpty())) {
             isLoading = true
         }
+        // 「换一批」轮次 → 页码（1..5 循环）；某一页没有内容（平台页数不够）时退回第 1 页并打乱
+        val page = 1 + (recommendSeed % 5)
         coroutineScope {
             launch {
-                val pl = runCatching { onFetchDiscoverPlaylists(currentSource) }.getOrDefault(emptyList())
+                var pl = runCatching { onFetchDiscoverPlaylists(currentSource, page) }.getOrDefault(emptyList())
+                if (pl.isEmpty() && page > 1) pl = runCatching { onFetchDiscoverPlaylists(currentSource, 1) }.getOrDefault(emptyList()).shuffled()
                 if (pl.isNotEmpty()) {
-                    recommendPlaylists = if (reloadTrigger > 0 && !isModeChanged) pl.shuffled() else pl
+                    recommendPlaylists = pl
                     isLoading = false
                 } else if (isModeChanged) {
                     recommendPlaylists = emptyList()
@@ -365,16 +379,17 @@ fun LemonDiscoverHomeScreen(
             launch {
                 val tl = runCatching { onFetchDiscoverToplists(currentSource) }.getOrDefault(emptyList())
                 if (tl.isNotEmpty()) {
-                    toplists = if (reloadTrigger > 0 && !isModeChanged) tl.shuffled() else tl
+                    toplists = tl
                     isLoading = false
                 } else if (isModeChanged) {
                     toplists = emptyList()
                 }
             }
             launch {
-                val ns = runCatching { onFetchDiscoverNewSongs(currentSource) }.getOrDefault(emptyList())
+                val ns = runCatching { onFetchDiscoverNewSongs(currentSource, DISCOVER_NEW_SONG_POOL) }.getOrDefault(emptyList())
                 if (ns.isNotEmpty()) {
-                    newSongs = if (reloadTrigger > 0 && !isModeChanged) ns.shuffled() else ns
+                    newSongPool = ns
+                    newSongs = discoverWindow(ns, recommendSeed, DISCOVER_NEW_SONG_WINDOW)
                     isLoading = false
                 } else if (isModeChanged) {
                     newSongs = emptyList()
@@ -382,9 +397,10 @@ fun LemonDiscoverHomeScreen(
             }
             if (onFetchDiscoverNewAlbums != null) {
                 launch {
-                    val na = runCatching { onFetchDiscoverNewAlbums(currentSource) }.getOrDefault(emptyList())
+                    var na = runCatching { onFetchDiscoverNewAlbums(currentSource, page) }.getOrDefault(emptyList())
+                    if (na.isEmpty() && page > 1) na = runCatching { onFetchDiscoverNewAlbums(currentSource, 1) }.getOrDefault(emptyList()).shuffled()
                     if (na.isNotEmpty()) {
-                        newAlbums = if (reloadTrigger > 0 && !isModeChanged) na.shuffled() else na
+                        newAlbums = na
                         isLoading = false
                     } else if (isModeChanged) {
                         newAlbums = emptyList()
@@ -396,7 +412,10 @@ fun LemonDiscoverHomeScreen(
     }
 
     // 今日推荐最少 3 首曲目池计算（换一批时通过 recommendSeed 偏移轮转，保证每次呈现新推荐）
-    val todaySongs = remember(resolvedNewSongs, allCachedSongs, recommendSeed) {
+    // 今日推荐的播放队列：有每日推荐就用它，否则沿用新歌 / 本地缓存
+    val todayQueue = if (dailyMixSongs.isNotEmpty()) dailyMixSongs else if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs
+    val todaySongs = remember(dailyMixSongs, resolvedNewSongs, allCachedSongs, recommendSeed) {
+      if (dailyMixSongs.isNotEmpty()) dailyMixSongs.take(3) else {
         val pool = if (resolvedNewSongs.isNotEmpty()) {
             resolvedNewSongs
         } else {
@@ -413,6 +432,7 @@ fun LemonDiscoverHomeScreen(
                 rotated.take(3)
             }
         }
+      }
     }
 
     // 最新专辑最少 3 张专辑池计算（换一批时通过 recommendSeed 偏移轮转，展示真实新碟专辑）
@@ -465,6 +485,110 @@ fun LemonDiscoverHomeScreen(
                 headerItems++ // 新歌首发标题栏与选项卡
                 runCatching { discoverListState.scrollToItem(headerItems + newIdx) }
             }
+        }
+    }
+
+    // 头部右侧「下载管理 + 服务器切换」：普通模式画在头部；液态玻璃模式登记到上层固定显示
+    val pinnedHeaderActions: @Composable () -> Unit = {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(if (isUltraCompactHeader) 4.dp else 6.dp)
+        ) {
+            com.lm.player.core.designsystem.component.HeaderDownloadPill(
+                activeDownloadCount = activeDownloadCount,
+                onClick = onOpenDownloads,
+                isCompactHeader = isCompactHeader,
+                horizontalPad = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp,
+                verticalPad = if (isCompactHeader) 5.dp else 6.dp,
+                surfaceColor = surfaceColor,
+                borderColor = borderColor,
+                blurAlpha = blurAlpha
+            )
+            ServerSwitchDropdownButton(
+                currentServer = serverName,
+                configuredServers = configuredServers,
+                blurAlpha = blurAlpha,
+                onSelectLocal = onSelectLocalServer,
+                onSelectServer = onSelectServer,
+                onSyncNow = onSyncNow,
+                onGoToSettings = onGoToSettings
+            )
+        }
+    }
+
+    // 音源切换胶囊：普通模式为红色半透明底；液态玻璃模式（头部固定在上层）为玻璃底 + 红色描边文字
+    val sourceSwitchPill: @Composable () -> Unit = {
+        val pillShape = RoundedCornerShape(20.dp)
+        val pillDensity = androidx.compose.ui.platform.LocalDensity.current
+        var pillWidthDp by remember { mutableStateOf(0.dp) }
+        val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+        Box {
+            Box(
+                modifier = Modifier
+                    .onSizeChanged { pillWidthDp = with(pillDensity) { it.width.toDp() } }
+                    .clip(pillShape)
+                    .then(
+                        if (glassOn) Modifier.border(BorderStroke(1.dp, AppleRed.copy(alpha = 0.55f)), pillShape)
+                        else Modifier
+                            .background(AppleRed.copy(alpha = 0.12f))
+                            .border(BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f)), pillShape)
+                    )
+                    .clickable { isSourceSelectorOpen = true }
+            ) {
+                if (glassOn) {
+                    val style = com.lm.player.core.designsystem.glass.GlassStyleState.barStyle
+                        ?: com.lm.player.core.designsystem.glass.barGlassStyle(isDark, blurAlpha, 16f)
+                    com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                        modifier = Modifier.matchParentSize(),
+                        cornerRadius = 20.dp,
+                        tint = style.tint,
+                        blurAmount = style.blurAmount,
+                        dispersion = style.dispersion,
+                        material = style.material
+                    )
+                }
+                Row(
+                    modifier = Modifier.padding(
+                        horizontal = if (isUltraCompactHeader) 7.dp else if (isCompactHeader) 8.dp else 10.dp,
+                        vertical = if (isCompactHeader) 5.dp else 6.dp
+                    ),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.GraphicEq,
+                        contentDescription = "操作音源",
+                        tint = AppleRed,
+                        modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text(
+                        text = currentSource.shortName,
+                        color = AppleRed,
+                        fontSize = dimensions.captionSize,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                    Spacer(modifier = Modifier.width(1.dp))
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = null,
+                        tint = AppleRed,
+                        modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
+                    )
+                }
+            }
+
+            OnlineSourceDropdownMenu(
+                expanded = isSourceSelectorOpen,
+                onDismissRequest = { isSourceSelectorOpen = false },
+                currentSource = currentSource,
+                onSourceSelect = { src ->
+                    onSourceChange(src)
+                    isSourceSelectorOpen = false
+                },
+                anchorWidth = pillWidthDp.takeIf { it > 0.dp }
+            )
         }
     }
 
@@ -540,101 +664,9 @@ fun LemonDiscoverHomeScreen(
                     horizontalArrangement = Arrangement.spacedBy(buttonGap)
                 ) {
                     // 音源切换胶囊按钮 (操作音源)
-                    Box {
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = AppleRed.copy(alpha = 0.12f),
-                            border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { isSourceSelectorOpen = true }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.GraphicEq,
-                                    contentDescription = "操作音源",
-                                    tint = AppleRed,
-                                    modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = currentSource.shortName,
-                                    color = AppleRed,
-                                    fontSize = dimensions.captionSize,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    softWrap = false
-                                )
-                                Spacer(modifier = Modifier.width(1.dp))
-                                Icon(
-                                    imageVector = Icons.Default.ArrowDropDown,
-                                    contentDescription = null,
-                                    tint = AppleRed,
-                                    modifier = Modifier.size(if (isCompactHeader) 14.dp else 16.dp)
-                                )
-                            }
-                        }
-
-                        OnlineSourceDropdownMenu(
-                            expanded = isSourceSelectorOpen,
-                            onDismissRequest = { isSourceSelectorOpen = false },
-                            currentSource = currentSource,
-                            onSourceSelect = { src ->
-                                onSourceChange(src)
-                                isSourceSelectorOpen = false
-                            }
-                        )
-                    }
-
-
-
-                    // 下载管理胶囊
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = surfaceColor,
-                        shadowElevation = 2.dp,
-                        border = BorderStroke(1.dp, borderColor),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .clickable(onClick = onOpenDownloads)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = pillHorizontalPad, vertical = pillVerticalPad),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
-                                contentDescription = "下载管理",
-                                tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
-                            )
-                            if (activeDownloadCount > 0) {
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
-                                    color = AppleRed,
-                                    fontSize = dimensions.captionSize,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    softWrap = false
-                                )
-                            }
-                        }
-                    }
-
-                    // 服务器切换下拉按键
-                    ServerSwitchDropdownButton(
-                        currentServer = serverName,
-                        configuredServers = configuredServers,
-                        blurAlpha = blurAlpha,
-                        onSelectLocal = onSelectLocalServer,
-                        onSelectServer = onSelectServer,
-                        onSyncNow = onSyncNow,
-                        onGoToSettings = onGoToSettings
-                    )
+                    sourceSwitchPill()
+                    // 下载管理 + 服务器切换
+                    pinnedHeaderActions()
                 }
             }
         }
@@ -689,7 +721,7 @@ fun LemonDiscoverHomeScreen(
                             isPaused = isAnyScrolling,
                             onClick = {
                                 todaySongs.firstOrNull()?.let {
-                                    playNonRoamingSong(it, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
+                                    playNonRoamingSong(it, todayQueue)
                                 }
                             }
                         ) {
@@ -705,7 +737,7 @@ fun LemonDiscoverHomeScreen(
                                                 .fillMaxWidth()
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .clickable {
-                                                    playNonRoamingSong(song, if (resolvedNewSongs.isNotEmpty()) resolvedNewSongs else allCachedSongs)
+                                                    playNonRoamingSong(song, todayQueue)
                                                 }
                                                 .padding(vertical = 2.dp, horizontal = 2.dp),
                                             verticalAlignment = Alignment.CenterVertically,
@@ -1056,6 +1088,9 @@ fun LemonDiscoverHomeScreen(
                                     coroutineScope.launch(Dispatchers.IO) {
                                         val res = com.lm.player.core.network.LemonMusicProtocol.fetchDailyMix(context, forceRefresh = true)
                                         res.onSuccess { st ->
+                                            if (st.songs.isNotEmpty()) {
+                                                withContext(Dispatchers.Main) { dailyMixSongs = st.songs }
+                                            }
                                             if (st.remainingRefreshes in 0..20 && st.remainingRefreshes != 18) {
                                                 withContext(Dispatchers.Main) {
                                                     remainingRefreshes = st.remainingRefreshes
@@ -1065,19 +1100,9 @@ fun LemonDiscoverHomeScreen(
                                         }
                                     }
                                     com.lm.player.core.network.LemonMusicProtocol.clearDiscoverCache()
+                                    // 真正换一批：歌单 / 新碟翻到下一页、新歌首发换下一段、今日推荐重新组（不再把同一批原地打乱）
                                     recommendSeed++
-                                    if (recommendPlaylists.size > 1) {
-                                        recommendPlaylists = recommendPlaylists.shuffled()
-                                    }
-                                    if (toplists.size > 1) {
-                                        toplists = toplists.shuffled()
-                                    }
-                                    if (newSongs.size > 1) {
-                                        newSongs = newSongs.shuffled()
-                                    }
-                                    if (newAlbums.size > 1) {
-                                        newAlbums = newAlbums.shuffled()
-                                    }
+                                    if (newSongPool.isNotEmpty()) newSongs = discoverWindow(newSongPool, recommendSeed, DISCOVER_NEW_SONG_WINDOW)
                                     reloadTrigger++
                                     android.widget.Toast.makeText(context, "已为您换一批推荐内容 (剩 ${newCount}/20 次)", android.widget.Toast.LENGTH_SHORT).show()
                                 }
@@ -1291,64 +1316,49 @@ fun LemonDiscoverHomeScreen(
 }
 }
 
-        // 顶部渐进毛玻璃吸顶层 (当页面向上滚动穿过状态栏时平滑出现)
-        com.lm.player.core.designsystem.component.ProgressiveFrostedTopBar(
-            isScrolled = isScrolledAway,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .height(18.dp)
-        ) {}
+        // 顶部渐进毛玻璃条已删除：应用不是 edge-to-edge，它只会在状态栏下方形成一条白 / 灰条
 
         // 官方权威排行榜全景下钻层 (点击【权威排行榜】大卡时展开，减少主页重复列表)
         if (isToplistsOverviewOpen && activeCollectionTitle == null) {
+            // 液态玻璃：顶栏放进上层玻璃（与资料库列表页同一套），网格铺满到屏幕顶部、从玻璃下面穿过，滚动后收成小胶囊
+            val overviewGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+            val overviewTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+            val toplistsGridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+            val toplistsCollapsed = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(toplistsGridState) {
+                toplistsGridState.firstVisibleItemIndex to toplistsGridState.firstVisibleItemScrollOffset
+            }
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                    .then(if (overviewGlass) Modifier else Modifier.statusBarsPadding())
+                    .padding(start = 16.dp, end = 16.dp, top = if (overviewGlass) 0.dp else 10.dp, bottom = 10.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = { isToplistsOverviewOpen = false }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                            tint = MaterialTheme.colorScheme.onBackground
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "官方权威排行榜",
-                            fontSize = dimensions.sectionTitleSize,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "${currentSource.displayName} · 共 ${toplists.size} 个官方热榜",
-                            fontSize = dimensions.captionSize,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
+                com.lm.player.core.designsystem.glass.GlassListHeader(
+                    key = "discover_toplists",
+                    title = "官方权威排行榜",
+                    subtitle = "${currentSource.displayName} · 共 ${toplists.size} 个官方热榜",
+                    onBack = { isToplistsOverviewOpen = false },
+                    collapsed = toplistsCollapsed,
+                    onTapCapsule = { coroutineScope.launch { toplistsGridState.animateScrollToItem(0) } },
+                    capsuleInfo = "${toplists.size} 个榜单",
+                    titleSize = dimensions.sectionTitleSize,
+                    subtitleSize = dimensions.captionSize,
+                    rowVerticalPadding = 4.dp
+                )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                if (!overviewGlass) Spacer(modifier = Modifier.height(10.dp))
 
                 LazyVerticalGrid(
+                    state = toplistsGridState,
                     columns = GridCells.Adaptive(minSize = 140.dp),
                     modifier = Modifier.fillMaxSize(),
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
-                    contentPadding = PaddingValues(bottom = contentPadding.calculateBottomPadding() + 24.dp)
+                    contentPadding = PaddingValues(
+                        top = if (overviewGlass) overviewTopInset + 10.dp else 0.dp,
+                        bottom = contentPadding.calculateBottomPadding() + 24.dp
+                    )
                 ) {
                     items(
                         items = toplists,
@@ -1385,49 +1395,39 @@ fun LemonDiscoverHomeScreen(
 
         // 最新专辑全景下钻层 (点击【最新专辑】大卡时展开，集中展示新碟首发)
         if (isAlbumsOverviewOpen && activeCollectionTitle == null) {
+            val overviewGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+            val overviewTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+            val albumsGridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+            val albumsCollapsed = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(albumsGridState) {
+                albumsGridState.firstVisibleItemIndex to albumsGridState.firstVisibleItemScrollOffset
+            }
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(MaterialTheme.colorScheme.background)
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                    .then(if (overviewGlass) Modifier else Modifier.statusBarsPadding())
+                    .padding(start = 16.dp, end = 16.dp, top = if (overviewGlass) 0.dp else 10.dp, bottom = 10.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = { isAlbumsOverviewOpen = false }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                            tint = MaterialTheme.colorScheme.onBackground
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "最新专辑",
-                            fontSize = dimensions.sectionTitleSize,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "${currentSource.displayName} · 共 ${newAlbums.size} 张新碟首发",
-                            fontSize = dimensions.captionSize,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
+                com.lm.player.core.designsystem.glass.GlassListHeader(
+                    key = "discover_albums",
+                    title = "最新专辑",
+                    subtitle = "${currentSource.displayName} · 共 ${newAlbums.size} 张新碟首发",
+                    onBack = { isAlbumsOverviewOpen = false },
+                    collapsed = albumsCollapsed,
+                    onTapCapsule = { coroutineScope.launch { albumsGridState.animateScrollToItem(0) } },
+                    capsuleInfo = "${newAlbums.size} 张",
+                    titleSize = dimensions.sectionTitleSize,
+                    subtitleSize = dimensions.captionSize,
+                    rowVerticalPadding = 4.dp
+                )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                if (!overviewGlass) Spacer(modifier = Modifier.height(10.dp))
 
                 if (newAlbums.isEmpty()) {
                     Box(
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(top = overviewTopInset),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -1438,11 +1438,15 @@ fun LemonDiscoverHomeScreen(
                     }
                 } else {
                     LazyVerticalGrid(
+                        state = albumsGridState,
                         columns = GridCells.Adaptive(minSize = 140.dp),
                         modifier = Modifier.fillMaxSize(),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
-                        contentPadding = PaddingValues(bottom = contentPadding.calculateBottomPadding() + 24.dp)
+                        contentPadding = PaddingValues(
+                            top = if (overviewGlass) overviewTopInset + 10.dp else 0.dp,
+                            bottom = contentPadding.calculateBottomPadding() + 24.dp
+                        )
                     ) {
                         items(
                             items = newAlbums,
@@ -1481,91 +1485,78 @@ fun LemonDiscoverHomeScreen(
 
     // 歌单/榜单下钻曲目视图 (页面内全屏呈现，不遮挡底部全局悬浮播放栏)
     if (activeCollectionTitle != null) {
+        // 液态玻璃：标题 + 播放全部条放进上层玻璃顶栏，曲目列表从玻璃下面穿过，滚动后收成「返回 + 歌单名 · 首数」小胶囊
+        val collectionGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+        val collectionTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+        val collectionScrolledDown = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(activeCollectionTitle) {
+            collectionListState.firstVisibleItemIndex to collectionListState.firstVisibleItemScrollOffset
+        }
+        val collectionPlayBar: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit = {
+            // 播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
+            Spacer(modifier = Modifier.height(6.dp))
+            SongListPlayAndBatchDownloadBar(
+                totalCount = resolvedCollectionSongs.size,
+                isMultiSelectMode = isCollectionMultiSelect,
+                selectedCount = selectedCollectionSongIds.size,
+                isAllSelected = resolvedCollectionSongs.isNotEmpty() && selectedCollectionSongIds.size == resolvedCollectionSongs.size,
+                onPlayAll = {
+                    resolvedCollectionSongs.firstOrNull()?.let { playNonRoamingSong(it, resolvedCollectionSongs) }
+                },
+                onEnterMultiSelect = {
+                    isCollectionMultiSelect = true
+                    selectedCollectionSongIds = emptySet()
+                },
+                onExitMultiSelect = {
+                    isCollectionMultiSelect = false
+                    selectedCollectionSongIds = emptySet()
+                },
+                onToggleSelectAll = {
+                    selectedCollectionSongIds = if (selectedCollectionSongIds.size == resolvedCollectionSongs.size) {
+                        emptySet()
+                    } else {
+                        resolvedCollectionSongs.map { it.id }.toSet()
+                    }
+                },
+                onBatchDownloadClick = {
+                    val selectedSongs = resolvedCollectionSongs.filter { selectedCollectionSongIds.contains(it.id) }
+                    if (selectedSongs.isNotEmpty()) {
+                        songsForBatchDownloadChoice = selectedSongs
+                    }
+                }
+            )
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .then(if (collectionGlass) Modifier else Modifier.statusBarsPadding())
+                .padding(start = 16.dp, end = 16.dp, top = if (collectionGlass) 0.dp else 10.dp, bottom = 10.dp)
         ) {
-            // 浮层顶部返回与标题
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = {
+            com.lm.player.core.designsystem.glass.GlassListHeader(
+                key = "discover_collection:${activeCollectionTitle}",
+                title = activeCollectionTitle ?: "",
+                subtitle = "${currentSource.displayName} · ${activeCollectionSongs.size} 首歌曲",
+                onBack = {
                     activeCollectionTitle = null
                     isCollectionMultiSelect = false
                     selectedCollectionSongIds = emptySet()
-                }) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "返回",
-                        tint = MaterialTheme.colorScheme.onBackground
-                    )
-                }
-                Spacer(modifier = Modifier.width(6.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = activeCollectionTitle ?: "",
-                        fontSize = dimensions.sectionTitleSize,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${currentSource.displayName} · ${activeCollectionSongs.size} 首歌曲",
-                        fontSize = dimensions.captionSize,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+                },
+                collapsed = collectionScrolledDown && !isCollectionMultiSelect,
+                onTapCapsule = { coroutineScope.launch { collectionListState.animateScrollToItem(0) } },
+                capsuleInfo = "${activeCollectionSongs.size} 首",
+                titleSize = dimensions.sectionTitleSize,
+                subtitleSize = dimensions.captionSize,
+                rowVerticalPadding = 4.dp,
+                below = if (resolvedCollectionSongs.isNotEmpty()) collectionPlayBar else null
+            )
 
-            // 播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
-            if (resolvedCollectionSongs.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                SongListPlayAndBatchDownloadBar(
-                    totalCount = resolvedCollectionSongs.size,
-                    isMultiSelectMode = isCollectionMultiSelect,
-                    selectedCount = selectedCollectionSongIds.size,
-                    isAllSelected = resolvedCollectionSongs.isNotEmpty() && selectedCollectionSongIds.size == resolvedCollectionSongs.size,
-                    onPlayAll = {
-                        resolvedCollectionSongs.firstOrNull()?.let { playNonRoamingSong(it, resolvedCollectionSongs) }
-                    },
-                    onEnterMultiSelect = {
-                        isCollectionMultiSelect = true
-                        selectedCollectionSongIds = emptySet()
-                    },
-                    onExitMultiSelect = {
-                        isCollectionMultiSelect = false
-                        selectedCollectionSongIds = emptySet()
-                    },
-                    onToggleSelectAll = {
-                        selectedCollectionSongIds = if (selectedCollectionSongIds.size == resolvedCollectionSongs.size) {
-                            emptySet()
-                        } else {
-                            resolvedCollectionSongs.map { it.id }.toSet()
-                        }
-                    },
-                    onBatchDownloadClick = {
-                        val selectedSongs = resolvedCollectionSongs.filter { selectedCollectionSongIds.contains(it.id) }
-                        if (selectedSongs.isNotEmpty()) {
-                            songsForBatchDownloadChoice = selectedSongs
-                        }
-                    }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
+            if (!collectionGlass) Spacer(modifier = Modifier.height(8.dp))
 
             if (isLoadingCollection) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(top = 100.dp),
+                        .padding(top = 100.dp + collectionTopInset),
                     contentAlignment = Alignment.TopCenter
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1578,7 +1569,7 @@ fun LemonDiscoverHomeScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(top = 100.dp),
+                        .padding(top = 100.dp + collectionTopInset),
                     contentAlignment = Alignment.TopCenter
                 ) {
                     Text("暂无曲目数据", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = dimensions.bodySize)
@@ -1588,6 +1579,7 @@ fun LemonDiscoverHomeScreen(
                     state = collectionListState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(
+                        top = if (collectionGlass) collectionTopInset + 8.dp else 0.dp,
                         bottom = contentPadding.calculateBottomPadding() + 24.dp
                     ),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -1640,6 +1632,41 @@ fun LemonDiscoverHomeScreen(
     }
 
     // 批量多选下载音质与目标选择弹窗
+    // 多选底部悬浮操作条（下载 / 加入歌单）：新歌首发与歌单 / 榜单 / 专辑详情各一条，放在页面顶层
+    val batchBarContext = androidx.compose.ui.platform.LocalContext.current
+    com.lm.player.core.designsystem.component.SongBatchFloatingBar(
+        key = "discover_new_songs",
+        visible = isNewSongsMultiSelect && activeCollectionTitle == null,
+        selectedCount = selectedNewSongIds.size,
+        selectedSongs = { resolvedNewSongs.filter { selectedNewSongIds.contains(it.id) } },
+        isServerConnected = isServerOk,
+        onDownload = { picked, target, quality ->
+            isNewSongsMultiSelect = false
+            selectedNewSongIds = emptySet()
+            onBatchDownloadSongsWithOptions(picked, target, quality)
+        },
+        onFinished = {
+            isNewSongsMultiSelect = false
+            selectedNewSongIds = emptySet()
+        }
+    )
+    com.lm.player.core.designsystem.component.SongBatchFloatingBar(
+        key = "discover_collection",
+        visible = isCollectionMultiSelect && activeCollectionTitle != null,
+        selectedCount = selectedCollectionSongIds.size,
+        selectedSongs = { resolvedCollectionSongs.filter { selectedCollectionSongIds.contains(it.id) } },
+        isServerConnected = isServerOk,
+        onDownload = { picked, target, quality ->
+            isCollectionMultiSelect = false
+            selectedCollectionSongIds = emptySet()
+            onBatchDownloadSongsWithOptions(picked, target, quality)
+        },
+        onFinished = {
+            isCollectionMultiSelect = false
+            selectedCollectionSongIds = emptySet()
+        }
+    )
+
     if (songsForBatchDownloadChoice.isNotEmpty()) {
         BatchDownloadQualityChoiceDialog(
             selectedCount = songsForBatchDownloadChoice.size,
@@ -1656,6 +1683,22 @@ fun LemonDiscoverHomeScreen(
             onDismiss = { songsForBatchDownloadChoice = emptyList() }
         )
     }
+}
+
+/** 新歌首发：一次拉的池子大小与每批显示条数 */
+private const val DISCOVER_NEW_SONG_POOL = 100
+private const val DISCOVER_NEW_SONG_WINDOW = 30
+
+/**
+ * 「换一批」第 [round] 轮显示池子里的第几段：池子够大时按段轮换（每段都是新的歌），
+ * 池子只有一段时退回打乱顺序。
+ */
+private fun <T> discoverWindow(pool: List<T>, round: Int, size: Int): List<T> {
+    if (pool.size <= size) return if (round > 0) pool.shuffled() else pool
+    val windows = (pool.size + size - 1) / size
+    val start = (round % windows) * size
+    val window = pool.drop(start).take(size)
+    return if (window.size < size) window + pool.take(size - window.size) else window
 }
 
 /**
@@ -1854,97 +1897,36 @@ fun OnlineSourceDropdownMenu(
     onDismissRequest: () -> Unit,
     currentSource: OnlineMusicSource,
     onSourceSelect: (OnlineMusicSource) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** 音源按钮的宽度：菜单与按钮同宽，直接在按钮下面展开 */
+    anchorWidth: androidx.compose.ui.unit.Dp? = null
 ) {
-    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    val menuBg = if (isDark) Color(0xFF1F1F26) else Color.White
-    DropdownMenu(
+    // 精简版：只列平台短名（酷我 / 网易 / QQ / 酷狗 / 咪咕），选中项红色加粗，宽度与按钮一致
+    com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = modifier
-            .widthIn(min = 250.dp, max = 310.dp)
-            .background(menuBg)
+        modifier = modifier.width((anchorWidth ?: 76.dp).coerceAtLeast(64.dp))
     ) {
-        Text(
-            text = "在线音源平台",
-            style = TextStyle(
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            ),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-        )
-        Text(
-            text = "发现主页推荐、榜单及全网检索切换源",
-            style = TextStyle(
-                fontSize = 10.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-            ),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp)
-        )
-
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-            thickness = 0.5.dp,
-            modifier = Modifier.padding(vertical = 4.dp)
-        )
-
         OnlineMusicSource.entries.forEach { src ->
             val isSelected = src == currentSource
-            val (iconColor, desc) = when (src) {
-                OnlineMusicSource.KUWO -> Pair(Color(0xFFFF9500), "酷我无损与车载特色源")
-                OnlineMusicSource.NETEASE -> Pair(Color(0xFFE53935), "网易云海量歌单与热评曲库")
-                OnlineMusicSource.QQ -> Pair(Color(0xFF34C759), "QQ音乐海量正版与流行金曲")
-                OnlineMusicSource.KUGOU -> Pair(Color(0xFF007AFF), "酷狗流行榜单与热门歌曲")
-                OnlineMusicSource.MIGU -> Pair(Color(0xFFFF2D55), "咪咕高保真正版无损源")
-            }
-
-            DropdownMenuItem(
-                text = {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.GraphicEq,
-                                contentDescription = null,
-                                tint = if (isSelected) AppleRed else iconColor,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Column {
-                                Text(
-                                    text = src.displayName,
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = desc,
-                                    fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                        if (isSelected) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = "当前选中",
-                                tint = AppleRed,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-                    }
-                },
-                onClick = {
-                    onSourceSelect(src)
-                },
+            Box(
                 modifier = Modifier
-                    .padding(horizontal = 4.dp, vertical = 2.dp)
-                    .clip(RoundedCornerShape(10.dp))
-            )
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                    .height(34.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (isSelected) AppleRed.copy(alpha = 0.14f) else Color.Transparent)
+                    .clickable { onSourceSelect(src) },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = src.shortName,
+                    fontSize = 13.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                    color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1
+                )
+            }
         }
     }
 }

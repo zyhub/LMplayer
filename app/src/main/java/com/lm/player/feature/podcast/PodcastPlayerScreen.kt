@@ -238,7 +238,8 @@ private fun PodcastPlayerPortraitLayout(
 
         // 4. 进度条与时间 (可拖动 Seek)
         Column(modifier = Modifier.fillMaxWidth()) {
-            Slider(
+            com.lm.player.core.designsystem.component.LiquidSlider(
+                commitOnRelease = true,
                 value = if (ui.durationMs > 0) (positionMs.toFloat() / ui.durationMs).coerceIn(0f, 1f) else 0f,
                 onValueChange = { ratio ->
                     if (ui.durationMs > 0) {
@@ -246,12 +247,8 @@ private fun PodcastPlayerPortraitLayout(
                     }
                 },
                 enabled = ui.durationMs > 0,
-                colors = SliderDefaults.colors(
-                    thumbColor = AppleRed,
-                    activeTrackColor = AppleRed,
-                    inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                ),
-                modifier = Modifier.fillMaxWidth().height(18.dp)
+                accentColor = AppleRed,
+                modifier = Modifier.fillMaxWidth().height(28.dp)
             )
 
             Row(
@@ -410,14 +407,15 @@ private fun PodcastPlayerLandscapeLayout(
             }
 
             Column(modifier = Modifier.fillMaxWidth()) {
-                Slider(
+                com.lm.player.core.designsystem.component.LiquidSlider(
+                commitOnRelease = true,
                     value = if (ui.durationMs > 0) (positionMs.toFloat() / ui.durationMs).coerceIn(0f, 1f) else 0f,
                     onValueChange = { ratio ->
                         if (ui.durationMs > 0) actions.onSeekTo((ratio * ui.durationMs).toLong())
                     },
                     enabled = ui.durationMs > 0,
-                    colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed),
-                    modifier = Modifier.fillMaxWidth().height(14.dp)
+                    accentColor = AppleRed,
+                    modifier = Modifier.fillMaxWidth().height(28.dp)
                 )
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(formatTime(positionMs), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -693,7 +691,7 @@ private fun PodcastMainControlsRow(
                 )
             }
 
-            DropdownMenu(
+            com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
                 expanded = showSpeedMenu,
                 onDismissRequest = { showSpeedMenu = false }
             ) {

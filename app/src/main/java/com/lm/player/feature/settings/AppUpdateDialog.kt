@@ -92,7 +92,7 @@ fun AppUpdateDialog(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        LinearProgressIndicator(
+                        com.lm.player.core.designsystem.component.ClassicLinearProgress(
                             progress = { downloadProgress },
                             modifier = Modifier
                                 .fillMaxWidth()

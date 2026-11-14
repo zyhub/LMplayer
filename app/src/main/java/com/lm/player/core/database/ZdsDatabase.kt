@@ -18,6 +18,7 @@ import com.lm.player.core.database.entity.ResolvedStreamCacheEntity
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.ServerSourceEntity
 import com.lm.player.core.database.entity.ServerSourceMetaEntity
+import com.lm.player.core.database.entity.ServerTrackAccelEntity
 import com.lm.player.core.database.entity.SongEntity
 
 @Database(
@@ -29,9 +30,10 @@ import com.lm.player.core.database.entity.SongEntity
         PlaylistSongEntity::class,
         ServerSourceEntity::class,
         ServerSourceMetaEntity::class,
-        ResolvedStreamCacheEntity::class
+        ResolvedStreamCacheEntity::class,
+        ServerTrackAccelEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = true
 )
 abstract class ZdsDatabase : RoomDatabase() {
@@ -40,6 +42,7 @@ abstract class ZdsDatabase : RoomDatabase() {
     abstract fun serverDao(): ServerDao
     abstract fun serverSourceDao(): ServerSourceDao
     abstract fun playlistDao(): PlaylistDao
+    abstract fun serverTrackAccelDao(): com.lm.player.core.database.dao.ServerTrackAccelDao
 
     companion object {
         @Volatile
@@ -100,6 +103,26 @@ abstract class ZdsDatabase : RoomDatabase() {
             }
         }
 
+        /** 第 8 版（2026-11-14，与 TV 第 7 版同一张表）：新增服务器歌曲加速表，只建表，不动任何已有数据 */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `server_track_accel` (" +
+                        "`songId` TEXT NOT NULL, `serverId` TEXT NOT NULL, `fileKey` TEXT NOT NULL, " +
+                        "`title` TEXT NOT NULL, `artist` TEXT NOT NULL, `durationMs` INTEGER NOT NULL, " +
+                        "`matchStatus` INTEGER NOT NULL, `platform` TEXT NOT NULL, `platformSongId` TEXT NOT NULL, " +
+                        "`matchJson` TEXT NOT NULL, `matchScore` INTEGER NOT NULL, `platformCoverUrl` TEXT NOT NULL, " +
+                        "`attempts` INTEGER NOT NULL, `lastTriedAt` INTEGER NOT NULL, `matchedAt` INTEGER NOT NULL, " +
+                        "`lyricText` TEXT NOT NULL, `lyricSource` TEXT NOT NULL, `lyricAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`songId`))"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_server_track_accel_serverId` ON `server_track_accel` (`serverId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_server_track_accel_matchStatus` ON `server_track_accel` (`matchStatus`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_server_track_accel_lyricAt` ON `server_track_accel` (`lyricAt`)")
+            }
+        }
+
+
         fun getInstance(context: Context): ZdsDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -108,7 +131,7 @@ abstract class ZdsDatabase : RoomDatabase() {
                     "zds_player.db"
                 )
                     .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                     .build()
                 INSTANCE = instance
                 instance

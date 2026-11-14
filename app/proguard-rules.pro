@@ -69,3 +69,4 @@
 # 这是用「牺牲一点运行期优化」换取「Android 8/9 上不再崩溃」的取舍；
 # 根治办法是把 FullscreenPlayerSheet 拆成多个小 Composable。
 -dontoptimize
+

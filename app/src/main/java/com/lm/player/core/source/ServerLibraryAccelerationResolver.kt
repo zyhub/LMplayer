@@ -2,7 +2,6 @@ package com.lm.player.core.source
 
 import android.content.Context
 import android.util.Log
-import com.lm.player.core.media.SongMatchingResolver
 import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.core.network.LemonMusicProtocol
@@ -10,28 +9,22 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
 import java.net.URI
 import java.net.URLDecoder
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 服务器曲库歌曲的本地加速解析。
  *
- * 服务器曲库只有文件元数据，没有平台 source/songId：先用**本地目录服务**（不经服务器）在各平台搜索同曲目，
- * 再交给 QuickJS 本地取链。匹配结果落盘（30 天），服务器离线时播放过的曲库歌曲仍可本地取链。
- * 任何失败都返回 failure，调用方回退 NAS 文件。
+ * 服务器曲库只有文件元数据，没有平台 source/songId：要先知道它在哪个平台对应哪一首，再交给 QuickJS 本地取链。
+ * 对应关系存在**服务器歌曲加速表**（[ServerTrackAccelStore]，2026-11-13 起取代原来最多 800 首的匹配文件）：
+ * 表里已匹配就跳过现搜；没有时用本地目录服务（不经服务器）在各平台搜同曲目，搜到写进表里。
+ * 后台预匹配（[ServerTrackPrematcher]）会提前把整个曲库填进这张表。任何失败都返回 failure，调用方回退 NAS 文件。
  */
 object ServerLibraryAccelerationResolver {
     private const val TAG = "ServerLibAccel"
     private const val DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000L
     private const val MIN_CACHE_TTL_MS = 60 * 1000L
     private const val MAX_CACHE_TTL_MS = 30 * 60 * 1000L
-    private const val MATCH_TTL_MS = 30L * 24 * 60 * 60 * 1000L
-    private const val MATCH_LIMIT = 800
-    private const val MATCH_FILE = "accel_library_matches.json"
     private const val FALLBACK_ORDER = "kw,tx,wy,kg,mg"
 
     data class Resolved(
@@ -40,22 +33,17 @@ object ServerLibraryAccelerationResolver {
         val source: String,
         val matchedTrack: UnifiedSong,
         val fromCache: Boolean = false,
-        val requestedQuality: AudioQuality = quality
+        val requestedQuality: AudioQuality = quality,
+        /** 探活拿到的文件大小（0=未知），播放缓存固定键用 */
+        val contentBytes: Long = 0L,
+        /** 链接实际对应的平台歌曲 ID */
+        val sourceSongId: String = ""
     )
 
-    private data class CachedMatch(val song: UnifiedSong, val at: Long)
-
-    private val matchCache = ConcurrentHashMap<String, CachedMatch>()
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    @Volatile
-    private var loaded = false
-
-    @Volatile
-    private var appContext: Context? = null
-
     fun init(context: Context) {
-        appContext = context.applicationContext
+        ServerTrackAccelStore.init(context)
     }
 
     suspend fun resolve(
@@ -64,8 +52,16 @@ object ServerLibraryAccelerationResolver {
         song: UnifiedSong,
         overrideQuality: String? = null,
         refresh: Boolean = false,
-        priority: ResolvePriority = ResolvePriority.PLAY
+        priority: ResolvePriority = ResolvePriority.PLAY,
+        /** 最低可接受音质：下载传目标音质 —— 本地拿不到同音质就返回失败，交给服务器原文件（2026-11-13 从手机端移植） */
+        floorQuality: AudioQuality? = null,
+        /** 本平台所有音源都拿不到时，是否到其它平台找同一首歌（下载的「换源」；服务器离线时播放也开） */
+        crossPlatform: Boolean = false,
+        budgetMsOverride: Long? = null
     ): Result<Resolved> {
+        // TV 按需启动：服务器歌曲取链以前不会触发引擎加载，模式一直是「只走服务器」，离线时只能干等超时。
+        // 现在先确保引擎：服务器在线时不等（本次走服务器），服务器离线时等引擎加载好（最多 8 秒）
+        SourceAccelerationController.ensureEnginesForResolve()
         val mode = SourceAccelerationController.playbackMode()
         if (mode != SourceAccelerationController.Mode.LOCAL_FIRST && mode != SourceAccelerationController.Mode.LOCAL_ONLY) {
             return Result.failure(IllegalStateException("音源加速未启用"))
@@ -76,25 +72,26 @@ object ServerLibraryAccelerationResolver {
         val budget = if (lenient) PlaybackAccelerator.LOCAL_ONLY_BUDGET_MS else PlaybackAccelerator.LOCAL_FIRST_BUDGET_MS
         val searchDeadline = System.currentTimeMillis() + searchBudget
         val quality = overrideQuality?.let { AudioQuality.fromKey(it) } ?: inferQuality(song)
-        ensureLoaded()
 
-        val key = matchKey(serverId, song)
-        val now = System.currentTimeMillis()
-        val cachedMatch = if (!refresh) matchCache[key]?.takeIf { now - it.at <= MATCH_TTL_MS }?.song else null
-        val match = cachedMatch ?: CrossPlatformMatcher.findFirst(song, platformOrder(serverId), searchDeadline)
+        // 加速表里已匹配（且服务器文件没变）→ 跳过现搜；refresh（上次取链失败）时重新搜一次
+        val stored = if (!refresh) ServerTrackAccelStore.matchFor(song) else null
+        val match = stored ?: CrossPlatformMatcher.findFirst(song, platformOrder(serverId), searchDeadline)
             ?: return Result.failure(IllegalStateException("服务器曲库歌曲未匹配到平台曲目"))
-        if (cachedMatch == null) {
-            matchCache[key] = CachedMatch(match, now)
-            persistSoon()
+        if (stored == null) {
+            // 写表不占取链时间
+            ioScope.launch { ServerTrackAccelStore.recordMatch(serverId, song, match) }
+        } else {
+            Log.d(TAG, "match from table: ${song.title} -> ${PlaybackAccelerator.platformOf(match)}")
         }
         val hit = PlaybackAccelerator.localResolve(
             song = match,
             requested = quality,
             priority = priority,
-            budgetMs = budget,
-            crossPlatform = false,
+            budgetMs = budgetMsOverride ?: budget,
+            crossPlatform = crossPlatform,
             refresh = refresh,
-            lenientProbe = lenient
+            lenientProbe = lenient,
+            floorQuality = floorQuality ?: AudioQuality.Q_128K
         ) ?: return Result.failure(IllegalStateException("服务器曲库本地解析失败"))
         if (hit.quality != quality) Log.i(TAG, "server library quality fallback: ${quality.key} -> ${hit.quality.key}")
         return Result.success(
@@ -103,21 +100,23 @@ object ServerLibraryAccelerationResolver {
                 quality = hit.quality,
                 source = hit.platform,
                 matchedTrack = match,
-                requestedQuality = quality
+                requestedQuality = quality,
+                contentBytes = hit.contentBytes,
+                sourceSongId = hit.sourceSongId.ifBlank {
+                    if (hit.platform.equals(PlaybackAccelerator.platformOf(match), true)) PlaybackAccelerator.rawIdOf(match) else ""
+                }
             )
         )
     }
 
     /** 探活/播放失败后主动失效。 */
     fun invalidate(serverId: String, song: UnifiedSong, qualityKey: String) {
-        val match = matchCache[matchKey(serverId, song)]?.song ?: return
-        SourceAccelerationSession.qualitiesFrom(qualityKey).forEach {
-            ResolvedUrlCache.invalidate(PlaybackAccelerator.platformOf(match), PlaybackAccelerator.rawIdOf(match), it)
+        ioScope.launch {
+            val match = ServerTrackAccelStore.matchFor(song) ?: return@launch
+            SourceAccelerationSession.qualitiesFrom(qualityKey).forEach {
+                ResolvedUrlCache.invalidate(PlaybackAccelerator.platformOf(match), PlaybackAccelerator.rawIdOf(match), it)
+            }
         }
-    }
-
-    fun clear() {
-        matchCache.clear()
     }
 
     private fun inferQuality(song: UnifiedSong): AudioQuality {
@@ -131,7 +130,8 @@ object ServerLibraryAccelerationResolver {
         }
     }
 
-    private suspend fun platformOrder(serverId: String): List<String> {
+    /** 搜索平台顺序：按服务器音源健康度排序，只取本地有脚本能取链的平台（预匹配也用） */
+    internal suspend fun platformOrder(serverId: String, requireResolvable: Boolean = true): List<String> {
         val platforms = LinkedHashMap<String, Int>()
         val entities = runCatching { ServerSourceRepository.getCachedSources(serverId) }.getOrDefault(emptyList())
         entities.filter { it.isActive }.forEach { source ->
@@ -151,90 +151,9 @@ object ServerLibraryAccelerationResolver {
         }
         val ordered = platforms.entries.sortedByDescending { it.value }.map { it.key }.toMutableList()
         FALLBACK_ORDER.split(",").forEach { if (it !in ordered) ordered.add(it) }
+        // 预匹配只用本地目录服务搜索（Kotlin，不需要 JS 引擎）：引擎没加载时按服务器音源声明的平台排
+        if (!requireResolvable && !SourceAccelerationSession.isReady()) return ordered.take(4)
         return ordered.filter { SourceAccelerationSession.canResolve(it) }.take(4)
-    }
-
-    private fun matchKey(serverId: String, song: UnifiedSong): String {
-        val title = SongMatchingResolver.normalizeTrackTitle(song.title)
-        val artist = SongMatchingResolver.normalizeArtist(song.artist)
-        return "$serverId|$title|$artist|${song.durationMs / 1000L}"
-    }
-
-    // ---------------- 匹配结果持久化 ----------------
-
-    private fun matchFile(): File? = appContext?.let { File(it.filesDir, MATCH_FILE) }
-
-    private fun ensureLoaded() {
-        if (loaded) return
-        synchronized(this) {
-            if (loaded) return
-            loaded = true
-            val file = matchFile() ?: return
-            runCatching {
-                if (!file.exists()) return
-                val arr = JSONArray(file.readText(Charsets.UTF_8))
-                val now = System.currentTimeMillis()
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val at = o.optLong("at")
-                    if (now - at > MATCH_TTL_MS) continue
-                    val s = o.optJSONObject("song") ?: continue
-                    matchCache[o.optString("key")] = CachedMatch(
-                        UnifiedSong(
-                            id = s.optString("id"),
-                            title = s.optString("title"),
-                            artist = s.optString("artist"),
-                            album = s.optString("album"),
-                            durationMs = s.optLong("durationMs"),
-                            coverUrl = s.optString("coverUrl"),
-                            serverId = "lemon_online",
-                            format = "mp3",
-                            rawMetaJson = s.optString("raw").takeIf { it.isNotBlank() }
-                        ),
-                        at
-                    )
-                }
-            }.onFailure { Log.w(TAG, "load match cache failed", it) }
-        }
-    }
-
-    @Volatile
-    private var persistScheduled = false
-
-    private fun persistSoon() {
-        if (persistScheduled) return
-        persistScheduled = true
-        ioScope.launch {
-            kotlinx.coroutines.delay(3_000L)
-            persistScheduled = false
-            val file = matchFile() ?: return@launch
-            runCatching {
-                val arr = JSONArray()
-                matchCache.entries.sortedByDescending { it.value.at }.take(MATCH_LIMIT).forEach { (k, v) ->
-                    arr.put(
-                        JSONObject()
-                            .put("key", k)
-                            .put("at", v.at)
-                            .put(
-                                "song", JSONObject()
-                                    .put("id", v.song.id)
-                                    .put("title", v.song.title)
-                                    .put("artist", v.song.artist)
-                                    .put("album", v.song.album)
-                                    .put("durationMs", v.song.durationMs)
-                                    .put("coverUrl", v.song.coverUrl)
-                                    .put("raw", v.song.rawMetaJson.orEmpty())
-                            )
-                    )
-                }
-                val tmp = File(file.parentFile, "$MATCH_FILE.tmp")
-                tmp.writeText(arr.toString(), Charsets.UTF_8)
-                if (!tmp.renameTo(file)) {
-                    tmp.copyTo(file, overwrite = true)
-                    tmp.delete()
-                }
-            }.onFailure { Log.w(TAG, "persist match cache failed", it) }
-        }
     }
 
     /**

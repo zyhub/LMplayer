@@ -105,5 +105,27 @@ object CrossPlatformMatcher {
     suspend fun findFirst(song: UnifiedSong, platforms: List<String>, deadline: Long): UnifiedSong? =
         alternatives(song, exclude = "", deadline = deadline, platforms = platforms).firstOrNull()
 
+    /** 预匹配的单首结果：match 为空且 anySearchOk=false 表示所有平台都搜失败（网络问题），不能当成「没有这首歌」 */
+    data class SequentialResult(val match: UnifiedSong?, val score: Int, val anySearchOk: Boolean)
+
+    /**
+     * 后台预匹配用（2026-11-13）：按平台顺序**逐个**搜，找到即停（不像播放时那样所有平台同时搜），减轻平台压力。
+     */
+    suspend fun findSequential(song: UnifiedSong, platforms: List<String>, perPlatformTimeoutMs: Long = 6_000L): SequentialResult {
+        if (song.title.isBlank()) return SequentialResult(null, 0, true)
+        val keyword = listOf(song.title, song.artist.takeIf { it.isNotBlank() && !it.contains("未知") })
+            .filterNotNull().joinToString(" ").trim()
+        var anyOk = false
+        for (p in platforms) {
+            val list = withTimeoutOrNull(perPlatformTimeoutMs) {
+                runCatching { LocalCatalog.searchSongs(keyword, p, 1, 10) }.getOrNull()
+            } ?: continue
+            anyOk = true
+            val hit = list.firstOrNull { isSameSong(song, it) } ?: continue
+            return SequentialResult(hit, trackNameArtistScore(hit, song.title, song.artist), true)
+        }
+        return SequentialResult(null, 0, anyOk)
+    }
+
     fun clear() = cache.clear()
 }

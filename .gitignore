@@ -27,3 +27,9 @@ keystore.properties
 *audit*.md
 *审计*.md
 *tvcar*.md
+
+# 签名文件永不上传
+*.jks
+*.keystore
+*keystore.properties
+*signing.properties

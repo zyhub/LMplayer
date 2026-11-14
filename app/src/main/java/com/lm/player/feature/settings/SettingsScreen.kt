@@ -39,6 +39,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -70,11 +71,11 @@ import kotlinx.coroutines.withContext
  * 设置分类选项卡 (对标柠檬音乐 Settings.vue 架构)
  */
 enum class SettingsTab(val label: String, val icon: ImageVector) {
-    ACCOUNT("账号与服务", Icons.Default.CloudSync),
-    SOURCES("音源状态", Icons.Default.GraphicEq),
-    LIBRARY_PATHS("存储与路径", Icons.Default.Folder),
-    DOWNLOAD("下载偏好", Icons.Default.Download),
-    PLAYBACK_UI("播放与外观", Icons.Default.Palette)
+    ACCOUNT("账号音源", Icons.Default.CloudSync),
+    PLAYBACK("播放", Icons.Default.PlayCircle),
+    DOWNLOAD("下载存储", Icons.Default.Download),
+    APPEARANCE("外观", Icons.Default.Palette),
+    ABOUT("关于", Icons.Default.Info)
 }
 
 /**
@@ -114,6 +115,9 @@ fun SettingsScreen(
     onLiquidGlassBlurChangeFinished: () -> Unit = {},
     bottomBarAnimMode: BottomBarAnimMode = BottomBarAnimMode.SLIDE,
     onBottomBarAnimModeChange: (BottomBarAnimMode) -> Unit = {},
+    /** 音乐栏动画：true = 展开，false = 滑出 */
+    playerOpenExpand: Boolean = true,
+    onPlayerOpenExpandChange: (Boolean) -> Unit = {},
     onEnableBottomBarAnimationChange: (Boolean) -> Unit,
     onAutoPlayOnStartupChange: (Boolean) -> Unit = {},
     onAutoFallbackToLocalChange: (Boolean) -> Unit = {},
@@ -157,6 +161,9 @@ fun SettingsScreen(
     }
     var autoCacheOnFavorite by remember {
         mutableStateOf(prefs.getBoolean("auto_cache_on_favorite", false) || prefs.getBoolean("auto_cache_to_server_on_favorite", false))
+    }
+    var autoTagScrapeOnPlay by remember {
+        mutableStateOf(prefs.getBoolean("auto_tag_scrape_on_play", false))
     }
     var offlineSyncAutoPush by remember {
         mutableStateOf(prefs.getBoolean("offline_sync_auto_push", false))
@@ -284,10 +291,14 @@ fun SettingsScreen(
 
     // 当切换到音源状态、下载偏好或存储路径 Tab 时，若连接了柠檬音乐则自动拉取同步
     LaunchedEffect(selectedTab, activeServer?.id, sourceStatusServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
-        if (selectedTab == SettingsTab.LIBRARY_PATHS) {
+        if (selectedTab == SettingsTab.DOWNLOAD) {
             localMusicPaths = (prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths).toSet()
         }
-        if (selectedTab == SettingsTab.SOURCES && liveServerOnline == true && sourceStatusServer != null) {
+        // 引擎按需加载（与 TV 一致）：打开音源状态所在的页面（含服务器离线时）就加载音源引擎
+        if (selectedTab == SettingsTab.ACCOUNT) {
+            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "settings_sources_tab")
+        }
+        if (selectedTab == SettingsTab.ACCOUNT && liveServerOnline == true && sourceStatusServer != null) {
             isRefreshingSources = true
             sourceStatusError = null
             try {
@@ -319,7 +330,7 @@ fun SettingsScreen(
                 }
             }
         }
-        if (selectedTab == SettingsTab.LIBRARY_PATHS && activeServer?.type == ServerType.LEMON_MUSIC) {
+        if (selectedTab == SettingsTab.DOWNLOAD && activeServer?.type == ServerType.LEMON_MUSIC) {
             isLoadingServerPaths = true
             val client = NetworkClientFactory.createOkHttpClient(context)
             val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
@@ -334,7 +345,7 @@ fun SettingsScreen(
             }
             isLoadingServerPaths = false
         }
-        if (selectedTab == SettingsTab.LIBRARY_PATHS) {
+        if (selectedTab == SettingsTab.DOWNLOAD) {
             isCalculatingStorage = true
             withContext(Dispatchers.IO) {
                 val allSongs = database.songDao().getAllSongsList()
@@ -365,17 +376,20 @@ fun SettingsScreen(
         }
     }
 
+    val settingsListState = rememberLazyListState()
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        // 1. 顶部固定导航区 (大标题与 Tab 胶囊排)
+        // 1. 顶部导航区 (大标题与 Tab 胶囊排)。液态玻璃模式下它是列表第一项（上层玻璃顶栏渲染同一个组件，滚动时收成小胶囊）
+        val settingsHeader: @Composable (Dp) -> Unit = { hPad ->
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
+                .padding(start = hPad, end = hPad, top = 16.dp, bottom = 8.dp)
         ) {
             Text(
                 text = "设置",
@@ -387,7 +401,7 @@ fun SettingsScreen(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "个性化您的音乐播放与同步体验 · 统一视觉规格",
+                text = "账号音源 · 播放 · 下载存储 · 外观 · 关于",
                 style = TextStyle(
                     fontSize = dimensions.captionSize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -496,11 +510,14 @@ fun SettingsScreen(
                 }
             }
         }
+        }
+        settingsHeader(16.dp)
 
         Spacer(modifier = Modifier.height(6.dp))
 
         // 2. 主设置内容区域 (根据选中 Tab 渲染对应设置卡片)
         LazyColumn(
+            state = settingsListState,
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
@@ -512,7 +529,7 @@ fun SettingsScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             when (selectedTab) {
-                // ==================== 1. 账号与服务 ====================
+                // ==================== 账号与音源 ====================
                 SettingsTab.ACCOUNT -> {
                     val accountServer = sourceStatusServer
                     val accountOnline = liveServerOnline == true
@@ -684,85 +701,7 @@ fun SettingsScreen(
                     }
 
                     item {
-                        SettingsCard(title = "软件更新", icon = Icons.Default.SystemUpdate) {
-                            SettingInfoRow(
-                                label = "当前版本",
-                                value = "v${AppUpdateManager.getAppVersionName(context)} (${AppUpdateManager.getAppVersionCode(context)})"
-                            )
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        runCatching {
-                                            context.startActivity(
-                                                android.content.Intent(
-                                                    android.content.Intent.ACTION_VIEW,
-                                                    android.net.Uri.parse("https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
-                                                )
-                                            )
-                                        }
-                                    }
-                                    .padding(vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}",
-                                    fontSize = 11.sp,
-                                    color = AppleRed,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = "复制地址",
-                                    fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.clickable {
-                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        clipboard.setPrimaryClip(
-                                            android.content.ClipData.newPlainText(
-                                                "GitHub",
-                                                "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}"
-                                            )
-                                        )
-                                        Toast.makeText(context, "GitHub 仓库地址已复制", Toast.LENGTH_SHORT).show()
-                                    }
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Button(
-                                onClick = {
-                                    if (!isCheckingUpdate) {
-                                        isCheckingUpdate = true
-                                        coroutineScope.launch {
-                                            val res = AppUpdateManager.checkForUpdates(context)
-                                            isCheckingUpdate = false
-                                            res.onSuccess { info ->
-                                                activeUpdateInfo = info
-                                                if (info.hasUpdate) {
-                                                    showUpdateDialog = true
-                                                } else {
-                                                    Toast.makeText(context, "当前已是最新版本 v${info.latestVersion}", Toast.LENGTH_SHORT).show()
-                                                }
-                                            }.onFailure { e ->
-                                                Toast.makeText(context, "检查更新失败: ${e.message}", Toast.LENGTH_LONG).show()
-                                            }
-                                        }
-                                    }
-                                },
-                                enabled = !isCheckingUpdate,
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(if (isCheckingUpdate) "检查中..." else "检查更新", fontSize = 12.sp)
-                            }
-                        }
-                    }
-                }
-
-                // ==================== 2. 音源与脚本 ====================
-                SettingsTab.SOURCES -> {
-                    item {
-                        SettingsCard(title = "默认在线操作音源", icon = Icons.Default.GraphicEq) {
+                        SettingsCard(title = "默认在线音源", icon = Icons.Default.GraphicEq) {
                             SettingDropdownRow(
                                 title = "默认在线音源",
                                 subtitle = "选择全网搜索、在线流式播放及发现推荐使用的首选音源",
@@ -804,7 +743,10 @@ fun SettingsScreen(
                                             if (res.isFailure) {
                                                 sourceStatusError = res.exceptionOrNull()?.message ?: "音源状态同步失败"
                                             }
+                                            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "settings_sources_sync")
                                             com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
+                                            // 刷新按钮立即从服务器拉取本地加速音源（不等 2 分钟），存为待用版、下次启动生效
+                                            com.lm.player.core.source.SourceAccelerationController.manualPull(context)
                                         } catch (e: kotlinx.coroutines.CancellationException) {
                                             throw e
                                         } catch (e: Exception) {
@@ -817,10 +759,525 @@ fun SettingsScreen(
                             }
                         )
                     }
+
+                    // 服务器歌曲加速：后台预匹配开关、进度、立即补全（与 TV 一致）
+                    item {
+                        ServerAccelPrematchCard()
+                    }
                 }
 
-                // ==================== 3. 存储与路径 ====================
-                SettingsTab.LIBRARY_PATHS -> {
+                // ==================== 播放 ====================
+                SettingsTab.PLAYBACK -> {
+                    item {
+                        SettingsCard(title = "在线试听音质与缓存", icon = Icons.Default.HighQuality) {
+                            // 1. Wi-Fi 状态试听音质
+                            SettingDropdownRow(
+                                icon = Icons.Default.Wifi,
+                                title = "Wi-Fi 状态试听音质",
+                                subtitle = "连接无线局域网时流式播放音质 (立即生效)",
+                                selectedValue = wifiStreamQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    wifiStreamQuality = q
+                                    prefs.edit().putString("wifi_stream_quality", q.key).apply()
+                                    onStreamQualityChanged()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // 2. 移动流量状态试听音质
+                            SettingDropdownRow(
+                                icon = Icons.Default.SignalCellularAlt,
+                                title = "移动流量状态试听音质",
+                                subtitle = "使用蜂窝网络时播放音质 (立即生效)",
+                                selectedValue = cellularStreamQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    cellularStreamQuality = q
+                                    prefs.edit().putString("cellular_stream_quality", q.key).apply()
+                                    onStreamQualityChanged()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f), thickness = 0.5.dp)
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // 3. 试听本地缓存开关
+                            SettingSwitchRow(
+                                title = "在线试听边听边存",
+                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已默认关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
+                                checked = streamCacheEnabled,
+                                onCheckedChange = { isEnabled ->
+                                    streamCacheEnabled = isEnabled
+                                    prefs.edit().putBoolean("stream_cache_enabled_v2", isEnabled).apply()
+                                    Media3Factory.setCacheEnabled(isEnabled)
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // 4. 清理试听缓存
+                            val formattedCacheSize = remember(cacheSizeBytes) {
+                                val mb = cacheSizeBytes.toDouble() / (1024 * 1024)
+                                if (mb >= 0.1) "%.1f MB".format(mb) else "${(cacheSizeBytes / 1024)} KB"
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text("当前试听缓存占用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                                    Text(formattedCacheSize, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        Media3Factory.clearStreamCache(context)
+                                        cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
+                                        Toast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
+                                    },
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(34.dp)
+                                ) {
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("清理试听缓存", fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    item {
+                        // 注意：这里曾用 remember 重复声明了一份 stopPlaybackOnExit，把外层状态**遮蔽**成
+                        // 死代码；更糟的是两处默认值相反（内层 true、外层 false），而
+                        // PlaybackService.onTaskRemoved 读同一键时用的默认值是 true ——
+                        // 同一个偏好项在不同卡片里读写的是不同变量，开关表现随机。
+                        // 现已删除内层声明，统一使用文件顶部的 hoisted 状态（默认值与 Service 契约一致）。
+                        SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
+                            SettingSwitchRow(
+                                title = "安卓系统启动后自动启动软件",
+                                subtitle = "手机/车机开机或重启进入系统后自动启动 LMPlayer 并拉起后台音频保活服务",
+                                checked = autoLaunchOnBoot,
+                                onCheckedChange = onAutoLaunchOnBootChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "启动自动继续播放",
+                                subtitle = "打开应用时自动恢复上次关闭前的曲目并继续播放",
+                                checked = autoPlayOnStartup,
+                                onCheckedChange = onAutoPlayOnStartupChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "网络容灾自动回退本地",
+                                subtitle = "在线音频遇到网络超时或无法缓冲时，无缝切换至已下载的本地歌曲",
+                                checked = autoFallbackToLocal,
+                                onCheckedChange = onAutoFallbackToLocalChange
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingSwitchRow(
+                                title = "退出应用时停止播放",
+                                // 副标题必须准确描述「控制什么、不影响什么」：
+                                // 此前两处同名开关共享同一 prefs key，且第二处副标题写「默认关闭」，
+                                // 与实际默认值 true 相反，用户会误以为「退到后台就停播」——而锁屏与按 Home
+                                // 走的是 Activity onStop，根本不读这个开关。这里把边界一次说清。
+                                subtitle = "关闭后：按返回键退至桌面，播放交由后台服务维持（锁屏同样不受影响）。" +
+                                    "开启后：双击返回键或从最近任务划掉应用时，彻底停止播放并释放后台服务",
+                                checked = stopPlaybackOnExit,
+                                onCheckedChange = { checked ->
+                                    stopPlaybackOnExit = checked
+                                    prefs.edit().putBoolean("stop_playback_on_exit", checked).apply()
+                                }
+                            )
+                        }
+                    }
+
+                    item {
+                        val systemIslandEnabled by DynamicIslandManager.systemIslandEnabledFlow.collectAsState()
+                        val islandDisplayMode by DynamicIslandManager.islandDisplayModeFlow.collectAsState()
+                        val showLyricsInPill by DynamicIslandManager.showLyricsInPillFlow.collectAsState()
+                        val deviceIslandProfile = remember { DynamicIslandManager.getDeviceIslandProfile() }
+                        var hasOverlayPerm by remember { mutableStateOf(DynamicIslandManager.hasOverlayPermission(context)) }
+                        val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                        DisposableEffect(lifecycleOwner) {
+                            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                                    hasOverlayPerm = DynamicIslandManager.hasOverlayPermission(context)
+                                }
+                            }
+                            lifecycleOwner.lifecycle.addObserver(observer)
+                            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                        }
+
+                        SettingsCard(title = "后台灵动岛", icon = Icons.Default.AutoAwesome) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = AppleRed.copy(alpha = 0.10f),
+                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.25f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Verified,
+                                        contentDescription = null,
+                                        tint = AppleRed,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "当前设备后台上岛协议识别（默认使用厂商系统原生上岛）",
+                                            fontSize = dimensions.captionSize,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = deviceIslandProfile,
+                                            fontSize = dimensions.bodySize,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            SettingSwitchRow(
+                                title = "启用挂后台手机灵动岛",
+                                subtitle = "退到后台播放音乐时自动激活小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊等系统原生媒体岛；关闭后彻底禁用后台上岛与悬浮胶囊",
+                                checked = systemIslandEnabled,
+                                onCheckedChange = { enabled ->
+                                    DynamicIslandManager.setSystemIslandEnabled(context, enabled)
+                                    Toast.makeText(
+                                        context,
+                                        if (enabled) "已开启挂后台手机灵动岛" else "已关闭挂后台手机灵动岛，后台不再上岛",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            )
+
+                            AnimatedVisibility(visible = systemIslandEnabled) {
+                                Column {
+                                    Spacer(modifier = Modifier.height(10.dp))
+
+                                    SettingDropdownRow(
+                                        title = "挂后台灵动岛通道模式",
+                                        subtitle = "默认使用厂商系统原生媒体上岛，保持持久稳定在线不掉岛",
+                                        selectedValue = islandDisplayMode,
+                                        options = IslandDisplayMode.entries,
+                                        getLabel = { it.label },
+                                        getSubtitle = { it.subtitle },
+                                        onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
+                                    )
+
+                                    if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY || DynamicIslandManager.isHuaweiOrHarmonyOS()) {
+                                        Spacer(modifier = Modifier.height(12.dp))
+
+                                        // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
+                                        Surface(
+                                            shape = RoundedCornerShape(12.dp),
+                                            color = if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.10f) else Color(0xFFFF9500).copy(alpha = 0.12f),
+                                            border = BorderStroke(
+                                                1.dp,
+                                                if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.35f) else Color(0xFFFF9500).copy(alpha = 0.45f)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .clickable {
+                                                    if (!hasOverlayPerm) {
+                                                        DynamicIslandManager.requestOverlayPermission(context)
+                                                    }
+                                                }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    modifier = Modifier.weight(1f)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (hasOverlayPerm) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                                                        contentDescription = null,
+                                                        tint = if (hasOverlayPerm) Color(0xFF34C759) else Color(0xFFFF9500),
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    Column {
+                                                        Text(
+                                                            text = if (hasOverlayPerm) "概念版顶部悬浮胶囊权限：已授权" else "概念版顶部悬浮胶囊权限：未开启",
+                                                            fontSize = dimensions.bodySize,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                        Text(
+                                                            text = if (hasOverlayPerm) {
+                                                                "当按 Home 键退到手机桌面或切换应用时，手机顶部将自动浮现黑胶灵动岛胶囊"
+                                                            } else {
+                                                                "当前选择了概念版悬浮胶囊模式，请点击授予悬浮窗权限以在后台顶部展示胶囊"
+                                                            },
+                                                            fontSize = dimensions.captionSize,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                                if (!hasOverlayPerm) {
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    Surface(
+                                                        shape = RoundedCornerShape(8.dp),
+                                                        color = AppleRed
+                                                    ) {
+                                                        Text(
+                                                            text = "去开启",
+                                                            fontSize = dimensions.captionSize,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = Color.White,
+                                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(modifier = Modifier.height(10.dp))
+
+                                        SettingSwitchRow(
+                                            title = "后台紧凑胶囊优先滚动同步歌词",
+                                            subtitle = "在后台顶部紧凑胶囊中优先翻滚显示实时歌词，无歌词时显示歌名与歌手（长按胶囊可上下微调避开前摄挖孔）",
+                                            checked = showLyricsInPill,
+                                            onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
+                                        )
+
+                                        Spacer(modifier = Modifier.height(12.dp))
+
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (!DynamicIslandManager.hasOverlayPermission(context)) {
+                                                    Toast.makeText(context, "请先授予悬浮窗权限以启用手机后台顶部灵动岛", Toast.LENGTH_SHORT).show()
+                                                    DynamicIslandManager.requestOverlayPermission(context)
+                                                } else {
+                                                    DynamicIslandManager.triggerIslandPreview(context)
+                                                    Toast.makeText(context, "已在屏幕顶部启动 4.5 秒后台灵动岛真机预览（点击可展开/收起）", Toast.LENGTH_SHORT).show()
+                                                }
+                                            },
+                                            shape = RoundedCornerShape(12.dp),
+                                            border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                }
+
+                // ==================== 下载与存储 ====================
+                SettingsTab.DOWNLOAD -> {
+                    item {
+                        SettingsCard(title = "下载默认设置", icon = Icons.Default.Download) {
+                            SettingDropdownRow(
+                                title = "默认下载音质",
+                                subtitle = "歌曲与专辑下载时优先选取的音质规格",
+                                selectedValue = defaultDownloadQuality,
+                                options = AudioQuality.entries,
+                                getLabel = { "${it.label} [${it.badge}]" },
+                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                onSelect = { q ->
+                                    defaultDownloadQuality = q
+                                    prefs.edit().putString("default_download_quality", q.key).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingDropdownRow(
+                                title = "默认下载目标",
+                                subtitle = "单曲与批量下载时的默认存储归属",
+                                selectedValue = defaultDownloadTarget,
+                                options = DownloadTarget.entries,
+                                getLabel = { it.displayName },
+                                onSelect = { target ->
+                                    defaultDownloadTarget = target
+                                    prefs.edit().putString("default_download_target", target.name).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            SettingDropdownRow(
+                                title = "同时下载缓存数设置",
+                                subtitle = "同步控制本机与柠檬音乐服务端并发下载任务数上限",
+                                selectedValue = maxConcurrentDownloads,
+                                options = listOf(1, 2, 3, 4, 5, 6),
+                                getLabel = { count ->
+                                    when (count) {
+                                        1 -> "1 个任务 (单线程顺序下载)"
+                                        3 -> "3 个任务 (推荐默认)"
+                                        else -> "$count 个任务并行"
+                                    }
+                                },
+                                getSubtitle = { count -> "最多同时下载 $count 首歌曲，超出任务自动进入等待队列" },
+                                onSelect = { count ->
+                                    maxConcurrentDownloads = count
+                                    prefs.edit().putBoolean("user_set_max_concurrent", true).apply()
+                                    onDownloadSettingsChange(downloadSettings.copy(maxConcurrent = count))
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.maxDownloadNum" to count.toString()))
+                                        }
+                                    }
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            // 三个「写入文件」开关合并成一行勾选
+                            SettingChipsRow(
+                                title = "下载时一并保存",
+                                subtitle = "勾选的内容会随歌曲一起保存（与服务器下载设置同步）",
+                                chips = listOf(
+                                    SettingChip("内嵌封面", embedCoverMeta) {
+                                    embedCoverMeta = it
+                                    prefs.edit().putBoolean("download_embed_cover", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isEmbedPic" to it.toString()))
+                                        }
+                                    }
+                                    },
+                                    SettingChip("内嵌歌词", embedLyricMeta) {
+                                    embedLyricMeta = it
+                                    prefs.edit().putBoolean("download_embed_lyric", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isEmbedLyric" to it.toString()))
+                                        }
+                                    }
+                                    },
+                                    SettingChip(".lrc 文件", downloadLrcFile) {
+                                    downloadLrcFile = it
+                                    prefs.edit().putBoolean("download_lrc_file_v2", it).apply()
+                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
+                                        coroutineScope.launch {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                activeServer.serverUrl,
+                                                activeServer.username,
+                                                activeServer.tokenOrApiKey
+                                            )
+                                            proto.updateServerSettings(mapOf("download.isDownloadLrc" to it.toString()))
+                                        }
+                                    }
+                                    }
+                                )
+                            )
+
+
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "收藏后自动缓存到服务器",
+                                subtitle = "在 App 内点击收藏歌曲后，后台自动将音频提交至服务器下载存储（默认关闭）",
+                                checked = autoCacheOnFavorite,
+                                onCheckedChange = {
+                                    autoCacheOnFavorite = it
+                                    prefs.edit()
+                                        .putBoolean("auto_cache_on_favorite", it)
+                                        .putBoolean("auto_cache_to_server_on_favorite", it)
+                                        .apply()
+                                    context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
+                                        .putBoolean("auto_cache_to_server_on_favorite", it)
+                                        .apply()
+                                }
+                            )
+
+                            if (autoCacheOnFavorite) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                SettingDropdownRow(
+                                    icon = Icons.Default.CloudDownload,
+                                    title = "收藏缓存音质",
+                                    subtitle = "收藏曲目自动缓存到服务器时优先请求的音质",
+                                    selectedValue = autoCacheServerQuality,
+                                    options = listOf(
+                                        AudioQuality.Q_128K,
+                                        AudioQuality.Q_320K,
+                                        AudioQuality.Q_FLAC,
+                                        AudioQuality.Q_HIRES
+                                    ),
+                                    getLabel = { "${it.label} [${it.badge}]" },
+                                    getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
+                                    onSelect = { q ->
+                                        autoCacheServerQuality = q
+                                        prefs.edit().putString("auto_cache_server_quality", q.key).apply()
+                                        context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
+                                            .putString("auto_cache_server_quality", q.key)
+                                            .apply()
+                                    }
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "离线下载自动同步至服务器",
+                                subtitle = "连接服务器并同步曲库时，自动把离线下载记录推送到服务器下载队列（默认关闭）",
+                                checked = offlineSyncAutoPush,
+                                onCheckedChange = {
+                                    offlineSyncAutoPush = it
+                                    prefs.edit().putBoolean("offline_sync_auto_push", it).apply()
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingSwitchRow(
+                                title = "播放时自动补全封面/歌词",
+                                subtitle = "播放到缺少内嵌封面的服务器歌曲时，自动在线匹配并把封面、歌词与缺失标签写入音频文件（匹配策略由服务端设置决定，刮错可用播放页修标签手动修正）",
+                                checked = autoTagScrapeOnPlay,
+                                onCheckedChange = {
+                                    autoTagScrapeOnPlay = it
+                                    prefs.edit().putBoolean("auto_tag_scrape_on_play", it).apply()
+                                }
+                            )
+                        }
+                    }
+
                     // A. 服务器保存路径 (顶部第一项，复用服务端的选择方式)
                     item {
                         SettingsCard(title = "服务器保存路径", icon = Icons.Default.Dns) {
@@ -1136,518 +1593,10 @@ fun SettingsScreen(
                     }
                 }
 
-                // ==================== 4. 下载偏好 ====================
-                SettingsTab.DOWNLOAD -> {
+                // ==================== 外观（主题字体 / 液态玻璃 / 导航动效） ====================
+                SettingsTab.APPEARANCE -> {
                     item {
-                        SettingsCard(title = "默认下载配置 (对标柠檬音乐 download.*)", icon = Icons.Default.Download) {
-                            SettingDropdownRow(
-                                title = "默认下载音质",
-                                subtitle = "歌曲与专辑下载时优先选取的音质规格",
-                                selectedValue = defaultDownloadQuality,
-                                options = AudioQuality.entries,
-                                getLabel = { "${it.label} [${it.badge}]" },
-                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
-                                onSelect = { q ->
-                                    defaultDownloadQuality = q
-                                    prefs.edit().putString("default_download_quality", q.key).apply()
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            SettingDropdownRow(
-                                title = "默认下载目标",
-                                subtitle = "单曲与批量下载时的默认存储归属",
-                                selectedValue = defaultDownloadTarget,
-                                options = DownloadTarget.entries,
-                                getLabel = { it.displayName },
-                                onSelect = { target ->
-                                    defaultDownloadTarget = target
-                                    prefs.edit().putString("default_download_target", target.name).apply()
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            SettingDropdownRow(
-                                title = "同时下载缓存数设置",
-                                subtitle = "同步控制本机与柠檬音乐服务端并发下载任务数上限 (download.maxDownloadNum)",
-                                selectedValue = maxConcurrentDownloads,
-                                options = listOf(1, 2, 3, 4, 5, 6),
-                                getLabel = { count ->
-                                    when (count) {
-                                        1 -> "1 个任务 (单线程顺序下载)"
-                                        3 -> "3 个任务 (推荐默认)"
-                                        else -> "$count 个任务并行"
-                                    }
-                                },
-                                getSubtitle = { count -> "最多同时下载 $count 首歌曲，超出任务自动进入等待队列" },
-                                onSelect = { count ->
-                                    maxConcurrentDownloads = count
-                                    prefs.edit().putBoolean("user_set_max_concurrent", true).apply()
-                                    onDownloadSettingsChange(downloadSettings.copy(maxConcurrent = count))
-                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                        coroutineScope.launch {
-                                            val proto = LemonMusicProtocol(
-                                                NetworkClientFactory.createOkHttpClient(context),
-                                                activeServer.serverUrl,
-                                                activeServer.username,
-                                                activeServer.tokenOrApiKey
-                                            )
-                                            proto.updateServerSettings(mapOf("download.maxDownloadNum" to count.toString()))
-                                        }
-                                    }
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(14.dp))
-                            SettingSwitchRow(
-                                title = "内嵌高清专辑封面",
-                                subtitle = "下载音频文件时将封面写入 ID3 标签 (isEmbedPic)",
-                                checked = embedCoverMeta,
-                                onCheckedChange = {
-                                    embedCoverMeta = it
-                                    prefs.edit().putBoolean("download_embed_cover", it).apply()
-                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                        coroutineScope.launch {
-                                            val proto = LemonMusicProtocol(
-                                                NetworkClientFactory.createOkHttpClient(context),
-                                                activeServer.serverUrl,
-                                                activeServer.username,
-                                                activeServer.tokenOrApiKey
-                                            )
-                                            proto.updateServerSettings(mapOf("download.isEmbedPic" to it.toString()))
-                                        }
-                                    }
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingSwitchRow(
-                                title = "内嵌歌词与翻译",
-                                subtitle = "将逐字/逐句歌词嵌入音频文件内部标签 (isEmbedLyric)",
-                                checked = embedLyricMeta,
-                                onCheckedChange = {
-                                    embedLyricMeta = it
-                                    prefs.edit().putBoolean("download_embed_lyric", it).apply()
-                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                        coroutineScope.launch {
-                                            val proto = LemonMusicProtocol(
-                                                NetworkClientFactory.createOkHttpClient(context),
-                                                activeServer.serverUrl,
-                                                activeServer.username,
-                                                activeServer.tokenOrApiKey
-                                            )
-                                            proto.updateServerSettings(mapOf("download.isEmbedLyric" to it.toString()))
-                                        }
-                                    }
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingSwitchRow(
-                                title = "同时保存 .lrc 独立歌词文件",
-                                subtitle = "在歌曲同级目录下保存独立同名 .lrc 歌词文件 (默认关闭 · isDownloadLrc)",
-                                checked = downloadLrcFile,
-                                onCheckedChange = {
-                                    downloadLrcFile = it
-                                    prefs.edit().putBoolean("download_lrc_file_v2", it).apply()
-                                    if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                        coroutineScope.launch {
-                                            val proto = LemonMusicProtocol(
-                                                NetworkClientFactory.createOkHttpClient(context),
-                                                activeServer.serverUrl,
-                                                activeServer.username,
-                                                activeServer.tokenOrApiKey
-                                            )
-                                            proto.updateServerSettings(mapOf("download.isDownloadLrc" to it.toString()))
-                                        }
-                                    }
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingSwitchRow(
-                                title = "收藏后自动缓存到服务器",
-                                subtitle = "在 App 内点击收藏歌曲后，后台自动将音频提交至服务器下载存储 (默认为关闭状态)",
-                                checked = autoCacheOnFavorite,
-                                onCheckedChange = {
-                                    autoCacheOnFavorite = it
-                                    prefs.edit()
-                                        .putBoolean("auto_cache_on_favorite", it)
-                                        .putBoolean("auto_cache_to_server_on_favorite", it)
-                                        .apply()
-                                    context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
-                                        .putBoolean("auto_cache_to_server_on_favorite", it)
-                                        .apply()
-                                }
-                            )
-
-                            if (autoCacheOnFavorite) {
-                                Spacer(modifier = Modifier.height(6.dp))
-                                SettingDropdownRow(
-                                    icon = Icons.Default.CloudDownload,
-                                    title = "收藏缓存音质",
-                                    subtitle = "收藏曲目自动缓存到服务器时优先请求的音质",
-                                    selectedValue = autoCacheServerQuality,
-                                    options = listOf(
-                                        AudioQuality.Q_128K,
-                                        AudioQuality.Q_320K,
-                                        AudioQuality.Q_FLAC,
-                                        AudioQuality.Q_HIRES
-                                    ),
-                                    getLabel = { "${it.label} [${it.badge}]" },
-                                    getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
-                                    onSelect = { q ->
-                                        autoCacheServerQuality = q
-                                        prefs.edit().putString("auto_cache_server_quality", q.key).apply()
-                                        context.getSharedPreferences("lm_player_settings", Context.MODE_PRIVATE).edit()
-                                            .putString("auto_cache_server_quality", q.key)
-                                            .apply()
-                                    }
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingSwitchRow(
-                                title = "离线下载自动同步至服务器",
-                                subtitle = "连接服务器并同步曲库时，自动把离线下载记录推送到服务器下载队列（默认关闭）",
-                                checked = offlineSyncAutoPush,
-                                onCheckedChange = {
-                                    offlineSyncAutoPush = it
-                                    prefs.edit().putBoolean("offline_sync_auto_push", it).apply()
-                                }
-                            )
-                        }
-                    }
-                }
-
-                // ==================== 5. 播放与外观 ====================
-                SettingsTab.PLAYBACK_UI -> {
-                    item {
-                        SettingsCard(title = "在线试听音质与缓存", icon = Icons.Default.HighQuality) {
-                            // 1. Wi-Fi 状态试听音质
-                            SettingDropdownRow(
-                                icon = Icons.Default.Wifi,
-                                title = "Wi-Fi 状态试听音质",
-                                subtitle = "连接无线局域网时流式播放音质 (立即生效)",
-                                selectedValue = wifiStreamQuality,
-                                options = AudioQuality.entries,
-                                getLabel = { "${it.label} [${it.badge}]" },
-                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
-                                onSelect = { q ->
-                                    wifiStreamQuality = q
-                                    prefs.edit().putString("wifi_stream_quality", q.key).apply()
-                                    onStreamQualityChanged()
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            // 2. 移动流量状态试听音质
-                            SettingDropdownRow(
-                                icon = Icons.Default.SignalCellularAlt,
-                                title = "移动流量状态试听音质",
-                                subtitle = "使用蜂窝网络时播放音质 (立即生效)",
-                                selectedValue = cellularStreamQuality,
-                                options = AudioQuality.entries,
-                                getLabel = { "${it.label} [${it.badge}]" },
-                                getSubtitle = { "${it.bitrate} kbps · ${it.format}" },
-                                onSelect = { q ->
-                                    cellularStreamQuality = q
-                                    prefs.edit().putString("cellular_stream_quality", q.key).apply()
-                                    onStreamQualityChanged()
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(14.dp))
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f), thickness = 0.5.dp)
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            // 3. 试听本地缓存开关
-                            SettingSwitchRow(
-                                title = "在线试听边听边存",
-                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已默认关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
-                                checked = streamCacheEnabled,
-                                onCheckedChange = { isEnabled ->
-                                    streamCacheEnabled = isEnabled
-                                    prefs.edit().putBoolean("stream_cache_enabled_v2", isEnabled).apply()
-                                    Media3Factory.setCacheEnabled(isEnabled)
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            // 4. 清理试听缓存
-                            val formattedCacheSize = remember(cacheSizeBytes) {
-                                val mb = cacheSizeBytes.toDouble() / (1024 * 1024)
-                                if (mb >= 0.1) "%.1f MB".format(mb) else "${(cacheSizeBytes / 1024)} KB"
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column {
-                                    Text("当前试听缓存占用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                                    Text(formattedCacheSize, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                OutlinedButton(
-                                    onClick = {
-                                        Media3Factory.clearStreamCache(context)
-                                        cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
-                                        Toast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
-                                    },
-                                    shape = RoundedCornerShape(10.dp),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                    modifier = Modifier.height(34.dp)
-                                ) {
-                                    Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("清理试听缓存", fontSize = 12.sp)
-                                }
-                            }
-                        }
-                    }
-
-                    item {
-                        // 注意：这里曾用 remember 重复声明了一份 stopPlaybackOnExit，把外层状态**遮蔽**成
-                        // 死代码；更糟的是两处默认值相反（内层 true、外层 false），而
-                        // PlaybackService.onTaskRemoved 读同一键时用的默认值是 true ——
-                        // 同一个偏好项在不同卡片里读写的是不同变量，开关表现随机。
-                        // 现已删除内层声明，统一使用文件顶部的 hoisted 状态（默认值与 Service 契约一致）。
-                        SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
-                            SettingSwitchRow(
-                                title = "安卓系统启动后自动启动软件",
-                                subtitle = "手机/车机开机或重启进入系统后自动启动 LMPlayer 并拉起后台音频保活服务",
-                                checked = autoLaunchOnBoot,
-                                onCheckedChange = onAutoLaunchOnBootChange
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingSwitchRow(
-                                title = "启动自动继续播放",
-                                subtitle = "打开应用时自动恢复上次关闭前的曲目并继续播放",
-                                checked = autoPlayOnStartup,
-                                onCheckedChange = onAutoPlayOnStartupChange
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingSwitchRow(
-                                title = "网络容灾自动回退本地",
-                                subtitle = "在线音频遇到网络超时或无法缓冲时，无缝切换至已下载的本地歌曲",
-                                checked = autoFallbackToLocal,
-                                onCheckedChange = onAutoFallbackToLocalChange
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingSwitchRow(
-                                title = "退出应用时停止播放",
-                                // 副标题必须准确描述「控制什么、不影响什么」：
-                                // 此前两处同名开关共享同一 prefs key，且第二处副标题写「默认关闭」，
-                                // 与实际默认值 true 相反，用户会误以为「退到后台就停播」——而锁屏与按 Home
-                                // 走的是 Activity onStop，根本不读这个开关。这里把边界一次说清。
-                                subtitle = "关闭后：按返回键退至桌面，播放交由后台服务维持（锁屏同样不受影响）。" +
-                                    "开启后：双击返回键或从最近任务划掉应用时，彻底停止播放并释放后台服务",
-                                checked = stopPlaybackOnExit,
-                                onCheckedChange = { checked ->
-                                    stopPlaybackOnExit = checked
-                                    prefs.edit().putBoolean("stop_playback_on_exit", checked).apply()
-                                }
-                            )
-                        }
-                    }
-
-                    item {
-                        val systemIslandEnabled by DynamicIslandManager.systemIslandEnabledFlow.collectAsState()
-                        val islandDisplayMode by DynamicIslandManager.islandDisplayModeFlow.collectAsState()
-                        val showLyricsInPill by DynamicIslandManager.showLyricsInPillFlow.collectAsState()
-                        val deviceIslandProfile = remember { DynamicIslandManager.getDeviceIslandProfile() }
-                        var hasOverlayPerm by remember { mutableStateOf(DynamicIslandManager.hasOverlayPermission(context)) }
-                        val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
-                        DisposableEffect(lifecycleOwner) {
-                            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                                    hasOverlayPerm = DynamicIslandManager.hasOverlayPermission(context)
-                                }
-                            }
-                            lifecycleOwner.lifecycle.addObserver(observer)
-                            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-                        }
-
-                        SettingsCard(title = "挂后台手机灵动岛设置", icon = Icons.Default.AutoAwesome) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = AppleRed.copy(alpha = 0.10f),
-                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.25f)),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Verified,
-                                        contentDescription = null,
-                                        tint = AppleRed,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column {
-                                        Text(
-                                            text = "当前设备后台上岛协议识别（默认使用厂商系统原生上岛）",
-                                            fontSize = dimensions.captionSize,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        Text(
-                                            text = deviceIslandProfile,
-                                            fontSize = dimensions.bodySize,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                    }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            SettingSwitchRow(
-                                title = "启用挂后台手机灵动岛",
-                                subtitle = "退到后台播放音乐时自动激活小米澎湃超级岛、OPPO流体云、vivo原子岛、荣耀灵动胶囊等系统原生媒体岛；关闭后彻底禁用后台上岛与悬浮胶囊",
-                                checked = systemIslandEnabled,
-                                onCheckedChange = { enabled ->
-                                    DynamicIslandManager.setSystemIslandEnabled(context, enabled)
-                                    Toast.makeText(
-                                        context,
-                                        if (enabled) "已开启挂后台手机灵动岛" else "已关闭挂后台手机灵动岛，后台不再上岛",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            )
-
-                            AnimatedVisibility(visible = systemIslandEnabled) {
-                                Column {
-                                    Spacer(modifier = Modifier.height(10.dp))
-
-                                    SettingDropdownRow(
-                                        title = "挂后台灵动岛通道模式",
-                                        subtitle = "默认使用厂商系统原生媒体上岛，保持持久稳定在线不掉岛",
-                                        selectedValue = islandDisplayMode,
-                                        options = IslandDisplayMode.entries,
-                                        getLabel = { it.label },
-                                        getSubtitle = { it.subtitle },
-                                        onSelect = { DynamicIslandManager.setIslandDisplayMode(context, it) }
-                                    )
-
-                                    if (islandDisplayMode != IslandDisplayMode.SYSTEM_ONLY || DynamicIslandManager.isHuaweiOrHarmonyOS()) {
-                                        Spacer(modifier = Modifier.height(12.dp))
-
-                                        // 手机全局悬浮窗权限状态卡片（仅在启用概念版悬浮胶囊模式时展示）
-                                        Surface(
-                                            shape = RoundedCornerShape(12.dp),
-                                            color = if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.10f) else Color(0xFFFF9500).copy(alpha = 0.12f),
-                                            border = BorderStroke(
-                                                1.dp,
-                                                if (hasOverlayPerm) Color(0xFF34C759).copy(alpha = 0.35f) else Color(0xFFFF9500).copy(alpha = 0.45f)
-                                            ),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(12.dp))
-                                                .clickable {
-                                                    if (!hasOverlayPerm) {
-                                                        DynamicIslandManager.requestOverlayPermission(context)
-                                                    }
-                                                }
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.SpaceBetween
-                                            ) {
-                                                Row(
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    modifier = Modifier.weight(1f)
-                                                ) {
-                                                    Icon(
-                                                        imageVector = if (hasOverlayPerm) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
-                                                        contentDescription = null,
-                                                        tint = if (hasOverlayPerm) Color(0xFF34C759) else Color(0xFFFF9500),
-                                                        modifier = Modifier.size(18.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(8.dp))
-                                                    Column {
-                                                        Text(
-                                                            text = if (hasOverlayPerm) "概念版顶部悬浮胶囊权限：已授权" else "概念版顶部悬浮胶囊权限：未开启",
-                                                            fontSize = dimensions.bodySize,
-                                                            fontWeight = FontWeight.Bold,
-                                                            color = MaterialTheme.colorScheme.onSurface
-                                                        )
-                                                        Text(
-                                                            text = if (hasOverlayPerm) {
-                                                                "当按 Home 键退到手机桌面或切换应用时，手机顶部将自动浮现黑胶灵动岛胶囊"
-                                                            } else {
-                                                                "当前选择了概念版悬浮胶囊模式，请点击授予悬浮窗权限以在后台顶部展示胶囊"
-                                                            },
-                                                            fontSize = dimensions.captionSize,
-                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                        )
-                                                    }
-                                                }
-                                                if (!hasOverlayPerm) {
-                                                    Spacer(modifier = Modifier.width(8.dp))
-                                                    Surface(
-                                                        shape = RoundedCornerShape(8.dp),
-                                                        color = AppleRed
-                                                    ) {
-                                                        Text(
-                                                            text = "去开启",
-                                                            fontSize = dimensions.captionSize,
-                                                            fontWeight = FontWeight.Bold,
-                                                            color = Color.White,
-                                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(10.dp))
-
-                                        SettingSwitchRow(
-                                            title = "后台紧凑胶囊优先滚动同步歌词",
-                                            subtitle = "在后台顶部紧凑胶囊中优先翻滚显示实时歌词，无歌词时显示歌名与歌手（长按胶囊可上下微调避开前摄挖孔）",
-                                            checked = showLyricsInPill,
-                                            onCheckedChange = { DynamicIslandManager.setShowLyricsInPill(context, it) }
-                                        )
-
-                                        Spacer(modifier = Modifier.height(12.dp))
-
-                                        OutlinedButton(
-                                            onClick = {
-                                                if (!DynamicIslandManager.hasOverlayPermission(context)) {
-                                                    Toast.makeText(context, "请先授予悬浮窗权限以启用手机后台顶部灵动岛", Toast.LENGTH_SHORT).show()
-                                                    DynamicIslandManager.requestOverlayPermission(context)
-                                                } else {
-                                                    DynamicIslandManager.triggerIslandPreview(context)
-                                                    Toast.makeText(context, "已在屏幕顶部启动 4.5 秒后台灵动岛真机预览（点击可展开/收起）", Toast.LENGTH_SHORT).show()
-                                                }
-                                            },
-                                            shape = RoundedCornerShape(12.dp),
-                                            border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) {
-                                            Icon(Icons.Default.AutoAwesomeMotion, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text("预览挂后台手机顶部灵动岛效果 (4.5秒演示)", color = AppleRed, fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    item {
-                        SettingsCard(title = "界面外观与字体规格", icon = Icons.Default.Palette) {
+                        SettingsCard(title = "主题与字体", icon = Icons.Default.Palette) {
                             SettingDropdownRow(
                                 title = "全局字体与排版规格",
                                 subtitle = "统一控制全应用 7 级标题、列表、正文与角标的字号层级缩放",
@@ -1676,32 +1625,136 @@ fun SettingsScreen(
                                 },
                                 onSelect = { onThemeModeChange(it) }
                             )
+                        }
+                    }
 
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text("播放栏透明度调节 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                    item {
+                        SettingsCard(title = "液态玻璃", icon = Icons.Default.AutoAwesome) {
+                            run {
+                                val glassContext = androidx.compose.ui.platform.LocalContext.current
+                                val glassSupported = androidx.compose.runtime.remember {
+                                    com.lm.player.core.designsystem.glass.LiquidGlassSupport.isDeviceSupported(glassContext)
+                                }
+                                val glassEnabled by com.lm.player.core.designsystem.glass.LiquidGlassSupport.enabled.collectAsState()
+                                val glassPowerSave by com.lm.player.core.designsystem.glass.LiquidGlassSupport.powerSave.collectAsState()
+                                val glassBroken by com.lm.player.core.designsystem.glass.LiquidGlassSupport.broken.collectAsState()
+                                val glassForced by com.lm.player.core.designsystem.glass.LiquidGlassSupport.forced.collectAsState()
+                                val glassError by com.lm.player.core.designsystem.glass.LiquidGlassSupport.lastError.collectAsState()
+                                val glassSdkOk = com.lm.player.core.designsystem.glass.LiquidGlassSupport.isSdkSupported()
+                                val glassDevice = com.lm.player.core.designsystem.glass.LiquidGlassSupport.deviceSummary()
+                                val glassPipeline by com.lm.player.core.designsystem.glass.LiquidGlassSupport.pipeline.collectAsState()
+                                val isEmulator = androidx.compose.runtime.remember {
+                                    com.lm.player.core.designsystem.glass.LiquidGlassSupport.isEmulatorLike()
+                                }
+                                // 诊断：当前实际走的渲染方式（打开过播放栏 / 播放页后才有）
+                                val pipelineText = when {
+                                    glassPipeline.isBlank() -> ""
+                                    else -> "当前：$glassPipeline"
+                                }
+                                SettingSwitchRow(
+                                    title = "启用液态玻璃",
+                                    subtitle = buildString {
+                                        when {
+                                            !glassSdkOk -> append("需要 Android 13 及以上，本机保持原半透明样式")
+                                            glassBroken -> {
+                                                append("本机绘制玻璃出错，已自动回退原样式；关掉再打开开关可重新尝试")
+                                                glassError?.let { append("\n原因：").append(it) }
+                                            }
+                                            glassPowerSave -> append("省电模式下自动关闭，退出省电模式后恢复")
+                                            else -> {
+                                                append("使用真实折射玻璃，可选低 / 高两档；关闭后恢复原半透明样式")
+                                                if (!glassSupported) append("\n本机配置不在推荐范围（内存低于 3GB），已按你的选择开启，可能更耗电")
+                                                if (isEmulator) append("\n已识别为模拟器：可看外观与交互，流畅度/耗电以真机为准")
+                                                if (pipelineText.isNotEmpty()) append("\n").append(pipelineText)
+                                            }
+                                        }
+                                        append("\n").append(glassDevice)
+                                    },
+                                    // Android 13+ 都允许打开：机型不在推荐范围时按「强制开启」处理
+                                    checked = glassSdkOk && (glassSupported || glassForced) && glassEnabled,
+                                    onCheckedChange = { checked ->
+                                        if (glassSdkOk) {
+                                            com.lm.player.core.designsystem.glass.LiquidGlassSupport.setEnabled(glassContext, checked)
+                                        }
+                                    }
+                                )
+                                // 档位：低档只有播放栏与列表顶栏是玻璃；高档全部
+                                if (glassSdkOk && (glassSupported || glassForced) && glassEnabled) {
+                                    val glassFull by com.lm.player.core.designsystem.glass.LiquidGlassSupport.fullLevel.collectAsState()
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Text("效果档位", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                                            .padding(3.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        listOf(
+                                            Triple(false, "低档", "播放栏 + 列表顶栏"),
+                                            Triple(true, "高档", "全部（播放页、弹出面板等）")
+                                        ).forEach { (full, label, desc) ->
+                                            val selected = glassFull == full
+                                            Column(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .clip(RoundedCornerShape(11.dp))
+                                                    .background(if (selected) AppleRed.copy(alpha = 0.14f) else Color.Transparent)
+                                                    .clickable {
+                                                        com.lm.player.core.designsystem.glass.LiquidGlassSupport.setFullLevel(glassContext, full)
+                                                    }
+                                                    .padding(vertical = 8.dp, horizontal = 6.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally
+                                            ) {
+                                                Text(
+                                                    text = label,
+                                                    fontSize = 13.sp,
+                                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                                    color = if (selected) AppleRed else MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = desc,
+                                                    fontSize = 10.5.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text("透明度 (${(blurAlpha * 100).toInt()}%)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                             Spacer(modifier = Modifier.height(2.dp))
-                            Text("调节悬浮底栏各组件整体透光度与背景融合效果", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
-                            Slider(
+                            Text("所有液态玻璃（播放栏、顶部、播放页按钮、弹出面板）的底色浓淡；拉到最低为不染色的通透玻璃。关闭液态玻璃时调节播放栏底色", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
+                            com.lm.player.core.designsystem.component.LiquidSlider(
                                 value = blurAlpha,
                                 onValueChange = onBlurAlphaChange,
                                 onValueChangeFinished = onBlurAlphaChangeFinished,
                                 valueRange = 0.10f..1.0f,
-                                colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                                accentColor = AppleRed
                             )
 
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text("液态玻璃高斯模糊 (${liquidGlassBlur.toInt()} dp)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text("高斯模糊 (${liquidGlassBlur.toInt()} dp)", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                             Spacer(modifier = Modifier.height(2.dp))
-                            Text("调节液态玻璃背景虚化强度与漫反射散射半径 (0 ~ 30 dp)", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
-                            Slider(
+                            Text("所有液态玻璃的背景虚化强度；拉到 0 只保留折射、高光与色散", fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
+                            com.lm.player.core.designsystem.component.LiquidSlider(
                                 value = liquidGlassBlur,
                                 onValueChange = onLiquidGlassBlurChange,
                                 onValueChangeFinished = onLiquidGlassBlurChangeFinished,
                                 valueRange = 0f..30f,
-                                colors = SliderDefaults.colors(thumbColor = AppleRed, activeTrackColor = AppleRed)
+                                accentColor = AppleRed
                             )
+                        }
+                    }
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                    item {
+                        SettingsCard(title = "导航与动效", icon = Icons.Default.Animation) {
                             SettingDropdownRow(
                                 title = "播放栏动画效果",
                                 subtitle = when (bottomBarAnimMode) {
@@ -1714,6 +1767,19 @@ fun SettingsScreen(
                                 getLabel = { it.label },
                                 getSubtitle = { it.subtitle },
                                 onSelect = { onBottomBarAnimModeChange(it) }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "音乐栏动画",
+                                subtitle = if (playerOpenExpand) "展开：点底部音乐栏，播放页从音乐栏像灵动岛一样展开，关闭时以神奇效果收回音乐栏（竖屏）"
+                                    else "滑出：点底部音乐栏，播放页从屏幕底部滑入，关闭时向下滑出",
+                                icon = Icons.Default.Animation,
+                                selectedValue = playerOpenExpand,
+                                options = listOf(false, true),
+                                getLabel = { if (it) "展开" else "滑出" },
+                                getSubtitle = { if (it) "从音乐栏展开 · 神奇效果收回" else "从底部滑入滑出" },
+                                onSelect = { onPlayerOpenExpandChange(it) }
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))
@@ -1739,24 +1805,87 @@ fun SettingsScreen(
                                 checked = dynamicCardEffects,
                                 onCheckedChange = onDynamicCardEffectsChange
                             )
-
-
                         }
                     }
+                }
 
+                // ==================== 关于 ====================
+                SettingsTab.ABOUT -> {
                     item {
-                        Button(
-                            onClick = onExitAppCompletely,
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.12f)),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.4f)),
-                            modifier = Modifier.fillMaxWidth().height(48.dp)
-                        ) {
-                            Icon(Icons.Default.PowerSettingsNew, contentDescription = null, tint = MaterialTheme.colorScheme.error)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("彻底退出应用并停止后台服务（无论上方开关如何设置都会停播）", color = MaterialTheme.colorScheme.error, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
+                        SettingsCard(title = "软件更新", icon = Icons.Default.SystemUpdate) {
+                            SettingInfoRow(
+                                label = "当前版本",
+                                value = "v${AppUpdateManager.getAppVersionName(context)} (${AppUpdateManager.getAppVersionCode(context)})"
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        runCatching {
+                                            context.startActivity(
+                                                android.content.Intent(
+                                                    android.content.Intent.ACTION_VIEW,
+                                                    android.net.Uri.parse("https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
+                                                )
+                                            )
+                                        }
+                                    }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}",
+                                    fontSize = 11.sp,
+                                    color = AppleRed,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = "复制地址",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.clickable {
+                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        clipboard.setPrimaryClip(
+                                            android.content.ClipData.newPlainText(
+                                                "GitHub",
+                                                "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}"
+                                            )
+                                        )
+                                        Toast.makeText(context, "GitHub 仓库地址已复制", Toast.LENGTH_SHORT).show()
+                                    }
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Button(
+                                onClick = {
+                                    if (!isCheckingUpdate) {
+                                        isCheckingUpdate = true
+                                        coroutineScope.launch {
+                                            val res = AppUpdateManager.checkForUpdates(context)
+                                            isCheckingUpdate = false
+                                            res.onSuccess { info ->
+                                                activeUpdateInfo = info
+                                                if (info.hasUpdate) {
+                                                    showUpdateDialog = true
+                                                } else {
+                                                    Toast.makeText(context, "当前已是最新版本 v${info.latestVersion}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }.onFailure { e ->
+                                                Toast.makeText(context, "检查更新失败: ${e.message}", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    }
+                                },
+                                enabled = !isCheckingUpdate,
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (isCheckingUpdate) "检查中..." else "检查更新", fontSize = 12.sp)
+                            }
                         }
                     }
+
                 }
             }
         }
@@ -2516,7 +2645,12 @@ private fun SettingsCard(
                 )
             }
             Spacer(modifier = Modifier.height(14.dp))
-            content()
+            // 卡片底色告诉液态玻璃开关 / 滑块：按下时玻璃滑块折射这个颜色
+            androidx.compose.runtime.CompositionLocalProvider(
+                com.lm.player.core.designsystem.component.LocalLiquidControlSurface provides cardColor
+            ) {
+                content()
+            }
         }
     }
 }
@@ -2534,6 +2668,50 @@ private fun SettingInfoRow(label: String, value: String) {
     ) {
         Text(label, fontSize = dimensions.bodySize, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, fontSize = dimensions.bodySize, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** 一组可勾选的小胶囊（把几个相关的开关合并成一行） */
+private class SettingChip(val label: String, val checked: Boolean, val onChange: (Boolean) -> Unit)
+
+@Composable
+private fun SettingChipsRow(
+    title: String,
+    subtitle: String,
+    chips: List<SettingChip>
+) {
+    val dimensions = LocalAppDimensions.current
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Text(title, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(subtitle, fontSize = dimensions.captionSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            chips.forEach { chip ->
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(if (chip.checked) AppleRed.copy(alpha = 0.14f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                        .clickable { chip.onChange(!chip.checked) }
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (chip.checked) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                        contentDescription = null,
+                        tint = if (chip.checked) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = chip.label,
+                        fontSize = 12.5.sp,
+                        fontWeight = if (chip.checked) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (chip.checked) AppleRed else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -2563,7 +2741,8 @@ private fun SettingSwitchRow(
                 lineHeight = (dimensions.captionSize.value * 1.35f).sp
             )
         }
-        Switch(
+        // 液态玻璃开关（Kyant0 示例 LiquidToggle）
+        com.lm.player.core.designsystem.component.LiquidToggle(
             checked = checked,
             onCheckedChange = onCheckedChange
         )
@@ -2722,11 +2901,10 @@ private fun <T> SettingDropdownRow(
                 }
             }
 
-            DropdownMenu(
+            com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
                 modifier = Modifier
-                    .background(if (isDark) Color(0xFF24242C) else Color.White)
                     .widthIn(min = 200.dp, max = 280.dp)
             ) {
                 options.forEach { option ->
@@ -2781,5 +2959,45 @@ private fun formatStorageSize(bytes: Long): String {
     } else {
         val mb = bytes.toDouble() / (1024.0 * 1024.0)
         String.format(java.util.Locale.getDefault(), "%.1f MB", mb)
+    }
+}
+
+/**
+ * 服务器歌曲加速（2026-11-13）：后台预匹配服务器曲库的开关、进度与「立即补全」。
+ * 预匹配把服务器歌曲在各平台上的对应关系提前存进本地数据库，弱网 / 服务器离线时播放不用现搜。
+ */
+@Composable
+private fun ServerAccelPrematchCard() {
+    val context = LocalContext.current
+    val progress by com.lm.player.core.source.ServerTrackPrematcher.progress.collectAsState()
+    LaunchedEffect(Unit) { com.lm.player.core.source.ServerTrackPrematcher.refreshCounts() }
+    SettingsCard(title = "服务器歌曲加速", icon = Icons.Default.Speed) {
+        Spacer(modifier = Modifier.height(8.dp))
+        SettingSwitchRow(
+            title = "后台预匹配服务器曲库",
+            subtitle = "提前为服务器歌曲找到平台对应，弱网或服务器离线时播放不用现搜；每天最多 ${progress.dailyLimit} 首，播放时自动让路，已下载的歌跳过",
+            checked = progress.enabled,
+            onCheckedChange = { com.lm.player.core.source.ServerTrackPrematcher.setEnabled(context, it) }
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        val detail = buildString {
+            append("已匹配 ${progress.matched} / 共 ${progress.total} 首")
+            if (progress.notFound > 0) append("，未找到 ${progress.notFound} 首")
+            append(" · 今天已补全 ${progress.todayCount} 首")
+            if (progress.status.isNotBlank()) append(" · ${progress.status}")
+        }
+        SettingActionRow(
+            title = "匹配进度",
+            subtitle = detail,
+            actionText = if (progress.running) "补全中…" else "立即补全",
+            onAction = {
+                if (!progress.running) {
+                    com.lm.player.core.source.ServerTrackPrematcher.kick("settings_now", force = true, delayMs = 0L)
+                    Toast.makeText(
+                        context, "已开始补全：本次不受每天上限限制，播放时自动让路", Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
     }
 }

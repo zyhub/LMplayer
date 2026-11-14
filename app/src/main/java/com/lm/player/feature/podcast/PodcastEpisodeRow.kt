@@ -186,7 +186,7 @@ fun PodcastEpisodeRow(
             // 收听中轻量进度条
             if (episode.playState == EpisodePlayState.IN_PROGRESS && episode.progress in 0.01f..0.99f) {
                 Spacer(modifier = Modifier.height(4.dp))
-                LinearProgressIndicator(
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(
                     progress = { episode.progress },
                     modifier = Modifier
                         .fillMaxWidth(0.85f)
@@ -237,7 +237,7 @@ fun PodcastEpisodeRow(
                     )
                 }
 
-                DropdownMenu(
+                com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
                     expanded = showMenu,
                     onDismissRequest = { showMenu = false }
                 ) {

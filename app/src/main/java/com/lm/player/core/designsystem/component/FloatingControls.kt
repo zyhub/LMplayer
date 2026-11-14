@@ -1,5 +1,8 @@
 package com.lm.player.core.designsystem.component
 
+import com.lm.player.feature.player.trackPlayerLaunchOrigin
+
+import com.lm.player.core.designsystem.glass.LiquidBottomTab
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
@@ -7,6 +10,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,6 +38,19 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import kotlin.math.roundToInt
+import androidx.compose.ui.graphics.drawscope.clipRect
+import com.lm.player.core.designsystem.glass.glassPressBulge
+import com.lm.player.core.designsystem.glass.BarDropletBase
+import com.lm.player.core.designsystem.glass.BarDropletMagnifier
+import com.lm.player.core.designsystem.glass.hideUnderBarDroplet
+import com.lm.player.core.designsystem.glass.liquidBarResponse
+import com.lm.player.core.designsystem.glass.barDropShape
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -44,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
@@ -171,7 +191,7 @@ fun CompactMorphingBottomBar(
     var isSourceDropdownExpanded by remember { mutableStateOf(false) }
 
     // 苹果 iOS 26 款连续几何形变进度 (0f = 常态长条播放, 1f = 完全展开搜索 & 播放栏变圆移至最左)
-    val searchProgress by animateFloatAsState(
+    val searchAnim = animateFloatAsState(
         targetValue = if (isSearchActive) 1f else 0f,
         animationSpec = spring(
             dampingRatio = 0.78f, // 物理流体弹性阻尼
@@ -179,6 +199,7 @@ fun CompactMorphingBottomBar(
         ),
         label = "search_morph_progress"
     )
+    val searchProgress by searchAnim
 
     // 全跨度导航手势拖拽状态管理
     var isNavDragging by remember { mutableStateOf(false) }
@@ -260,6 +281,44 @@ fun CompactMorphingBottomBar(
         Color(0xFFFCFCFE)
     }
 
+    // ===== 液态玻璃（仅当底栏在上层绘制层、且设备支持时生效；否则沿用上面的半透明渐变） =====
+    val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    // 「播放栏透明度」控制底色浓淡、「液态玻璃高斯模糊」控制磨砂；都拉到最低 = 通透玻璃（只剩折射 / 高光 / 色散）
+    val barGlass = com.lm.player.core.designsystem.glass.barGlassStyle(isDark, blurAlpha, liquidGlassBlur)
+    // 液态玻璃：iOS 26 式玻璃滴的物理状态（Kyant0 LiquidBottomTabs 同款模型，见 glass/LiquidIndicator.kt）
+    // 物理与 Kyant0 示例 LiquidBottomTabs 一致：按下等比放大 78/56、拖动按速度拉伸、临界阻尼弹簧紧跟手指
+    val navIndicator = com.lm.player.core.designsystem.glass.rememberLiquidIndicatorState(
+        initialIndex = hoveredNavIndex,
+        tabCount = 3
+    )
+    // 点选导航项触发的切页：玻璃珠「按下 → 滑过去 → 抬起」；其余外部切页（左右滑页面等）直接就位
+    var navClickAnimate by remember { mutableStateOf(false) }
+    // 液态玻璃：导航轨道里用 Kyant0 示例的 LiquidBottomTabs（等比缩到 56dp），从左侧圆钮按下拖出时由它驱动水滴
+    val tabsController = remember { com.lm.player.core.designsystem.glass.LiquidBottomTabsController() }
+    // 轨道已点开时直接拖示例标签栏的水滴，外层这套「从圆钮拖出」的手势不再处理，免得两套同时推水滴
+    var navDragIgnored by remember { mutableStateOf(false) }
+    val compactTabState = rememberUpdatedState(
+        when (currentScreen) {
+            Screen.HOME, Screen.PODCASTS -> 0
+            Screen.LIBRARY, Screen.DOWNLOADS -> 1
+            Screen.SETTINGS -> 2
+        }
+    )
+    LaunchedEffect(currentScreen) {
+        val idx = when (currentScreen) {
+            Screen.HOME, Screen.PODCASTS -> 0f
+            Screen.LIBRARY, Screen.DOWNLOADS -> 1f
+            Screen.SETTINGS -> 2f
+        }
+        // 松手 / 点选时玻璃滴已经在滑向这一格：不要再「瞬移」打断它（之前松手后玻璃滴会一下跳到位）
+        if (navClickAnimate) {
+            navClickAnimate = false
+            navIndicator.animateTo(idx)
+        } else if (!isNavDragging && kotlin.math.abs(navIndicator.intendedValue - idx) > 0.01f) {
+            navIndicator.snapTo(idx)
+        }
+    }
+
     val currentScreenIcon = when (currentScreen) {
         Screen.HOME, Screen.PODCASTS -> Icons.Filled.Home
         Screen.LIBRARY, Screen.DOWNLOADS -> Icons.Filled.LibraryMusic
@@ -273,24 +332,33 @@ fun CompactMorphingBottomBar(
     }
 
     // 导航展开动画进度 (物理弹性流体阻尼)
-    val navExpandProgress by animateFloatAsState(
-        targetValue = if (isNavDragging || isNavManuallyExpanded) 1f else 0f,
+    // 示例水滴是否还在滑向目标格：只在真 / 假切换时重组（直接读会让水滴每动一帧整条底栏重组一次）
+    val tabsSettling by remember { derivedStateOf { tabsController.isSettling } }
+    val navExpandAnim = animateFloatAsState(
+        // 玻璃模式：松手后等玻璃滴滑到目标格再收起轨道，滑动过程完整可见
+        targetValue = if (isNavDragging || isNavManuallyExpanded || (glassOn && tabsSettling)) 1f else 0f,
         animationSpec = spring(
             dampingRatio = 0.78f,
             stiffness = 450f
         ),
         label = "nav_expand_progress"
     )
+    // 性能：展开 / 搜索形变进度只在越过阈值时触发重组；轨道宽、胶囊位置与宽度、透明度、缩放都在布局 / 绘制阶段读取
+    val navTrackWide by remember { derivedStateOf { navExpandAnim.value > 0.08f } }
+    val navAboveAll by remember { derivedStateOf { navExpandAnim.value > 0.01f } }
+    val rightBtnVisible by remember { derivedStateOf { navExpandAnim.value < 0.396f } }
+    val morphRectShown by remember { derivedStateOf { maxOf(searchAnim.value, navExpandAnim.value) < 0.85f } }
+    val morphCircleShown by remember { derivedStateOf { maxOf(searchAnim.value, navExpandAnim.value) > 0.15f } }
 
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
-            .height(52.dp)
+            .height(if (glassOn) 56.dp else 52.dp)
     ) {
         val density = LocalDensity.current
         val totalWidth = maxWidth
         val isWideBar = totalWidth >= 430.dp
-        val barHeight = 52.dp
+        val barHeight = if (glassOn) 56.dp else 52.dp
         val pillShape = RoundedCornerShape(barHeight / 2)
         val outerGap = if (totalWidth < 380.dp) 8.dp else 10.dp
         val coverBoxSize = if (totalWidth < 360.dp) 34.dp else 38.dp
@@ -306,41 +374,51 @@ fun CompactMorphingBottomBar(
         // 双向流体对称核心插值：
         // 1. 搜索激活时（向左）：播放栏从 restingPlayerX 滑至 0dp 并缩为 52dp 正圆；
         // 2. 导航滑动时（向右）：播放栏从 restingPlayerX 滑至 restingSearchX 并缩为 52dp 正圆！
-        val currentPlayerX = when {
-            searchProgress > 0f -> restingPlayerX * (1f - searchProgress)
-            navExpandProgress > 0f -> restingPlayerX + (restingSearchX - restingPlayerX) * navExpandProgress
-            else -> restingPlayerX
+        // 连续几何在布局 / 绘制阶段读取（展开动画期间不再逐帧重组整条底栏）
+        val restingPlayerXPx = with(density) { restingPlayerX.toPx() }
+        val restingSearchXPx = with(density) { restingSearchX.toPx() }
+        val restingPlayerWidthPx = with(density) { restingPlayerWidth.toPx() }
+        val barHeightPx = with(density) { barHeight.toPx() }
+        val morphNow: () -> Float = { maxOf(searchAnim.value, navExpandAnim.value) }
+        val playerXPx: () -> Float = {
+            val sp = searchAnim.value
+            val np = navExpandAnim.value
+            when {
+                sp > 0f -> restingPlayerXPx * (1f - sp)
+                np > 0f -> restingPlayerXPx + (restingSearchXPx - restingPlayerXPx) * np
+                else -> restingPlayerXPx
+            }
         }
-        val morphProgress = maxOf(searchProgress, navExpandProgress)
-        val currentPlayerWidth = restingPlayerWidth - (restingPlayerWidth - barHeight) * morphProgress
+        val playerWidthPx: () -> Float = { restingPlayerWidthPx - (restingPlayerWidthPx - barHeightPx) * morphNow() }
 
         // 全跨度导航轨道展开宽度 (延伸至紧贴右侧搜索圆圈边缘)
         val maxNavTrackWidth = (totalWidth - barHeight - outerGap).coerceAtLeast(barHeight)
-        val animatedNavTrackWidth = barHeight + (maxNavTrackWidth - barHeight) * navExpandProgress
-        val isNavTrackExpanded = isNavDragging || isNavManuallyExpanded || navExpandProgress > 0.08f
+        val maxNavTrackWidthPx = with(density) { maxNavTrackWidth.toPx() }
+        val trackWidthPx: () -> Float = { barHeightPx + (maxNavTrackWidthPx - barHeightPx) * navExpandAnim.value }
+        val isNavTrackExpanded = isNavDragging || isNavManuallyExpanded || navTrackWide
 
         // 导航底轨背景：浅色模式下展开为【透明淡灰色】rgba(120, 120, 128, 0.16)
         val navTrackBgBrush = if (isDark) {
-            if (navExpandProgress > 0.08f) {
+            if (navTrackWide) {
                 Brush.verticalGradient(listOf(Color(0x4D303038), Color(0x38202028)))
             } else {
                 liquidGlassBrush
             }
         } else {
-            if (navExpandProgress > 0.08f) {
+            if (navTrackWide) {
                 Brush.verticalGradient(listOf(Color(0x33787880), Color(0x24787880)))
             } else {
                 liquidGlassBrush
             }
         }
         val navTrackBorderBrush = if (isDark) {
-            if (navExpandProgress > 0.08f) {
+            if (navTrackWide) {
                 Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.22f), Color.White.copy(alpha = 0.08f)))
             } else {
                 liquidGlassBorderBrush
             }
         } else {
-            if (navExpandProgress > 0.08f) {
+            if (navTrackWide) {
                 Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.75f), Color(0x18000000)))
             } else {
                 liquidGlassBorderBrush
@@ -398,31 +476,60 @@ fun CompactMorphingBottomBar(
         // - 拖拽：全跨度拉伸至紧贴搜索框，包含 1:1 指尖实时绝对物理跟随的凸显聚焦胶囊；
         // - 搜索激活时：透明度随圆形播放器移入而平滑淡出。
         // =========================================================================
+        // 液态融合：导航滑动展开期间，左侧轨道与右移缩圆的歌曲栏改由同一块玻璃绘制，
+        // 两个形状用 smin 平滑并集，间隙处像水银一样黏连；各自的玻璃底板这段时间不画
+        val mergeGlass = false // 展开的导航轨道是示例 LiquidBottomTabs，自带玻璃
+
         val homeCircleAlpha = (1f - searchProgress * 1.5f).coerceIn(0f, 1f)
         if (homeCircleAlpha > 0f) {
             Box(
                 modifier = Modifier
                     .offset(x = 0.dp)
-                    .width(animatedNavTrackWidth)
+                    .layout { measurable, constraints ->
+                        val w = trackWidthPx().roundToInt().coerceIn(constraints.minWidth, constraints.maxWidth)
+                        val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
+                        layout(w, placeable.height) { placeable.place(0, 0) }
+                    }
                     .height(barHeight)
                     .zIndex(if (isNavDragging || isNavManuallyExpanded) 30f else 10f)
                     .alpha(homeCircleAlpha)
+                    .glassPressBulge(glassOn, holdOff = isNavTrackExpanded)
                     .shadow(
-                        elevation = if (isNavTrackExpanded) 6.dp else 4.dp,
+                        // 玻璃是半透明的，投影会从中间透出来把玻璃压脏，玻璃模式下不画
+                        elevation = if (glassOn) 0.dp else if (isNavTrackExpanded) 6.dp else 4.dp,
                         shape = pillShape,
                         ambientColor = if (isDark) Color(0x55000000) else Color(0x18000000),
                         spotColor = if (isDark) Color(0x38000000) else Color(0x10000000)
                     )
-                    .clip(pillShape)
-                    .background(navTrackBgBrush)
-                    .border(BorderStroke(1.dp, navTrackBorderBrush), pillShape)
+                    // 玻璃模式不裁切：按住时浮起的玻璃珠要能超出播放栏上下边（玻璃底板自带圆角）
+                    .then(if (glassOn) Modifier else Modifier.clip(pillShape))
+                    .then(
+                        if (glassOn) Modifier
+                        else Modifier
+                            .background(navTrackBgBrush)
+                            .border(BorderStroke(1.dp, navTrackBorderBrush), pillShape)
+                    )
+                    .then(
+                        // 轨道已展开（点开 / 拖动中）时：手指按下就把玻璃滴顶到手指所在的一格并浮起成玻璃珠，
+                        // 抬起（没拖动）时缩回；拖动交给下面的拖动手势（它先处理，会把 isNavDragging 置为 true）
+                        Modifier
+                    )
                     .then(
                         if (bottomBarAnimMode == BottomBarAnimMode.SLIDE && !isSearchActive) {
                             Modifier.pointerInput(currentScreen, isSearchActive) {
                                 detectHorizontalDragGestures(
                                     onDragStart = { offset ->
+                                        if (glassOn && isNavManuallyExpanded) {
+                                            navDragIgnored = true
+                                            return@detectHorizontalDragGestures
+                                        }
                                         isNavDragging = true
-                                        currentFingerXPx = offset.x
+                                        if (glassOn) {
+                                            // 水滴直接出现在手指所在格（按展开后的最终格宽换算，不受轨道展开动画影响），不再从中间那格滑过来
+                                            tabsController.beginDrag((offset.x.coerceIn(center0Px, center2Px) - padPx) / slotWidthPx - 0.5f)
+                                        } else {
+                                            currentFingerXPx = offset.x
+                                        }
                                         val liveCenter = offset.x.coerceIn(center0Px, center2Px)
                                         val newIndex = when {
                                             liveCenter < padPx + slotWidthPx -> 0
@@ -433,12 +540,20 @@ fun CompactMorphingBottomBar(
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     },
                                     onDragEnd = {
+                                        if (navDragIgnored) {
+                                            navDragIgnored = false
+                                            return@detectHorizontalDragGestures
+                                        }
                                         val targetScreen = when (hoveredNavIndex) {
                                             0 -> Screen.HOME
                                             1 -> Screen.LIBRARY
                                             else -> Screen.SETTINGS
                                         }
-                                        if (targetScreen != currentScreen) {
+                                        if (glassOn) {
+                                            // 示例的松手：吸附到最近一格，onTabSelected 里切页；标签栏还没展开出来就松手时按手指所在格切页
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            if (!tabsController.endDrag() && targetScreen != currentScreen) onNavigate(targetScreen)
+                                        } else if (targetScreen != currentScreen) {
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             onNavigate(targetScreen)
                                         }
@@ -446,13 +561,24 @@ fun CompactMorphingBottomBar(
                                         isNavManuallyExpanded = false
                                     },
                                     onDragCancel = {
+                                        if (navDragIgnored) {
+                                            navDragIgnored = false
+                                            return@detectHorizontalDragGestures
+                                        }
+                                        if (glassOn) tabsController.endDrag()
                                         isNavDragging = false
                                         isNavManuallyExpanded = false
                                     },
                                     onHorizontalDrag = { change, _ ->
+                                        if (navDragIgnored) return@detectHorizontalDragGestures
                                         change.consume()
-                                        currentFingerXPx = change.position.x
                                         val liveCenter = change.position.x.coerceIn(center0Px, center2Px)
+                                        if (glassOn) {
+                                            // 玻璃模式只推水滴，不写参与重组的手指坐标（否则每个触摸事件整条底栏重组一次）
+                                            tabsController.dragTo((liveCenter - padPx) / slotWidthPx - 0.5f, change.position.x - change.previousPosition.x)
+                                        } else {
+                                            currentFingerXPx = change.position.x
+                                        }
                                         val newIndex = when {
                                             liveCenter < padPx + slotWidthPx -> 0
                                             liveCenter > padPx + slotWidthPx * 2f -> 2
@@ -467,7 +593,10 @@ fun CompactMorphingBottomBar(
                             }
                         } else Modifier
                     )
-                    .clickable {
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = if (glassOn) null else androidx.compose.foundation.LocalIndication.current
+                    ) {
                         if (bottomBarAnimMode == BottomBarAnimMode.CLICK) {
                             if (isSearchActive) {
                                 onDismissSearch()
@@ -481,24 +610,108 @@ fun CompactMorphingBottomBar(
                     },
                 contentAlignment = Alignment.CenterStart
             ) {
+                // 液态玻璃底板：收起时的圆钮。常驻组合、展开时不绘制（之前每次展开 / 收起都会销毁重建这块玻璃并重新编译着色器）
+                if (glassOn && !mergeGlass) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .drawWithContent { if (!isNavTrackExpanded) drawContent() }
+                    ) {
+                        com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                            modifier = Modifier.matchParentSize(),
+                            cornerRadius = barHeight / 2,
+                            tint = barGlass.tint,
+                            blurAmount = barGlass.blurAmount,
+                            dispersion = barGlass.dispersion,
+                            material = barGlass.material
+                        )
+                    }
+                }
+                    val navItems = listOf(
+                        Triple(0, Icons.Filled.Home, "首页"),
+                        Triple(1, Icons.Filled.LibraryMusic, "资料库"),
+                        Triple(2, Icons.Filled.Settings, "设置")
+                    )
+                    val onNavItemClick: (Int) -> Unit = { idx ->
+                        val target = when (idx) {
+                            0 -> Screen.HOME
+                            1 -> Screen.LIBRARY
+                            else -> Screen.SETTINGS
+                        }
+                        if (target != currentScreen) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            navClickAnimate = true
+                            onNavigate(target)
+                        }
+                        isNavManuallyExpanded = false
+                        isNavDragging = false
+                    }
+
+                if (glassOn) {
+                    // ===== 液态玻璃：Kyant0 示例 LiquidBottomTabs（按 56dp 等比缩小），点选 / 拖水滴 / 从圆钮拖出都是同一套滑动效果 =====
+                    // 性能：常驻组合 —— 玻璃、图层与着色器在底栏出现时就建好，按下拖动时零创建（之前每次开始拖动都新建 3 层玻璃、编译约 6 个着色器，首帧卡顿）；
+                    // 收起时不绘制、不响应触摸、不进无障碍树
+                    val tabsBackdrop = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current
+                    if (tabsBackdrop != null) {
+                        val tabContentColor = if (isDark) Color.White else Color.Black
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .drawWithContent { if (isNavTrackExpanded) drawContent() }
+                                .then(if (isNavTrackExpanded) Modifier else Modifier.clearAndSetSemantics { })
+                        ) {
+                            com.lm.player.core.designsystem.glass.LiquidBottomTabs(
+                                selectedTabIndex = { compactTabState.value },
+                                onTabSelected = { idx -> onNavItemClick(idx) },
+                                backdrop = tabsBackdrop,
+                                tabsCount = 3,
+                                accentColor = AppleRed,
+                                barHeight = barHeight,
+                                innerPadding = 3.5.dp,
+                                controller = tabsController,
+                                active = isNavTrackExpanded,
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                navItems.forEach { (idx, icon, title) ->
+                                    LiquidBottomTab(onClick = { onNavItemClick(idx) }) {
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = title,
+                                            tint = tabContentColor,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Text(
+                                            text = title,
+                                            fontSize = 11.sp,
+                                            color = tabContentColor,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (isNavTrackExpanded) {
+                    if (!glassOn) {
+
                     // 1:1 指尖实时绝对跟随的聚焦白胶囊 (方案 A：纯白立体微光液态胶囊)
                     Box(
                         modifier = Modifier
                             .offset(x = pillXDp)
                             .width(pillWidthDp)
-                            .height(barHeight - 10.dp)
+                            .height(barHeight - 8.dp)
                             .shadow(
                                 elevation = if (isDark) 4.dp else 6.dp,
-                                shape = RoundedCornerShape((barHeight - 10.dp) / 2),
+                                shape = RoundedCornerShape((barHeight - 8.dp) / 2),
                                 ambientColor = if (isDark) Color(0x66000000) else Color(0x30000000),
                                 spotColor = if (isDark) Color(0x44000000) else Color(0x1C000000)
                             )
-                            .clip(RoundedCornerShape((barHeight - 10.dp) / 2))
+                            .clip(RoundedCornerShape((barHeight - 8.dp) / 2))
                             .background(navFocusPillBrush)
                             .border(
                                 BorderStroke(0.8.dp, navFocusPillBorderBrush),
-                                RoundedCornerShape((barHeight - 10.dp) / 2)
+                                RoundedCornerShape((barHeight - 8.dp) / 2)
                             )
                     )
 
@@ -511,11 +724,6 @@ fun CompactMorphingBottomBar(
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val navItems = listOf(
-                            Triple(0, Icons.Filled.Home, "首页"),
-                            Triple(1, Icons.Filled.LibraryMusic, "资料库"),
-                            Triple(2, Icons.Filled.Settings, "设置")
-                        )
                         navItems.forEach { (idx, icon, title) ->
                             val isHovered = hoveredNavIndex == idx
                             Column(
@@ -525,19 +733,7 @@ fun CompactMorphingBottomBar(
                                     .weight(1f)
                                     .scale(if (isHovered) 1.10f else 0.95f)
                                     .clip(RoundedCornerShape(16.dp))
-                                    .clickable {
-                                        val target = when (idx) {
-                                            0 -> Screen.HOME
-                                            1 -> Screen.LIBRARY
-                                            else -> Screen.SETTINGS
-                                        }
-                                        if (target != currentScreen) {
-                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            onNavigate(target)
-                                        }
-                                        isNavManuallyExpanded = false
-                                        isNavDragging = false
-                                    }
+                                    .clickable { onNavItemClick(idx) }
                             ) {
                                 Icon(
                                     imageVector = icon,
@@ -557,6 +753,7 @@ fun CompactMorphingBottomBar(
                                 )
                             }
                         }
+                    }
                     }
                 } else {
                     // 常态单图标居中
@@ -583,37 +780,61 @@ fun CompactMorphingBottomBar(
         // =========================================================================
         Box(
             modifier = Modifier
-                .offset(x = currentPlayerX)
-                .width(currentPlayerWidth)
+                .offset { IntOffset(playerXPx().roundToInt(), 0) }
+                .layout { measurable, constraints ->
+                    val w = playerWidthPx().roundToInt().coerceIn(constraints.minWidth, constraints.maxWidth)
+                    val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
+                    layout(w, placeable.height) { placeable.place(0, 0) }
+                }
                 .height(barHeight)
                 .zIndex(
                     when {
-                        navExpandProgress > 0.01f -> 35f // 导航滑动展开时位于最高层 (35f > 30f & 20f)，保证向右缩圆平滑可见！
+                        navAboveAll -> 35f // 导航滑动展开时位于最高层 (35f > 30f & 20f)，保证向右缩圆平滑可见！
                         searchProgress > 0.5f -> 22f
                         else -> 15f
                     }
                 )
+                .glassPressBulge(glassOn)
+                .trackPlayerLaunchOrigin()
                 .shadow(
-                    elevation = 8.dp,
+                    elevation = if (glassOn) 0.dp else 8.dp,
                     shape = pillShape,
                     ambientColor = if (isDark) Color(0x66000000) else Color(0x22000000),
                     spotColor = if (isDark) Color(0x44000000) else Color(0x16000000)
                 )
                 .clip(pillShape)
-                .background(liquidGlassBrush)
-                .border(BorderStroke(1.2.dp, liquidGlassBorderBrush), pillShape)
+                .then(
+                    if (glassOn) Modifier
+                    else Modifier
+                        .background(liquidGlassBrush)
+                        .border(BorderStroke(1.2.dp, liquidGlassBorderBrush), pillShape)
+                )
                 .clickable {
                     onOpenFullPlayer()
                 }
         ) {
-            // A. 常态长条播放内容：当变圆形变发生时 (morphProgress > 0) 平滑淡出
-            if (morphProgress < 0.85f) {
-                val rectContentAlpha = (1f - morphProgress * 1.8f).coerceIn(0f, 1f)
+            // 液态玻璃底板：长条 ⇄ 正圆连续形变（搜索左移 / 导航右移）时逐帧跟随
+            if (glassOn && !mergeGlass) {
+                com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                    modifier = Modifier.matchParentSize(),
+                    cornerRadius = barHeight / 2,
+                    tint = barGlass.tint,
+                    blurAmount = barGlass.blurAmount,
+                    dispersion = barGlass.dispersion,
+                    material = barGlass.material
+                )
+            }
+            // A. 常态长条播放内容：当变圆形变发生时 平滑淡出
+            if (morphRectShown) {
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
-                        .alpha(rectContentAlpha)
-                        .scale(1f - morphProgress * 0.15f)
+                        .graphicsLayer {
+                            val m = morphNow()
+                            alpha = (1f - m * 1.8f).coerceIn(0f, 1f)
+                            scaleX = 1f - m * 0.15f
+                            scaleY = 1f - m * 0.15f
+                        }
                         .padding(start = 7.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -713,14 +934,17 @@ fun CompactMorphingBottomBar(
                 }
 
                 // B. 圆形环形进度条微缩内容：在变圆就位时（无论左滑还是右滑）淡入呈现
-                if (morphProgress > 0.15f) {
-                    val circleContentAlpha = ((morphProgress - 0.15f) / 0.7f).coerceIn(0f, 1f)
+                if (morphCircleShown) {
                     Box(
                         modifier = Modifier
                             .size(barHeight)
                             .align(Alignment.Center)
-                            .alpha(circleContentAlpha)
-                            .scale(0.75f + 0.25f * morphProgress),
+                            .graphicsLayer {
+                                val m = morphNow()
+                                alpha = ((m - 0.15f) / 0.7f).coerceIn(0f, 1f)
+                                scaleX = 0.75f + 0.25f * m
+                                scaleY = 0.75f + 0.25f * m
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         CircularProgressIndicator(
@@ -769,13 +993,26 @@ fun CompactMorphingBottomBar(
                     .alpha(searchBarAlpha)
                     .scale(0.85f + 0.15f * searchProgress)
                     .clip(pillShape)
-                    .background(searchOverlaySurfaceColor)
-                    .border(BorderStroke(1.2.dp, AppleRed.copy(alpha = 0.55f)), pillShape)
-                    .padding(horizontal = 12.dp),
+                    .then(if (glassOn) Modifier else Modifier.background(searchOverlaySurfaceColor))
+                    .border(BorderStroke(1.2.dp, AppleRed.copy(alpha = 0.55f)), pillShape),
                 contentAlignment = Alignment.CenterStart
             ) {
+                // 液态玻璃：搜索输入胶囊（输入时文字要清楚，用面板档：跟随滑块但保底底色）
+                if (glassOn) {
+                    val searchGlass = com.lm.player.core.designsystem.glass.panelGlassStyle(isDark)
+                    com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                        modifier = Modifier.matchParentSize(),
+                        cornerRadius = barHeight / 2,
+                        tint = searchGlass.tint,
+                        blurAmount = searchGlass.blurAmount,
+                        dispersion = searchGlass.dispersion,
+                        material = searchGlass.material
+                    )
+                }
                 Row(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
@@ -871,116 +1108,20 @@ fun CompactMorphingBottomBar(
                             }
                         }
 
-                        DropdownMenu(
-                            expanded = isSourceDropdownExpanded,
-                            onDismissRequest = { isSourceDropdownExpanded = false },
-                            modifier = Modifier.width(232.dp)
-                        ) {
-                            // 搜索类别分段选择
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                            ) {
-                                Text(
-                                    text = "搜索类别",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(bottom = 6.dp, start = 2.dp)
-                                )
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = if (isDark) Color(0xFF1C1C22) else Color(0xFFEFEFF4),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(34.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .padding(3.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(3.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        SearchContentType.entries.forEach { type ->
-                                            val isTypeSelected = type == selectedSearchType
-                                            Box(
-                                                modifier = Modifier
-                                                    .weight(1f)
-                                                    .fillMaxHeight()
-                                                    .clip(RoundedCornerShape(9.dp))
-                                                    .background(
-                                                        if (isTypeSelected) AppleRed else Color.Transparent
-                                                    )
-                                                    .clickable {
-                                                        onSearchTypeChange(type)
-                                                        if (!showOnlineSourceSelector) {
-                                                            isSourceDropdownExpanded = false
-                                                        }
-                                                    },
-                                                contentAlignment = Alignment.Center
-                                            ) {
-                                                Text(
-                                                    text = type.displayName,
-                                                    fontSize = 12.sp,
-                                                    fontWeight = if (isTypeSelected) FontWeight.Bold else FontWeight.Medium,
-                                                    color = if (isTypeSelected) Color.White else MaterialTheme.colorScheme.onSurface
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 在线音源列表
-                            if (showOnlineSourceSelector) {
-                                HorizontalDivider(
-                                    modifier = Modifier.padding(vertical = 4.dp),
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                                )
-                                Text(
-                                    text = "在线音乐源",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                                )
-                                OnlineMusicSource.entries.forEach { source ->
-                                    val isSourceSelected = source == selectedOnlineSource
-                                    DropdownMenuItem(
-                                        text = {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(
-                                                    text = source.displayName,
-                                                    fontSize = 13.sp,
-                                                    fontWeight = if (isSourceSelected) FontWeight.Bold else FontWeight.Normal,
-                                                    color = if (isSourceSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                                )
-                                                if (isSourceSelected) {
-                                                    Icon(
-                                                        imageVector = Icons.Default.Check,
-                                                        contentDescription = null,
-                                                        tint = AppleRed,
-                                                        modifier = Modifier.size(16.dp)
-                                                    )
-                                                }
-                                            }
-                                        },
-                                        onClick = {
-                                            onOnlineSourceChange(source)
-                                            isSourceDropdownExpanded = false
-                                        }
-                                    )
-                                }
-                            }
-                        }
                     }
                 }
+                // 类别 / 音源选择：与搜索栏同宽，点标签后从搜索栏上沿液态涌出
+                SearchSourcePanel(
+                    width = restingPlayerWidth,
+                    expanded = isSourceDropdownExpanded,
+                    onDismissRequest = { isSourceDropdownExpanded = false },
+                    isDark = isDark,
+                    selectedSearchType = selectedSearchType,
+                    onSearchTypeChange = onSearchTypeChange,
+                    showOnlineSourceSelector = showOnlineSourceSelector,
+                    selectedOnlineSource = selectedOnlineSource,
+                    onOnlineSourceChange = onOnlineSourceChange
+                )
             }
         }
 
@@ -990,35 +1131,54 @@ fun CompactMorphingBottomBar(
         // - 常态：搜索圆圈按键 (Left = totalWidth - barHeight, Width = 52dp)
         // - 搜索展开时：变身为独立的圆圈 ✕ 退出按键 (原地顺畅自旋变身为红圈 ✕，点击退出搜索)
         // =========================================================================
-        val rightBtnNavAlpha = (1f - navExpandProgress * 2.5f).coerceIn(0f, 1f)
-        if (rightBtnNavAlpha > 0.01f) {
+        // 常驻组合（玻璃不随导航展开 / 收起销毁重建）：透明度在绘制阶段读，看不见时不绘制、不响应点击
+        run {
             Box(
                 modifier = Modifier
                     .offset(x = restingSearchX)
                     .size(barHeight)
                     .zIndex(20f)
-                    .alpha(rightBtnNavAlpha)
+                    .graphicsLayer { alpha = (1f - navExpandAnim.value * 2.5f).coerceIn(0f, 1f) }
+                    .drawWithContent { if (rightBtnVisible) drawContent() }
+                    .glassPressBulge(glassOn)
                     .shadow(
-                        elevation = 4.dp,
+                        elevation = if (glassOn) 0.dp else 4.dp,
                         shape = pillShape,
                         ambientColor = if (isDark) Color(0x55000000) else Color(0x18000000),
                         spotColor = if (isDark) Color(0x38000000) else Color(0x10000000)
                     )
                     .clip(pillShape)
-                    .background(liquidGlassBrush)
-                    .border(
-                        BorderStroke(1.dp, liquidGlassBorderBrush),
-                        pillShape
+                    .then(
+                        if (glassOn) Modifier
+                        else Modifier
+                            .background(liquidGlassBrush)
+                            .border(
+                                BorderStroke(1.dp, liquidGlassBorderBrush),
+                                pillShape
+                            )
                     )
-                    .clickable {
-                        if (isSearchActive) {
-                            onDismissSearch()
-                        } else {
-                            onSearchClick()
-                        }
-                    },
+                    // 看不见时整个去掉 clickable（禁用的 clickable 仍会吃掉点击），点击照常落到下面
+                    .then(
+                        if (rightBtnVisible) Modifier.clickable {
+                            if (isSearchActive) {
+                                onDismissSearch()
+                            } else {
+                                onSearchClick()
+                            }
+                        } else Modifier
+                    ),
                 contentAlignment = Alignment.Center
             ) {
+                if (glassOn) {
+                    com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                        modifier = Modifier.matchParentSize(),
+                        cornerRadius = barHeight / 2,
+                        tint = barGlass.tint,
+                        blurAmount = barGlass.blurAmount,
+                        dispersion = barGlass.dispersion,
+                        material = barGlass.material
+                    )
+                }
                 // 放大镜图标 (常态可见，搜索展开时旋转90度淡出)
                 val magnifierAlpha = (1f - searchProgress * 2f).coerceIn(0f, 1f)
                 if (magnifierAlpha > 0f) {
@@ -1126,9 +1286,52 @@ fun ExpandedMorphingBottomBar(
         Color(0xFFFCFCFE).copy(alpha = 0.98f)
     }
 
+    // ===== 液态玻璃（与 CompactMorphingBottomBar 同一套参数）：未播放歌曲 / 点击模式展开 / 关闭底栏动画时用的就是这个双层底栏 =====
+    val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    val barGlass = com.lm.player.core.designsystem.glass.barGlassStyle(isDark, blurAlpha, liquidGlassBlur)
+    val glassSurface: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {
+        if (glassOn) {
+            com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                modifier = Modifier.matchParentSize(),
+                cornerRadius = BottomBarHeight / 2,
+                tint = barGlass.tint,
+                blurAmount = barGlass.blurAmount,
+                dispersion = barGlass.dispersion,
+                material = barGlass.material
+            )
+        }
+    }
+    // 玻璃模式下不画渐变底色 / 描边 / 投影（投影会从半透明玻璃中间透出来）
+    val pillSurfaceModifier = if (glassOn) Modifier
+    else Modifier
+        .background(glassBrush)
+        .border(BorderStroke(1.2.dp, glassBorderBrush), UnifiedPillShape)
+
+    // 液态玻璃：三个导航标签共用一颗会滑动的玻璃滴（点选：按下→滑过去→抬起；也可直接按住拖动切换）
+    val tabIndex = when (currentScreen) {
+        Screen.HOME, Screen.PODCASTS -> 0
+        Screen.LIBRARY, Screen.DOWNLOADS -> 1
+        Screen.SETTINGS -> 2
+    }
+    // 物理与 Kyant0 示例 LiquidBottomTabs 一致（按下 78/56、速度拉伸、临界阻尼弹簧）
+    val tabIndicator = com.lm.player.core.designsystem.glass.rememberLiquidIndicatorState(initialIndex = tabIndex, tabCount = 3)
+    var tabDragging by remember { mutableStateOf(false) }
+    LaunchedEffect(tabIndex) {
+        if (kotlin.math.abs(tabIndicator.targetValue - tabIndex) > 0.01f) tabIndicator.animateTo(tabIndex.toFloat())
+    }
+    var tabRowWidthPx by remember { mutableIntStateOf(0) }
+    // 示例 LiquidBottomTabs 的 selectedTabIndex 要求是稳定的 lambda：读这个 State，外部切页时水滴才会滑过去
+    val kyantTabState = rememberUpdatedState(tabIndex)
+    // 玻璃模式标签栏与搜索圆按钮按示例 64dp 高
+    val tabsBarHeight = if (glassOn) 64.dp else BottomBarHeight
+    val tabDensity = LocalDensity.current
+    val tabRowPadPx = with(tabDensity) { 8.dp.toPx() }
+    val tabSlotWidthPx = ((tabRowWidthPx - tabRowPadPx * 2f) / 3f).coerceAtLeast(1f)
+
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     var isSourceDropdownExpanded by remember { mutableStateOf(false) }
+    var searchCapsuleWidthPx by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(isSearchActive) {
         if (isSearchActive) {
@@ -1154,17 +1357,18 @@ fun ExpandedMorphingBottomBar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(BottomBarHeight)
+                    .trackPlayerLaunchOrigin()
                     .shadow(
-                        elevation = 8.dp,
+                        elevation = if (glassOn) 0.dp else 8.dp,
                         shape = UnifiedPillShape,
                         ambientColor = if (isDark) Color(0x66000000) else Color(0x22000000),
                         spotColor = if (isDark) Color(0x44000000) else Color(0x16000000)
                     )
                     .clip(UnifiedPillShape)
-                    .background(glassBrush)
-                    .border(BorderStroke(1.2.dp, glassBorderBrush), UnifiedPillShape)
+                    .then(pillSurfaceModifier)
                     .clickable(onClick = onOpenFullPlayer)
             ) {
+                glassSurface()
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
@@ -1254,51 +1458,227 @@ fun ExpandedMorphingBottomBar(
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(BottomBarHeight),
+                    .height(tabsBarHeight),
                 contentAlignment = Alignment.CenterEnd
             ) {
                 // 底层 (zIndex = 0f)：首页、资料库、设置三个导航项
+                val kyantBackdrop = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current
+                if (glassOn && kyantBackdrop != null) {
+                    // 液态玻璃：原样使用 Kyant0 示例的 LiquidBottomTabs（栏高 64dp、水滴 56dp、一格宽，物理与效果一致）
+                    val kyantTabs = listOf(
+                        Triple(Screen.HOME, Icons.Default.Home, "首页"),
+                        Triple(Screen.LIBRARY, Icons.Default.LibraryMusic, "资料库"),
+                        Triple(Screen.SETTINGS, Icons.Default.Settings, "设置")
+                    )
+                    val tabContentColor = if (isDark) Color.White else Color.Black
+                    com.lm.player.core.designsystem.glass.LiquidBottomTabs(
+                        selectedTabIndex = { kyantTabState.value },
+                        onTabSelected = { idx ->
+                            if (idx != kyantTabState.value) onNavigate(kyantTabs[idx].first)
+                        },
+                        backdrop = kyantBackdrop,
+                        tabsCount = 3,
+                        accentColor = AppleRed,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .zIndex(0f)
+                    ) {
+                        kyantTabs.forEach { (screen, icon, title) ->
+                            LiquidBottomTab(
+                                onClick = { if (screen != kyantTabs[kyantTabState.value].first || currentScreen != screen) onNavigate(screen) }
+                            ) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = title,
+                                    tint = tabContentColor,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Text(
+                                    text = title,
+                                    fontSize = 12.sp,
+                                    color = tabContentColor,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                } else {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(0f)
                         .shadow(
-                            elevation = 6.dp,
+                            elevation = if (glassOn) 0.dp else 6.dp,
                             shape = UnifiedPillShape,
                             ambientColor = if (isDark) Color(0x55000000) else Color(0x18000000)
                         )
-                        .clip(UnifiedPillShape)
-                        .background(glassBrush)
-                        .border(BorderStroke(1.2.dp, glassBorderBrush), UnifiedPillShape)
+                        // 玻璃模式不裁切：按住标签时浮起的玻璃珠要能超出导航胶囊
+                        .then(if (glassOn) Modifier else Modifier.clip(UnifiedPillShape))
+                        .then(pillSurfaceModifier)
+                        // 示例 LiquidBottomTabs 的栏反馈：按下整条栏微微放大、拖动橡皮筋偏移、玻璃珠位置一圈柔光
+                        .liquidBarResponse(tabIndicator, tabSlotWidthPx, tabRowPadPx, enabled = glassOn && !isSearchActive)
                 ) {
+                    glassSurface()
+                    if (glassOn && tabRowWidthPx > 0 && !isSearchActive) {
+                        BarDropletBase(
+                            state = tabIndicator,
+                            slotWidthPx = tabSlotWidthPx,
+                            startPad = 8.dp,
+                            width = with(tabDensity) { tabSlotWidthPx.toDp() } - 6.dp,
+                            height = BottomBarHeight - 8.dp,
+                            barWidthPx = tabRowWidthPx.toFloat(),
+                            barHeightPx = with(tabDensity) { BottomBarHeight.toPx() },
+                            barStyle = barGlass,
+                            isDark = isDark,
+                            backdrop = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current
+                        )
+                    }
+                    val tabScreens = listOf(Screen.HOME, Screen.LIBRARY, Screen.SETTINGS)
                     Row(
                         modifier = Modifier
                             .fillMaxSize()
+                            .then(
+                                if (glassOn && !isSearchActive) Modifier.hideUnderBarDroplet(
+                                    tabIndicator, tabSlotWidthPx, 8.dp,
+                                    with(tabDensity) { tabSlotWidthPx.toDp() } - 6.dp, BottomBarHeight - 8.dp
+                                ) else Modifier
+                            )
+                            .onSizeChanged { tabRowWidthPx = it.width }
+                            .then(
+                                // 按住标签（不拖）也浮起玻璃珠，抬起缩回；拖动交给下面的拖动手势
+                                if (glassOn && !isSearchActive) Modifier.pointerInput(tabSlotWidthPx) {
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+                                        val slot = ((down.position.x - tabRowPadPx) / tabSlotWidthPx).toInt().coerceIn(0, 2)
+                                        // 示例：只有按在玻璃珠上才浮起；按其它标签，点选后再「按下 → 滑过去 → 抬起」
+                                        if (slot != kotlin.math.round(tabIndicator.value).toInt()) return@awaitEachGesture
+                                        tabIndicator.press()
+                                        waitForUpOrCancellation()
+                                        if (!tabDragging) tabIndicator.release()
+                                    }
+                                } else Modifier
+                            )
+                            .then(
+                                if (glassOn) Modifier.pointerInput(tabSlotWidthPx) {
+                                    detectHorizontalDragGestures(
+                                        onDragStart = {
+                                            tabDragging = true
+                                            tabIndicator.press()
+                                        },
+                                        onDragEnd = {
+                                            tabDragging = false
+                                            tabIndicator.releasePanel()
+                                            val idx = kotlin.math.round(tabIndicator.targetValue).toInt().coerceIn(0, 2)
+                                            tabIndicator.animateTo(idx.toFloat())
+                                            if (tabScreens[idx] != currentScreen) onNavigate(tabScreens[idx])
+                                        },
+                                        onDragCancel = {
+                                            tabDragging = false
+                                            tabIndicator.releasePanel()
+                                            tabIndicator.animateTo(tabIndex.toFloat())
+                                        }
+                                    ) { change, dragAmount ->
+                                        change.consume()
+                                        tabIndicator.dragTo(tabIndicator.targetValue + dragAmount / tabSlotWidthPx)
+                                        tabIndicator.dragPanel(dragAmount)
+                                    }
+                                } else Modifier
+                            )
                             .padding(horizontal = 8.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val tabSlot: @Composable RowScope.(@Composable () -> Unit) -> Unit = { item ->
+                            if (glassOn) {
+                                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) { item() }
+                            } else {
+                                item()
+                            }
+                        }
+                        tabSlot {
                         FloatingNavTabItem(
                             title = "首页",
                             icon = Icons.Default.Home,
                             selected = !isSearchActive && currentScreen == Screen.HOME,
                             onClick = { onNavigate(Screen.HOME) }
                         )
+                        }
 
+                        tabSlot {
                         FloatingNavTabItem(
                             title = "资料库",
                             icon = Icons.Default.LibraryMusic,
                             selected = !isSearchActive && currentScreen == Screen.LIBRARY,
                             onClick = { onNavigate(Screen.LIBRARY) }
                         )
+                        }
 
+                        tabSlot {
                         FloatingNavTabItem(
                             title = "设置",
                             icon = Icons.Default.Settings,
                             selected = !isSearchActive && currentScreen == Screen.SETTINGS,
                             onClick = { onNavigate(Screen.SETTINGS) }
                         )
+                        }
                     }
+                    // 玻璃珠上层：珠子范围里放大的标签（与下面的标签同样式）
+                    if (glassOn && tabRowWidthPx > 0 && !isSearchActive) {
+                        BarDropletMagnifier(
+                            state = tabIndicator,
+                            slotWidthPx = tabSlotWidthPx,
+                            startPad = 8.dp,
+                            width = with(tabDensity) { tabSlotWidthPx.toDp() } - 6.dp,
+                            height = BottomBarHeight - 8.dp
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // 示例：珠子按下时，珠子里看到的标签放大到 1.2 倍
+                                val dropletContentScale = com.lm.player.core.designsystem.glass.LocalBarDropletContentScale.current
+                                listOf(
+                                    Triple(Screen.HOME, Icons.Default.Home, "首页"),
+                                    Triple(Screen.LIBRARY, Icons.Default.LibraryMusic, "资料库"),
+                                    Triple(Screen.SETTINGS, Icons.Default.Settings, "设置")
+                                ).forEach { (screen, icon, title) ->
+                                    val sel = !isSearchActive && (currentScreen == screen ||
+                                        (screen == Screen.HOME && currentScreen == Screen.PODCASTS) ||
+                                        (screen == Screen.LIBRARY && currentScreen == Screen.DOWNLOADS))
+                                    val glyphColor = if (sel) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .graphicsLayer {
+                                                val sc = dropletContentScale()
+                                                scaleX = sc
+                                                scaleY = sc
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            Icon(imageVector = icon, contentDescription = null, tint = glyphColor, modifier = Modifier.size(22.dp))
+                                            Spacer(modifier = Modifier.height(1.dp))
+                                            Text(
+                                                text = title,
+                                                style = TextStyle(
+                                                    fontSize = dimensions.captionSize,
+                                                    fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium,
+                                                    color = glyphColor
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 }
 
                 // 顶层 (zIndex = 10f，层级在首页、资料库、设置三个上方)：点击搜索时向左平滑出现的搜索框
@@ -1325,18 +1705,32 @@ fun ExpandedMorphingBottomBar(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .shadow(8.dp, UnifiedPillShape)
+                            .onSizeChanged { searchCapsuleWidthPx = it.width }
+                            .shadow(if (glassOn) 0.dp else 8.dp, UnifiedPillShape)
                             .clip(UnifiedPillShape)
-                            .background(searchOverlaySurfaceColor)
+                            .then(if (glassOn) Modifier else Modifier.background(searchOverlaySurfaceColor))
                             .border(
                                 BorderStroke(1.2.dp, AppleRed.copy(alpha = 0.52f)),
                                 UnifiedPillShape
-                            )
-                            .padding(start = 12.dp, end = 6.dp),
+                            ),
                         contentAlignment = Alignment.CenterStart
                     ) {
+                        // 液态玻璃：搜索输入胶囊（面板档：跟随滑块但保底底色，输入文字清楚）
+                        if (glassOn) {
+                            val searchGlass = com.lm.player.core.designsystem.glass.panelGlassStyle(isDark)
+                            com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                                modifier = Modifier.matchParentSize(),
+                                cornerRadius = BottomBarHeight / 2,
+                                tint = searchGlass.tint,
+                                blurAmount = searchGlass.blurAmount,
+                                dispersion = searchGlass.dispersion,
+                                material = searchGlass.material
+                            )
+                        }
                         Row(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(start = 12.dp, end = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
@@ -1453,116 +1847,20 @@ fun ExpandedMorphingBottomBar(
                                     }
                                 }
 
-                                DropdownMenu(
-                                    expanded = isSourceDropdownExpanded,
-                                    onDismissRequest = { isSourceDropdownExpanded = false },
-                                    modifier = Modifier.width(232.dp)
-                                ) {
-                                    // 1. 顶部：搜索内容维度分段选择 [ 歌曲 | 专辑 | 歌单 ]
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                                    ) {
-                                        Text(
-                                            text = "搜索类别",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(bottom = 6.dp, start = 2.dp)
-                                        )
-                                        Surface(
-                                            shape = RoundedCornerShape(12.dp),
-                                            color = if (isDark) Color(0xFF1C1C22) else Color(0xFFEFEFF4),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(34.dp)
-                                        ) {
-                                            Row(
-                                                modifier = Modifier
-                                                    .fillMaxSize()
-                                                    .padding(3.dp),
-                                                horizontalArrangement = Arrangement.spacedBy(3.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                SearchContentType.entries.forEach { type ->
-                                                    val isTypeSelected = type == selectedSearchType
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .weight(1f)
-                                                            .fillMaxHeight()
-                                                            .clip(RoundedCornerShape(9.dp))
-                                                            .background(
-                                                                if (isTypeSelected) AppleRed else Color.Transparent
-                                                            )
-                                                            .clickable {
-                                                                onSearchTypeChange(type)
-                                                                if (!showOnlineSourceSelector) {
-                                                                    isSourceDropdownExpanded = false
-                                                                }
-                                                            },
-                                                        contentAlignment = Alignment.Center
-                                                    ) {
-                                                        Text(
-                                                            text = type.displayName,
-                                                            fontSize = 12.sp,
-                                                            fontWeight = if (isTypeSelected) FontWeight.Bold else FontWeight.Medium,
-                                                            color = if (isTypeSelected) Color.White else MaterialTheme.colorScheme.onSurface
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // 2. 底部：在线音源平台列表（来自柠檬音乐服务端）
-                                    if (showOnlineSourceSelector) {
-                                        HorizontalDivider(
-                                            modifier = Modifier.padding(vertical = 4.dp),
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.14f)
-                                        )
-                                        Text(
-                                            text = "柠檬服务端在线音源",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
-                                        )
-                                        OnlineMusicSource.entries.forEach { src ->
-                                            val isSelected = src == selectedOnlineSource
-                                            DropdownMenuItem(
-                                                text = {
-                                                    Row(
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                                        verticalAlignment = Alignment.CenterVertically
-                                                    ) {
-                                                        Text(
-                                                            text = src.displayName,
-                                                            fontSize = 13.sp,
-                                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                                            color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
-                                                        )
-                                                        if (isSelected) {
-                                                            Icon(
-                                                                imageVector = Icons.Default.Check,
-                                                                contentDescription = "已选中",
-                                                                tint = AppleRed,
-                                                                modifier = Modifier.size(16.dp)
-                                                            )
-                                                        }
-                                                    }
-                                                },
-                                                onClick = {
-                                                    onOnlineSourceChange(src)
-                                                    isSourceDropdownExpanded = false
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
                             }
                         }
+                        // 类别 / 音源选择：与搜索栏同宽，点标签后从搜索栏上沿液态涌出
+                        SearchSourcePanel(
+                            width = with(LocalDensity.current) { searchCapsuleWidthPx.toDp() },
+                            expanded = isSourceDropdownExpanded,
+                            onDismissRequest = { isSourceDropdownExpanded = false },
+                            isDark = isDark,
+                            selectedSearchType = selectedSearchType,
+                            onSearchTypeChange = onSearchTypeChange,
+                            showOnlineSourceSelector = showOnlineSourceSelector,
+                            selectedOnlineSource = selectedOnlineSource,
+                            onOnlineSourceChange = onOnlineSourceChange
+                        )
                     }
                 }
             }
@@ -1570,18 +1868,22 @@ fun ExpandedMorphingBottomBar(
             // 右侧独立圆形按钮：默认显示搜索放大镜，搜索激活时变成 X (功能为退出搜索模式，真液态玻璃材质！)
             Box(
                 modifier = Modifier
-                    .size(BottomBarHeight)
+                    .size(tabsBarHeight)
                     .shadow(
-                        elevation = 4.dp,
+                        elevation = if (glassOn) 0.dp else 4.dp,
                         shape = UnifiedPillShape,
                         ambientColor = if (isDark) Color(0x55000000) else Color(0x18000000),
                         spotColor = if (isDark) Color(0x38000000) else Color(0x10000000)
                     )
                     .clip(UnifiedPillShape)
-                    .background(glassBrush)
-                    .border(
-                        BorderStroke(1.dp, glassBorderBrush),
-                        UnifiedPillShape
+                    .then(
+                        if (glassOn) Modifier
+                        else Modifier
+                            .background(glassBrush)
+                            .border(
+                                BorderStroke(1.dp, glassBorderBrush),
+                                UnifiedPillShape
+                            )
                     )
                     .clickable(
                         onClick = {
@@ -1594,6 +1896,7 @@ fun ExpandedMorphingBottomBar(
                     ),
                 contentAlignment = Alignment.Center
             ) {
+                glassSurface()
                 AnimatedContent(
                     targetState = isSearchActive,
                     transitionSpec = {
@@ -1635,14 +1938,22 @@ private fun FloatingNavTabItem(
     val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
     val contentColor = if (selected) activeColor else inactiveColor
 
+    // 液态玻璃模式：选中项底下垫一颗通透的玻璃滴（与滑动模式的选中胶囊同一风格），按下时鼓起
+    val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     Box(
         modifier = Modifier
+            .glassPressBulge(glassOn)
             .clip(RoundedCornerShape(20.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 6.dp),
+            .clickable(
+                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                indication = if (glassOn) null else androidx.compose.foundation.LocalIndication.current,
+                onClick = onClick
+            ),
         contentAlignment = Alignment.Center
     ) {
         Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -1698,7 +2009,9 @@ fun MorphingFloatingBottomBar(
     onSearchClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    if (bottomBarAnimMode == BottomBarAnimMode.CLICK) {
+    // 液态玻璃：两种底栏模式都用「迷你播放条 + 示例 LiquidBottomTabs + 搜索圆钮」，标签栏常驻
+    val kyantGlassBar = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    if (bottomBarAnimMode == BottomBarAnimMode.CLICK && !kyantGlassBar) {
         val effectiveExpanded = isNavExpanded || isSearchActive
         Box(
             modifier = modifier
@@ -1715,11 +2028,8 @@ fun MorphingFloatingBottomBar(
             )
 
             Box(modifier = Modifier.scale(scale)) {
-                Crossfade(
-                    targetState = effectiveExpanded,
-                    animationSpec = tween(durationMillis = 200, easing = animationEasing),
-                    label = "morphing_bar_crossfade"
-                ) { expanded ->
+                val glassBarOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+                val barBody: @Composable (Boolean) -> Unit = { expanded ->
                     if (expanded) {
                         ExpandedMorphingBottomBar(
                             currentScreen = currentScreen,
@@ -1774,6 +2084,37 @@ fun MorphingFloatingBottomBar(
                             onSearchClick = onSearchClick
                         )
                     }
+                }
+                if (glassBarOn) {
+                    // 液态玻璃：两套底栏各自是一块玻璃，交叉淡化时两层玻璃叠在一起会发灰、像压了一层阴影；
+                    // 改为旧的先快速淡出、新的随后展开，任何时刻基本只有一层玻璃
+                    AnimatedContent(
+                        targetState = effectiveExpanded,
+                        transitionSpec = {
+                            (fadeIn(animationSpec = tween(170, delayMillis = 90)) +
+                                scaleIn(
+                                    animationSpec = tween(240, delayMillis = 90, easing = FastOutSlowInEasing),
+                                    initialScale = 0.94f,
+                                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 1f)
+                                )) togetherWith
+                                (fadeOut(animationSpec = tween(90)) +
+                                    scaleOut(
+                                        animationSpec = tween(120),
+                                        targetScale = 0.97f,
+                                        transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 1f)
+                                    )) using androidx.compose.animation.SizeTransform(clip = false) { _, _ ->
+                                    androidx.compose.animation.core.snap()
+                                }
+                        },
+                        contentAlignment = Alignment.BottomCenter,
+                        label = "morphing_bar_glass_switch"
+                    ) { expanded -> barBody(expanded) }
+                } else {
+                    Crossfade(
+                        targetState = effectiveExpanded,
+                        animationSpec = tween(durationMillis = 200, easing = animationEasing),
+                        label = "morphing_bar_crossfade"
+                    ) { expanded -> barBody(expanded) }
                 }
             }
         }
@@ -1870,17 +2211,36 @@ fun ServerSwitchDropdownButton(
     val verticalPad = if (isCompactScreen) 6.dp else 7.dp
     val pillShape = RoundedCornerShape(12.dp)
 
+    // 液态玻璃：首页 / 资料库在玻璃模式下把这个按键固定在上层（有玻璃背景来源）
+    val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    val glassStyle = com.lm.player.core.designsystem.glass.GlassStyleState.barStyle
+        ?: com.lm.player.core.designsystem.glass.barGlassStyle(isDark, blurAlpha, 16f)
+
     Box(modifier = modifier) {
         Box(
             modifier = Modifier
-                .shadow(4.dp, pillShape)
+                // 不画投影：投影在切页、透明度变化、玻璃模式下都会透出灰影，只用描边区分
                 .clip(pillShape)
-                .background(surfaceColor)
-                .border(BorderStroke(1.dp, borderColor), pillShape)
+                .then(
+                    if (glassOn) Modifier
+                    else Modifier
+                        .background(surfaceColor)
+                        .border(BorderStroke(1.dp, borderColor), pillShape)
+                )
                 .clickable { expanded = true }
-                .padding(horizontal = horizontalPad, vertical = verticalPad)
         ) {
+            if (glassOn) {
+                com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                    modifier = Modifier.matchParentSize(),
+                    cornerRadius = 12.dp,
+                    tint = glassStyle.tint,
+                    blurAmount = glassStyle.blurAmount,
+                    dispersion = glassStyle.dispersion,
+                    material = glassStyle.material
+                )
+            }
             Row(
+                modifier = Modifier.padding(horizontal = horizontalPad, vertical = verticalPad),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
@@ -1911,7 +2271,7 @@ fun ServerSwitchDropdownButton(
             }
         }
 
-        DropdownMenu(
+        com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
             modifier = Modifier.widthIn(min = 180.dp, max = 260.dp)
@@ -1996,6 +2356,182 @@ fun ServerSwitchDropdownButton(
                 },
                 modifier = Modifier.padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp))
             )
+        }
+    }
+}
+
+/**
+ * 首页 / 资料库头部的「下载管理」胶囊（三个页面共用）。
+ * - 液态玻璃模式（固定在上层、有玻璃背景来源）：玻璃底，跟随播放栏滑块；
+ * - 普通模式：原半透明底色；投影只在底色足够不透明时画，避免透明度调低后投影透出来成白块。
+ */
+@Composable
+fun HeaderDownloadPill(
+    activeDownloadCount: Int,
+    onClick: () -> Unit,
+    isCompactHeader: Boolean,
+    horizontalPad: androidx.compose.ui.unit.Dp,
+    verticalPad: androidx.compose.ui.unit.Dp,
+    surfaceColor: Color,
+    borderColor: Color,
+    blurAlpha: Float
+) {
+    val dimensions = LocalAppDimensions.current
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val glassOn = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current != null
+    val shape = RoundedCornerShape(20.dp)
+    Box(
+        modifier = Modifier
+            .clip(shape)
+            .then(
+                if (glassOn) Modifier
+                else Modifier
+                    .background(surfaceColor)
+                    .border(BorderStroke(1.dp, borderColor), shape)
+            )
+            .clickable(onClick = onClick)
+    ) {
+        if (glassOn) {
+            val style = com.lm.player.core.designsystem.glass.GlassStyleState.barStyle
+                ?: com.lm.player.core.designsystem.glass.barGlassStyle(isDark, blurAlpha, 16f)
+            com.lm.player.core.designsystem.glass.LiquidGlassLayer(
+                modifier = Modifier.matchParentSize(),
+                cornerRadius = 20.dp,
+                tint = style.tint,
+                blurAmount = style.blurAmount,
+                dispersion = style.dispersion,
+                material = style.material
+            )
+        }
+        Row(
+            modifier = Modifier.padding(horizontal = horizontalPad, vertical = verticalPad),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = if (activeDownloadCount > 0) Icons.Default.FileDownload else Icons.Outlined.FileDownload,
+                contentDescription = "下载管理",
+                tint = if (activeDownloadCount > 0) AppleRed else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(if (isCompactHeader) 16.dp else 18.dp)
+            )
+            if (activeDownloadCount > 0) {
+                Spacer(modifier = Modifier.width(3.dp))
+                Text(
+                    text = if (activeDownloadCount > 99) "99+" else "$activeDownloadCount",
+                    color = AppleRed,
+                    fontSize = dimensions.captionSize,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 搜索栏的「搜索类别 / 在线音源」选择面板：与搜索栏同宽、左右对齐，点搜索栏里的标签后从搜索栏上沿液态涌出（玻璃）。
+ * 精简为两段：类别分段胶囊 + 音源小胶囊（每行 4 个）；选音源后自动收起。
+ */
+@Composable
+private fun SearchSourcePanel(
+    expanded: Boolean,
+    onDismissRequest: () -> Unit,
+    width: Dp,
+    isDark: Boolean,
+    selectedSearchType: SearchContentType,
+    onSearchTypeChange: (SearchContentType) -> Unit,
+    showOnlineSourceSelector: Boolean,
+    selectedOnlineSource: OnlineMusicSource,
+    onOnlineSourceChange: (OnlineMusicSource) -> Unit
+) {
+    if (width <= 0.dp) return
+    val chipBg = if (isDark) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.05f)
+    com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = Modifier.width(width),
+        alignStart = true,
+        scrollable = false,
+        preferAbove = true,
+        emerge = true
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 2.dp)
+        ) {
+            // 搜索类别：分段胶囊
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(chipBg)
+                    .padding(3.dp),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SearchContentType.entries.forEach { type ->
+                    val selected = type == selectedSearchType
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(13.dp))
+                            .background(if (selected) AppleRed else Color.Transparent)
+                            .clickable {
+                                onSearchTypeChange(type)
+                                if (!showOnlineSourceSelector) onDismissRequest()
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = type.displayName,
+                            fontSize = 12.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+            // 在线音源：小胶囊网格
+            if (showOnlineSourceSelector) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OnlineMusicSource.entries.chunked(4).forEach { rowSources ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        rowSources.forEach { source ->
+                            val selected = source == selectedOnlineSource
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(30.dp)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(if (selected) AppleRed.copy(alpha = 0.16f) else chipBg)
+                                    .clickable {
+                                        onOnlineSourceChange(source)
+                                        onDismissRequest()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = source.shortName,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) AppleRed else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                        repeat(4 - rowSources.size) { Spacer(modifier = Modifier.weight(1f)) }
+                    }
+                }
+            }
         }
     }
 }

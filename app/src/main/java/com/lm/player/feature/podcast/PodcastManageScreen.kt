@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.podcast.*
+import kotlinx.coroutines.launch
 
 /**
  * 播客订阅管理页
@@ -141,11 +142,50 @@ fun PodcastManageScreen(
         )
     }
 
+    // 液态玻璃：顶栏放进上层玻璃（与播客首页 / 节目页同一套），列表从玻璃下面穿过，滚动后收成小胶囊
+    val podcastGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+    val podcastTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+    val manageListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val podcastScope = rememberCoroutineScope()
+    val manageCollapsed = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(manageListState) {
+        manageListState.firstVisibleItemIndex to manageListState.firstVisibleItemScrollOffset
+    }
+    val manageBarActions: @Composable RowScope.() -> Unit = {
+                    if (ui.shows.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                isBatchMode = !isBatchMode
+                                if (!isBatchMode) selectedIds = emptySet()
+                            }
+                        ) {
+                            Text(
+                                text = if (isBatchMode) "完成" else "批量管理",
+                                color = if (isBatchMode) AppleRed else MaterialTheme.colorScheme.onBackground,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.5.sp
+                            )
+                        }
+                    }
+                }
+    if (podcastGlass) {
+        com.lm.player.core.designsystem.glass.GlassListHeader(
+            key = "podcast_manage",
+            title = "管理订阅",
+            subtitle = "共 ${ui.shows.size} 个 RSS 订阅源",
+            onBack = actions.onBack,
+            collapsed = manageCollapsed && !isBatchMode,
+            onTapCapsule = { podcastScope.launch { manageListState.animateScrollToItem(0) } },
+            capsuleInfo = "${ui.shows.size} 个订阅",
+            actions = manageBarActions
+        )
+    }
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = if (podcastGlass) ScaffoldDefaults.contentWindowInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom) else ScaffoldDefaults.contentWindowInsets,
         topBar = {
-            TopAppBar(
+            if (!podcastGlass) TopAppBar(
                 title = {
                     Column {
                         Text(
@@ -170,23 +210,7 @@ fun PodcastManageScreen(
                         )
                     }
                 },
-                actions = {
-                    if (ui.shows.isNotEmpty()) {
-                        TextButton(
-                            onClick = {
-                                isBatchMode = !isBatchMode
-                                if (!isBatchMode) selectedIds = emptySet()
-                            }
-                        ) {
-                            Text(
-                                text = if (isBatchMode) "完成" else "批量管理",
-                                color = if (isBatchMode) AppleRed else MaterialTheme.colorScheme.onBackground,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 13.5.sp
-                            )
-                        }
-                    }
-                },
+                actions = manageBarActions,
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
         },
@@ -232,11 +256,12 @@ fun PodcastManageScreen(
         }
     ) { innerPadding ->
         LazyColumn(
+            state = manageListState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
             contentPadding = PaddingValues(
-                top = 8.dp,
+                top = 8.dp + podcastTopInset,
                 bottom = contentPadding.calculateBottomPadding() + 80.dp,
                 start = 16.dp,
                 end = 16.dp

@@ -13,6 +13,8 @@ import com.lm.player.core.model.UnifiedSong
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -894,9 +896,17 @@ object LyricsManager {
         return memoryCache[songId]
     }
 
+    /**
+     * 歌词失效计数：每次 [invalidateLyrics] +1。
+     * 播放页的歌词加载以它为 key 之一，后台写回歌词（如播放时自动补全）后正在播放的歌词也能立即重载。
+     */
+    private val _invalidationTick = kotlinx.coroutines.flow.MutableStateFlow(0)
+    val invalidationTick: kotlinx.coroutines.flow.StateFlow<Int> = _invalidationTick
+
     /** 清除指定歌曲的歌词内存缓存：在线修标签写回歌词后，歌曲 id 不变但文件内容已变（PR #5） */
     fun invalidateLyrics(songId: String) {
         memoryCache.remove(songId)
+        _invalidationTick.value++
     }
 
     suspend fun loadLyrics(
@@ -960,8 +970,23 @@ object LyricsManager {
             } catch (_: Exception) {}
         }
 
+        // 1.5 服务器曲库歌曲（与 TV 一致）：加速表里缓存的歌词直接用；
+        //     没有时服务器和平台一起取、谁先拿到有效歌词用谁的；弱网时直接优先用平台歌词；
+        //     服务器的歌词晚到也写进加速表，下次用（只存在加速表，不改资料库）
+        var serverLyricTried = false
+        if (isServerLibrarySong(song)) {
+            val accel = runCatching {
+                accelServerSongLyric(song, client, resolveServerConfig(context, song, serverConfig))
+            }.getOrNull()
+            if (accel != null) {
+                if (!accel.text.isNullOrBlank()) return@withContext accel.text
+                serverLyricTried = accel.serverTried
+            }
+        }
+
         // 2. 柠檬音乐服务端 API (优先读取资料库服务器音频内嵌歌词 /api/tag/read + HTTP Range，再回退 /api/play/lyric)
-        try {
+        // 上面服务器曲库加速已经问过服务器的，不再重复等一次
+        if (!serverLyricTried) try {
             val effectiveServer = serverConfig ?: run {
                 try {
                     val db = ZdsDatabase.getInstance(context)
@@ -1179,6 +1204,134 @@ object LyricsManager {
 
         // 7. 若未匹配到在线歌词，生成曲目信息展示卡
         generateFallbackLyrics(song).toLrcString()
+    }
+
+    // ---------------- 服务器曲库歌曲歌词加速（与 TV 一致，2026-11-14 移植） ----------------
+
+    private val accelScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
+
+    /** 本进程内已经在后台向服务器补取过歌词的歌（平台歌词 → 服务器歌词替换，每首只试一次） */
+    private val serverRefreshTried = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    private class AccelLyric(val text: String?, val serverTried: Boolean)
+
+    private const val LYRIC_SOURCE_SERVER = "server"
+    private const val LYRIC_SOURCE_PLATFORM = "platform"
+
+    /** 服务器曲库歌曲：不是在线曲目、不是本地扫描的歌，并且带服务器文件路径 */
+    private fun isServerLibrarySong(song: UnifiedSong): Boolean {
+        if (com.lm.player.core.source.PlaybackAccelerator.isOnlineSong(song)) return false
+        if (song.serverId.isBlank() || song.serverId in setOf("local_storage", "local_folder", "local_saf")) return false
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(song)) return false
+        return com.lm.player.core.source.ServerTrackAccelStore.fileKeyOf(song).isNotBlank()
+    }
+
+    private suspend fun resolveServerConfig(context: Context, song: UnifiedSong, serverConfig: ServerConfig?): ServerConfig? =
+        serverConfig ?: runCatching {
+            val db = ZdsDatabase.getInstance(context)
+            db.serverDao().getAllServers().firstOrNull { it.id == song.serverId || it.isCurrentActive }?.let {
+                ServerConfig(
+                    id = it.id,
+                    name = it.name,
+                    type = it.type,
+                    serverUrl = it.serverUrl,
+                    username = it.username,
+                    tokenOrApiKey = it.tokenOrApiKey,
+                    saltOrSecret = it.saltOrSecret,
+                    syncMode = it.syncMode,
+                    isCurrentActive = it.isCurrentActive
+                )
+            }
+        }.getOrNull()
+
+    /** 有效歌词：至少解析出一行（服务器 / 平台偶尔返回空串、"null" 或纯文本说明） */
+    private fun isValidLyric(text: String?): Boolean {
+        if (text.isNullOrBlank() || text.equals("null", ignoreCase = true)) return false
+        return runCatching { LrcParser.parse(text).lines.isNotEmpty() }.getOrDefault(false)
+    }
+
+    private suspend fun accelServerSongLyric(song: UnifiedSong, client: OkHttpClient, server: ServerConfig?): AccelLyric {
+        val store = com.lm.player.core.source.ServerTrackAccelStore
+        val serverId = server?.id ?: song.serverId
+        val serverUsable = server != null && server.serverUrl.isNotBlank() &&
+            server.type == ServerType.LEMON_MUSIC && !com.lm.player.core.source.ServerLinkState.isLost
+        val weak = com.lm.player.core.source.SourceAccelerationController.isServerWeak()
+
+        suspend fun fromServer(): String? = runCatching {
+            val protocol = LemonMusicProtocol(client, server!!.serverUrl, server.username, server.tokenOrApiKey)
+            protocol.ensureAuthenticated()
+            protocol.getRawLyricsForSong(song).getOrNull()
+                ?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                ?.let { SmartCharsetDecoder.repairMojibakeIfNeeded(it).trim() }
+        }.getOrNull()?.takeIf { isValidLyric(it) }
+
+        suspend fun fromPlatform(): String? {
+            if (!com.lm.player.core.source.SourceAccelerationController.localSourceConfigured()) return null
+            val match = store.matchFor(song) ?: run {
+                val platforms = com.lm.player.core.source.ServerLibraryAccelerationResolver.platformOrder(serverId, requireResolvable = false)
+                if (platforms.isEmpty()) return null
+                com.lm.player.core.source.CrossPlatformMatcher.findFirst(song, platforms, System.currentTimeMillis() + 3_000L)
+                    ?.also { m -> accelScope.launch { store.recordMatch(serverId, song, m) } }
+            } ?: return null
+            val text = kotlinx.coroutines.withTimeoutOrNull(6_000L) {
+                runCatching { com.lm.player.core.source.catalog.LocalCatalog.lyricForSong(match) }.getOrNull()
+            }
+            return text?.let { SmartCharsetDecoder.repairMojibakeIfNeeded(it).trim() }?.takeIf { isValidLyric(it) }
+        }
+
+        // 1) 加速表里缓存的歌词：立即用。缓存的是平台歌词、服务器又正常时，后台向服务器补取一次，拿到就替换（下次用）
+        store.lyricFor(song)?.let { (text, source) ->
+            if (isValidLyric(text)) {
+                if (source != LYRIC_SOURCE_SERVER && serverUsable && !weak && serverRefreshTried.add(song.id)) {
+                    accelScope.launch {
+                        fromServer()?.let { store.saveLyric(serverId, song, it, LYRIC_SOURCE_SERVER) }
+                    }
+                }
+                Log.d(TAG, "lyric from accel table ($source): ${song.title}")
+                return AccelLyric(text, serverTried = false)
+            }
+        }
+
+        // 2) 服务器和平台一起取
+        val serverJob = if (serverUsable) accelScope.async { fromServer() } else null
+        val platformJob = accelScope.async { fromPlatform() }
+
+        if (weak || serverJob == null) {
+            // 弱网 / 服务器不可用：直接优先用平台歌词；服务器的晚到了也存下来
+            val p = kotlinx.coroutines.withTimeoutOrNull(9_000L) { platformJob.await() }
+            if (p != null) {
+                store.saveLyric(serverId, song, p, LYRIC_SOURCE_PLATFORM)
+                serverJob?.let { job ->
+                    accelScope.launch { job.await()?.let { store.saveLyric(serverId, song, it, LYRIC_SOURCE_SERVER) } }
+                }
+                return AccelLyric(p, serverTried = serverJob != null)
+            }
+            val s = serverJob?.let { job -> kotlinx.coroutines.withTimeoutOrNull(10_000L) { job.await() } }
+            if (s != null) store.saveLyric(serverId, song, s, LYRIC_SOURCE_SERVER)
+            return AccelLyric(s, serverTried = serverJob != null)
+        }
+
+        // 网络正常：谁先拿到有效歌词用谁的；平台先到、服务器之后也拿到时，服务器的写进表里（下次用）
+        val winner = kotlinx.coroutines.CompletableDeferred<Pair<String, String>?>()
+        val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+        accelScope.launch {
+            val s = runCatching { serverJob.await() }.getOrNull()
+            if (s != null) {
+                if (!winner.complete(s to LYRIC_SOURCE_SERVER)) store.saveLyric(serverId, song, s, LYRIC_SOURCE_SERVER)
+            }
+            if (remaining.decrementAndGet() == 0) winner.complete(null)
+        }
+        accelScope.launch {
+            val p = runCatching { platformJob.await() }.getOrNull()
+            if (p != null) winner.complete(p to LYRIC_SOURCE_PLATFORM)
+            if (remaining.decrementAndGet() == 0) winner.complete(null)
+        }
+        val won = kotlinx.coroutines.withTimeoutOrNull(12_000L) { winner.await() }
+        if (won != null) {
+            store.saveLyric(serverId, song, won.first, won.second)
+            Log.d(TAG, "lyric race won by ${won.second}: ${song.title}")
+        }
+        return AccelLyric(won?.first, serverTried = true)
     }
 
     private suspend fun fetchLyricsInternal(

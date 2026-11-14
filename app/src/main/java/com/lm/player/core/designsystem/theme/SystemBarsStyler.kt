@@ -32,6 +32,34 @@ object SystemBarsStyler {
     private var baseStyle: Style? = null
     private val overrides = ArrayList<Pair<Any, Style>>()
 
+    /**
+     * 需要「内容画到状态栏下面」的页面（液态玻璃列表顶栏）：有登记时状态栏透明、内容延伸到状态栏下，
+     * 玻璃顶栏从屏幕最顶端开始，状态栏图标直接浮在玻璃上（不再是一条纯色状态栏把玻璃隔开）。
+     * 只用旧版 SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN：只放开状态栏区域，导航栏与软键盘 adjustResize 行为不变。
+     */
+    private val drawBehindRequests = LinkedHashSet<Any>()
+
+    internal fun requestDrawBehindStatusBar(key: Any, window: Window, view: View) {
+        if (drawBehindRequests.add(key) && drawBehindRequests.size == 1) applyDrawBehind(window, view, true)
+    }
+
+    internal fun releaseDrawBehindStatusBar(key: Any, window: Window, view: View) {
+        // 全局沉浸：状态栏始终透明、内容始终延伸到状态栏下，页面撤销登记时不再恢复成纯色状态栏
+        drawBehindRequests.remove(key)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyDrawBehind(window: Window, view: View, enabled: Boolean) {
+        val decor = window.decorView
+        val flags = decor.systemUiVisibility
+        decor.systemUiVisibility = if (enabled) {
+            flags or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+        } else {
+            flags and View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN.inv()
+        }
+        render(window, view)
+    }
+
     /** 应用底色，与 Theme.kt 中配色方案的 background 保持一致 */
     fun backgroundFor(dark: Boolean): Color = if (dark) AppleDarkBg else AppleLightBg
 
@@ -52,7 +80,8 @@ object SystemBarsStyler {
         val bg = backgroundFor(dark).toArgb()
         baseStyle = Style(bg, bg)
         window.setBackgroundDrawable(ColorDrawable(bg))
-        render(window, view)
+        // 全局沉浸：所有页面（横竖屏、播放页）都直接画到状态栏下面，不再用一条纯色状态栏去「配色」，避免断层
+        applyDrawBehind(window, view, true)
     }
 
     internal fun push(key: Any, statusBar: Color, navigationBar: Color, window: Window, view: View) {
@@ -69,7 +98,9 @@ object SystemBarsStyler {
         val style = overrides.lastOrNull()?.second ?: baseStyle ?: return
         val controller = WindowCompat.getInsetsController(window, view)
 
-        window.statusBarColor = style.statusBar
+        // 内容画到状态栏下面时状态栏透明（图标深浅仍按当前页面底色决定）
+        // 状态栏始终透明（全局沉浸），只用页面底色决定图标深浅
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
         // isAppearanceLightStatusBars = true 表示「浅色底、深色图标」
         controller.isAppearanceLightStatusBars = Color(style.statusBar).luminance() > 0.5f
 
@@ -98,6 +129,47 @@ fun SystemBarsColor(statusBar: Color, navigationBar: Color = statusBar) {
         if (window != null) SystemBarsStyler.push(key, statusBar, navigationBar, window, view)
         onDispose {
             if (window != null) SystemBarsStyler.pop(key, window, view)
+        }
+    }
+}
+
+/**
+ * 当前页面在组合中期间让内容延伸到状态栏下面（状态栏透明），离开后恢复。
+ * 用于液态玻璃列表顶栏：玻璃从屏幕最顶端开始，和系统状态栏连成一片。页面自己负责 statusBarsPadding。
+ */
+@Composable
+fun DrawBehindStatusBar(enabled: Boolean = true) {
+    val view = LocalView.current
+    if (view.isInEditMode) return
+    val key = remember { Any() }
+    DisposableEffect(enabled) {
+        val window = (view.context as? Activity)?.window
+        if (enabled && window != null) SystemBarsStyler.requestDrawBehindStatusBar(key, window, view)
+        onDispose {
+            if (window != null) SystemBarsStyler.releaseDrawBehindStatusBar(key, window, view)
+        }
+    }
+}
+
+/**
+ * 沉浸式：当前页面在组合中期间隐藏系统状态栏与导航栏（从屏幕边缘滑动可临时呼出），离开后恢复。
+ * 用于横屏播放页，画面不再被一条纯色状态栏割开，封面区域也更大。
+ */
+@Composable
+fun ImmersiveSystemBars(enabled: Boolean = true) {
+    val view = LocalView.current
+    if (view.isInEditMode) return
+    DisposableEffect(enabled) {
+        val window = (view.context as? Activity)?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+        if (enabled && controller != null) {
+            controller.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose {
+            if (enabled && controller != null) {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 }

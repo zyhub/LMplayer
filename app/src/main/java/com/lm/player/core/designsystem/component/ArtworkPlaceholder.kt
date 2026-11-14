@@ -46,7 +46,7 @@ fun getGradientForId(id: String): List<Color> {
     return AppleGradients[index]
 }
 
-private fun normalizeMusicCoverUrl(raw: String?): String? {
+internal fun normalizeMusicCoverUrl(raw: String?): String? {
     if (raw.isNullOrBlank()) return null
     var url = raw.trim()
     if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
@@ -98,15 +98,18 @@ private fun buildMusicImageRequest(
     context: android.content.Context,
     rawUrl: String?,
     width: Int,
-    height: Int = width
+    height: Int = width,
+    /** 非 0：失败后的重试，绕过缓存直接向服务器重新取 */
+    retryNonce: Long = 0L
 ): ImageRequest? {
     val cleanUrl = normalizeMusicCoverUrl(rawUrl) ?: return null
+    val retrying = retryNonce != 0L
     val builder = ImageRequest.Builder(context)
         .data(cleanUrl)
         .size(width, height)
         .crossfade(false)
-        .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
-        .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+        .memoryCachePolicy(if (retrying) coil.request.CachePolicy.WRITE_ONLY else coil.request.CachePolicy.ENABLED)
+        .diskCachePolicy(if (retrying) coil.request.CachePolicy.WRITE_ONLY else coil.request.CachePolicy.ENABLED)
         .networkCachePolicy(coil.request.CachePolicy.ENABLED)
 
     if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
@@ -132,11 +135,20 @@ fun AlbumArtworkImage(
     targetSize: Int = 160 // 默认按列表高保真 160px 解码，大幅减少 75% 显存
 ) {
     val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
-    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
+    // 柠檬服务器封面（/api/tag/cover 需要登录）加载失败时自动重试：启动时会话还没就绪 / 会话刚过期会 401，
+    // 以前失败后不再重试，新封面（没进过缓存）就一直空着
+    var retryNonce by remember(cleanModel) { mutableStateOf(0L) }
+    var retryCount by remember(cleanModel) { mutableStateOf(0) }
     val gradientColors = remember(seedId, cleanModel) {
         getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "seed"))
     }
     val context = LocalContext.current
+    if (retryCount > 0 && retryNonce == 0L) {
+        androidx.compose.runtime.LaunchedEffect(cleanModel, retryCount) {
+            kotlinx.coroutines.delay(1500L * retryCount)
+            retryNonce = System.currentTimeMillis()
+        }
+    }
 
     Box(
         modifier = modifier
@@ -147,12 +159,18 @@ fun AlbumArtworkImage(
     ) {
         if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
-                model = remember(cleanModel, targetSize) {
-                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
+                model = remember(cleanModel, targetSize, retryNonce) {
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize, retryNonce)
                 },
                 contentDescription = null,
                 contentScale = contentScale,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize(),
+                onError = {
+                    if (cleanModel.contains("/api/tag/cover") && retryCount < 2) {
+                        retryCount += 1
+                        retryNonce = 0L
+                    }
+                }
             )
         } else {
             DefaultMusicPlaceholder(colors = gradientColors)

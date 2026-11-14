@@ -33,6 +33,7 @@ import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.PullToRefreshLayout
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.podcast.*
+import kotlinx.coroutines.launch
 
 /**
  * 播客主页
@@ -51,40 +52,15 @@ fun PodcastHomeScreen(
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     var showMoreMenu by remember { mutableStateOf(false) }
 
-    Scaffold(
-        modifier = modifier.fillMaxSize(),
-        containerColor = MaterialTheme.colorScheme.background,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "播客",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 20.sp,
-                            color = MaterialTheme.colorScheme.onBackground
-                        )
-                        if (ui.refreshProgressText.isNotBlank()) {
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = ui.refreshProgressText,
-                                fontSize = 11.5.sp,
-                                color = AppleRed,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = actions.onBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                            tint = MaterialTheme.colorScheme.onBackground
-                        )
-                    }
-                },
-                actions = {
+    // 液态玻璃：顶栏放进上层玻璃（与资料库列表页同一套），列表铺满到屏幕顶部、从玻璃下面穿过，滚动后收成小胶囊
+    val podcastGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+    val podcastTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+    val homeListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val podcastScope = rememberCoroutineScope()
+    val homeCollapsed = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(homeListState) {
+        homeListState.firstVisibleItemIndex to homeListState.firstVisibleItemScrollOffset
+    }
+    val homeBarActions: @Composable RowScope.() -> Unit = {
                     // 搜索按钮
                     IconButton(onClick = actions.onOpenSearch) {
                         Icon(
@@ -134,7 +110,7 @@ fun PodcastHomeScreen(
                             )
                         }
 
-                        DropdownMenu(
+                        com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
                             expanded = showMoreMenu,
                             onDismissRequest = { showMoreMenu = false }
                         ) {
@@ -156,7 +132,60 @@ fun PodcastHomeScreen(
                             )
                         }
                     }
+                }
+    if (podcastGlass) {
+        com.lm.player.core.designsystem.glass.GlassListHeader(
+            key = "podcast_home",
+            title = "播客",
+            subtitle = when {
+                ui.refreshProgressText.isNotBlank() -> ui.refreshProgressText
+                ui.shows.isNotEmpty() -> "我的订阅 · ${ui.shows.size} 个节目"
+                else -> "订阅并收听你喜欢的节目"
+            },
+            onBack = actions.onBack,
+            collapsed = homeCollapsed && ui.state == PodcastLoadState.READY,
+            onTapCapsule = { podcastScope.launch { homeListState.animateScrollToItem(0) } },
+            capsuleInfo = if (ui.shows.isNotEmpty()) "${ui.shows.size} 个订阅" else "",
+            actions = homeBarActions
+        )
+    }
+
+    Scaffold(
+        modifier = modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+        // 液态玻璃：顶栏在上层玻璃里，内容从屏幕最顶端开始（顶部不再让出状态栏）
+        contentWindowInsets = if (podcastGlass) ScaffoldDefaults.contentWindowInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom) else ScaffoldDefaults.contentWindowInsets,
+        topBar = {
+            if (!podcastGlass) TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "播客",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 20.sp,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        if (ui.refreshProgressText.isNotBlank()) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = ui.refreshProgressText,
+                                fontSize = 11.5.sp,
+                                color = AppleRed,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
                 },
+                navigationIcon = {
+                    IconButton(onClick = actions.onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
+                },
+                actions = homeBarActions,
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background
                 )
@@ -166,19 +195,20 @@ fun PodcastHomeScreen(
         PullToRefreshLayout(
             isRefreshing = ui.isRefreshing,
             onRefresh = actions.onRefresh,
+            indicatorTopPadding = podcastTopInset,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
             when (ui.state) {
                 PodcastLoadState.LOADING -> {
-                    PodcastLoadingSkeleton(modifier = Modifier.fillMaxSize())
+                    PodcastLoadingSkeleton(modifier = Modifier.fillMaxSize().padding(top = podcastTopInset))
                 }
                 PodcastLoadState.EMPTY -> {
                     PodcastHomeEmptyView(
                         onOpenSearch = actions.onOpenSearch,
                         onOpenManage = actions.onOpenManage,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize().padding(top = podcastTopInset)
                     )
                 }
                 PodcastLoadState.NO_SERVER -> {
@@ -190,7 +220,7 @@ fun PodcastHomeScreen(
                         onPrimaryClick = actions.onGoToServerSettings,
                         secondaryButtonText = "重试",
                         onSecondaryClick = actions.onRetry,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize().padding(top = podcastTopInset)
                     )
                 }
                 PodcastLoadState.UNSUPPORTED -> {
@@ -200,7 +230,7 @@ fun PodcastHomeScreen(
                         message = ui.message.ifBlank { "当前连接的柠檬音乐服务器尚未支持播客接口 (/api/podcasts)，请升级服务器端。" },
                         primaryButtonText = "重试",
                         onPrimaryClick = actions.onRetry,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize().padding(top = podcastTopInset)
                     )
                 }
                 PodcastLoadState.ERROR -> {
@@ -210,7 +240,7 @@ fun PodcastHomeScreen(
                         message = ui.message.ifBlank { "网络开小差了，无法加载播客内容" },
                         primaryButtonText = "重试",
                         onPrimaryClick = actions.onRetry,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize().padding(top = podcastTopInset)
                     )
                 }
                 PodcastLoadState.READY -> {
@@ -218,13 +248,17 @@ fun PodcastHomeScreen(
                         PodcastHomeLandscapeContent(
                             ui = ui,
                             actions = actions,
-                            contentPadding = contentPadding
+                            contentPadding = contentPadding,
+                            listState = homeListState,
+                            topInset = podcastTopInset
                         )
                     } else {
                         PodcastHomePortraitContent(
                             ui = ui,
                             actions = actions,
-                            contentPadding = contentPadding
+                            contentPadding = contentPadding,
+                            listState = homeListState,
+                            topInset = podcastTopInset
                         )
                     }
                 }
@@ -240,12 +274,15 @@ fun PodcastHomeScreen(
 private fun PodcastHomePortraitContent(
     ui: PodcastHomeUi,
     actions: PodcastActions,
-    contentPadding: PaddingValues
+    contentPadding: PaddingValues,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    topInset: androidx.compose.ui.unit.Dp
 ) {
     LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
-            top = 8.dp,
+            top = 8.dp + topInset,
             bottom = contentPadding.calculateBottomPadding() + 80.dp,
             start = 16.dp,
             end = 16.dp
@@ -310,7 +347,9 @@ private fun PodcastHomePortraitContent(
 private fun PodcastHomeLandscapeContent(
     ui: PodcastHomeUi,
     actions: PodcastActions,
-    contentPadding: PaddingValues
+    contentPadding: PaddingValues,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    topInset: androidx.compose.ui.unit.Dp
 ) {
     Row(
         modifier = Modifier
@@ -323,7 +362,7 @@ private fun PodcastHomeLandscapeContent(
             modifier = Modifier
                 .weight(0.38f)
                 .fillMaxHeight(),
-            contentPadding = PaddingValues(top = 8.dp, bottom = contentPadding.calculateBottomPadding() + 40.dp),
+            contentPadding = PaddingValues(top = 8.dp + topInset, bottom = contentPadding.calculateBottomPadding() + 40.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             if (ui.continueListening.isNotEmpty()) {
@@ -354,10 +393,11 @@ private fun PodcastHomeLandscapeContent(
 
         // 右栏：最新单集纵向滚动列表 (占 62% 宽)
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .weight(0.62f)
                 .fillMaxHeight(),
-            contentPadding = PaddingValues(top = 8.dp, bottom = contentPadding.calculateBottomPadding() + 40.dp),
+            contentPadding = PaddingValues(top = 8.dp + topInset, bottom = contentPadding.calculateBottomPadding() + 40.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             item {
@@ -448,7 +488,7 @@ private fun ContinueListeningSection(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Spacer(modifier = Modifier.height(6.dp))
-                            LinearProgressIndicator(
+                            com.lm.player.core.designsystem.component.ClassicLinearProgress(
                                 progress = { episode.progress },
                                 modifier = Modifier
                                     .fillMaxWidth()

@@ -8,13 +8,19 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import com.lm.player.core.designsystem.glass.LiquidBottomTab
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -65,6 +71,8 @@ fun DownloadManagerScreen(
     onDeleteDownloadedSongs: (List<UnifiedSong>) -> Unit = {},
     onReEmbedSong: (UnifiedSong) -> Unit = {},
     onReEmbedAll: () -> Unit = {},
+    /** 多选「补全标签」：通过服务端标签匹配为所选本机文件补封面 / 歌词 / 缺失的歌手专辑 */
+    onFillTagsFromServer: (List<UnifiedSong>) -> Unit = {},
     downloadPath: String = "",
     onBack: () -> Unit,
     contentPadding: PaddingValues = PaddingValues(0.dp)
@@ -87,6 +95,20 @@ fun DownloadManagerScreen(
 
     var isMultiSelectActiveMode by remember { mutableStateOf(false) }
     val selectedActiveTaskIds = remember { mutableStateListOf<String>() }
+    // 服务器下载：多选删除
+    var isMultiSelectServerMode by remember { mutableStateOf(false) }
+    val selectedServerTaskIds = remember { mutableStateListOf<String>() }
+    var showServerBatchDeleteDialog by remember { mutableStateOf(false) }
+
+    // 搜索（只过滤当前分段的列表，不走网络）与三个分段各自的滚动位置
+    var dmSearchOpen by remember { mutableStateOf(false) }
+    // 「离线下载待同步」提示：用户关掉后不再显示（推送入口移到 ⋯ 菜单）
+    val dmPrefs = remember { context.getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE) }
+    var pushBannerHidden by remember { mutableStateOf(dmPrefs.getBoolean("dm_push_banner_hidden", false)) }
+    var dmQuery by remember { mutableStateOf("") }
+    val activeListState = rememberLazyListState()
+    val serverListState = rememberLazyListState()
+    val completedListState = rememberLazyListState()
 
     // 服务器下载任务列表与状态
     var serverDownloads by remember { mutableStateOf<List<LemonServerDownloadTaskRecord>>(emptyList()) }
@@ -132,6 +154,24 @@ fun DownloadManagerScreen(
         }
     }
 
+    /** 批量删除服务器下载任务（服务端没有批量接口，逐个删，完成后统一刷新一次） */
+    fun deleteServerTasks(taskIds: List<String>) {
+        if (taskIds.isEmpty()) return
+        scope.launch {
+            var ok = 0
+            var failed = 0
+            for (id in taskIds) {
+                if (LemonMusicProtocol.deleteServerDownloadTask(id, context).isSuccess) ok++ else failed++
+            }
+            Toast.makeText(
+                context,
+                if (failed == 0) "已删除 $ok 个服务器下载任务" else "已删除 $ok 个，$failed 个删除失败",
+                Toast.LENGTH_SHORT
+            ).show()
+            refreshServerDownloads()
+        }
+    }
+
     fun clearCompletedServerTasks() {
         scope.launch {
             LemonMusicProtocol.clearCompletedServerDownloads(context)
@@ -166,6 +206,10 @@ fun DownloadManagerScreen(
     // 安卓系统返回键逐层回退：先退出多选状态，否则返回上一级页面
     BackHandler {
         when {
+            dmSearchOpen -> {
+                dmSearchOpen = false
+                dmQuery = ""
+            }
             isMultiSelectMode -> {
                 isMultiSelectMode = false
                 selectedSongIds.clear()
@@ -173,6 +217,10 @@ fun DownloadManagerScreen(
             isMultiSelectActiveMode -> {
                 isMultiSelectActiveMode = false
                 selectedActiveTaskIds.clear()
+            }
+            isMultiSelectServerMode -> {
+                isMultiSelectServerMode = false
+                selectedServerTaskIds.clear()
             }
             else -> onBack()
         }
@@ -220,332 +268,346 @@ fun DownloadManagerScreen(
         }
     }
 
+    // 底栏高度：列表底部留白用它，而不是把整页往上缩（缩了以后底栏下面只剩背景色，像一条白条挡住列表）
+    val bottomInset = contentPadding.calculateBottomPadding()
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(contentPadding)
+        modifier = Modifier.fillMaxSize()
     ) {
+        // 搜索过滤（歌名 / 歌手 / 专辑）
+        val dmQ = dmQuery.trim()
+        val shownActiveTasks = if (dmQ.isEmpty()) activeTasks else activeTasks.filter { it.song.dmMatches(dmQ) }
+        val shownCompletedSongs = if (dmQ.isEmpty()) completedSongs else completedSongs.filter { it.dmMatches(dmQ) }
+        val shownServerDownloads = if (dmQ.isEmpty()) serverDownloads else serverDownloads.filter {
+            it.name.contains(dmQ, ignoreCase = true) || it.singer.contains(dmQ, ignoreCase = true) || it.album.contains(dmQ, ignoreCase = true)
+        }
+        // ===== 精简后的下载管理：一行标题栏（返回 / 标题 / 搜索 / 更多）+ 三段切换（+ 搜索框）；
+        // 液态玻璃时整块放进上层玻璃顶栏，列表从下面穿过，滚动后收成小胶囊 =====
+        val dmGlass = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
+        val dmTopInset = com.lm.player.core.designsystem.glass.rememberGlassListTopInset()
+        val dmListTop = if (dmGlass) dmTopInset + 8.dp else 8.dp
+        val currentListState = when (selectedTab) {
+            0 -> activeListState
+            1 -> serverListState
+            else -> completedListState
+        }
+        val isAnyMultiSelect = when (selectedTab) {
+            0 -> isMultiSelectActiveMode
+            1 -> isMultiSelectServerMode
+            else -> isMultiSelectMode
+        }
+        val currentSelectIds = when (selectedTab) {
+            0 -> selectedActiveTaskIds
+            1 -> selectedServerTaskIds
+            else -> selectedSongIds
+        }
+        val currentSelectCount = currentSelectIds.size
+        val dmScrolledDown = com.lm.player.core.designsystem.glass.rememberTopBarCollapsed(selectedTab) {
+            currentListState.firstVisibleItemIndex to currentListState.firstVisibleItemScrollOffset
+        }
+        val downloadingCount = activeTasks.count { it.status == DownloadStatus.DOWNLOADING }
+        val pausedCount = activeTasks.count { it.status == DownloadStatus.PAUSED }
+        val dmSubtitle = buildList {
+            if (activeTasks.isNotEmpty()) add(if (downloadingCount > 0) "$downloadingCount 首下载中" else "${activeTasks.size} 个任务已暂停")
+            add("已下载 ${completedSongs.size} 首")
+            if (totalSizeBytes > 0L) add(formatStorageSize(totalSizeBytes))
+        }.joinToString(" · ")
+        var dmMenuOpen by remember { mutableStateOf(false) }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .then(if (dmGlass) Modifier else Modifier.statusBarsPadding())
                 .padding(horizontal = 16.dp)
         ) {
-            // 1. 顶部 Header 与操作工具栏
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(top = 16.dp, bottom = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBackIosNew, contentDescription = "返回", tint = AppleRed)
-                    }
-                    val isAnyMultiSelect = if (selectedTab == 0) isMultiSelectActiveMode else isMultiSelectMode
-                    val currentSelectCount = if (selectedTab == 0) selectedActiveTaskIds.size else selectedSongIds.size
-                    Text(
-                        text = if (isAnyMultiSelect) "批量管理 (${currentSelectCount})" else "下载管理",
-                        style = TextStyle(
-                            fontSize = dimensions.pageTitleSize,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onBackground
-                        )
-                    )
-                }
-
-                // 正在下载 Tab 批量管理操作
-                if (selectedTab == 0 && activeTasks.isNotEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (isMultiSelectActiveMode) {
-                            TextButton(
-                                onClick = {
-                                    if (selectedActiveTaskIds.size == activeTasks.size) {
-                                        selectedActiveTaskIds.clear()
-                                    } else {
-                                        selectedActiveTaskIds.clear()
-                                        selectedActiveTaskIds.addAll(activeTasks.map { it.song.id })
-                                    }
-                                }
-                            ) {
-                                Text(
-                                    text = if (selectedActiveTaskIds.size == activeTasks.size) "取消全选" else "全选",
-                                    color = AppleRed,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-
-                            Button(
-                                onClick = {
-                                    isMultiSelectActiveMode = false
-                                    selectedActiveTaskIds.clear()
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Text("完成", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-                        } else {
-                            OutlinedButton(
-                                onClick = {
-                                    isMultiSelectActiveMode = true
-                                    selectedActiveTaskIds.clear()
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, borderColor),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("批量管理", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
-                            }
+            com.lm.player.core.designsystem.glass.GlassListHeader(
+                key = "download_manager",
+                title = if (isAnyMultiSelect) "已选 $currentSelectCount 项" else "下载管理",
+                subtitle = dmSubtitle,
+                onBack = {
+                    when {
+                        isMultiSelectMode -> {
+                            isMultiSelectMode = false
+                            selectedSongIds.clear()
                         }
-                    }
-                }
-
-                // 服务器下载 Tab 顶部操作 (清空已完成 & 刷新)
-                if (selectedTab == 1) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        if (serverDownloads.any { it.status == "completed" }) {
-                            TextButton(
-                                onClick = { clearCompletedServerTasks() },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text("清空已完成", color = AppleRed, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                            }
+                        isMultiSelectActiveMode -> {
+                            isMultiSelectActiveMode = false
+                            selectedActiveTaskIds.clear()
                         }
-                        IconButton(
-                            onClick = { refreshServerDownloads() },
-                            modifier = Modifier.size(32.dp)
+                        isMultiSelectServerMode -> {
+                            isMultiSelectServerMode = false
+                            selectedServerTaskIds.clear()
+                        }
+                        else -> onBack()
+                    }
+                },
+                collapsed = dmScrolledDown && !dmSearchOpen && !isAnyMultiSelect,
+                onTapCapsule = { scope.launch { currentListState.animateScrollToItem(0) } },
+                capsuleInfo = when (selectedTab) {
+                    0 -> "下载中 ${activeTasks.size}"
+                    1 -> "服务器 ${serverDownloads.size}"
+                    else -> "已完成 ${completedSongs.size}"
+                },
+                titleSize = dimensions.sectionTitleSize,
+                subtitleSize = dimensions.captionSize,
+                rowVerticalPadding = 6.dp,
+                actions = {
+                    if (isAnyMultiSelect) {
+                        val selectable = when (selectedTab) {
+                            0 -> shownActiveTasks.map { it.song.id }
+                            1 -> shownServerDownloads.map { it.id }
+                            else -> shownCompletedSongs.map { it.id }
+                        }
+                        val allSelected = selectable.isNotEmpty() && currentSelectIds.containsAll(selectable)
+                        TextButton(
+                            onClick = {
+                                val target = currentSelectIds
+                                target.clear()
+                                if (!allSelected) target.addAll(selectable)
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                         ) {
-                            Icon(Icons.Default.Refresh, contentDescription = "刷新", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+                            Text(if (allSelected) "取消全选" else "全选", color = AppleRed, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         }
-                    }
-                }
-
-                // 仅在已完成 Tab 展示批量管理操作
-                if (selectedTab == 2 && completedSongs.isNotEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (isMultiSelectMode) {
-                            TextButton(
-                                onClick = {
-                                    if (selectedSongIds.size == completedSongs.size) {
-                                        selectedSongIds.clear()
-                                    } else {
-                                        selectedSongIds.clear()
-                                        selectedSongIds.addAll(completedSongs.map { it.id })
+                        Button(
+                            onClick = {
+                                isMultiSelectMode = false
+                                selectedSongIds.clear()
+                                isMultiSelectActiveMode = false
+                                selectedActiveTaskIds.clear()
+                                isMultiSelectServerMode = false
+                                selectedServerTaskIds.clear()
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("完成", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        DmIconButton(Icons.Default.Search, "搜索") {
+                            dmSearchOpen = !dmSearchOpen
+                            if (!dmSearchOpen) dmQuery = ""
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Box {
+                            DmIconButton(Icons.Default.MoreHoriz, "更多") { dmMenuOpen = true }
+                            com.lm.player.core.designsystem.glass.AdaptiveDropdownMenu(
+                                expanded = dmMenuOpen,
+                                onDismissRequest = { dmMenuOpen = false }
+                            ) {
+                                when (selectedTab) {
+                                    0 -> {
+                                        if (activeTasks.isNotEmpty()) DropdownMenuItem(
+                                            text = { Text("多选管理") },
+                                            leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                isMultiSelectActiveMode = true
+                                                selectedActiveTaskIds.clear()
+                                            }
+                                        )
+                                        if (downloadingCount > 0) DropdownMenuItem(
+                                            text = { Text("全部暂停") },
+                                            leadingIcon = { Icon(Icons.Default.Pause, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                onPauseAll()
+                                            }
+                                        )
+                                        if (pausedCount > 0) DropdownMenuItem(
+                                            text = { Text("全部继续") },
+                                            leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                onResumeAll()
+                                            }
+                                        )
+                                    }
+                                    1 -> {
+                                        if (serverDownloads.isNotEmpty()) DropdownMenuItem(
+                                            text = { Text("多选管理") },
+                                            leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                isMultiSelectServerMode = true
+                                                selectedServerTaskIds.clear()
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("刷新") },
+                                            leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                refreshServerDownloads()
+                                            }
+                                        )
+                                        if (serverDownloads.any { it.status == "completed" }) DropdownMenuItem(
+                                            text = { Text("清空已完成") },
+                                            leadingIcon = { Icon(Icons.Default.ClearAll, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                clearCompletedServerTasks()
+                                            }
+                                        )
+                                    }
+                                    else -> {
+                                        if (completedSongs.isNotEmpty()) DropdownMenuItem(
+                                            text = { Text("多选管理") },
+                                            leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                isMultiSelectMode = true
+                                                selectedSongIds.clear()
+                                            }
+                                        )
+                                        if (pendingPushCount > 0) DropdownMenuItem(
+                                            text = { Text("推送离线下载 ($pendingPushCount)") },
+                                            leadingIcon = { Icon(Icons.Default.CloudUpload, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                showFineGrainedSyncDialog = true
+                                            }
+                                        )
+                                        if (completedSongs.isNotEmpty()) DropdownMenuItem(
+                                            text = { Text("补全全部标签") },
+                                            leadingIcon = { Icon(Icons.Default.AutoFixHigh, contentDescription = null) },
+                                            onClick = {
+                                                dmMenuOpen = false
+                                                onReEmbedAll()
+                                            }
+                                        )
                                     }
                                 }
-                            ) {
-                                Text(
-                                    text = if (selectedSongIds.size == completedSongs.size) "取消全选" else "全选",
-                                    color = AppleRed,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-
-                            Button(
-                                onClick = {
-                                    isMultiSelectMode = false
-                                    selectedSongIds.clear()
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Text("完成", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            }
-                        } else {
-                            OutlinedButton(
-                                onClick = {
-                                    isMultiSelectMode = true
-                                    selectedSongIds.clear()
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, borderColor),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("批量管理", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. 分段切换器 (本地下载 vs 服务器下载 vs 已完成)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(40.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
-                    .padding(3.dp)
-            ) {
-                // Tab 0: 本地下载
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(17.dp))
-                        .background(if (selectedTab == 0) MaterialTheme.colorScheme.surface else Color.Transparent)
-                        .clickable {
-                            selectedTab = 0
-                            isMultiSelectMode = false
-                            selectedSongIds.clear()
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "本地下载 (${activeTasks.size})",
-                        fontSize = 12.sp,
-                        fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selectedTab == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                // Tab 1: 服务器下载
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(17.dp))
-                        .background(if (selectedTab == 1) MaterialTheme.colorScheme.surface else Color.Transparent)
-                        .clickable {
-                            selectedTab = 1
-                            isMultiSelectMode = false
-                            selectedSongIds.clear()
-                            isMultiSelectActiveMode = false
-                            selectedActiveTaskIds.clear()
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "服务器下载 (${serverDownloads.size})",
-                        fontSize = 12.sp,
-                        fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selectedTab == 1) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                // Tab 2: 已完成
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(17.dp))
-                        .background(if (selectedTab == 2) MaterialTheme.colorScheme.surface else Color.Transparent)
-                        .clickable {
-                            selectedTab = 2
-                            isMultiSelectActiveMode = false
-                            selectedActiveTaskIds.clear()
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "已完成 (${completedSongs.size})",
-                        fontSize = 12.sp,
-                        fontWeight = if (selectedTab == 2) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selectedTab == 2) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // 3. 内容区域
-            if (selectedTab == 0) {
-                // ====== 正在下载列表 ======
-                if (activeTasks.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(top = 80.dp),
-                        contentAlignment = Alignment.TopCenter
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
-                                imageVector = Icons.Outlined.FileDownload,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                modifier = Modifier.size(56.dp)
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = "当前没有正在下载的音乐",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 15.sp
-                            )
-                        }
-                    }
-                } else {
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        if (!isMultiSelectActiveMode) {
-                            val downloadingCount = activeTasks.count { it.status == DownloadStatus.DOWNLOADING }
-                            val pausedCount = activeTasks.count { it.status == DownloadStatus.PAUSED }
-
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = buildString {
-                                        if (downloadingCount > 0) append("${downloadingCount} 首下载中")
-                                        if (downloadingCount > 0 && pausedCount > 0) append("，")
-                                        if (pausedCount > 0) append("${pausedCount} 首已暂停")
-                                        if (downloadingCount == 0 && pausedCount == 0) append("${activeTasks.size} 个任务")
+                                if (currentPathDisplay.isNotBlank()) DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text("存储位置")
+                                            Text(
+                                                text = "剩余 ${formatStorageSize(freeSizeBytes)} · $currentPathDisplay",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
                                     },
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    leadingIcon = { Icon(Icons.Default.Storage, contentDescription = null) },
+                                    onClick = { dmMenuOpen = false }
                                 )
-
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    if (downloadingCount > 0) {
-                                        OutlinedButton(
-                                            onClick = onPauseAll,
-                                            shape = RoundedCornerShape(10.dp),
-                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                            modifier = Modifier.height(28.dp),
-                                            border = BorderStroke(0.8.dp, borderColor)
-                                        ) {
-                                            Icon(Icons.Default.Pause, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Text("全部暂停", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
-                                        }
-                                    }
-                                    if (pausedCount > 0) {
-                                        Button(
-                                            onClick = onResumeAll,
-                                            shape = RoundedCornerShape(10.dp),
-                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                            modifier = Modifier.height(28.dp),
-                                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed)
-                                        ) {
-                                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Text("全部继续", fontSize = 11.sp, color = Color.White)
-                                        }
+                            }
+                        }
+                    }
+                },
+                searchField = if (dmSearchOpen) {
+                    {
+                        com.lm.player.feature.library.LibrarySubViewSearchField(
+                            query = dmQuery,
+                            onQueryChange = { dmQuery = it },
+                            onClose = {
+                                dmSearchOpen = false
+                                dmQuery = ""
+                            },
+                            placeholder = "搜索歌名、歌手、专辑",
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                } else null,
+                below = {
+                    // 三段切换：下载中 / 服务器 / 已完成。液态玻璃时与播放页「歌曲 | 歌词」同一套玻璃标签栏
+                    val selectTab: (Int) -> Unit = { idx ->
+                        selectedTab = idx
+                        isMultiSelectMode = false
+                        selectedSongIds.clear()
+                        isMultiSelectActiveMode = false
+                        selectedActiveTaskIds.clear()
+                        isMultiSelectServerMode = false
+                        selectedServerTaskIds.clear()
+                    }
+                    val tabs = listOf(
+                        Triple(0, "下载中", activeTasks.size),
+                        Triple(1, "服务器", serverDownloads.size),
+                        Triple(2, "已完成", completedSongs.size)
+                    )
+                    val tabBackdrop = com.lm.player.core.designsystem.glass.LocalGlassBackdrop.current
+                    if (tabBackdrop != null) {
+                        val latestTab = rememberUpdatedState(selectedTab)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(36.dp)
+                        ) {
+                            com.lm.player.core.designsystem.glass.LiquidBottomTabs(
+                                selectedTabIndex = { latestTab.value },
+                                onTabSelected = { selectTab(it) },
+                                backdrop = tabBackdrop,
+                                tabsCount = 3,
+                                accentColor = AppleRed,
+                                barHeight = 36.dp,
+                                innerPadding = 3.dp,
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                tabs.forEach { (idx, label, count) ->
+                                    LiquidBottomTab(onClick = { selectTab(idx) }) {
+                                        Text(
+                                            text = if (count > 0) "$label $count" else label,
+                                            fontSize = 12.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1
+                                        )
                                     }
                                 }
                             }
-                            Spacer(modifier = Modifier.height(8.dp))
                         }
+                    } else Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(36.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                            .padding(3.dp)
+                    ) {
+                        tabs.forEach { (idx, label, count) ->
+                            val selected = selectedTab == idx
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(if (selected) MaterialTheme.colorScheme.surface else Color.Transparent)
+                                    .clickable { selectTab(idx) },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = if (count > 0) "$label $count" else label,
+                                    fontSize = 12.5.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            )
 
+            // 内容区域
+            when (selectedTab) {
+                0 -> {
+                    if (shownActiveTasks.isEmpty()) {
+                        DmEmptyState(
+                            icon = Icons.Outlined.FileDownload,
+                            text = if (dmQuery.isNotBlank() && activeTasks.isNotEmpty()) "没有匹配「${dmQuery.trim()}」的下载任务" else "当前没有正在下载的音乐",
+                            topPadding = dmListTop
+                        )
+                    } else {
                         LazyColumn(
+                            state = activeListState,
                             modifier = Modifier.fillMaxSize(),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
-                            contentPadding = PaddingValues(bottom = if (isMultiSelectActiveMode) 100.dp else 80.dp)
+                            contentPadding = PaddingValues(top = dmListTop, bottom = bottomInset + if (isMultiSelectActiveMode) 132.dp else 24.dp)
                         ) {
                             items(
-                                items = activeTasks,
+                                items = shownActiveTasks,
                                 key = { it.song.id },
                                 contentType = { "active_download_task" }
                             ) { task ->
@@ -565,434 +627,222 @@ fun DownloadManagerScreen(
                         }
                     }
                 }
-            } else if (selectedTab == 1) {
-                // ====== 服务器下载列表 ======
-                ServerDownloadTasksContent(
-                    serverDownloads = serverDownloads,
-                    isLoading = isServerLoading,
-                    errorMessage = serverDownloadError,
-                    onRefresh = { refreshServerDownloads() },
-                    onDeleteTask = { taskPendingDelete = it },
-                    onHandleConfirm = { taskPendingConfirm = it }
-                )
-            } else {
-                // ====== 已下载完成列表 (Tab 2) ======
-                if (completedSongs.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(top = 80.dp),
-                        contentAlignment = Alignment.TopCenter
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
-                                imageVector = Icons.Outlined.CheckCircle,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                modifier = Modifier.size(56.dp)
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = "暂无已下载的离线音乐",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 15.sp
-                            )
-                        }
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = if (isMultiSelectMode) 100.dp else 40.dp)
-                    ) {
-                        // 顶部存储信息看板
-                        item {
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                                border = BorderStroke(1.dp, borderColor),
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
+                1 -> {
+                    ServerDownloadTasksContent(
+                        serverDownloads = shownServerDownloads,
+                        isLoading = isServerLoading,
+                        errorMessage = serverDownloadError,
+                        onRefresh = { refreshServerDownloads() },
+                        onDeleteTask = { taskPendingDelete = it },
+                        onHandleConfirm = { taskPendingConfirm = it },
+                        listState = serverListState,
+                        topPadding = dmListTop,
+                        bottomPadding = bottomInset + if (isMultiSelectServerMode) 132.dp else 24.dp,
+                        isMultiSelectMode = isMultiSelectServerMode,
+                        selectedIds = selectedServerTaskIds,
+                        onToggleSelect = { id -> if (id in selectedServerTaskIds) selectedServerTaskIds.remove(id) else selectedServerTaskIds.add(id) },
+                        emptyText = if (dmQuery.isNotBlank() && serverDownloads.isNotEmpty()) "没有匹配「${dmQuery.trim()}」的服务器任务" else null
+                    )
+                }
+                else -> {
+                    if (shownCompletedSongs.isEmpty() && (pendingPushCount == 0 || pushBannerHidden)) {
+                        DmEmptyState(
+                            icon = Icons.Outlined.CheckCircle,
+                            text = if (dmQuery.isNotBlank() && completedSongs.isNotEmpty()) "没有匹配「${dmQuery.trim()}」的歌曲" else "暂无已下载的离线音乐",
+                            topPadding = dmListTop
+                        )
+                    } else {
+                        LazyColumn(
+                            state = completedListState,
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            contentPadding = PaddingValues(top = dmListTop, bottom = bottomInset + if (isMultiSelectMode) 132.dp else 24.dp)
+                        ) {
+                            // 离线期间下载、待推送到服务器：一行提示 + 两个小按钮
+                            if (pendingPushCount > 0 && !isMultiSelectMode && !pushBannerHidden) {
+                                item(key = "dm_pending_push") {
                                     Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(AppleRed.copy(alpha = 0.08f))
+                                            .padding(start = 12.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Icon(Icons.Default.Storage, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text("本地下载存储看板", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            if (!isMultiSelectMode && completedSongs.isNotEmpty()) {
-                                                OutlinedButton(
-                                                    onClick = onReEmbedAll,
-                                                    shape = RoundedCornerShape(10.dp),
-                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                                    modifier = Modifier.height(26.dp),
-                                                    border = BorderStroke(0.8.dp, borderColor)
-                                                ) {
-                                                    Icon(Icons.Default.AutoFixHigh, contentDescription = null, modifier = Modifier.size(12.dp), tint = AppleRed)
-                                                    Spacer(modifier = Modifier.width(4.dp))
-                                                    Text("补全全部标签", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
-                                                }
-                                            }
-                                            Text(
-                                                text = if (isMultiSelectMode) "多选编辑中" else "正常模式",
-                                                fontSize = 11.sp,
-                                                color = if (isMultiSelectMode) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                    }
-
-                                    Spacer(modifier = Modifier.height(10.dp))
-
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text(
-                                                text = "${completedSongs.size} 首",
-                                                fontSize = 16.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Spacer(modifier = Modifier.height(2.dp))
-                                            Text("已下载曲目", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-
-                                        Box(
-                                            modifier = Modifier
-                                                .width(1.dp)
-                                                .height(30.dp)
-                                                .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-                                        )
-
-                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text(
-                                                text = formatStorageSize(totalSizeBytes),
-                                                fontSize = 16.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = AppleRed
-                                            )
-                                            Spacer(modifier = Modifier.height(2.dp))
-                                            Text("音频总占用", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-
-                                        Box(
-                                            modifier = Modifier
-                                                .width(1.dp)
-                                                .height(30.dp)
-                                                .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-                                        )
-
-                                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text(
-                                                text = formatStorageSize(freeSizeBytes),
-                                                fontSize = 16.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Spacer(modifier = Modifier.height(2.dp))
-                                            Text("设备剩余空间", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-
-                                    if (currentPathDisplay.isNotBlank()) {
-                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Icon(Icons.Default.CloudUpload, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
                                         Text(
-                                            text = "存储路径: $currentPathDisplay",
-                                            fontSize = 10.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
+                                            text = if (pendingPushFailedCount > 0) "$pendingPushCount 首待同步到服务器（$pendingPushFailedCount 首上次失败）" else "$pendingPushCount 首离线下载待同步到服务器",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 2,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(
+                                            onClick = { showFineGrainedSyncDialog = true },
+                                            enabled = !isPushingToServer,
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) { Text("选择", fontSize = 12.sp, color = AppleRed) }
+                                        TextButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    val res = syncManager.pushAllPendingTasksToServer()
+                                                    if (res.isSuccess) {
+                                                        val count = res.getOrDefault(0)
+                                                        val msg = if (count > 0) "已成功推送 $count 首歌曲至服务器下载队列" else "没有需要推送的歌曲（可能已在服务器曲库）"
+                                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                }
+                                            },
+                                            enabled = !isPushingToServer,
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            if (isPushingToServer) {
+                                                CircularProgressIndicator(color = AppleRed, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                            } else {
+                                                Text("全部推送", fontSize = 12.sp, color = AppleRed, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .clip(CircleShape)
+                                                .clickable {
+                                                    pushBannerHidden = true
+                                                    dmPrefs.edit().putBoolean("dm_push_banner_hidden", true).apply()
+                                                    Toast.makeText(context, "已关闭提示，之后可在右上角 ⋯ 菜单里推送", Toast.LENGTH_SHORT).show()
+                                                },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(Icons.Default.Close, contentDescription = "关闭提示", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                }
+                            }
+                            // 播放全部
+                            if (shownCompletedSongs.isNotEmpty() && !isMultiSelectMode) {
+                                item(key = "dm_play_all") {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .height(32.dp)
+                                                .clip(RoundedCornerShape(16.dp))
+                                                .background(AppleRed)
+                                                .clickable { shownCompletedSongs.firstOrNull()?.let { onSongClick(it, shownCompletedSongs) } }
+                                                .padding(horizontal = 12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("播放全部", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                        }
+                                        Spacer(Modifier.width(10.dp))
+                                        Text(
+                                            text = if (dmQuery.isNotBlank()) "找到 ${shownCompletedSongs.size} 首" else "共 ${completedSongs.size} 首 · ${formatStorageSize(totalSizeBytes)}",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }
                             }
-                        }
-
-                        // 离线下载待推送到服务器专属看板
-                        if (pendingPushCount > 0) {
-                            item {
-                                Surface(
-                                    shape = RoundedCornerShape(16.dp),
-                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
-                                    border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.5f)),
-                                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(14.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Icon(Icons.Default.CloudUpload, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text("离线下载待同步至服务器", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                            }
-                                            Spacer(modifier = Modifier.height(4.dp))
-                                            Text(
-                                                text = if (pendingPushFailedCount > 0) {
-                                                    "发现 $pendingPushCount 首待同步，其中 $pendingPushFailedCount 首上次推送失败，可重试"
-                                                } else {
-                                                    "发现 $pendingPushCount 首离线期间下载的歌曲，可一键推送到柠檬 NAS 服务器曲库下载归档"
-                                                },
-                                                fontSize = 11.sp,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            OutlinedButton(
-                                                onClick = { showFineGrainedSyncDialog = true },
-                                                enabled = !isPushingToServer,
-                                                shape = RoundedCornerShape(12.dp),
-                                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.8f)),
-                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                                                modifier = Modifier.height(34.dp)
-                                            ) {
-                                                Icon(Icons.Default.Checklist, contentDescription = null, modifier = Modifier.size(14.dp), tint = AppleRed)
-                                                Spacer(modifier = Modifier.width(3.dp))
-                                                Text("多选同步", fontSize = 12.sp, color = AppleRed, fontWeight = FontWeight.SemiBold)
-                                            }
-
-                                            Button(
-                                                onClick = {
-                                                    scope.launch {
-                                                        val res = syncManager.pushAllPendingTasksToServer()
-                                                        if (res.isSuccess) {
-                                                            val count = res.getOrDefault(0)
-                                                            val msg = if (count > 0) {
-                                                                "已成功推送 $count 首歌曲至服务器下载队列"
-                                                            } else {
-                                                                "没有需要推送的歌曲（可能已在服务器曲库）"
-                                                            }
-                                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                                        } else {
-                                                            Toast.makeText(context, "推送失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
-                                                        }
-                                                    }
-                                                },
-                                                enabled = !isPushingToServer,
-                                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                                shape = RoundedCornerShape(12.dp),
-                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                                modifier = Modifier.height(34.dp)
-                                            ) {
-                                                if (isPushingToServer) {
-                                                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                                                    Spacer(modifier = Modifier.width(4.dp))
-                                                    Text("推送中", fontSize = 12.sp, color = Color.White)
-                                                } else {
-                                                    Icon(Icons.Default.Upload, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
-                                                    Spacer(modifier = Modifier.width(3.dp))
-                                                    Text("一键推送", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 已下载歌曲列表
-                        if (completedSongs.isNotEmpty()) {
-                            item {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "已下载歌曲 (${completedSongs.size} 首)",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Button(
-                                        onClick = {
-                                            completedSongs.firstOrNull()?.let { onSongClick(it, completedSongs) }
-                                        },
-                                        shape = RoundedCornerShape(14.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(15.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("播放全部", fontSize = 12.sp)
-                                    }
-                                }
-                            }
-                        }
-
-                        items(
-                            items = completedSongs,
-                            key = { it.id },
-                            contentType = { "completed_download_song" }
-                        ) { song ->
-                            val isSelected = song.id in selectedSongIds
-                            CompletedDownloadSongRow(
-                                song = song,
-                                isMultiSelectMode = isMultiSelectMode,
-                                isSelected = isSelected,
-                                onToggleSelect = {
-                                    if (isSelected) selectedSongIds.remove(song.id) else selectedSongIds.add(song.id)
-                                },
-                                onClick = {
-                                    if (isMultiSelectMode) {
+                            items(
+                                items = shownCompletedSongs,
+                                key = { it.id },
+                                contentType = { "completed_download_song" }
+                            ) { song ->
+                                val isSelected = song.id in selectedSongIds
+                                CompletedDownloadSongRow(
+                                    song = song,
+                                    isMultiSelectMode = isMultiSelectMode,
+                                    isSelected = isSelected,
+                                    onToggleSelect = {
                                         if (isSelected) selectedSongIds.remove(song.id) else selectedSongIds.add(song.id)
-                                    } else {
-                                        onSongClick(song, completedSongs)
-                                    }
-                                },
-                                onDelete = { singleSongToDelete = song },
-                                onShowDetails = { songForDetailsDialog = song }
-                            )
+                                    },
+                                    onClick = {
+                                        if (isMultiSelectMode) {
+                                            if (isSelected) selectedSongIds.remove(song.id) else selectedSongIds.add(song.id)
+                                        } else {
+                                            onSongClick(song, shownCompletedSongs)
+                                        }
+                                    },
+                                    onDelete = { singleSongToDelete = song },
+                                    onShowDetails = { songForDetailsDialog = song }
+                                )
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 4.1 正在下载多选模式下底部浮动批量操作条
-        AnimatedVisibility(
-            visible = isMultiSelectActiveMode && selectedTab == 0,
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(16.dp)
-        ) {
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = if (isDark) Color(0xFF1E1E26) else Color.White,
-                shadowElevation = 8.dp,
-                border = BorderStroke(1.dp, borderColor)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "已选 ${selectedActiveTaskIds.size} 项任务",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "共 ${activeTasks.size} 个正在进行",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        val selectedTasks = activeTasks.filter { it.song.id in selectedActiveTaskIds }
-                        val hasDownloading = selectedTasks.any { it.status == DownloadStatus.DOWNLOADING }
-                        val hasPaused = selectedTasks.any { it.status == DownloadStatus.PAUSED }
-
-                        if (hasDownloading) {
-                            OutlinedButton(
-                                onClick = {
-                                    val toPause = selectedTasks.filter { it.status == DownloadStatus.DOWNLOADING }.map { it.song.id }.toSet()
-                                    onPauseTasks(toPause)
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                                border = BorderStroke(1.dp, borderColor)
-                            ) {
-                                Icon(Icons.Default.Pause, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("暂停", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
-                            }
-                        }
-
-                        if (hasPaused) {
-                            Button(
-                                onClick = {
-                                    val toResume = selectedTasks.filter { it.status == DownloadStatus.PAUSED }.map { it.song.id }.toSet()
-                                    onResumeTasks(toResume)
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                            ) {
-                                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("继续", fontSize = 12.sp, color = Color.White)
-                            }
-                        }
-
-                        Button(
-                            onClick = {
-                                val toCancel = selectedActiveTaskIds.toSet()
-                                onCancelTasks(toCancel)
+        // 4. 多选悬浮操作条（下载中 / 服务器 / 已完成）：液态玻璃时登记到上层画成玻璃，折射下面的列表
+        val selectionBarVisible = when (selectedTab) {
+            0 -> isMultiSelectActiveMode
+            1 -> isMultiSelectServerMode
+            else -> isMultiSelectMode
+        }
+        val selectionBar: @Composable (Boolean) -> Unit = { glass ->
+            when (selectedTab) {
+                0 -> {
+                    val selectedTasks = activeTasks.filter { it.song.id in selectedActiveTaskIds }
+                    DmSelectionBar(
+                        title = "已选 ${selectedActiveTaskIds.size} 项",
+                        subtitle = "共 ${activeTasks.size} 个任务",
+                        isDark = isDark,
+                        borderColor = borderColor,
+                        glass = glass,
+                        actions = listOf(
+                            DmBarAction(Icons.Default.Pause, "暂停", enabled = selectedTasks.any { it.status == DownloadStatus.DOWNLOADING }) {
+                                onPauseTasks(selectedTasks.filter { it.status == DownloadStatus.DOWNLOADING }.map { it.song.id }.toSet())
+                            },
+                            DmBarAction(Icons.Default.PlayArrow, "继续", enabled = selectedTasks.any { it.status == DownloadStatus.PAUSED }) {
+                                onResumeTasks(selectedTasks.filter { it.status == DownloadStatus.PAUSED }.map { it.song.id }.toSet())
+                            },
+                            DmBarAction(Icons.Default.Close, "取消下载", enabled = selectedActiveTaskIds.isNotEmpty(), danger = true) {
+                                onCancelTasks(selectedActiveTaskIds.toSet())
                                 selectedActiveTaskIds.clear()
                                 isMultiSelectActiveMode = false
-                            },
-                            enabled = selectedActiveTaskIds.isNotEmpty(),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("取消", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
+                            }
+                        )
+                    )
                 }
-            }
-        }
-
-        // 4.2 已下载多选模式下底部浮动批量操作条
-        AnimatedVisibility(
-            visible = isMultiSelectMode && selectedTab == 2,
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(16.dp)
-        ) {
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = if (isDark) Color(0xFF1E1E26) else Color.White,
-                shadowElevation = 8.dp,
-                border = BorderStroke(1.dp, borderColor)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "已选 ${selectedSongIds.size} 首歌曲",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
+                1 -> {
+                    val hasSelection = selectedServerTaskIds.isNotEmpty()
+                    val doneCount = serverDownloads.count { it.id in selectedServerTaskIds && it.status == "completed" }
+                    DmSelectionBar(
+                        title = "已选 ${selectedServerTaskIds.size} 项",
+                        subtitle = if (hasSelection) "其中已完成 $doneCount 项 · 只删除任务记录" else "点任务进行选择",
+                        isDark = isDark,
+                        borderColor = borderColor,
+                        glass = glass,
+                        actions = listOf(
+                            DmBarAction(Icons.Default.Refresh, "刷新") { refreshServerDownloads() },
+                            DmBarAction(Icons.Default.Delete, "删除任务", enabled = hasSelection, danger = true) {
+                                showServerBatchDeleteDialog = true
+                            }
                         )
-                        Text(
-                            text = "占用空间: ${formatStorageSize(selectedTotalSizeBytes)}",
-                            fontSize = 11.sp,
-                            color = AppleRed
-                        )
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Button(
-                            onClick = {
+                    )
+                }
+                else -> {
+                    val hasSelection = selectedSongIds.isNotEmpty()
+                    DmSelectionBar(
+                        title = "已选 ${selectedSongIds.size} 首",
+                        subtitle = if (hasSelection) "占用 ${formatStorageSize(selectedTotalSizeBytes)}" else "点歌曲进行选择",
+                        isDark = isDark,
+                        borderColor = borderColor,
+                        glass = glass,
+                        actions = listOf(
+                            DmBarAction(Icons.Default.AutoFixHigh, "补全标签", enabled = hasSelection) {
+                                onFillTagsFromServer(selectedSongs)
+                                selectedSongIds.clear()
+                                isMultiSelectMode = false
+                            },
+                            DmBarAction(Icons.Default.CloudUpload, if (isPushingToServer) "同步中…" else "同步到服务器", enabled = hasSelection && !isPushingToServer) {
                                 val requestedCount = selectedSongIds.size
                                 scope.launch {
                                     val res = syncManager.pushSelectedTasksToServer(selectedSongIds.toList())
@@ -1012,36 +862,63 @@ fun DownloadManagerScreen(
                                     }
                                 }
                             },
-                            enabled = selectedSongIds.isNotEmpty() && !isPushingToServer,
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            if (isPushingToServer) {
-                                CircularProgressIndicator(color = Color.White, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("同步中", fontSize = 12.sp, color = Color.White)
-                            } else {
-                                Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("同步至服务器 (${selectedSongIds.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            DmBarAction(androidx.compose.material.icons.Icons.AutoMirrored.Filled.PlaylistAdd, "加入歌单", enabled = hasSelection) {
+                                com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, selectedSongs) {
+                                    selectedSongIds.clear()
+                                    isMultiSelectMode = false
+                                }
+                            },
+                            DmBarAction(Icons.Default.Delete, "删除", enabled = hasSelection, danger = true) {
+                                showBatchDeleteConfirmDialog = true
                             }
-                        }
-
-                        Button(
-                            onClick = { showBatchDeleteConfirmDialog = true },
-                            enabled = selectedSongIds.isNotEmpty(),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                        ) {
-                            Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("批量删除 (${selectedSongIds.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
+                        )
+                    )
                 }
             }
         }
+        if (dmGlass) {
+            if (selectionBarVisible) {
+                com.lm.player.core.designsystem.glass.RegisterGlassFloatingBar(
+                    key = "download_manager_selection",
+                    bottomPadding = bottomInset + 8.dp
+                ) { selectionBar(true) }
+            }
+        } else {
+            AnimatedVisibility(
+                visible = selectionBarVisible,
+                enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+                exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 12.dp, bottom = bottomInset + 8.dp)
+            ) {
+                selectionBar(false)
+            }
+        }
+    }
+
+    // 4.3 服务器下载：批量删除确认
+    if (showServerBatchDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showServerBatchDeleteDialog = false },
+            title = { Text("删除 ${selectedServerTaskIds.size} 个服务器下载任务？", fontWeight = FontWeight.Bold) },
+            text = { Text("只删除服务器上的下载任务记录；已下载进服务器曲库的歌曲文件不受影响。此操作无法撤销。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showServerBatchDeleteDialog = false
+                        deleteServerTasks(selectedServerTaskIds.toList())
+                        selectedServerTaskIds.clear()
+                        isMultiSelectServerMode = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showServerBatchDeleteDialog = false }) { Text("取消") }
+            }
+        )
     }
 
     // 5. 批量删除二次确认弹窗
@@ -1694,7 +1571,7 @@ private fun ActiveDownloadTaskRow(
         shadowElevation = 1.dp,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = isMultiSelectMode, onClick = onToggleSelect)
+            .then(if (isMultiSelectMode) Modifier.clickable(onClick = onToggleSelect) else Modifier)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(
@@ -1702,12 +1579,7 @@ private fun ActiveDownloadTaskRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (isMultiSelectMode) {
-                    Checkbox(
-                        checked = isSelected,
-                        onCheckedChange = { onToggleSelect() },
-                        colors = CheckboxDefaults.colors(checkedColor = AppleRed),
-                        modifier = Modifier.size(24.dp)
-                    )
+                    DmSelectIndicator(selected = isSelected)
                     Spacer(modifier = Modifier.width(10.dp))
                 }
 
@@ -1755,7 +1627,7 @@ private fun ActiveDownloadTaskRow(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            LinearProgressIndicator(
+            com.lm.player.core.designsystem.component.ClassicLinearProgress(
                 progress = { task.progress },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1848,12 +1720,7 @@ private fun CompletedDownloadSongRow(
         ) {
             // 多选复选框
             if (isMultiSelectMode) {
-                Checkbox(
-                    checked = isSelected,
-                    onCheckedChange = { onToggleSelect() },
-                    colors = CheckboxDefaults.colors(checkedColor = AppleRed),
-                    modifier = Modifier.size(24.dp)
-                )
+                DmSelectIndicator(selected = isSelected)
                 Spacer(modifier = Modifier.width(10.dp))
             }
 
@@ -1943,13 +1810,22 @@ private fun ServerDownloadTasksContent(
     errorMessage: String?,
     onRefresh: () -> Unit,
     onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit,
-    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null
+    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null,
+    listState: LazyListState = rememberLazyListState(),
+    /** 列表顶部留白（液态玻璃顶栏的高度） */
+    topPadding: Dp = 0.dp,
+    /** 搜索没有结果时的提示；null = 默认「暂无服务器端下载任务」 */
+    emptyText: String? = null,
+    bottomPadding: Dp = 60.dp,
+    isMultiSelectMode: Boolean = false,
+    selectedIds: List<String> = emptyList(),
+    onToggleSelect: (String) -> Unit = {}
 ) {
     if (isLoading && serverDownloads.isEmpty()) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(top = 80.dp),
+                .padding(top = 80.dp + topPadding),
             contentAlignment = Alignment.TopCenter
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1962,7 +1838,7 @@ private fun ServerDownloadTasksContent(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(top = 80.dp),
+                .padding(top = 80.dp + topPadding),
             contentAlignment = Alignment.TopCenter
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1989,7 +1865,7 @@ private fun ServerDownloadTasksContent(
                         fontSize = 12.sp
                     )
                 } else {
-                    Text("暂无服务器端下载任务", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+                    Text(emptyText ?: "暂无服务器端下载任务", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
                 }
                 Spacer(modifier = Modifier.height(12.dp))
                 OutlinedButton(
@@ -2004,9 +1880,10 @@ private fun ServerDownloadTasksContent(
         }
     } else {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(10.dp),
-            contentPadding = PaddingValues(bottom = 60.dp)
+            contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding)
         ) {
             items(
                 items = serverDownloads,
@@ -2015,7 +1892,10 @@ private fun ServerDownloadTasksContent(
                 ServerDownloadTaskRow(
                     task = task,
                     onDelete = { onDeleteTask(task) },
-                    onHandleConfirm = onHandleConfirm
+                    onHandleConfirm = onHandleConfirm,
+                    isMultiSelectMode = isMultiSelectMode,
+                    isSelected = task.id in selectedIds,
+                    onToggleSelect = { onToggleSelect(task.id) }
                 )
             }
         }
@@ -2026,7 +1906,10 @@ private fun ServerDownloadTasksContent(
 private fun ServerDownloadTaskRow(
     task: LemonServerDownloadTaskRecord,
     onDelete: () -> Unit,
-    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null
+    onHandleConfirm: ((LemonServerDownloadTaskRecord) -> Unit)? = null,
+    isMultiSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onToggleSelect: () -> Unit = {}
 ) {
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.08f)
@@ -2056,15 +1939,21 @@ private fun ServerDownloadTaskRow(
 
     Surface(
         shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        border = BorderStroke(1.dp, borderColor),
-        modifier = Modifier.fillMaxWidth()
+        color = if (isSelected) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = BorderStroke(1.dp, if (isSelected) AppleRed else borderColor),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (isMultiSelectMode) Modifier.clickable(onClick = onToggleSelect) else Modifier)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                if (isMultiSelectMode) {
+                    DmSelectIndicator(selected = isSelected)
+                    Spacer(modifier = Modifier.width(10.dp))
+                }
                 // 歌曲封面与状态角标
                 Box(modifier = Modifier.size(48.dp)) {
                     AlbumArtworkImage(
@@ -2157,8 +2046,8 @@ private fun ServerDownloadTaskRow(
                     }
                 }
 
-                // 删除按钮
-                IconButton(onClick = onDelete) {
+                // 删除按钮（多选时隐藏，用底部操作条删除）
+                if (!isMultiSelectMode) IconButton(onClick = onDelete) {
                     Icon(
                         imageVector = Icons.Outlined.Delete,
                         contentDescription = "删除任务",
@@ -2205,7 +2094,7 @@ private fun ServerDownloadTaskRow(
             // 若在下载中，展示进度条
             if (task.status.lowercase() == "downloading") {
                 Spacer(modifier = Modifier.height(8.dp))
-                LinearProgressIndicator(
+                com.lm.player.core.designsystem.component.ClassicLinearProgress(
                     progress = { (task.progress.coerceIn(0, 100)) / 100f },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2216,5 +2105,141 @@ private fun ServerDownloadTaskRow(
                 )
             }
         }
+    }
+}
+
+private fun UnifiedSong.dmMatches(q: String): Boolean =
+    title.contains(q, ignoreCase = true) || artist.contains(q, ignoreCase = true) || album.contains(q, ignoreCase = true)
+
+/** 顶栏右侧的小圆钮（搜索 / 更多） */
+@Composable
+private fun DmIconButton(icon: androidx.compose.ui.graphics.vector.ImageVector, description: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(icon, contentDescription = description, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+    }
+}
+
+@Composable
+private fun DmEmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, topPadding: Dp) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(top = 72.dp + topPadding),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.size(56.dp)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(text = text, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+        }
+    }
+}
+
+private class DmBarAction(
+    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+    val label: String,
+    val enabled: Boolean = true,
+    val danger: Boolean = false,
+    val onClick: () -> Unit
+)
+
+/**
+ * 下载管理多选悬浮条：上面一行「已选 N · 补充信息」，下面一排等宽的「图标 + 文字」按钮，
+ * 按钮再多也只是平分宽度，不会像以前几个长按钮挤在一行里被压扁。
+ */
+@Composable
+private fun DmSelectionBar(
+    title: String,
+    subtitle: String,
+    isDark: Boolean,
+    borderColor: Color,
+    actions: List<DmBarAction>,
+    /** 画在上层玻璃里：不要自己的底色 / 阴影 / 描边 */
+    glass: Boolean = false
+) {
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = if (glass) Color.Transparent else if (isDark) Color(0xFF1E1E26) else Color.White,
+        shadowElevation = if (glass) 0.dp else 10.dp,
+        border = if (glass) null else BorderStroke(1.dp, borderColor)
+    ) {
+        Column(modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = subtitle,
+                    fontSize = 11.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(modifier = Modifier.fillMaxWidth()) {
+                actions.forEach { action ->
+                    val tint = when {
+                        !action.enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                        action.danger -> MaterialTheme.colorScheme.error
+                        else -> AppleRed
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(14.dp))
+                            .clickable(enabled = action.enabled, onClick = action.onClick)
+                            .padding(vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(action.icon, contentDescription = action.label, tint = tint, modifier = Modifier.size(22.dp))
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            text = action.label,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (action.enabled) MaterialTheme.colorScheme.onSurface else tint,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 多选时的圆形选择标记（选中：红底白勾；未选：细圆圈） */
+@Composable
+private fun DmSelectIndicator(selected: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(22.dp)
+            .clip(CircleShape)
+            .then(
+                if (selected) Modifier.background(AppleRed)
+                else Modifier.border(1.5.dp, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f), CircleShape)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        if (selected) Icon(Icons.Default.Check, contentDescription = "已选", tint = Color.White, modifier = Modifier.size(15.dp))
     }
 }

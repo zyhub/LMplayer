@@ -44,12 +44,6 @@ object SourceAccelerationSession {
     /** 单个脚本初始化上限（服务端为 20s）。各脚本并行初始化。 */
     private const val INIT_TIMEOUT_MS = 15_000L
 
-    /** bundle 拉取上限：服务器失联时不能把会话启动卡到共享客户端的 300 秒。 */
-    private const val BOOTSTRAP_TIMEOUT_MS = 15_000L
-
-    /** 缓存脚本在「列表版本一致」时直接复用；超过该时长强制完整刷新一次（防止脚本内容变了版本号没变）。 */
-    private const val FULL_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000L
-
     val QUALITY_ORDER = listOf("flac24bit", "flac", "320k", "128k")
 
     enum class State { IDLE, LOADING, READY, FAILED }
@@ -65,19 +59,23 @@ object SourceAccelerationSession {
         val loadedFromCache: Boolean = false,
         /** 服务器已删除/解绑，脚本独立运行 */
         val detached: Boolean = false,
-        /** 正在从服务器拉取 / 初始化脚本（含已就绪后的后台刷新） */
-        val pulling: Boolean = false,
-        /** 拉取进度：已完成的脚本数 / 本次脚本总数（总数为 0 表示还在下载脚本包） */
-        val pullDone: Int = 0,
-        val pullTotal: Int = 0
+        /** 装载进度：已装载完（成功或失败）的脚本数 / 本次脚本总数 */
+        val loadDone: Int = 0,
+        val loadTotal: Int = 0,
+        /** 本次装载的这一版脚本是什么时候从服务器拉取的 */
+        val versionSavedAt: Long = 0L,
+        /** 本次装载出的问题（某个脚本没装上、已退回上一版等），详情窗口显示 */
+        val loadIssues: List<String> = emptyList()
     ) {
         val isReady: Boolean get() = state == State.READY && readyCount > 0
 
-        /** 拉取进度 0~1：下载脚本包阶段固定 10%，之后按脚本初始化完成数推进 */
-        val pullProgress: Float get() = when {
-            !pulling -> if (isReady) 1f else 0f
-            pullTotal <= 0 -> 0.1f
-            else -> (0.1f + 0.9f * pullDone.toFloat() / pullTotal).coerceIn(0.1f, 1f)
+        /** 正在从本机装载引擎（状态环蓝色） */
+        val isLoading: Boolean get() = state == State.LOADING
+
+        /** 装载进度 0~1 */
+        val loadProgress: Float get() = when {
+            loadTotal <= 0 -> if (isReady) 1f else 0f
+            else -> (loadDone.toFloat() / loadTotal).coerceIn(0f, 1f)
         }
     }
 
@@ -132,59 +130,25 @@ object SourceAccelerationSession {
     // 启动 / 刷新
     // ======================================================================
 
-    suspend fun start(
-        server: ServerConfig,
-        protocol: LemonMusicProtocol,
-        force: Boolean = false
-    ): Result<Unit> = withContext(Dispatchers.IO) {
-        val current = _status.value
-        val sameServerReady = current.isReady && current.serverId == server.id && poolSnapshot.isNotEmpty()
-        if (!force && sameServerReady) {
-            val now = System.currentTimeMillis()
-            if (!current.loadedFromCache && !current.detached) return@withContext Result.success(Unit)
-            // 冷启动从缓存恢复的会话：先用轻量的 /api/source/list 核对「激活脚本 id+版本」，
-            // 没变就不下载、不重建引擎；缓存超过 24 小时才强制完整刷新一次。
-            val cacheFresh = cachedSavedAt > 0L && now - cachedSavedAt < FULL_REFRESH_INTERVAL_MS
-            if (cacheFresh) {
-                val unchanged = withTimeoutOrNull(8_000L) {
-                    runCatching { activeListMatchesCurrent(protocol) }.getOrDefault(false)
-                } ?: false
-                if (unchanged) {
-                    _status.value = _status.value.copy(loadedFromCache = false, detached = false, updatedAt = now, error = null)
-                    Log.i(TAG, "cached scripts verified against server list, skip reload")
-                    return@withContext Result.success(Unit)
-                }
-            }
-        }
-        startInternal(server, force = force, fromCache = false) {
-            try {
-                protocol.fetchActiveScriptBundle()
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
-        }
-    }
-
-    private suspend fun activeListMatchesCurrent(protocol: LemonMusicProtocol): Boolean {
-        val bundle = currentBundle ?: return false
-        val list = protocol.fetchSourceList().getOrNull() ?: return false
-        val active = list.filter { it.isActive }.associate { it.id to it.version }
-        val installed = bundle.sources.associate { it.id to it.version }
-        return active.isNotEmpty() && active == installed
-    }
-
-    /** 冷启动离线恢复：直接用加密缓存里的 bundle 初始化，不访问服务器。 */
+    /**
+     * 用本机的一份脚本装载引擎。
+     *
+     * 2026-11-13 起会话**只从本机装载**、不再联网下载：从服务器拉取 / 更新由 [SourceScriptUpdater] 在后台完成，
+     * 存为待用版，下次冷启动才转正装载（用户规则「拉取的音源下次启动生效」）。本次启动全程用同一版，拉取不影响使用。
+     *
+     * @param savedAt 这一版从服务器拉取的时间（详情窗口显示）
+     * @param fallback 上一版：某个脚本装载失败时改用上一版里同一个脚本；全部失败时整体改用上一版
+     */
     suspend fun startFromCache(
         server: ServerConfig,
         bundle: SourceScriptBundle,
         detached: Boolean = false,
-        savedAt: Long = 0L
+        savedAt: Long = 0L,
+        fallback: SourceScriptBundle? = null
     ): Result<Unit> {
         if (bundle.sources.isEmpty()) return Result.failure(IllegalStateException("脚本缓存为空"))
         if (isReady()) return Result.success(Unit)
-        val result = startInternal(server, force = true, fromCache = true) { Result.success(bundle) }
+        val result = startInternal(server, bundle, savedAt, fallback)
         if (result.isSuccess) {
             cachedSavedAt = savedAt
             if (detached) _status.value = _status.value.copy(detached = true)
@@ -192,108 +156,114 @@ object SourceAccelerationSession {
         return result
     }
 
+    /** 补上 sha256（缓存校验、对比用），同 ID 的重复条目只取第一个（否则会多建一个实例池，且永远不会被关闭） */
+    private fun normalize(bundle: SourceScriptBundle): SourceScriptBundle = bundle.copy(sources = bundle.sources.map { e ->
+        if (e.hash.isBlank()) e.copy(hash = SourceScriptStore.sha256(e.script)) else e
+    }.distinctBy { it.id })
+
+    /** 初始化一个脚本的实例池：成功返回 (池, null)，失败返回 (null, 原因) */
+    private suspend fun initPool(ctx: Context, entry: SourceScriptEntry, maxSize: Int): Pair<SourceEnginePool?, String?> {
+        val pool = SourceEnginePool(ctx, entry, maxSize, resolveScope, INIT_TIMEOUT_MS)
+        val r = pool.start()
+        if (r.isSuccess) return pool to null
+        val msg = r.exceptionOrNull()?.message.orEmpty()
+        if (msg.contains("超时")) poisonedScripts.add(scriptKey(entry))
+        runCatching { pool.close() }
+        return null to msg.ifBlank { "初始化失败" }
+    }
+
     private suspend fun startInternal(
         server: ServerConfig,
-        force: Boolean,
-        fromCache: Boolean,
-        bundleProvider: suspend () -> Result<SourceScriptBundle>
+        rawBundle: SourceScriptBundle,
+        savedAt: Long,
+        rawFallback: SourceScriptBundle?
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val ctx = contextRef ?: return@withContext Result.failure(IllegalStateException("加速会话未初始化"))
-        try { mutex.withLock {
-            val current = _status.value
-            if (fromCache && current.isReady && poolSnapshot.isNotEmpty()) {
+        mutex.withLock {
+            if (_status.value.isReady && poolSnapshot.isNotEmpty()) {
                 return@withLock Result.success(Unit)
             }
-            val hadReady = pools.isNotEmpty() && current.isReady
-            if (!hadReady) {
-                _status.value = Status(
-                    state = State.LOADING,
-                    serverId = server.id,
-                    serverHost = serverHost(server.serverUrl),
-                    updatedAt = System.currentTimeMillis(),
-                    pulling = true
-                )
-            } else {
-                _status.update { it.copy(pulling = true, pullDone = 0, pullTotal = 0) }
+            val bundle = normalize(rawBundle)
+            val fallback = rawFallback?.let { normalize(it) }
+            val issues = ArrayList<String>()
+            val valid = ArrayList<SourceScriptEntry>()
+            for (entry in bundle.sources) {
+                when {
+                    entry.id.isBlank() -> issues.add("「${entry.name}」缺少 ID，已跳过")
+                    scriptKey(entry) in poisonedScripts -> issues.add("「${entry.name}」本次运行中初始化超时过，已停用")
+                    else -> valid.add(entry)
+                }
             }
-            Log.i(TAG, "starting session for ${server.name} (force=$force, keepOld=$hadReady, fromCache=$fromCache)")
-
-            val fetchDeferred = resolveScope.async { bundleProvider() }
-            val fetched = withTimeoutOrNull(BOOTSTRAP_TIMEOUT_MS) { fetchDeferred.await() }
-            val bundleResult = fetched
-                ?: Result.failure(IllegalStateException("脚本加载超时(${BOOTSTRAP_TIMEOUT_MS}ms)"))
-            if (bundleResult.isFailure) {
-                return@withLock failStart(hadReady, bundleResult.exceptionOrNull() ?: IllegalStateException("脚本加载失败"), server)
-            }
-            val rawBundle = bundleResult.getOrThrow()
-            if (rawBundle.sources.isEmpty()) {
-                return@withLock failStart(hadReady, IllegalStateException("没有可用脚本"), server)
-            }
-            // 统一补上 sha256，用于增量对比与缓存校验
-            val bundle = rawBundle.copy(sources = rawBundle.sources.map { e ->
-                if (e.hash.isBlank()) e.copy(hash = SourceScriptStore.sha256(e.script)) else e
-            }.distinctBy { it.id }) // 同 ID 的重复条目只取第一个：否则会多建一个实例池，且永远不会被关闭
+            _status.value = Status(
+                state = State.LOADING,
+                serverId = server.id,
+                serverHost = serverHost(server.serverUrl),
+                updatedAt = System.currentTimeMillis(),
+                loadedFromCache = true,
+                loadDone = 0,
+                loadTotal = valid.size,
+                versionSavedAt = savedAt
+            )
+            Log.i(TAG, "loading ${valid.size} local script(s) for ${server.name}")
 
             val maxSize = poolSize(ctx)
-            val keep = LinkedHashMap<String, SourceEnginePool>()
-            val toInit = ArrayList<SourceScriptEntry>()
-            var lastError: String? = null
-            for (entry in bundle.sources) {
-                if (entry.id.isBlank()) {
-                    lastError = "脚本缺少 ID: ${entry.name}"
-                    continue
-                }
-                if (scriptKey(entry) in poisonedScripts) {
-                    lastError = "脚本初始化超时，已停用: ${entry.name}"
-                    continue
-                }
-                val existing = pools[entry.id]
-                if (existing != null && !existing.closed && !existing.isPoisoned && existing.entry.hash == entry.hash) {
-                    keep[entry.id] = existing
-                } else {
-                    toInit.add(entry)
-                }
-            }
-
-            _status.update { it.copy(pulling = true, pullDone = keep.size, pullTotal = keep.size + toInit.size) }
-            // 并行初始化变化的脚本：总耗时 ≈ 最慢的一个，而不是逐个累加
-            val inited = toInit.map { entry ->
+            // 并行初始化：总耗时 ≈ 最慢的一个，而不是逐个累加
+            val results = valid.map { entry ->
                 resolveScope.async {
-                    val pool = SourceEnginePool(ctx, entry, maxSize, resolveScope, INIT_TIMEOUT_MS)
-                    val r = pool.start()
-                    _status.update { it.copy(pullDone = (it.pullDone + 1).coerceAtMost(it.pullTotal)) }
-                    if (r.isFailure) {
-                        val msg = r.exceptionOrNull()?.message.orEmpty()
-                        if (msg.contains("超时")) poisonedScripts.add(scriptKey(entry))
-                        pool.close()
-                        entry to (null to msg)
-                    } else {
-                        entry to (pool to null)
-                    }
+                    val r = initPool(ctx, entry, maxSize)
+                    _status.update { it.copy(loadDone = (it.loadDone + 1).coerceAtMost(it.loadTotal)) }
+                    entry to r
                 }
             }.awaitAll()
 
             val newPools = LinkedHashMap<String, SourceEnginePool>()
-            for (entry in bundle.sources) {
-                val kept = keep[entry.id]
-                if (kept != null) {
-                    newPools[entry.id] = kept
+            val usedEntries = ArrayList<SourceScriptEntry>()
+            val tried = HashSet<String>()
+            for ((entry, r) in results) {
+                tried.add(scriptKey(entry))
+                val pool = r.first
+                if (pool != null) {
+                    newPools[entry.id] = pool
+                    usedEntries.add(entry)
                     continue
                 }
-                val (pool, err) = inited.firstOrNull { it.first.id == entry.id }?.second ?: continue
-                if (pool != null) newPools[entry.id] = pool
-                if (err != null) lastError = err
+                // 新版这个脚本装载失败：上一版里有这个脚本的另一个版本就改用它
+                val old = fallback?.sources?.firstOrNull { it.id == entry.id && it.hash != entry.hash }
+                if (old != null && scriptKey(old) !in poisonedScripts) {
+                    tried.add(scriptKey(old))
+                    val r2 = initPool(ctx, old, maxSize)
+                    if (r2.first != null) {
+                        newPools[entry.id] = r2.first!!
+                        usedEntries.add(old)
+                        issues.add("「${entry.name}」装载失败（${r.second}），已改用上一版")
+                        continue
+                    }
+                    issues.add("「${entry.name}」装载失败（${r.second}），上一版也失败（${r2.second}）")
+                } else {
+                    issues.add("「${entry.name}」装载失败（${r.second}）")
+                }
+            }
+            // 这一版全部失败：整体改用上一版
+            if (newPools.isEmpty() && fallback != null) {
+                for (old in fallback.sources) {
+                    if (old.id.isBlank() || scriptKey(old) in tried || scriptKey(old) in poisonedScripts) continue
+                    val r = initPool(ctx, old, maxSize)
+                    if (r.first != null) {
+                        newPools[old.id] = r.first!!
+                        usedEntries.add(old)
+                    }
+                }
+                if (newPools.isNotEmpty()) issues.add("这一版全部装载失败，已整体改用上一版")
             }
             if (newPools.isEmpty()) {
-                return@withLock failStart(hadReady, IllegalStateException(lastError ?: "脚本全部加载失败"), server)
+                return@withLock failStart(IllegalStateException(issues.lastOrNull() ?: "脚本全部加载失败"), server, issues, savedAt)
             }
 
-            val removed = pools.filterKeys { it !in newPools.keys || newPools[it] !== pools[it] }.values.toList()
+            val removed = pools.values.filter { old -> newPools.values.none { it === old } }
             pools.clear()
             pools.putAll(newPools)
             poolSnapshot = pools.values.toList()
-            currentBundle = bundle
-            if (!fromCache) cachedSavedAt = 0L
+            currentBundle = bundle.copy(sources = usedEntries)
             _status.value = Status(
                 state = State.READY,
                 readyCount = newPools.size,
@@ -302,40 +272,32 @@ object SourceAccelerationSession {
                 serverId = server.id,
                 serverHost = serverHost(server.serverUrl),
                 updatedAt = System.currentTimeMillis(),
-                loadedFromCache = fromCache
+                loadedFromCache = true,
+                loadDone = valid.size,
+                loadTotal = valid.size,
+                versionSavedAt = savedAt,
+                loadIssues = issues
             )
             removed.forEach { runCatching { it.close() } }
-            Log.i(TAG, "session ready: ${newPools.size}/${bundle.sources.size} (kept=${keep.size}, inited=${toInit.size}) fromCache=$fromCache")
-            if (!fromCache) {
-                runCatching { SourceScriptStore.save(ctx, server.id, bundle) }
-                    .onFailure { Log.w(TAG, "save script cache failed", it) }
-            }
+            Log.i(TAG, "session ready: ${newPools.size}/${bundle.sources.size}, issues=${issues.size}")
             refreshRanking(server.id)
             Result.success(Unit)
-        } } finally {
-            // 取消 / 异常退出时也要收起「拉取中」，否则状态环会一直停在黄色
-            if (_status.value.pulling) _status.update { it.copy(pulling = false) }
         }
     }
 
     private fun scriptKey(entry: SourceScriptEntry): String =
         "${entry.id}|${entry.hash.ifBlank { SourceScriptStore.sha256(entry.script) }}|${entry.version}"
 
-    private fun failStart(hadReady: Boolean, e: Throwable, server: ServerConfig): Result<Unit> {
-        val now = System.currentTimeMillis()
-        _status.value = if (hadReady) {
-            // 旧引擎仍然可用：保留 READY，仅记录最近一次刷新错误。
-            _status.value.copy(error = e.message, updatedAt = now, pulling = false)
-        } else {
-            _status.value.copy(
-                state = State.FAILED,
-                error = e.message,
-                serverId = server.id,
-                serverHost = serverHost(server.serverUrl),
-                updatedAt = now,
-                pulling = false
-            )
-        }
+    private fun failStart(e: Throwable, server: ServerConfig, issues: List<String>, savedAt: Long): Result<Unit> {
+        _status.value = _status.value.copy(
+            state = State.FAILED,
+            error = e.message,
+            serverId = server.id,
+            serverHost = serverHost(server.serverUrl),
+            updatedAt = System.currentTimeMillis(),
+            versionSavedAt = savedAt,
+            loadIssues = issues
+        )
         return Result.failure(e)
     }
 
@@ -451,6 +413,12 @@ object SourceAccelerationSession {
     }
 
     /** 兼容旧调用：带预算的单音质取链。 */
+    /** 本地音源 ID → 脚本显示名（播放页「解析来源」用） */
+    fun sourceNameOf(sourceId: String?): String? {
+        if (sourceId.isNullOrBlank()) return null
+        return poolSnapshot.firstOrNull { it.sourceId == sourceId }?.sourceName?.takeIf { it.isNotBlank() }
+    }
+
     suspend fun resolveMusicUrlWithBudget(
         source: String,
         quality: String,

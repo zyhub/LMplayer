@@ -183,7 +183,7 @@ fun CarDockPlayerPanel(
             }
 
             // 进度指示条
-            Slider(
+            com.lm.player.core.designsystem.component.ClassicSlider(
                 value = if (totalDurationMs > 0) progressMs.toFloat() / totalDurationMs else 0f,
                 onValueChange = {},
                 colors = SliderDefaults.colors(
