@@ -27,6 +27,17 @@ LMPlayer 是 [柠檬音乐服务端（lemon-muisc）](https://github.com/jia0703
 - **本地播放加速**：服务器歌曲预匹配、歌词与封面竞速加载、已缓存歌曲直接播放，弱网下切歌更快。
 - **更多**：桌面小组件、播客、系统灵动岛 / 超级岛通知歌词、应用内检查更新。
 
+## 截图
+
+| 发现 | 资料库 | 播放页 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/01_discover.webp" width="260" alt="发现" /> | <img src="docs/screenshots/02_library.webp" width="260" alt="资料库" /> | <img src="docs/screenshots/03_player.webp" width="260" alt="播放页" /> |
+
+<p align="center">
+  <img src="docs/screenshots/04_player_landscape.webp" width="820" alt="横屏播放页 · 专辑流" /><br />
+  横屏播放页 · 专辑流
+</p>
+
 ## 下载安装
 
 在 [Releases](https://github.com/zyhub/LMplayer/releases) 下载最新的 `LMPlayer-<版本号>.apk`。
