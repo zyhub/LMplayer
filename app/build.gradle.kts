@@ -19,8 +19,8 @@ android {
         targetSdk = 34
         // 版本号唯一来源：代码中通过 BuildConfig.VERSION_NAME / VERSION_CODE 读取，禁止再在 Kotlin 里硬编码
         // 【版本号已锁定】按维护者要求固定为 1.7.33 (68)（2026-11-08 由 1.7.32 升级），编译出包时不要自动递增；如需变更请先征得维护者同意
-        versionCode = 68
-        versionName = "1.7.33"
+        versionCode = 69
+        versionName = "1.7.34"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

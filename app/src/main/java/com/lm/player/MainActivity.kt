@@ -4100,6 +4100,7 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                             FullscreenPlayerSheet(
                                 song = song,
                                 downloadProgress = activeDownloadTasks.firstOrNull { it.song.id == song.id }?.progress,
+                                downloadTask = activeDownloadTasks.firstOrNull { it.song.id == song.id },
                                 playlist = currentQueue.ifEmpty { songList },
                                 isPlaying = isPlaying,
                                 progressMs = localProgressMs,

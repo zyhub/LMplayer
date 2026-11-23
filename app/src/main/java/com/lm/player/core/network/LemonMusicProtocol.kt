@@ -4838,11 +4838,12 @@ class LemonMusicProtocol(
     }
 
     /**
-     * 拉取 active 音源脚本 bundle。
+     * 拉取 active 音源脚本 bundle（脚本进入内存会话与本机脚本缓存）。
      *
-     * 依次尝试 /api/backup/export（按已激活 id 过滤）、/api/source/:id/raw、音源 homepage。
-     * 服务端没有 active-bundle 接口（也不会部署补丁），因此不再请求它。
-     * 脚本只进入内存会话，不落盘。
+     * 主通道：GET /api/backup/export（设置页「手动备份」用的接口，只需登录、只读）。响应是 `{ ok, data: <备份包> }`，
+     * 音源脚本在 **data.data.sources[]**。2026-11-22 修正：此前只找 data.sources，一直取不到，实际全靠音源 homepage
+     * 从外网兜底，弱网 / 首次安装时下载完备份包（进度 69%）就失败。现在按已激活 id 流式解析，不把整包读成字符串。
+     * 兜底：音源 homepage 直链（外网，限时 15 秒）。服务端没有 /api/source/:id/raw，不再请求。
      */
     suspend fun fetchActiveScriptBundle(onProgress: ((Float) -> Unit)? = null): Result<SourceScriptBundle> = withContext(Dispatchers.IO) {
         try {
@@ -4855,28 +4856,36 @@ class LemonMusicProtocol(
                 return@withContext Result.failure(Exception("没有已激活的音源"))
             }
             onProgress?.invoke(0.05f)
-            // 不改服务器的取脚本通道：/api/backup/export 会带出全部音源脚本（只需登录、只读），按已激活 id 过滤。
-            // 优先级：backup/export → /:id/raw → homepage（服务端无 active-bundle 接口，不再请求）。
-            val fromBackup = runCatching {
-                fetchScriptsFromBackupExport(active.map { it.id }.toSet()) { read, total ->
+            val problems = ArrayList<String>()
+            val fromBackup: Map<String, Pair<String, String>> = try {
+                fetchScriptsFromBackupExport(active.map { it.id }.toSet(), problems) { read, total ->
                     if (total > 0L) onProgress?.invoke(0.05f + 0.75f * (read.toFloat() / total).coerceIn(0f, 1f))
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // 含 OutOfMemoryError：备份包异常大时不让应用崩溃，改走兜底
+                Log.w(TAG, "backup/export script fetch failed", e)
+                problems.add("备份接口读取失败（${e.message ?: e.javaClass.simpleName}）")
+                emptyMap()
             }
-                .onFailure { Log.w(TAG, "backup/export script fetch failed", it) }
-                .getOrNull()
-                .orEmpty()
             onProgress?.invoke(0.80f)
             val entries = ArrayList<SourceScriptEntry>()
             for ((index, source) in active.withIndex()) {
                 onProgress?.invoke(0.80f + 0.20f * index / active.size)
                 val backupEntry = fromBackup[source.id]
                 var script = backupEntry?.first.orEmpty()
-                if (!looksLikeSourceScript(script)) script = fetchRawScript(source.id).orEmpty()
-                if (!looksLikeSourceScript(script) && source.homepage.startsWith("http")) {
-                    script = fetchExternalScript(source.homepage).orEmpty()
+                if (script.isEmpty() && source.homepage.startsWith("http")) {
+                    script = try {
+                        fetchExternalScript(source.homepage).orEmpty()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "homepage script fetch failed for ${source.id}", e)
+                        ""
+                    }
                 }
-                if (!looksLikeSourceScript(script)) {
+                if (script.isEmpty()) {
                     Log.w(TAG, "No usable script for ${source.name} (${source.id})")
+                    problems.add("「${source.name}」没有拿到脚本")
                     continue
                 }
                 entries.add(
@@ -4893,7 +4902,7 @@ class LemonMusicProtocol(
             }
             onProgress?.invoke(1f)
             if (entries.isEmpty()) {
-                Result.failure(Exception("服务端脚本接口不可用，且 homepage 未返回有效脚本"))
+                Result.failure(Exception("没有拿到可用的音源脚本：" + problems.distinct().joinToString("；")))
             } else {
                 Result.success(SourceScriptBundle(sources = entries))
             }
@@ -4905,70 +4914,187 @@ class LemonMusicProtocol(
     }
 
     /**
-     * 不改服务器即可拿到音源脚本（C-05）：GET /api/backup/export 是设置页「手动备份」用的接口，
-     * 只需登录（不要求管理员）、只读无副作用，返回的 data.sources[] 含全部音源的完整脚本与平台声明。
-     * 只取 [wantedIds]（当前用户已激活）对应条目。返回 id → (script, sourcesJson)。
+     * 从 GET /api/backup/export 取已激活音源的脚本（不改服务器）。返回 id → (script, sourcesJson)。
+     * 边下载边解析（JsonReader），只保留 [wantedIds] 的脚本，歌单 / 收藏 / 播放记录和未激活音源的脚本全部跳过，
+     * 内存里不会同时出现整包文本和解析结果。拿不到时把原因写进 [problems]。
      */
     private fun fetchScriptsFromBackupExport(
         wantedIds: Set<String>,
+        problems: MutableList<String>,
         onBytes: ((read: Long, total: Long) -> Unit)? = null
     ): Map<String, Pair<String, String>> {
         if (wantedIds.isEmpty()) return emptyMap()
         val req = newAuthRequest("$cleanBase/api/backup/export").get().build()
         client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyMap()
-            val body = resp.body ?: return emptyMap()
-            val text = if (onBytes == null) body.string() else {
-                // 逐块读取并回报已收到的字节数（服务器没给总大小时 total = -1，调用方不推进百分比）
-                val total = body.contentLength()
-                val source = body.source()
-                val buffer = okio.Buffer()
-                var read = 0L
-                while (true) {
-                    val n = source.read(buffer, 16 * 1024L)
-                    if (n == -1L) break
-                    read += n
-                    onBytes(read, total)
-                }
-                buffer.readString(body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
+            if (!resp.isSuccessful) {
+                problems.add("备份接口返回 HTTP ${resp.code}")
+                return emptyMap()
             }
-            val root = JSONObject(text)
-            val arr = (root.optJSONObject("data") ?: root).optJSONArray("sources") ?: return emptyMap()
+            val body = resp.body ?: run {
+                problems.add("备份接口没有返回内容")
+                return emptyMap()
+            }
+            // 服务器没给总大小时 total = -1，调用方不推进百分比
+            val total = body.contentLength()
+            var read = 0L
+            val counted = object : java.io.FilterInputStream(body.byteStream()) {
+                override fun read(): Int {
+                    val b = super.read()
+                    if (b >= 0) {
+                        read++
+                        onBytes?.invoke(read, total)
+                    }
+                    return b
+                }
+
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = super.read(b, off, len)
+                    if (n > 0) {
+                        read += n
+                        onBytes?.invoke(read, total)
+                    }
+                    return n
+                }
+            }
+            val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
             val out = HashMap<String, Pair<String, String>>()
-            for (i in 0 until arr.length()) {
-                val item = arr.optJSONObject(i) ?: continue
-                val id = item.optString("id")
-                if (id !in wantedIds) continue
-                val script = item.optString("script")
-                if (!looksLikeSourceScript(script)) continue
-                out[id] = Pair(script, item.optJSONObject("sources")?.toString() ?: "{}")
+            val sawSources = android.util.JsonReader(java.io.InputStreamReader(counted, charset))
+                .use { r -> readBackupScripts(r, wantedIds, out, 0) }
+            when {
+                !sawSources -> problems.add("备份包里没有音源脚本列表")
+                out.isEmpty() -> problems.add("备份包里没有已激活音源的脚本")
             }
             return out
         }
     }
 
-    private suspend fun fetchRawScript(sourceId: String): String? {
-        if (sourceId.isBlank()) return null
-        val encoded = java.net.URLEncoder.encode(sourceId, "UTF-8")
-        val req = newAuthRequest("$cleanBase/api/source/$encoded/raw").get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val body = resp.body?.string().orEmpty()
-            return body.takeIf { looksLikeSourceScript(it) }
+    /** 在备份包里找 sources[]（data.data.sources / data.sources / sources 都认）；返回是否见到过 sources 列表 */
+    private fun readBackupScripts(
+        r: android.util.JsonReader,
+        wantedIds: Set<String>,
+        out: MutableMap<String, Pair<String, String>>,
+        depth: Int
+    ): Boolean {
+        if (r.peek() != android.util.JsonToken.BEGIN_OBJECT) {
+            r.skipValue()
+            return false
+        }
+        var saw = false
+        r.beginObject()
+        while (r.hasNext()) {
+            val name = r.nextName()
+            val token = r.peek()
+            when {
+                name == "sources" && token == android.util.JsonToken.BEGIN_ARRAY -> {
+                    saw = true
+                    r.beginArray()
+                    while (r.hasNext()) readBackupScriptItem(r, wantedIds, out)
+                    r.endArray()
+                }
+                name == "data" && depth < 3 && token == android.util.JsonToken.BEGIN_OBJECT -> {
+                    if (readBackupScripts(r, wantedIds, out, depth + 1)) saw = true
+                }
+                else -> r.skipValue()
+            }
+        }
+        r.endObject()
+        return saw
+    }
+
+    /** sources[] 的一条：{ id, name, …, script, sources }；不需要的音源连脚本一起跳过 */
+    private fun readBackupScriptItem(
+        r: android.util.JsonReader,
+        wantedIds: Set<String>,
+        out: MutableMap<String, Pair<String, String>>
+    ) {
+        if (r.peek() != android.util.JsonToken.BEGIN_OBJECT) {
+            r.skipValue()
+            return
+        }
+        var id = ""
+        var script: String? = null
+        var platforms = "{}"
+        r.beginObject()
+        while (r.hasNext()) {
+            val name = r.nextName()
+            val token = r.peek()
+            val unwanted = id.isNotEmpty() && id !in wantedIds
+            when {
+                name == "id" && (token == android.util.JsonToken.STRING || token == android.util.JsonToken.NUMBER) ->
+                    id = r.nextString().trim()
+                name == "script" && !unwanted && token == android.util.JsonToken.STRING ->
+                    script = r.nextString()
+                name == "sources" && !unwanted && token == android.util.JsonToken.BEGIN_OBJECT ->
+                    platforms = (readJsonValue(r) as? JSONObject)?.toString() ?: "{}"
+                else -> r.skipValue()
+            }
+        }
+        r.endObject()
+        val s = script ?: return
+        if (id in wantedIds && looksLikeServerScript(s)) out[id] = Pair(s, platforms)
+    }
+
+    /** JsonReader 当前值 → org.json 对象（只用于音源的平台声明这类小对象） */
+    private fun readJsonValue(r: android.util.JsonReader): Any? = when (r.peek()) {
+        android.util.JsonToken.BEGIN_OBJECT -> {
+            val o = JSONObject()
+            r.beginObject()
+            while (r.hasNext()) {
+                val k = r.nextName()
+                o.put(k, readJsonValue(r) ?: JSONObject.NULL)
+            }
+            r.endObject()
+            o
+        }
+        android.util.JsonToken.BEGIN_ARRAY -> {
+            val a = JSONArray()
+            r.beginArray()
+            while (r.hasNext()) a.put(readJsonValue(r) ?: JSONObject.NULL)
+            r.endArray()
+            a
+        }
+        android.util.JsonToken.STRING -> r.nextString()
+        android.util.JsonToken.NUMBER -> {
+            val raw = r.nextString()
+            raw.toLongOrNull() ?: raw.toDoubleOrNull() ?: raw
+        }
+        android.util.JsonToken.BOOLEAN -> r.nextBoolean()
+        android.util.JsonToken.NULL -> {
+            r.nextNull()
+            null
+        }
+        else -> {
+            r.skipValue()
+            null
         }
     }
 
-    private suspend fun fetchExternalScript(url: String): String? {
+    /**
+     * 服务器自己的音源脚本：服务端导入时已校验并在运行，这里只排除空内容 / 网页 / 异常大小，
+     * 不再要求出现 lx 关键字（混淆过的脚本里找不到这些字面量）。
+     */
+    private fun looksLikeServerScript(text: String): Boolean {
+        if (text.length < 50 || text.length > 10 * 1024 * 1024) return false
+        return !text.trimStart().startsWith("<")
+    }
+
+    /** 音源 homepage 兜底（外网）：限时 15 秒，拿不到就算了，不拖住整个拉取 */
+    private fun fetchExternalScript(url: String): String? {
         val req = Request.Builder()
             .url(url)
             .header("User-Agent", "LMPlayer/1.7.29")
             .get()
             .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val body = resp.body?.string().orEmpty()
-            return body.takeIf { looksLikeSourceScript(it) }
-        }
+        client.newBuilder()
+            .callTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+            .newCall(req)
+            .execute()
+            .use { resp ->
+                if (!resp.isSuccessful) return null
+                val body = resp.body?.string().orEmpty()
+                return body.takeIf { looksLikeSourceScript(it) }
+            }
     }
 
     private fun looksLikeSourceScript(text: String): Boolean {

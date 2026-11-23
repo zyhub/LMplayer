@@ -689,11 +689,9 @@ fun HalfGreenCheckIcon(
 }
 
 /**
- * 统一的歌曲末尾同步与下载状态操作栏：
- * 1. 双方同步：绿色勾并显示 [服务器 · 本地]
- * 2. 单方下载：半截绿色勾并显示 [仅本地] 或 [仅服务器]，点击弹出置灰单方并展示未下载方的补全下载菜单
- * 3. 双方未下载：常规下载图标，点击展开三端下载菜单
- * 4. 下载中：旋转进度环与百分比
+ * 统一的歌曲末尾同步与下载状态（2026-11-23 起图标对齐 iOS，见 [DownloadStateIcon]）：
+ * - 等待中 / 下载中 / 已暂停：点一下打开下载管理；
+ * - 下载失败 / 未下载 / 仅本机 / 仅服务器 / 双端：点一下弹出下载菜单（已有的一方置灰）。
  */
 @Composable
 fun SongSyncStatusTrailing(
@@ -705,88 +703,30 @@ fun SongSyncStatusTrailing(
     hasServer: Boolean,
     onOpenDownloads: () -> Unit,
     onDownloadWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** 下载引擎里这首歌的任务（含已暂停）：用来区分等待 / 下载中 / 已暂停 */
+    activeTask: com.lm.player.core.model.DownloadTask? = null
 ) {
-    val isBoth = hasLocal && hasServer
-    val isOnlyOne = hasLocal xor hasServer
     var isMenuOpen by remember { mutableStateOf(false) }
-
-    if (isDownloading) {
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = AppleRed.copy(alpha = 0.12f),
-            modifier = modifier
-                .clip(RoundedCornerShape(12.dp))
-                .clickable { onOpenDownloads() }
+    val failed = com.lm.player.core.media.SongStatusStore.rememberFailed(song.id)
+    val state = resolveDownloadIconState(
+        task = activeTask,
+        failed = failed,
+        hasLocal = hasLocal,
+        hasServer = hasServer,
+        staleDownloading = isDownloading
+    )
+    Box(modifier = modifier) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .clickable { if (state.isActive) onOpenDownloads() else isMenuOpen = true },
+            contentAlignment = Alignment.Center
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                CircularProgressIndicator(
-                    progress = { downloadProgress },
-                    modifier = Modifier.size(16.dp),
-                    color = AppleRed,
-                    strokeWidth = 2.dp
-                )
-                Spacer(modifier = Modifier.width(5.dp))
-                Text(
-                    text = "${(downloadProgress * 100).toInt()}%",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = AppleRed
-                )
-            }
+            DownloadStateIcon(state = state, progress = activeTask?.progress ?: downloadProgress, size = 22.dp)
         }
-    } else if (isBoth) {
-        // 双端同步：绿色勾，并显示存储位置（服务器、本地）
-        Box(modifier = modifier) {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable { isMenuOpen = true }
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.CheckCircle,
-                    contentDescription = "本地与服务器都已保存",
-                    tint = Color(0xFF34C759),
-                    modifier = Modifier.size(22.dp)
-                )
-            }
-
-            DownloadQualityDropdownMenu(
-                expanded = isMenuOpen,
-                onDismissRequest = { isMenuOpen = false },
-                song = song,
-                isServerConnected = isServerConnected,
-                hasLocal = true,
-                hasServer = true,
-                onConfirm = { target, quality ->
-                    isMenuOpen = false
-                    onDownloadWithOptions(song, target, quality)
-                }
-            )
-        }
-    } else if (isOnlyOne) {
-        // 仅存在一方下载：半截绿色勾，并显示存储位置；点击后显示未下载的一方，已下载的一方显示灰色
-        Box(modifier = modifier) {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable { isMenuOpen = true }
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = if (hasLocal) Icons.Default.DownloadDone else Icons.Default.CloudDone,
-                    contentDescription = if (hasLocal) "已下载到本机" else "服务器曲库已有",
-                    tint = if (hasLocal) Color(0xFF34C759) else Color(0xFF0A84FF),
-                    modifier = Modifier.size(22.dp)
-                )
-            }
-
+        if (!state.isActive) {
             DownloadQualityDropdownMenu(
                 expanded = isMenuOpen,
                 onDismissRequest = { isMenuOpen = false },
@@ -794,34 +734,6 @@ fun SongSyncStatusTrailing(
                 isServerConnected = isServerConnected,
                 hasLocal = hasLocal,
                 hasServer = hasServer,
-                onConfirm = { target, quality ->
-                    isMenuOpen = false
-                    onDownloadWithOptions(song, target, quality)
-                }
-            )
-        }
-    } else {
-        // 双方均未下载：显示下载按键
-        Box(modifier = modifier) {
-            IconButton(
-                onClick = { isMenuOpen = true },
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.ArrowCircleDown,
-                    contentDescription = "下载歌曲",
-                    tint = AppleRed,
-                    modifier = Modifier.size(22.dp)
-                )
-            }
-
-            DownloadQualityDropdownMenu(
-                expanded = isMenuOpen,
-                onDismissRequest = { isMenuOpen = false },
-                song = song,
-                isServerConnected = isServerConnected,
-                hasLocal = false,
-                hasServer = false,
                 onConfirm = { target, quality ->
                     isMenuOpen = false
                     onDownloadWithOptions(song, target, quality)

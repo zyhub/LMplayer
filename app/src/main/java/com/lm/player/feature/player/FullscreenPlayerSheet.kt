@@ -104,6 +104,8 @@ fun FullscreenPlayerSheet(
     onCyclePlayMode: () -> Unit,
     /** 当前歌曲的本地下载进度（0~1）；null = 没在下载 */
     downloadProgress: Float? = null,
+    /** 下载引擎里这首歌的任务（含已暂停）：下载按钮区分等待 / 下载中 / 已暂停 */
+    downloadTask: DownloadTask? = null,
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
@@ -733,47 +735,20 @@ fun FullscreenPlayerSheet(
                             ) {
                                 val isDownloaded = hasPhysicalLocal && (liveSong.downloadStatus == DownloadStatus.DOWNLOADED || !liveSong.localFilePath.isNullOrBlank())
                                 val isServerCached = liveSong.isServerLibrarySong /* 与列表徽标同一口径（PR #7 合入时统一） */
-                                if (downloadProgress != null) {
-                                    // 下载中：进度圈 + 百分比
-                                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(30.dp)) {
-                                        CircularProgressIndicator(
-                                            progress = { downloadProgress.coerceIn(0f, 1f) },
-                                            modifier = Modifier.fillMaxSize(),
-                                            color = AppleRed,
-                                            strokeWidth = 2.5.dp,
-                                            trackColor = primaryTextColor.copy(alpha = 0.15f)
-                                        )
-                                        Text(
-                                            text = "${(downloadProgress * 100).toInt().coerceIn(0, 100)}%",
-                                            fontSize = 8.sp,
-                                            letterSpacing = (-0.3).sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = primaryTextColor,
-                                            maxLines = 1
-                                        )
-                                    }
-                                } else if (isDownloaded && isServerCached) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = "双端已同步",
-                                        tint = Color(0xFF34C759),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                } else if (isDownloaded || isServerCached) {
-                                    Icon(
-                                        imageVector = if (isDownloaded) Icons.Default.DownloadDone else Icons.Default.CloudDone,
-                                        contentDescription = if (isDownloaded) "已下载到本机" else "服务器曲库已有",
-                                        tint = if (isDownloaded) Color(0xFF34C759) else Color(0xFF0A84FF),
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = Icons.Default.FileDownload,
-                                        contentDescription = "下载",
-                                        tint = primaryTextColor,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
+                                // 下载状态图标与列表、iOS 一致：等待三点 / 进度环 / 暂停圈 / 出错感叹号 / 已下载勾 / 云勾 / 双端实心勾
+                                val downloadFailed = com.lm.player.core.media.SongStatusStore.rememberFailed(liveSong.id)
+                                com.lm.player.core.designsystem.component.DownloadStateIcon(
+                                    state = com.lm.player.core.designsystem.component.resolveDownloadIconState(
+                                        task = downloadTask,
+                                        failed = downloadFailed,
+                                        hasLocal = isDownloaded,
+                                        hasServer = isServerCached,
+                                        staleDownloading = downloadProgress != null
+                                    ),
+                                    progress = downloadTask?.progress ?: downloadProgress ?: 0f,
+                                    size = 20.dp,
+                                    idleColor = primaryTextColor
+                                )
                             }
                             }
 

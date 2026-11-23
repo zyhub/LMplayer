@@ -837,6 +837,7 @@ class DownloadEngine(
             downloadDao.insertOrUpdate(initialEntity)
             
             updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
+            com.lm.player.core.media.SongStatusStore.clearFailed(song.id)
 
             // 3. 进入并发信号量等待队列 (超出并发上限自动排队)
             Log.i(TAG, "Waiting for download permit: ${song.title}")
@@ -1305,6 +1306,7 @@ class DownloadEngine(
                         )
                         downloadDao.insertOrUpdate(failedEntity)
                         songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null)
+                        com.lm.player.core.media.SongStatusStore.markFailed(song.id)
                         removeTask(song.id)
                         urlResolverMap.remove(song.id)
                     fallbackResolverMap.remove(song.id)
@@ -1345,6 +1347,7 @@ class DownloadEngine(
                         }
                     }
                     runCatching { songDao.updateDownloadStatus(song.id, DownloadStatus.FAILED, null) }
+                    com.lm.player.core.media.SongStatusStore.markFailed(song.id)
                     removeTask(song.id)
                     withContext(Dispatchers.Main) {
                         Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -1372,6 +1375,7 @@ class DownloadEngine(
         }
         // 立即向活跃任务映射中加入，确保 UI 在点击瞬间立即可见 (避免直链解析网络延迟导致下载中空白)
         updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
+        com.lm.player.core.media.SongStatusStore.clearFailed(song.id)
         job.start()
         Log.i(TAG, "Download enqueued: ${song.title} (id=${song.id}, resolver=${urlResolver != null})")
         return true

@@ -33,6 +33,7 @@ import com.lm.player.core.designsystem.component.ArtistAvatarImage
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
+import com.lm.player.core.designsystem.component.isActive
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.model.AudioQuality
@@ -502,57 +503,36 @@ fun SongListItemRow(
                 hasLocal = hasLocal,
                 hasServer = hasServer,
                 onOpenDownloads = onOpenDownloads,
-                onDownloadWithOptions = onDownloadWithOptions
+                onDownloadWithOptions = onDownloadWithOptions,
+                activeTask = activeTask
             )
-        } else if (isDownloading) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = AppleRed.copy(alpha = 0.12f),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable { onOpenDownloads() }
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    CircularProgressIndicator(
-                        progress = { currentProgress },
-                        modifier = Modifier.size(16.dp),
-                        color = AppleRed,
-                        strokeWidth = 2.dp
-                    )
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Text(
-                        text = "${(currentProgress * 100).toInt()}%",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = AppleRed
-                    )
-                }
-            }
-        } else if (isDownloaded) {
-            IconButton(
-                onClick = onClick,
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.CheckCircle,
-                    contentDescription = "已离线",
-                    tint = Color(0xFF34C759),
-                    modifier = Modifier.size(22.dp)
-                )
-            }
         } else {
-            IconButton(
-                onClick = onDownloadClick,
-                modifier = Modifier.size(36.dp)
+            // 没有下载菜单的列表：同一套下载状态图标；下载中点开下载管理，已下载点了播放，其余点了下载
+            val failed = com.lm.player.core.media.SongStatusStore.rememberFailed(song.id)
+            val state = com.lm.player.core.designsystem.component.resolveDownloadIconState(
+                task = activeTask,
+                failed = failed,
+                hasLocal = isDownloaded,
+                hasServer = hasServer,
+                staleDownloading = isDownloading
+            )
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .clickable {
+                        when {
+                            state.isActive -> onOpenDownloads()
+                            isDownloaded -> onClick()
+                            else -> onDownloadClick()
+                        }
+                    },
+                contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = Icons.Default.ArrowCircleDown,
-                    contentDescription = "下载歌曲",
-                    tint = AppleRed,
-                    modifier = Modifier.size(22.dp)
+                com.lm.player.core.designsystem.component.DownloadStateIcon(
+                    state = state,
+                    progress = currentProgress,
+                    size = 22.dp
                 )
             }
         }

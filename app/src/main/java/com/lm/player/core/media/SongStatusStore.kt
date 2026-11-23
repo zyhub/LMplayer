@@ -32,7 +32,9 @@ object SongStatusStore {
         /** 本地文件已删除（覆盖快照里的路径） */
         val removed: Boolean = false,
         /** 所属服务器 id（null = 不覆盖） */
-        val serverId: String? = null
+        val serverId: String? = null,
+        /** 本机下载失败（下载图标显示红色感叹号；重新开始下载或下载完成时清掉） */
+        val failed: Boolean = false
     )
 
     private val library = mutableStateOf<Map<String, Status>>(emptyMap())
@@ -63,7 +65,8 @@ object SongStatusStore {
                     else -> true
                 }
                 val serverSettled = o.serverId == null || l?.serverId == o.serverId
-                !(pathSettled && serverSettled)
+                // 下载失败的标记不随数据库重读清掉（重新下载 / 下载完成时才清）
+                !(pathSettled && serverSettled) || o.failed
             }
             if (kept.size != ov.size) overlay.value = kept
         }
@@ -80,7 +83,7 @@ object SongStatusStore {
 
     /** 本地下载完成（下载引擎写库时调用） */
     fun markDownloaded(songId: String, localFilePath: String) {
-        edit(listOf(songId)) { it.copy(localFilePath = localFilePath, removed = false) }
+        edit(listOf(songId)) { it.copy(localFilePath = localFilePath, removed = false, failed = false) }
         // 双端下载的本地部分完成：请求刷新当前页面
         if (bothExpected.remove(songId) != null) {
             bothDone[songId] = localFilePath to System.currentTimeMillis()
@@ -148,6 +151,15 @@ object SongStatusStore {
         return bothDone.mapValues { it.value.first }
     }
 
+    /** 本机下载失败（下载引擎写库时调用） */
+    fun markFailed(songId: String) = edit(listOf(songId)) { it.copy(failed = true) }
+
+    /** 重新开始下载：清掉失败标记（没有标记时不改动，避免无谓的重组） */
+    fun clearFailed(songId: String) {
+        if (overlay.value[songId]?.failed != true) return
+        edit(listOf(songId)) { it.copy(failed = false) }
+    }
+
     /** 本地文件已删除 */
     fun markRemoved(songIds: Collection<String>) =
         edit(songIds) { it.copy(localFilePath = null, removed = true) }
@@ -185,6 +197,13 @@ object SongStatusStore {
         }
         if (path == song.localFilePath && status == song.downloadStatus && server == song.serverId) return song
         return song.copy(localFilePath = path, downloadStatus = status, serverId = server)
+    }
+
+    /** 本次运行里这首歌的本机下载失败了（只看本次运行的失败，旧的失败记录不显示）；只有这首歌的标记变化才会触发重组 */
+    @Composable
+    fun rememberFailed(songId: String): Boolean {
+        val failed by remember(songId) { derivedStateOf { overlay.value[songId]?.failed == true } }
+        return failed
     }
 
     /** 列表行 / 播放页用：拿到带最新下载与服务器状态的歌曲；只有这首歌的状态变化才会触发重组 */
