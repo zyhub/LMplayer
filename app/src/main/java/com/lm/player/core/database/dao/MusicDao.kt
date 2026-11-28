@@ -326,16 +326,16 @@ interface ServerDao {
 
 @Dao
 interface PlaylistDao {
-    @Query("SELECT * FROM playlists ORDER BY updatedTimestamp DESC")
+    @Query("SELECT * FROM playlists ORDER BY updatedTimestamp DESC, id ASC")
     fun getAllPlaylistsFlow(): Flow<List<PlaylistEntity>>
 
-    @Query("SELECT * FROM playlists WHERE isOnline = :isOnline ORDER BY updatedTimestamp DESC")
+    @Query("SELECT * FROM playlists WHERE isOnline = :isOnline ORDER BY updatedTimestamp DESC, id ASC")
     fun getPlaylistsByModeFlow(isOnline: Boolean): Flow<List<PlaylistEntity>>
 
-    @Query("SELECT * FROM playlists WHERE serverId = :serverId ORDER BY updatedTimestamp DESC")
+    @Query("SELECT * FROM playlists WHERE serverId = :serverId ORDER BY updatedTimestamp DESC, id ASC")
     fun getPlaylistsByServerFlow(serverId: String): Flow<List<PlaylistEntity>>
 
-    @Query("SELECT * FROM playlists ORDER BY updatedTimestamp DESC")
+    @Query("SELECT * FROM playlists ORDER BY updatedTimestamp DESC, id ASC")
     suspend fun getAllPlaylists(): List<PlaylistEntity>
 
     @Query("SELECT * FROM playlists WHERE id = :playlistId LIMIT 1")

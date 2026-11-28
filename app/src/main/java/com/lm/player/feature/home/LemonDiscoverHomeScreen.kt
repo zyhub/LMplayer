@@ -200,6 +200,9 @@ fun LemonDiscoverHomeScreen(
     }
 
     LaunchedEffect(Unit) {
+        if (com.lm.player.core.source.SourceAccelerationController.hasCachedScripts(context)) {
+            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "discover_home")
+        }
         coroutineScope.launch(Dispatchers.IO) {
             val state = com.lm.player.core.network.LemonMusicProtocol.fetchDailyMix(context, forceRefresh = false).getOrNull()
             if (state != null && state.songs.isNotEmpty()) {

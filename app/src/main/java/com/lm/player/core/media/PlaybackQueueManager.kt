@@ -36,7 +36,8 @@ object PlaybackQueueManager {
     private const val MAX_PERSISTED_QUEUE_SIZE = 120
     private const val RECENT_PLAY_PREFS = "zds_recent_play_prefs"
     private const val KEY_RECENT_PLAYED_SONGS = "recent_played_songs_json"
-    private const val MAX_RECENT_PLAY_SIZE = 50
+    // 2026-11-25：三端统一为服务器那 100 首（原 50）
+    private const val MAX_RECENT_PLAY_SIZE = 100
 
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var playJob: Job? = null
@@ -338,6 +339,29 @@ object PlaybackQueueManager {
             persistRecentPlayed(context, merged)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to merge recent played songs", e)
+        }
+    }
+
+    /**
+     * 2026-11-25：在线时「最近播放」整份采用服务器的记录（三端一致，见 UserDataMirror）。
+     * 顺序以服务器为准；本机已有的同一首沿用本机那条（带本地文件路径等）。
+     * 取代 [rememberRecentPlayed] 的「本机为主、服务器只补在末尾」。
+     */
+    fun replaceRecentPlayedFromServer(context: Context, serverSongs: List<UnifiedSong>) {
+        try {
+            val current = _recentPlayedSongsFlow.value
+            val localById = current.associateBy { it.id }
+            val songs = serverSongs.asSequence()
+                .filter { it.id.isNotBlank() }
+                .distinctBy { it.id }
+                .take(MAX_RECENT_PLAY_SIZE)
+                .map { s -> localById[s.id]?.let { mergeSongMetadata(it, s) } ?: s }
+                .toList()
+            if (songs.map { it.id } == current.map { it.id }) return
+            _recentPlayedSongsFlow.value = songs
+            persistRecentPlayed(context.applicationContext, songs)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to apply server recent plays", e)
         }
     }
 
@@ -1385,6 +1409,8 @@ object PlaybackQueueManager {
         // 播客单集不进「最近播放」（那是音乐足迹；播客有自己的「继续收听」）
         if (!com.lm.player.core.podcast.PodcastSongs.isPodcast(targetSong)) {
             addRecentPlayedSong(appCtx, targetSong)
+            // 2026-11-25：同时写进服务器「最近播放」（合并 2 秒内的切歌，离线时攒着回到在线再推）
+            com.lm.player.core.network.UserDataMirror.onPlayed(appCtx, targetSong)
         }
 
         // 立即同步持久化当前播放歌曲完整元数据、播放队列与起始进度，确保任意时刻关闭应用均可精准恢复
@@ -1638,7 +1664,31 @@ object PlaybackQueueManager {
                         activeServer.username,
                         activeServer.tokenOrApiKey
                     )
-                    val favSync = protocol.toggleFavoriteSongOnServer(updated, newFav)
+                    // 2026-11-26：播放中的已下载/加速曲目可能把内存对象里的 streamUrl 覆写成本地路径或第三方直链；
+                    // 同步至服务器前从 Room 原始曲目记录补齐 rawMetaJson / streamUrl(path=) / coverUrl，确保准确解析出 filePath 与封面
+                    val songForServer = if (existing != null) {
+                        val mergedStream = if (updated.streamUrl.contains("path=")) {
+                            updated.streamUrl
+                        } else if (existing.streamUrl.contains("path=")) {
+                            existing.streamUrl
+                        } else {
+                            updated.streamUrl
+                        }
+                        val mergedMeta = updated.rawMetaJson?.takeIf { it.isNotBlank() } ?: existing.rawMetaJson
+                        val mergedCover = updated.coverUrl.takeIf { it.isNotBlank() && !it.startsWith("/") && !it.startsWith("file:") && !it.startsWith("content:") }
+                            ?: existing.coverUrl.takeIf { it.isNotBlank() }
+                            ?: updated.coverUrl
+                        updated.copy(
+                            streamUrl = mergedStream,
+                            coverUrl = mergedCover,
+                            rawMetaJson = mergedMeta
+                        )
+                    } else {
+                        updated
+                    }
+                    val favSync = protocol.toggleFavoriteSongOnServer(songForServer, newFav)
+                    // 2026-11-25：通知界面按服务器重新拉「我喜欢」（数量以服务器为准，与 iOS / 车机一致）
+                    com.lm.player.core.network.UserDataMirror.notifyFavoritesChanged()
                     if (favSync.isFailure) {
                         // 本地已更新；服务器同步失败（含「读取服务器收藏失败、为防覆盖已取消」）时明确告知，
                         // 不再静默吞掉。

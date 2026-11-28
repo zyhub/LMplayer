@@ -149,9 +149,17 @@ object DownloadRequestPlanner {
         preferServerFile: Boolean,
         skipLocalAcceleration: Boolean
     ): ResolvedDownloadStream? {
-        val accelMode = com.lm.player.core.source.SourceAccelerationController.playbackMode()
-        // 服务器已判定离线：本地音源是唯一出路（按需加载下引擎可能还没加载，此时 accelMode 还不是 LOCAL_ONLY）
+        // 服务器已判定离线：本地音源是唯一出路；下载前先按需唤醒并有限等待本地引擎就绪，
+        // 避免冷启动未播歌直接点下载时因引擎未加载而跳过本地音源直撞服务器或直接失败
         val serverOffline = protocol != null && com.lm.player.core.source.ServerLinkState.isLost
+        if (!skipLocalAcceleration) {
+            if (protocol == null || serverOffline) {
+                com.lm.player.core.source.SourceAccelerationController.awaitEngines(8_000L)
+            } else if (com.lm.player.core.source.SourceAccelerationController.localSourceConfigured()) {
+                com.lm.player.core.source.SourceAccelerationController.ensureEnginesForResolve()
+            }
+        }
+        val accelMode = com.lm.player.core.source.SourceAccelerationController.playbackMode()
         val localOnly = protocol == null || serverOffline || accelMode == com.lm.player.core.source.SourceAccelerationController.Mode.LOCAL_ONLY
         val tryLocal = serverOffline || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()
 
@@ -360,10 +368,13 @@ object DownloadRequestPlanner {
         }
 
         // 服务器路径也没拿到：最后用本地完整阶梯兜底（服务器音源不可用、但本地脚本可能拿得到）
-        if (url.isNullOrBlank() && !skipLocalAcceleration && resolveAccelerationSource(song).isNotBlank() &&
-            com.lm.player.core.source.SourceAccelerationController.canResolveLocally()
-        ) {
-            localFullLadder(song, quality)?.let { return it }
+        if (url.isNullOrBlank() && !skipLocalAcceleration && resolveAccelerationSource(song).isNotBlank()) {
+            if (!accelerationAttempted) {
+                com.lm.player.core.source.SourceAccelerationController.awaitEngines(6_000L)
+            }
+            if (com.lm.player.core.source.SourceAccelerationController.canResolveLocally()) {
+                localFullLadder(song, quality)?.let { return it }
+            }
         }
 
         // 兜底：歌曲自带的直链。必须是 http(s) 绝对地址 ——

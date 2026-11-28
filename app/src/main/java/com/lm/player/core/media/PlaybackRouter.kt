@@ -301,7 +301,7 @@ class PlaybackRouter(
                                     if (outcome.localAttempted && !song.streamUrl.startsWith("http", ignoreCase = true)) finalStreamUrl = ""
                                 }
                             }
-                        } else if (isServerSong && (serverOffline || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate())) {
+                        } else if (isServerSong && (serverOffline || com.lm.player.core.source.SourceAccelerationController.isServerWeak() || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate())) {
                             // 服务器曲库没有平台 ID：用本地目录服务搜索同曲目再本地取链（不经服务器）；
                             // 失败直接回 NAS 文件。结果已经过 CDN 探活。
                             accelerationAttempted = true

@@ -550,6 +550,7 @@ internal fun sortSubViewSongs(
 internal fun LibrarySortButton(
     mode: SubSongSort,
     reversed: Boolean,
+    defaultMode: SubSongSort = SubSongSort.DATE,
     onSelect: (SubSongSort) -> Unit
 ) {
     var open by remember { mutableStateOf(false) }
@@ -591,7 +592,7 @@ internal fun LibrarySortButton(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = m.label + if (m == SubSongSort.DATE) "（默认）" else "",
+                        text = m.label + if (m == defaultMode) "（默认）" else "",
                         fontSize = 14.sp,
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                         color = if (selected) AppleRed else onSurface,

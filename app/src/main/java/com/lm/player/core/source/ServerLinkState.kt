@@ -81,9 +81,9 @@ object ServerLinkState {
         // 不使用 OkHttp 磁盘缓存，避免拿到缓存里的旧探活结果。
         base.newBuilder()
             .cache(null)
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(7, TimeUnit.SECONDS)
-            .callTimeout(9, TimeUnit.SECONDS)
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .callTimeout(5, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
     }

@@ -134,6 +134,8 @@ fun LocalLibraryScreen(
     // 「我喜欢的音乐」的数据源由宿主注入：在线模式=服务器收藏，本地/已下载模式=服务器收藏 ∩ 已下载。
     // 为空时回落到 allSongs.filter { isFavorite }，保证断网等异常场景下收藏卡片不会整块消失。
     favoriteSongs: List<UnifiedSong> = emptyList(),
+    // 2026-11-25：为 true 表示 favoriteSongs 已按服务器收藏算好（为空就是真的没有），不再回落本机红心标记
+    favoritesFromServer: Boolean = false,
     downloadedSongs: List<UnifiedSong> = emptyList(),
     recentlyPlayedSongs: List<UnifiedSong> = emptyList(),
     recentlyAddedSongs: List<UnifiedSong> = emptyList(),
@@ -233,9 +235,11 @@ fun LocalLibraryScreen(
     // 二级页右上角小放大镜：展开后只过滤当前列表
     var subSearchOpen by remember { mutableStateOf(false) }
     var subSearchQuery by remember { mutableStateOf("") }
-    // 文件夹 / 歌单歌曲排序（默认按日期，最新在上；再点同一方式切换方向）
-    var subSortMode by remember { mutableStateOf(SubSongSort.DATE) }
-    var subSortReversed by remember { mutableStateOf(false) }
+    // 2026-11-26：二级列表按视图分别记忆默认排序：「我喜欢的音乐」默认按服务器原顺序（序号，与 TV / iOS 一致），
+    // 文件夹 / 其它歌单默认按日期最新在上；切换二级页时自动恢复该页默认排序，避免串味
+    val defaultSubSortMode = if (activeSubViewTitle == "我喜欢的音乐") SubSongSort.INDEX else SubSongSort.DATE
+    var subSortMode by remember(activeSubViewTitle) { mutableStateOf(defaultSubSortMode) }
+    var subSortReversed by remember(activeSubViewTitle) { mutableStateOf(false) }
     // 当前二级页实际显示的顺序（排序 / 搜索后），供「定位正在播放」使用
     val shownSongsHolder = remember { arrayOfNulls<List<UnifiedSong>>(1) }
 
@@ -431,9 +435,10 @@ fun LocalLibraryScreen(
     }
 
     // 我喜欢的音乐实时聚合：卡片计数与下钻视图共用同一份记忆化数据源。
-    // 优先用宿主注入的服务器收藏口径，只有宿主拿不到时才退回本地 isFavorite 标记。
-    val favSongs = remember(allSongs, favoriteSongs) {
-        (if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }).distinctBy { it.id }
+    // 2026-11-26：当数据来自服务器收藏时与 TV / iOS 严格 1:1 对齐，不再二次 distinctBy 丢弃；仅离线兜底时去重。
+    val favSongs = remember(allSongs, favoriteSongs, favoritesFromServer) {
+        if (favoritesFromServer || favoriteSongs.isNotEmpty()) favoriteSongs
+        else allSongs.filter { it.isFavorite }.distinctBy { it.id }
     }
 
     // 我喜欢的音乐下钻视图联动刷新。
@@ -553,10 +558,15 @@ fun LocalLibraryScreen(
         }
     }
 
-    // 歌单排序：最新加入数据的歌单在最前，依次递减显示
+    // 歌单排序：按确定性时间戳倒序 + id 升序兜底，杜绝同时间戳时顺序抖动
     val sortedPlaylists = remember(playlists) {
-        playlists.sortedByDescending { it.updatedTimestamp }
+        playlists.sortedWith(compareByDescending<UnifiedPlaylist> { it.updatedTimestamp }.thenBy { it.id })
     }
+
+    // 2026-11-25：云端歌单联网补齐后的最终封面，按「歌曲数 + 快照封面 + 歌单封面」签名缓存。
+    // 刷新资料库时曲库 / 歌单列表会连续变好几次，每次都整轮重算：先发布快照封面、再联网换成另一组 ——
+    // 卡片封面就 A→B→A 地闪。内容没变的歌单直接沿用上次的最终结果，也不再重复联网
+    val finalCoverMemo = remember { java.util.concurrent.ConcurrentHashMap<String, Pair<String, List<String>>>() }
 
     // 动态提取/加载歌单内部歌曲图片 (前 4 首) 用于 4 格子展示，优化高量曲目下(2000+)的检索开销
     val localPlaylistCovers by produceState<Map<String, List<String>>>(
@@ -683,7 +693,15 @@ fun LocalLibraryScreen(
                 // 6. 如果是云端歌单且仍不足 4 首（或含有尚未核验 hasPicture 的 /api/tag/cover 链接），拉取一次歌单歌曲核验并补齐真实封面
                 val targetCoverCount = minOf(4, pl.songCount.coerceAtLeast(1))
                 if (pl.isOnline && onFetchPlaylistSongs != null && (covers.size < targetCoverCount || covers.any { it.contains("/api/tag/cover") })) {
-                    pendingCoverFetches.add(pl to covers)
+                    val signature = "${pl.songCount}|${pl.previewCovers.joinToString(",")}|${pl.coverUrl}"
+                    val memo = finalCoverMemo[pl.id]
+                    if (memo != null && memo.first == signature) {
+                        // 歌单内容没变：沿用上次补齐的结果，不先闪回快照封面、也不再联网
+                        covers.clear()
+                        covers.addAll(memo.second)
+                    } else {
+                        pendingCoverFetches.add(pl to covers)
+                    }
                 }
 
                 // 7. 回退 fallbackCoverUrl
@@ -695,7 +713,12 @@ fun LocalLibraryScreen(
                     map[pl.id] = covers.take(4)
                 }
             }
-            // 先立即发布一轮已有封面，避免等待网络补齐期间卡片空白
+            // 先立即发布一轮已有封面，避免等待网络补齐期间卡片空白；
+            // 正在联网补齐的歌单若已经显示着封面，先保持原样，等补齐结果出来再换（不闪回快照封面）
+            val shown = value
+            for ((pl, _) in pendingCoverFetches) {
+                shown[pl.id]?.takeIf { it.isNotEmpty() }?.let { map[pl.id] = it }
+            }
             value = HashMap(map)
 
             // 并发补齐封面：每个歌单一次网络请求，彼此独立，用 async 并行发出。
@@ -737,7 +760,11 @@ fun LocalLibraryScreen(
                     }
                 }
                 for ((pl, covers) in pendingCoverFetches) {
-                    if (covers.isNotEmpty()) map[pl.id] = covers.take(4)
+                    if (covers.isNotEmpty()) {
+                        map[pl.id] = covers.take(4)
+                        val signature = "${pl.songCount}|${pl.previewCovers.joinToString(",")}|${pl.coverUrl}"
+                        finalCoverMemo[pl.id] = signature to covers.take(4)
+                    }
                 }
                 value = HashMap(map)
             }
@@ -1195,7 +1222,7 @@ fun LocalLibraryScreen(
                     isPullRefreshing = true
                     coroutineScope.launch {
                         runCatching {
-                            onRefreshPlaylists()
+                            // onSyncNow 内部已覆盖歌单、曲库与收藏同步，避免再叠加一次 onRefreshPlaylists 触发重复同步与双 Toast
                             onSyncNow()
                             kotlinx.coroutines.delay(800)
                         }
@@ -1247,7 +1274,11 @@ fun LocalLibraryScreen(
                                     )
                                 )
                                 Text(
-                                    text = if (currentServerName.contains("本地") || currentServerName.contains("已下载")) "本地离线曲库" else "已连接 · $currentServerName",
+                                    text = when {
+                                        currentServerName.contains("锁定") -> "本地 · 网络不稳定已锁定"
+                                        currentServerName.contains("本地") || currentServerName.contains("已下载") -> "本地离线曲库"
+                                        else -> "已连接 · $currentServerName"
+                                    },
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                     style = TextStyle(
@@ -1264,6 +1295,7 @@ fun LocalLibraryScreen(
                 // ==================== 1.5 核心入口流光卡片 (动态液态光影设计) ====================
                 item(key = "lib_top_bento_cards") {
                     val topAlbum = recentAddedAlbums.firstOrNull() ?: albums.firstOrNull()
+                    val isAutoLockedLocal = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
 
                     @Composable
                     fun ServerStatusCard(cardModifier: Modifier = Modifier) {
@@ -1292,7 +1324,7 @@ fun LocalLibraryScreen(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Icon(
-                                            imageVector = if (isServerOk) Icons.Default.CloudDone else Icons.Default.FolderSpecial,
+                                            imageVector = if (isServerOk) Icons.Default.CloudDone else if (isAutoLockedLocal) Icons.Default.Lock else Icons.Default.FolderSpecial,
                                             contentDescription = null,
                                             tint = Color.White,
                                             modifier = Modifier.size(18.dp)
@@ -1304,7 +1336,7 @@ fun LocalLibraryScreen(
                                     color = Color.White.copy(alpha = 0.20f)
                                 ) {
                                     Text(
-                                        text = if (isServerOk) "云端服务" else "本地离线",
+                                        text = if (isServerOk) "云端服务" else if (isAutoLockedLocal) "已锁定本地" else "本地离线",
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = Color.White,
@@ -1316,7 +1348,7 @@ fun LocalLibraryScreen(
                             // 中间服务名与曲库概览
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(
-                                    text = if (isServerOk) currentServerName else "本地离线曲库",
+                                    text = if (isServerOk) currentServerName else if (isAutoLockedLocal) "网络不稳定已锁定" else "本地离线曲库",
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White,
@@ -1379,7 +1411,7 @@ fun LocalLibraryScreen(
                                             tint = Color.White,
                                             modifier = Modifier.size(11.dp)
                                         )
-                                        Text(if (isServerOk) "切本地" else "连服务", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                        Text(if (isServerOk) "切本地" else if (isAutoLockedLocal) "恢复在线" else "连服务", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
                                     }
                                 }
                             }
@@ -2160,7 +2192,7 @@ fun LocalLibraryScreen(
             val isGridSubView = activeSubViewTitle in listOf("全部歌单", "全部文件夹", "全部歌手", "全部专辑") || isArtistAlbumsPage
             val heroMode = subViewHero != null && subViewHero?.title == activeSubViewTitle && !isGridSubView
             val searchQ = subSearchQuery.trim()
-            // 文件夹 / 歌单（含「我喜欢的音乐」）支持排序，默认按日期最新在上
+            // 文件夹 / 歌单支持排序（「我喜欢的音乐」默认按服务器序号顺序，与 TV / iOS 一致；文件夹与歌单默认按日期最新在上）
             val sortableSubView = !isGridSubView && !heroMode &&
                 (activePlaylistId != null || activeSubViewTitle?.startsWith("文件夹 · ") == true || activeSubViewTitle == "我喜欢的音乐" || activeSubViewTitle == "本地下载")
             val sizeSortActive = sortableSubView && subSortMode == SubSongSort.SIZE
@@ -2188,11 +2220,12 @@ fun LocalLibraryScreen(
             ) {
                 // 普通歌曲子列表：播放全部 + 多选/全选下载操作栏（放置在播放全部按钮旁边）
                 val playBatchBar: @Composable () -> Unit = {
+                    val uniqueSubSongIds = activeSubViewSongs.mapTo(HashSet()) { it.id }
                     SongListPlayAndBatchDownloadBar(
                         totalCount = activeSubViewSongs.size,
                         isMultiSelectMode = isSubViewMultiSelect,
                         selectedCount = selectedSubViewSongIds.size,
-                        isAllSelected = activeSubViewSongs.isNotEmpty() && selectedSubViewSongIds.size == activeSubViewSongs.size,
+                        isAllSelected = uniqueSubSongIds.isNotEmpty() && selectedSubViewSongIds.containsAll(uniqueSubSongIds),
                         onPlayAll = {
                             shownSubViewSongs.firstOrNull()?.let { onSongClick(it, shownSubViewSongs) }
                         },
@@ -2205,10 +2238,10 @@ fun LocalLibraryScreen(
                             selectedSubViewSongIds = emptySet()
                         },
                         onToggleSelectAll = {
-                            selectedSubViewSongIds = if (selectedSubViewSongIds.size == activeSubViewSongs.size) {
+                            selectedSubViewSongIds = if (uniqueSubSongIds.isNotEmpty() && selectedSubViewSongIds.containsAll(uniqueSubSongIds)) {
                                 emptySet()
                             } else {
-                                activeSubViewSongs.map { it.id }.toSet()
+                                uniqueSubSongIds
                             }
                         },
                         onBatchDownloadClick = {
@@ -2367,6 +2400,7 @@ fun LocalLibraryScreen(
                         LibrarySortButton(
                             mode = subSortMode,
                             reversed = subSortReversed,
+                            defaultMode = defaultSubSortMode,
                             onSelect = { m ->
                                 if (m == subSortMode) {
                                     subSortReversed = !subSortReversed

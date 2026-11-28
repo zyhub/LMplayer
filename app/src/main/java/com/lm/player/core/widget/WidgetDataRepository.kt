@@ -214,7 +214,8 @@ internal object WidgetDataRepository {
         val all = db.playlistDao().getAllPlaylists()
         val favSongs = runCatching { db.songDao().getFavoriteSongsFlow().first() }.getOrDefault(emptyList())
         val serverFav = all.firstOrNull { it.id == "lemon_favorites" }
-        val favCount = maxOf(favSongs.size, serverFav?.songCount ?: 0)
+        // 2026-11-25：有服务器收藏记录就用服务器的数量（与 App 内、iOS、车机一致）；没有才数本机红心
+        val favCount = serverFav?.songCount ?: favSongs.size
         val favCover = cleanCover(serverFav?.coverUrl)
             ?: favSongs.firstNotNullOfOrNull { cleanCover(it.coverUrl) }
 

@@ -94,9 +94,17 @@ class LMApplication : Application(), ImageLoaderFactory {
             com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
-            // 冷启动：上次下载好的待用版音源转正、记保留期；引擎按需加载（第一次要取链 / 打开音源页 / 服务器断线时才装载，与 TV 一致）
+            // 冷启动：上次下载好的待用版音源转正、记保留期；若本机已有缓存脚本，避开首帧渲染 1.2 秒后在后台静默预热引擎，
+            // 确保首次点播/下载即可命中本地音源，不再在服务器高延迟或刚断联时卡顿
             com.lm.player.core.source.SourceAccelerationController.recordProcessStart(this@LMApplication)
-            com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            if (com.lm.player.core.source.SourceAccelerationController.hasCachedScripts(this@LMApplication)) {
+                launch {
+                    kotlinx.coroutines.delay(1_200L)
+                    com.lm.player.core.source.SourceAccelerationController.demandEngines(this@LMApplication, "launch_prewarm")
+                }
+            } else {
+                com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            }
             // 服务器歌曲加速表：旧匹配文件并入（只做一次），再启动后台预匹配（登录、曲库同步后也会再触发）
             com.lm.player.core.source.ServerTrackAccelStore.ensureLegacyImported()
             com.lm.player.core.source.ServerTrackPrematcher.init(this@LMApplication)

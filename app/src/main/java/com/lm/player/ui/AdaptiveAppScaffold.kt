@@ -1,6 +1,5 @@
 package com.lm.player.ui
 
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.MaterialTheme
@@ -8,11 +7,7 @@ import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import com.lm.player.core.designsystem.component.ExpandedMorphingBottomBar
 import com.lm.player.core.designsystem.component.MorphingFloatingBottomBar
@@ -22,11 +17,10 @@ import com.lm.player.core.model.OnlineMusicSource
 import com.lm.player.core.model.Screen
 import com.lm.player.core.model.SearchContentType
 import com.lm.player.core.model.UnifiedSong
-import kotlin.math.abs
 
 /**
  * 统一响应式脚手架
- * - 增加可视内容区域：缩放后动态释放底部空间 (100dp ⇄ 145dp)
+ * - 固定采用滑动切换悬浮底栏（单条模式，底部安全间距 100dp / 液态玻璃 104dp）
  * - 播放栏集成「上一首」「播放/暂停」「下一首」完整触控
  * - 支持弹出式平滑左滑搜索框：搜索框在音乐播放栏下方向左平滑展开覆盖于首页/资料库/设置上方，搜索按键变为 X
  * - 支持毛玻璃透明度调节与线性滑动缩放动效
@@ -49,8 +43,6 @@ fun AdaptiveAppScaffold(
     totalDurationMs: Long = 0L,
     blurAlpha: Float = 0.85f,
     liquidGlassBlur: Float = 16f,
-    bottomBarAnimMode: BottomBarAnimMode = BottomBarAnimMode.SLIDE,
-    enableBottomBarAnimation: Boolean = true,
     useLinearAnimation: Boolean = true,
     onNavigate: (Screen) -> Unit,
     onDismissSearch: () -> Unit = {},
@@ -67,29 +59,9 @@ fun AdaptiveAppScaffold(
     topChromeHidden: Boolean = false,
     content: @Composable (PaddingValues) -> Unit
 ) {
-    // 悬浮导航栏展开状态 (未播放歌曲或处于弹出搜索模式时始终展开)
-    var isNavExpanded by remember { mutableStateOf(false) }
-
-    // 智能滚动监听连接器：在点击模式下，滑动歌曲列表或页面时自动平滑收起展开栏 (搜索模式下保持展开)
-    val nestedScrollConnection = remember(currentPlayingSong, enableBottomBarAnimation, isSearchActive, bottomBarAnimMode) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (bottomBarAnimMode == BottomBarAnimMode.CLICK && !isSearchActive && currentPlayingSong != null && enableBottomBarAnimation && abs(available.y) > 4f && isNavExpanded) {
-                    isNavExpanded = false
-                }
-                return Offset.Zero
-            }
-        }
-    }
-
-    // 动态底部安全间距 (点击展开双排状态下占用 145dp，收缩与滑动单条模式占用 100dp)
+    // 底部安全间距（滑动单条模式固定 100dp；液态玻璃底栏 104dp）
     val kyantBar = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
-    val isDoubleLayer = bottomBarAnimMode == BottomBarAnimMode.CLICK && (currentPlayingSong == null || !enableBottomBarAnimation || isNavExpanded)
-    val dynamicBottomPadding by animateDpAsState(
-        // 液态玻璃底栏：单行 56dp（播放胶囊 + 两侧圆钮，导航展开为示例标签栏）
-        targetValue = if (kyantBar) 104.dp else if (isDoubleLayer) 145.dp else 100.dp,
-        label = "scaffold_bottom_padding"
-    )
+    val dynamicBottomPadding = if (kyantBar) 104.dp else 100.dp
 
     val glassActive = com.lm.player.core.designsystem.glass.rememberLiquidGlassActive()
 
@@ -117,8 +89,8 @@ fun AdaptiveAppScaffold(
                 .imePadding(),
             contentAlignment = Alignment.BottomCenter
         ) {
-            if (currentPlayingSong == null || !enableBottomBarAnimation) {
-                // 没有播放歌曲或关闭动画时：始终完整常显导航底栏
+            if (currentPlayingSong == null) {
+                // 没有播放歌曲时：常显导航底栏
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -158,7 +130,7 @@ fun AdaptiveAppScaffold(
                     )
                 }
             } else {
-                // 有歌曲播放且开启过渡模式：支持滑动隐藏与点击展开，搜索激活时液态置换
+                // 默认固定为滑动切换悬浮底栏，搜索激活时液态置换
                 MorphingFloatingBottomBar(
                     currentScreen = currentScreen,
                     currentSong = currentPlayingSong,
@@ -171,19 +143,18 @@ fun AdaptiveAppScaffold(
                     selectedSearchType = selectedSearchType,
                     onSearchTypeChange = onSearchTypeChange,
                     showOnlineSourceSelector = showOnlineSourceSelector,
-                    isNavExpanded = isNavExpanded,
+                    isNavExpanded = false,
                     progressMs = progressMs,
                     totalDurationMs = totalDurationMs,
                     blurAlpha = blurAlpha,
                     liquidGlassBlur = liquidGlassBlur,
-                    bottomBarAnimMode = bottomBarAnimMode,
+                    bottomBarAnimMode = BottomBarAnimMode.SLIDE,
                     useLinearAnimation = useLinearAnimation,
-                    onToggleNavExpanded = { isNavExpanded = it },
+                    onToggleNavExpanded = {},
                     onDismissSearch = onDismissSearch,
                     onNavigate = { screen ->
                         onDismissSearch()
                         onNavigate(screen)
-                        isNavExpanded = false
                     },
                     onPrevious = onPrevious,
                     onTogglePlay = onPlayPauseToggle,
@@ -207,7 +178,6 @@ fun AdaptiveAppScaffold(
             // 不必把整页的绘制指令重新执行一遍
             .then(if (glassActive) Modifier.graphicsLayer() else Modifier)
             .background(MaterialTheme.colorScheme.background)
-            .nestedScroll(nestedScrollConnection)
     ) {
         // 核心页面内容 (动态底部间距，最大化可视内容)
         content(PaddingValues(bottom = dynamicBottomPadding))

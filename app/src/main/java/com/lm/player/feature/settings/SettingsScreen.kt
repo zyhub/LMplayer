@@ -43,7 +43,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import com.lm.player.core.model.BottomBarAnimMode
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerSourceEntity
 import com.lm.player.core.database.entity.ServerSourceMetaEntity
@@ -91,7 +90,6 @@ fun SettingsScreen(
     themeMode: AppThemeMode,
     currentScaleMode: UiScaleMode,
     blurAlpha: Float,
-    enableBottomBarAnimation: Boolean,
     dynamicCardEffects: Boolean = true,
     onDynamicCardEffectsChange: (Boolean) -> Unit = {},
     enableMainTabSwipe: Boolean = false,
@@ -113,12 +111,9 @@ fun SettingsScreen(
     liquidGlassBlur: Float = 16f,
     onLiquidGlassBlurChange: (Float) -> Unit = {},
     onLiquidGlassBlurChangeFinished: () -> Unit = {},
-    bottomBarAnimMode: BottomBarAnimMode = BottomBarAnimMode.SLIDE,
-    onBottomBarAnimModeChange: (BottomBarAnimMode) -> Unit = {},
     /** 音乐栏动画：true = 展开，false = 滑出 */
     playerOpenExpand: Boolean = true,
     onPlayerOpenExpandChange: (Boolean) -> Unit = {},
-    onEnableBottomBarAnimationChange: (Boolean) -> Unit,
     onAutoPlayOnStartupChange: (Boolean) -> Unit = {},
     onAutoFallbackToLocalChange: (Boolean) -> Unit = {},
     onAutoLaunchOnBootChange: (Boolean) -> Unit = {},
@@ -645,6 +640,10 @@ fun SettingsScreen(
                                 }
 
                                 Spacer(modifier = Modifier.height(14.dp))
+                                val presenceMode by com.lm.player.core.source.ServerPresence.mode.collectAsState()
+                                val disconnectLockSec by com.lm.player.core.source.ServerPresence.disconnectLockSeconds.collectAsState()
+                                val isAutoLockedLocal = presenceMode == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
+
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     OutlinedButton(
                                         onClick = {
@@ -685,6 +684,36 @@ fun SettingsScreen(
                                         Text("管理服务器", fontSize = 12.sp)
                                     }
                                 }
+
+                                if (isAutoLockedLocal) {
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Button(
+                                        onClick = {
+                                            com.lm.player.core.source.ServerPresence.unlockToOnline()
+                                            onSelectServer(accountServer)
+                                            Toast.makeText(context, "已解除本地锁定，正在恢复在线模式…", Toast.LENGTH_SHORT).show()
+                                        },
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Default.CloudQueue, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("网络不稳定已锁定本地 · 点击恢复在线", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(14.dp))
+                                HorizontalDivider(color = borderColor.copy(alpha = 0.6f))
+                                Spacer(modifier = Modifier.height(10.dp))
+                                SettingDropdownRow(
+                                    title = "断联 / 高延迟自动锁定本地",
+                                    subtitle = "服务器持续断联或高延迟超过该时长后，资料库自动锁定为本地模式不再来回切换（在线发现、播放与下载仍由本地音源接管）",
+                                    selectedValue = disconnectLockSec,
+                                    options = com.lm.player.core.source.ServerPresence.LOCK_SECOND_OPTIONS,
+                                    getLabel = { com.lm.player.core.source.ServerPresence.formatLockSeconds(it) },
+                                    onSelect = { com.lm.player.core.source.ServerPresence.setDisconnectLockSeconds(it) }
+                                )
                             } else {
                                 Spacer(modifier = Modifier.height(14.dp))
                                 Text("当前为本地离线模式，未连接柠檬音乐服务器。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1756,21 +1785,6 @@ fun SettingsScreen(
                     item {
                         SettingsCard(title = "导航与动效", icon = Icons.Default.Animation) {
                             SettingDropdownRow(
-                                title = "播放栏动画效果",
-                                subtitle = when (bottomBarAnimMode) {
-                                    BottomBarAnimMode.CLICK -> "点击展开：点击左侧图标展开双层导航栏，向上滚动页面自动收缩 (v1.7.28 经典模式)"
-                                    BottomBarAnimMode.SLIDE -> "滑动切换：按住左侧图标横向滑动物理跟随切页，歌曲缩圆位移 (v1.7.29 流体模式)"
-                                },
-                                icon = Icons.Default.Animation,
-                                selectedValue = bottomBarAnimMode,
-                                options = listOf(BottomBarAnimMode.CLICK, BottomBarAnimMode.SLIDE),
-                                getLabel = { it.label },
-                                getSubtitle = { it.subtitle },
-                                onSelect = { onBottomBarAnimModeChange(it) }
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingDropdownRow(
                                 title = "音乐栏动画",
                                 subtitle = if (playerOpenExpand) "展开：点底部音乐栏，播放页从音乐栏像灵动岛一样展开，关闭时以神奇效果收回音乐栏（竖屏）"
                                     else "滑出：点底部音乐栏，播放页从屏幕底部滑入，关闭时向下滑出",
@@ -1780,14 +1794,6 @@ fun SettingsScreen(
                                 getLabel = { if (it) "展开" else "滑出" },
                                 getSubtitle = { if (it) "从音乐栏展开 · 神奇效果收回" else "从底部滑入滑出" },
                                 onSelect = { onPlayerOpenExpandChange(it) }
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingSwitchRow(
-                                title = "悬浮播放底栏自动收缩",
-                                subtitle = "页面向上滚动时自动收起导航栏，为列表展示释放最大可视区域",
-                                checked = enableBottomBarAnimation,
-                                onCheckedChange = onEnableBottomBarAnimationChange
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))

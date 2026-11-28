@@ -4,10 +4,11 @@
 
 <h1 align="center">LMPlayer</h1>
 
-<p align="center">柠檬音乐服务端的 Android 手机 / 平板客户端</p>
+<p align="center">柠檬音乐服务端的 Android / iOS 手机客户端</p>
 
 <p align="center">
   <a href="https://github.com/zyhub/LMplayer/releases">下载</a> ·
+  <a href="#ios-版">iOS 版</a> ·
   <a href="https://github.com/jia070310/lemon-muisc">柠檬服务端</a> ·
   <a href="https://github.com/zyhub/LMPlayer-tvcar">TV / 车机版</a> ·
   <a href="LICENSE">许可证</a>
@@ -45,6 +46,12 @@ LMPlayer 是 [柠檬音乐服务端（lemon-muisc）](https://github.com/jia0703
 - 系统要求：Android 6.0 及以上
 - 支持架构：arm64-v8a、armeabi-v7a、x86_64
 - 安装包使用固定签名，新版本可直接覆盖安装
+
+### iOS 版
+
+- 在 [Releases](https://github.com/zyhub/LMplayer/releases) 下载对应的 `LMPlayer-iOS-<版本号>.ipa`
+- 支持系统：iOS 17.0 及以上（iPhone / iPad / Apple CarPlay）
+- 安装方式：支持自签工具、TrollStore（巨魔）或 LiveContainer 安装
 
 ## 编译
 

@@ -63,6 +63,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.whenStarted
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -291,10 +292,6 @@ class MainActivity : ComponentActivity() {
             var liquidGlassBlur by remember {
                 mutableStateOf(uiPrefs.getFloat("ui_liquid_glass_blur", 16f).coerceIn(0f, 30f))
             }
-            var bottomBarAnimMode by remember {
-                val savedMode = uiPrefs.getString("ui_bottom_bar_anim_mode", BottomBarAnimMode.SLIDE.name)
-                mutableStateOf(BottomBarAnimMode.fromName(savedMode))
-            }
             // 音乐栏动画：点底栏播放条打开播放页时 true = 展开（灵动岛展开 + Genie 收回），false = 滑出（从底部滑入滑出）
             // 首次（没设置过）：玻璃高档用「展开」，低档 / 不支持玻璃用「滑出」；之后用户在设置里改的会保存
             var playerOpenExpand by remember {
@@ -304,9 +301,6 @@ class MainActivity : ComponentActivity() {
                     uiPrefs.edit().putBoolean("ui_player_open_expand", auto).apply()
                 }
                 mutableStateOf(uiPrefs.getBoolean("ui_player_open_expand", true))
-            }
-            var enableBottomBarAnimation by remember {
-                mutableStateOf(uiPrefs.getBoolean("enable_bottom_bar_anim", true))
             }
             var dynamicCardEffects by remember {
                 mutableStateOf(uiPrefs.getBoolean("dynamic_card_effects", true))
@@ -438,6 +432,9 @@ class MainActivity : ComponentActivity() {
             // 本地 Room 的 isFavorite 只是这份服务器收藏在本机的镜像，用它来枚举收藏会漏掉
             // 「在别的设备/网页端收藏、本机没同步过」的曲目，所以收藏列表一律以服务器为准。
             var serverFavoriteSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+            // 2026-11-25：服务器收藏是否已经拉到过。拉到过就以它为准（哪怕是空的）；
+            // 此前「服务器收藏为空」就退回本机红心标记，本机导入文件的红心不归服务器管，数量就和 iOS / 车机对不上
+            var serverFavoritesLoaded by remember { mutableStateOf(false) }
             // 最近播放足迹来自 PlaybackQueueManager 的持久化记录（真实播放行为驱动），
             // 不再用「曲库前 N 首」冒充 —— 那正是资料库「最近播放」卡片歌曲不对的根因
             val recentlyPlayedSongs by PlaybackQueueManager.recentPlayedSongsFlow.collectAsState()
@@ -673,6 +670,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // 2026-11-25：服务器歌单对齐到本机库，三处同步共用（串行执行；服务器上已没有的云端歌单——
+            // 包括本机建的 pl_ 歌单——一律删掉，别的设备删的歌单才同步得过来；见 ServerPlaylistSync）
+            val syncServerPlaylistsWith: suspend (LemonMusicProtocol, ServerConfig) -> Unit = { proto, config ->
+                com.lm.player.core.network.ServerPlaylistSync.sync(database, proto, config) { pl ->
+                    val joinedCovers = if (pl.previewCovers.isNotEmpty()) {
+                        pl.previewCovers.joinToString("|")
+                    } else {
+                        pl.coverUrl
+                    }
+                    com.lm.player.core.database.entity.PlaylistEntity(
+                        id = pl.id,
+                        name = pl.name,
+                        coverUrl = joinedCovers,
+                        serverId = config.id,
+                        isOnline = true,
+                        songCount = pl.songCount
+                    )
+                }
+            }
+
             // 极速同步服务器歌单 (轻量级秒级同步，完全解耦于大体量歌曲全量同步)
             val syncServerPlaylists: (ServerConfig) -> Unit = { config ->
                 lifecycleScope.launch(Dispatchers.IO) {
@@ -685,35 +702,7 @@ class MainActivity : ComponentActivity() {
                             LemonMusicProtocol(client, config.serverUrl, config.username, effectiveToken)
                         } else protocol
 
-                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                        if (playlistRes.isSuccess) {
-                            val plList = playlistRes.getOrNull() ?: emptyList()
-                            val incomingIds = plList.map { it.id }.toSet()
-                            val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                            for (oldPl in existingPlaylists) {
-                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                    database.playlistDao().deletePlaylist(oldPl.id)
-                                }
-                            }
-                            val plEntities = plList.map { pl ->
-                                val joinedCovers = if (pl.previewCovers.isNotEmpty()) {
-                                    pl.previewCovers.joinToString("|")
-                                } else {
-                                    pl.coverUrl
-                                }
-                                com.lm.player.core.database.entity.PlaylistEntity(
-                                    id = pl.id,
-                                    name = pl.name,
-                                    coverUrl = joinedCovers,
-                                    serverId = config.id,
-                                    isOnline = true,
-                                    songCount = pl.songCount
-                                )
-                            }
-                            database.playlistDao().insertPlaylists(plEntities)
-                            Log.i("MainActivity", "Successfully synced ${plEntities.size} server playlists for server ${config.id}")
-                        }
+                        syncServerPlaylistsWith(activeProto, config)
                     } catch (e: Exception) {
                         Log.e("MainActivity", "syncServerPlaylists failed", e)
                     }
@@ -781,34 +770,7 @@ class MainActivity : ComponentActivity() {
 
                         // 优先瞬时同步服务器歌单 (不等大体积曲库请求，秒级完成并更新界面)
                         try {
-                            val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                            if (playlistRes.isSuccess) {
-                                val plList = playlistRes.getOrNull() ?: emptyList()
-                                val incomingIds = plList.map { it.id }.toSet()
-                                val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                    .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                                for (oldPl in existingPlaylists) {
-                                    if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                        database.playlistDao().deletePlaylist(oldPl.id)
-                                    }
-                                }
-                                val plEntities = plList.map { pl ->
-                                    val joinedCovers = if (pl.previewCovers.isNotEmpty()) {
-                                        pl.previewCovers.joinToString("|")
-                                    } else {
-                                        pl.coverUrl
-                                    }
-                                    com.lm.player.core.database.entity.PlaylistEntity(
-                                        id = pl.id,
-                                        name = pl.name,
-                                        coverUrl = joinedCovers,
-                                        serverId = config.id,
-                                        isOnline = true,
-                                        songCount = pl.songCount
-                                    )
-                                }
-                                database.playlistDao().insertPlaylists(plEntities)
-                            }
+                            syncServerPlaylistsWith(activeProto, config)
                         } catch (e: Exception) {
                             Log.w("MainActivity", "Pre-sync playlists failed", e)
                         }
@@ -953,14 +915,16 @@ class MainActivity : ComponentActivity() {
                         } catch (e: Exception) {
                             Log.w("MainActivity", "Syncing user favorites failed", e)
                         }
+                        // 2026-11-25：上面只会「标为喜欢」；触发「我喜欢」重新拉取，拉取时按服务器收藏把别处取消的红心清掉
+                        withContext(Dispatchers.Main) { favoritesRefreshTrigger++ }
 
                         // 在线模式的「最近添加」「最近播放」「最近添加专辑」一律以服务器数据为准，
                         // 本地 Room 只是服务器曲库的镜像，按它推断"最近添加"会把同步那一刻当成加入时间。
                         val addedList = activeProto.getRecentlyAdded(limit = 50).getOrNull() ?: emptyList()
                         if (addedList.isNotEmpty()) recentlyAddedSongs = addedList
 
-                        val playedList = activeProto.getRecentlyPlayed(limit = 50).getOrNull() ?: emptyList()
-                        if (playedList.isNotEmpty()) PlaybackQueueManager.rememberRecentPlayed(this@MainActivity, playedList)
+                        // 2026-11-25：「最近播放」三端统一用服务器那 100 首（本机播放也会写回服务器，见 UserDataMirror）
+                        com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, activeProto)
 
                         // 专辑聚合同样取服务器口径（/api/library/albums），失败时回落到本地聚合
                         val albumList = try {
@@ -972,34 +936,7 @@ class MainActivity : ComponentActivity() {
                         if (albumList.isNotEmpty()) withContext(Dispatchers.Main) { serverAlbums = albumList }
 
                         // 再次对齐服务器播放列表至数据库（含差量清理）
-                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                        if (playlistRes.isSuccess) {
-                            val plList = playlistRes.getOrNull() ?: emptyList()
-                            val incomingIds = plList.map { it.id }.toSet()
-                            val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                            for (oldPl in existingPlaylists) {
-                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                    database.playlistDao().deletePlaylist(oldPl.id)
-                                }
-                            }
-                            val plEntities = plList.map { pl ->
-                                val joinedCovers = if (pl.previewCovers.isNotEmpty()) {
-                                    pl.previewCovers.joinToString("|")
-                                } else {
-                                    pl.coverUrl
-                                }
-                                com.lm.player.core.database.entity.PlaylistEntity(
-                                    id = pl.id,
-                                    name = pl.name,
-                                    coverUrl = joinedCovers,
-                                    serverId = config.id,
-                                    isOnline = true,
-                                    songCount = pl.songCount
-                                )
-                            }
-                            database.playlistDao().insertPlaylists(plEntities)
-                        }
+                        syncServerPlaylistsWith(activeProto, config)
 
                         // 第二十三节：音源同步与本地加速已提前到登录成功后立即启动 (见本函数开头)
 
@@ -1201,16 +1138,75 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 服务器可用性（带防抖，见 ServerPresence）驱动资料库在线 / 本地模式自动切换：
-            // - 持续离线满 60 秒：资料库切到本地模式（发现页、搜索、播放始终走本地音源，界面不变）；
-            // - 离线后稳定在线满 30 秒：自动登录、切回在线资料库并增量同步、核对音源脚本。
-            // 只自动切回「因离线而进入」的本地模式；用户手动选择的本地曲库不动。
+            // 2026-11-25：在前台时每次回到前台、以及之后每分钟，轻量检查服务器 user-data 的 revision
+            // （服务器对 ?sinceRevision= 没变化只回 unchanged 标记）。别的设备（iOS / 车机 / 网页）建、删歌单后，
+            // 手机回到 App 或停在歌单页时也能跟上；有变化才整份拉歌单。退到后台即停。
+            LaunchedEffect(Unit) {
+                repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    while (isActive) {
+                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                        if (active != null && !inLocalMode) {
+                            val proto = LemonMusicProtocol(
+                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                active.serverUrl, active.username, active.tokenOrApiKey
+                            )
+                            val changed = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    com.lm.player.core.network.ServerPlaylistSync.changedSinceLastSync(proto, active)
+                                }.getOrDefault(false)
+                            }
+                            if (changed) {
+                                Log.i("MainActivity", "Server user-data changed, re-syncing playlists / favorites / recent plays")
+                                syncServerPlaylists(active)
+                                // 收藏、最近播放同样以服务器为准（别的设备点红心、听歌后这边跟上）
+                                favoritesRefreshTrigger++
+                                withContext(Dispatchers.IO) {
+                                    runCatching { com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, proto) }
+                                }
+                            }
+                        }
+                        delay(60_000L)
+                    }
+                }
+            }
+
+            // 2026-11-25：在线时「最近播放」整份用服务器那 100 首（三端一致），本机播放也写回服务器；
+            // 本地模式不连服务器，播放先攒着，回到在线再补推（见 UserDataMirror）
+            LaunchedEffect(serversList, activeServerName) {
+                val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                val active = if (inLocalMode) null else (
+                    serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                    )
+                com.lm.player.core.network.UserDataMirror.setServer(this@MainActivity, active)
+                if (active == null) return@LaunchedEffect
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                        val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
+                        com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, protocol)
+                    }
+                }
+            }
+
+            // 服务器可用性（带防抖 + 持续不稳定自动锁定，见 ServerPresence）驱动资料库在线 / 本地模式自动切换：
+            // - 持续断联 / 高延迟满阈值：资料库自动锁定本地模式（LOCKED_LOCAL），不再来回抖动，需手动恢复在线；
+            // - 关闭自动锁定时沿用原 60s 离线切本地、恢复稳定 30s 自动切回在线；
+            // - 发现页、搜索、播放与下载始终继续走本地音源，不受资料库锁定影响。
             val serverPresence by com.lm.player.core.source.ServerPresence.mode.collectAsState()
             LaunchedEffect(serverPresence) {
                 val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                     ?: return@LaunchedEffect
                 val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
                 when (serverPresence) {
+                    com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL -> {
+                        if (!inLocalMode || activeServerName == "本地 · 服务器离线") {
+                            Log.w("MainActivity", "Server ${active.name} unstable/offline: library auto-locked to local mode")
+                            activeServerName = "本地 · 网络不稳定已锁定"
+                            localModeDueToOffline = true
+                        }
+                    }
                     com.lm.player.core.source.ServerPresence.Mode.OFFLINE -> if (!inLocalMode) {
                         Log.w("MainActivity", "Server ${active.name} offline (confirmed): library switches to local mode")
                         activeServerName = "本地 · 服务器离线"
@@ -1857,26 +1853,29 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                        // 2. 本地插入 playlist_songs 关联并补齐歌单封面
+                        // 2. 本地插入 playlist_songs 关联（仅本地离线歌单或未连接服务器时本地维护 songCount 与封面，
+                        // 云端歌单以服务器同步结果为准，避免先写成不完整的本地关联条数再被同步覆盖引发顺序/计数跳动）
+                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                         database.playlistDao().addSongToPlaylist(
                             com.lm.player.core.database.entity.PlaylistSongEntity(
                                 playlistId = targetPlaylist.id,
                                 songId = songToAdd.id
                             )
                         )
-                        database.playlistDao().updateSongCount(targetPlaylist.id)
-                        if (songToAdd.coverUrl.isNotBlank()) {
-                            database.playlistDao().getPlaylistById(targetPlaylist.id)?.let { plEntity ->
-                                val existingCovers = plEntity.coverUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
-                                if (!existingCovers.contains(songToAdd.coverUrl) && existingCovers.size < 4) {
-                                    existingCovers.add(songToAdd.coverUrl)
-                                    database.playlistDao().insertPlaylist(plEntity.copy(coverUrl = existingCovers.joinToString("|")))
+                        if (!targetPlaylist.isOnline || active == null) {
+                            database.playlistDao().updateSongCount(targetPlaylist.id)
+                            if (songToAdd.coverUrl.isNotBlank()) {
+                                database.playlistDao().getPlaylistById(targetPlaylist.id)?.let { plEntity ->
+                                    val existingCovers = plEntity.coverUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+                                    if (!existingCovers.contains(songToAdd.coverUrl) && existingCovers.size < 4) {
+                                        existingCovers.add(songToAdd.coverUrl)
+                                        database.playlistDao().insertPlaylist(plEntity.copy(coverUrl = existingCovers.joinToString("|")))
+                                    }
                                 }
                             }
                         }
 
                         // 3. 若为云端在线歌单且配置了服务端，同步至服务器 customPlaylists (携带完整 trackSnapshots)
-                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                         if (targetPlaylist.isOnline && active != null) {
                             val protocol = LemonMusicProtocol(
                                 NetworkClientFactory.createOkHttpClient(this@MainActivity),
@@ -1884,39 +1883,19 @@ class MainActivity : ComponentActivity() {
                                 active.username,
                                 active.tokenOrApiKey
                             )
-                            val serverPath = LemonMusicProtocol.getServerFilePath(songToAdd.id, songToAdd.streamUrl, songToAdd.coverUrl)
-                            val isOnlineTrack = songToAdd.id.startsWith("lemon_online_") || songToAdd.streamUrl.startsWith("lemon_online://")
-                            val onlineParts = if (songToAdd.id.startsWith("lemon_online_")) {
-                                songToAdd.id.removePrefix("lemon_online_").split("_", limit = 2)
-                            } else emptyList()
-                            val onlinePlatform = onlineParts.getOrNull(0)?.ifBlank { "kw" } ?: "kw"
-                            val onlineRawId = onlineParts.getOrNull(1)?.ifBlank { songToAdd.id } ?: songToAdd.id
-                            val key = when {
-                                !serverPath.isNullOrBlank() -> "local:$serverPath"
-                                songToAdd.id.startsWith("lemon_") && songToAdd.streamUrl.contains("path=") -> {
-                                    val decoded = try {
-                                        java.net.URLDecoder.decode(songToAdd.streamUrl.substringAfter("path=").substringBefore("&"), "UTF-8")
-                                    } catch (_: Exception) { null }
-                                    if (decoded != null) "local:$decoded" else songToAdd.id
-                                }
-                                isOnlineTrack -> "$onlinePlatform:$onlineRawId"
-                                else -> songToAdd.id
+                            val songForServer = if (existing != null) {
+                                songToAdd.copy(
+                                    streamUrl = if (songToAdd.streamUrl.contains("path=")) songToAdd.streamUrl
+                                        else existing.streamUrl.takeIf { it.contains("path=") } ?: songToAdd.streamUrl,
+                                    coverUrl = songToAdd.coverUrl.takeIf { it.isNotBlank() && !it.startsWith("/") && !it.startsWith("file:") && !it.startsWith("content:") }
+                                        ?: existing.coverUrl.takeIf { it.isNotBlank() }
+                                        ?: songToAdd.coverUrl,
+                                    rawMetaJson = songToAdd.rawMetaJson?.takeIf { it.isNotBlank() } ?: existing.rawMetaJson
+                                )
+                            } else {
+                                songToAdd
                             }
-                            val snapObj = org.json.JSONObject().apply {
-                                put("key", key)
-                                put("name", songToAdd.title)
-                                put("singer", songToAdd.artist)
-                                put("album", songToAdd.album)
-                                put("picUrl", songToAdd.coverUrl)
-                                put("interval", (songToAdd.durationMs / 1000L).toInt())
-                                if (key.startsWith("local:")) {
-                                    put("source", "local")
-                                    put("localPath", key.removePrefix("local:"))
-                                } else {
-                                    put("source", onlinePlatform)
-                                    put("songId", onlineRawId)
-                                }
-                            }
+                            val (key, snapObj) = protocol.buildTrackKeyAndSnapshot(songForServer)
                             protocol.addTracksToCustomPlaylist(targetPlaylist.id, listOf(key), mapOf(key to snapObj))
                             syncServerPlaylists(active)
                         }
@@ -2309,12 +2288,15 @@ class MainActivity : ComponentActivity() {
                         // key 用「当前页面」与「服务器身份」本身，而不是布尔表达式：
                         // 表达式作 key 时，任何一次同步导致 serversList 变成新实例都会让
                         // activeLemonServerForSearch 变化，从而重复拉取整份服务器收藏；
+                        // 2026-11-25：本机点红心写完服务器后也重新拉一次（数量以服务器为准）
+                        val favoritesVersion by com.lm.player.core.network.UserDataMirror.favoritesVersion.collectAsState()
                         LaunchedEffect(
                             activeLemonServerForSearch?.id,
                             activeLemonServerForSearch?.tokenOrApiKey,
                             activeServerId,
                             activeServerName,
                             favoritesRefreshTrigger,
+                            favoritesVersion,
                             currentScreen
                         ) {
                             val srv = activeLemonServerForSearch ?: return@LaunchedEffect
@@ -2322,7 +2304,9 @@ class MainActivity : ComponentActivity() {
                                 try {
                                     val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                     val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
-                                    val rawFavs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()?.distinctBy { it.id }
+                                    // 2026-11-26：与 TV / iOS 保持严格 1:1 数量口径，不做 distinctBy 丢弃
+                                    val rawFavs = com.lm.player.core.network.UserDataMirror
+                                        .pullFavorites(database, protocol)
                                     if (rawFavs != null) {
                                         rawFavs.map { s ->
                                             val validCover = s.coverUrl.takeIf { it.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(it) }
@@ -2339,7 +2323,10 @@ class MainActivity : ComponentActivity() {
                                     null
                                 }
                             }
-                            if (fetched != null) serverFavoriteSongs = fetched.distinctBy { it.id }
+                            if (fetched != null) {
+                                serverFavoriteSongs = fetched
+                                serverFavoritesLoaded = true
+                            }
                         }
 
                         val isLocalModeHeader = activeServerName.contains("本地") || activeServerName.contains("已下载")
@@ -2354,6 +2341,7 @@ class MainActivity : ComponentActivity() {
 
                         // 统一模式切换刷新规则：切换本地曲库与在线服务器时自动刷新全量关联数据，防止跨模式状态残留引发错误
                         val switchToLocalLibraryMode: (String) -> Unit = { displayName ->
+                            com.lm.player.core.source.ServerPresence.clearAutoLockForManualLocal()
                             activeServerName = displayName
                             localModeDueToOffline = false
                             activeServerId = "local_mode"
@@ -2369,12 +2357,14 @@ class MainActivity : ComponentActivity() {
                         }
 
                         val switchToOnlineServerMode: (ServerConfig) -> Unit = { selectedServer ->
+                            com.lm.player.core.source.ServerPresence.unlockToOnline()
                             activeServerName = selectedServer.name
                             localModeDueToOffline = false
                             activeServerId = selectedServer.id
                             LemonMusicProtocol.clearDiscoverCache()
                             refreshServerFavorites()
                             lifecycleScope.launch(Dispatchers.IO) {
+                                com.lm.player.core.source.ServerLinkState.probeNow()
                                 database.serverDao().setActiveServer(selectedServer.id)
                                 syncServerPlaylists(selectedServer)
                                 syncServerSongs(selectedServer)
@@ -2428,8 +2418,6 @@ class MainActivity : ComponentActivity() {
                         totalDurationMs = appPlaybackDurationMs,
                         blurAlpha = blurAlpha,
                         liquidGlassBlur = liquidGlassBlur,
-                        bottomBarAnimMode = bottomBarAnimMode,
-                        enableBottomBarAnimation = enableBottomBarAnimation,
                         useLinearAnimation = true,
                         onNavigate = { targetNavScreen ->
                             navigateToScreen(targetNavScreen)
@@ -2708,9 +2696,10 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 Screen.LIBRARY -> {
-                                    // 服务器确认离线 / 已删除：资料库自动按本地模式展示（服务器恢复后自动切回）
-                                    // 资料库按「防抖后的服务器可用性」切换：服务器短时波动（60 秒内恢复）不会把资料库切到本地
-                                    val libraryServerLost = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.OFFLINE
+                                    // 服务器确认离线 / 长时间不稳定锁定 / 已删除：资料库自动按本地模式展示
+                                    val presenceMode = com.lm.player.core.source.ServerPresence.mode.collectAsState().value
+                                    val libraryAutoLocked = presenceMode == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
+                                    val libraryServerLost = presenceMode == com.lm.player.core.source.ServerPresence.Mode.OFFLINE || libraryAutoLocked
                                     val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载") || libraryServerLost
                                     val activeConfig = if (isLocalMode) null else serversList.firstOrNull { it.isCurrentActive }
                                     val librarySongs = remember(songList, activeConfig, isLocalMode) {
@@ -2755,10 +2744,12 @@ class MainActivity : ComponentActivity() {
                                     // 拉不到服务器收藏（列表为空，例如断网）时回落到本地 isFavorite 标记，
                                     // 避免收藏卡片整块变空这种更糟的退化。
                                     val favoriteSongs = remember(
-                                        serverFavoriteSongs, librarySongs, completedDownloadedSongs, isLocalMode
+                                        serverFavoriteSongs, serverFavoritesLoaded, librarySongs, completedDownloadedSongs, isLocalMode
                                     ) {
                                         when {
-                                            serverFavoriteSongs.isEmpty() -> librarySongs.filter { it.isFavorite }.distinctBy { it.id }
+                                            // 只有还没拉到过服务器收藏（例如断网启动）才退回本机红心标记
+                                            !serverFavoritesLoaded && serverFavoriteSongs.isEmpty() ->
+                                                librarySongs.filter { it.isFavorite }.distinctBy { it.id }
                                             !isLocalMode -> {
                                                 // 服务器收藏里存在「在线音源身份」的记录（serverId=lemon_online），
                                                 // 其 id 与服务器曲库文件 id 不同，只按 id 匹配永远落空；这里额外按
@@ -2766,10 +2757,12 @@ class MainActivity : ComponentActivity() {
                                                 val serverLibraryByTitle = librarySongs
                                                     .filter { it.isServerLibrarySong && it.title.isNotBlank() }
                                                     .groupBy { SongMatchingResolver.normalizeTrackTitle(it.title) }
+                                                // 2026-11-26：严格保持服务器 favorites 1:1 数量口径（与 TV / iOS 一致），
+                                                // 逐条映射替换曲库记录（带本地路径与服务器封面），不再二次过滤丢弃任何条目
                                                 serverFavoriteSongs.map { fav ->
                                                     resolveFavoriteSong(fav, librarySongs, serverLibraryByTitle)
                                                         .copy(isFavorite = true)
-                                                }.distinctBy { it.id }
+                                                }
                                             }
                                             else -> serverFavoriteSongs.mapNotNull { fav ->
                                                 completedDownloadedSongs.firstOrNull { local ->
@@ -2795,6 +2788,7 @@ class MainActivity : ComponentActivity() {
                                     LocalLibraryScreen(
                                         allSongs = librarySongs,
                                         favoriteSongs = favoriteSongs,
+                                        favoritesFromServer = serverFavoritesLoaded,
                                         downloadedSongs = completedDownloadedSongs,
                                         recentlyPlayedSongs = recentlyPlayedSongs,
                                         recentlyAddedSongs = if (isLocalMode) emptyList() else recentlyAddedSongs,
@@ -2814,7 +2808,11 @@ class MainActivity : ComponentActivity() {
                                         activeServerConfig = activeConfig,
                                         activeDownloadTasks = activeDownloadTasks,
                                         activeDownloadCount = activeDownloadTasks.size,
-                                        currentServerName = if (libraryServerLost && !activeServerName.contains("本地")) "本地 · 服务器离线" else activeServerName,
+                                        currentServerName = when {
+                                            libraryAutoLocked && !activeServerName.contains("本地") -> "本地 · 网络不稳定已锁定"
+                                            libraryServerLost && !activeServerName.contains("本地") -> "本地 · 服务器离线"
+                                            else -> activeServerName
+                                        },
                                         configuredServers = serversList,
                                         blurAlpha = blurAlpha,
                                         dynamicCardEffects = dynamicCardEffects,
@@ -2997,19 +2995,9 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onFetchPlaylistSongs = { playlistId, isOnline ->
                                             val rawList = if (isOnline && activeConfig != null) {
                                                 val protocol = LemonMusicProtocol(NetworkClientFactory.createOkHttpClient(this@MainActivity), activeConfig.serverUrl, activeConfig.username, activeConfig.tokenOrApiKey)
-                                                val fetched = protocol.getPlaylistSongs(playlistId).getOrNull() ?: emptyList()
-                                                if (fetched.isNotEmpty()) {
-                                                    lifecycleScope.launch(Dispatchers.IO) {
-                                                        try {
-                                                            database.playlistDao().getPlaylistById(playlistId)?.let { entity ->
-                                                                if (entity.songCount != fetched.size) {
-                                                                    database.playlistDao().insertPlaylist(entity.copy(songCount = fetched.size))
-                                                                }
-                                                            }
-                                                        } catch (_: Exception) { }
-                                                    }
-                                                }
-                                                fetched
+                                                // 2026-11-26：在线歌单的 songCount 由 ServerPlaylistSync 唯一维护，这里不再回写 Room，
+                                                // 避免 fetched.size 与服务端 tracks.length() 不一致导致每次刷新乒乓改库与跳序
+                                                protocol.getPlaylistSongs(playlistId).getOrNull() ?: emptyList()
                                             } else {
                                                 database.playlistDao().getSongsForPlaylist(playlistId).map { entity ->
                                                     UnifiedSong(
@@ -3141,20 +3129,24 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                                 }
                                             } else localMatchedList
 
-                                            // 同步用歌单内前 4 首有封面的歌曲回写歌单卡片封面
-                                            val topCovers = finalSongs.mapNotNull {
-                                                it.coverUrl.takeIf { c -> c.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(c) }
-                                            }.distinct().take(4)
-                                            if (topCovers.isNotEmpty()) {
-                                                lifecycleScope.launch(Dispatchers.IO) {
-                                                    try {
-                                                        database.playlistDao().getPlaylistById(playlistId)?.let { entity ->
-                                                            val joined = topCovers.joinToString("|")
-                                                            if (entity.coverUrl != joined || entity.songCount != finalSongs.size) {
-                                                                database.playlistDao().insertPlaylist(entity.copy(coverUrl = joined, songCount = finalSongs.size))
+                                            // 仅本地离线歌单回写前 4 首封面与曲目数到 Room；
+                                            // 云端歌单的封面补齐由 LocalLibraryScreen 内存缓存承载，不再并发回写 playlists 表，
+                                            // 彻底消除与 ServerPlaylistSync 之间的 coverUrl/songCount 乒乓及 SQLite rowid 随机洗牌
+                                            if (!isOnline) {
+                                                val topCovers = finalSongs.mapNotNull {
+                                                    it.coverUrl.takeIf { c -> c.isNotBlank() && !LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(c) }
+                                                }.distinct().take(4)
+                                                if (topCovers.isNotEmpty()) {
+                                                    lifecycleScope.launch(Dispatchers.IO) {
+                                                        try {
+                                                            database.playlistDao().getPlaylistById(playlistId)?.let { entity ->
+                                                                val joined = topCovers.joinToString("|")
+                                                                if (entity.coverUrl != joined || entity.songCount != finalSongs.size) {
+                                                                    database.playlistDao().insertPlaylist(entity.copy(coverUrl = joined, songCount = finalSongs.size))
+                                                                }
                                                             }
-                                                        }
-                                                    } catch (_: Exception) {}
+                                                        } catch (_: Exception) {}
+                                                    }
                                                 }
                                             }
 
@@ -3356,20 +3348,10 @@ onScrollPositionChange = { isScrolledAwayFromTop = it },
                                         onLiquidGlassBlurChangeFinished = {
                                             uiPrefs.edit().putFloat("ui_liquid_glass_blur", liquidGlassBlur).apply()
                                         },
-                                        bottomBarAnimMode = bottomBarAnimMode,
-                                        onBottomBarAnimModeChange = { newMode ->
-                                            bottomBarAnimMode = newMode
-                                            uiPrefs.edit().putString("ui_bottom_bar_anim_mode", newMode.name).apply()
-                                        },
                                         playerOpenExpand = playerOpenExpand,
                                         onPlayerOpenExpandChange = { expand ->
                                             playerOpenExpand = expand
                                             uiPrefs.edit().putBoolean("ui_player_open_expand", expand).apply()
-                                        },
-                                        enableBottomBarAnimation = enableBottomBarAnimation,
-                                        onEnableBottomBarAnimationChange = { isEnabled ->
-                                            enableBottomBarAnimation = isEnabled
-                                            uiPrefs.edit().putBoolean("enable_bottom_bar_anim", isEnabled).apply()
                                         },
                                         dynamicCardEffects = dynamicCardEffects,
                                         onDynamicCardEffectsChange = { isEnabled ->

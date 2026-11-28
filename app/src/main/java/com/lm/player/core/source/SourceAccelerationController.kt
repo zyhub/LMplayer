@@ -129,15 +129,22 @@ object SourceAccelerationController {
     }
 
     /**
-     * 取链前调用：引擎未就绪则按需加载；有可用服务器时不等（本次走服务器，引擎在后台加载好后下次本地优先），
-     * 没有可用服务器（未配置 / 离线）时等引擎就绪，最多 [timeoutMs]。返回引擎此刻是否可用。
+     * 取链前调用：引擎未就绪则按需加载；
+     * - 本机没有缓存脚本且服务器可用：立即返回 false 走服务器，不白等；
+     * - 本机已缓存脚本但引擎仍在加载：短暂等待就绪（常规 2.5s / 服务器弱网 4.5s / 无服务器或离线 8s），
+     *   避免首首在线点播或下载跳过本地音源去撞高延迟 / 刚断联的服务器。
      */
     suspend fun ensureEnginesForResolve(timeoutMs: Long = 8_000L): Boolean {
         if (SourceAccelerationSession.isReady()) return true
-        demandEngines("resolve")
         val serverUsable = server != null && !ServerLinkState.isLost
-        if (serverUsable) return false
-        return awaitEngines(timeoutMs)
+        val hasLocal = localSourceConfigured() || context?.let { SourceScriptStore.hasCache(it) } == true
+        demandEngines("resolve")
+        if (!serverUsable) {
+            return awaitEngines(timeoutMs)
+        }
+        if (!hasLocal) return false
+        val waitMs = (if (isServerWeak()) 4_500L else 2_500L).coerceAtMost(timeoutMs)
+        return awaitEngines(waitMs)
     }
 
     /** 本机当前版脚本可以给这台服务器用（没有概要的旧缓存先当作可用，装载时再按服务器核对） */
@@ -211,6 +218,7 @@ object SourceAccelerationController {
         ServerLinkState.listener = { old, new -> onLinkChanged(old, new) }
         ServerLibraryAccelerationResolver.init(context)
         com.lm.player.core.source.catalog.CatalogDiskCache.init(context)
+        ServerPresence.init(context)
         ServerPresence.start()
     }
 
@@ -555,6 +563,7 @@ object SourceAccelerationController {
      */
     fun onServerSample(host: String, elapsedMs: Long, success: Boolean) {
         if (serverHost.isBlank() || NetworkScopeDetector.hostOf(host) != serverHost) return
+        ServerPresence.onServerSample(elapsedMs, success)
         if (success) {
             ServerLinkState.reportSuccess(host)
             val now = System.currentTimeMillis()
